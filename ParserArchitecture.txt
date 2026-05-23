@@ -1,0 +1,320 @@
+Here we go—this is the **parser architecture** Anti Gravity 2.0 should generate for GRISP 1.0 and G‑Blocks.
+
+I’ll keep it focused, concrete, and Delphi‑ready.
+
+---
+
+### 1. Overall structure
+
+The parser stack should be split into three layers:
+
+1. **Lexer**  
+   Turns raw text into tokens.
+
+2. **Parser**  
+   Consumes tokens, builds `TGGraph` (`TGNode` + `TGValue`).
+
+3. **Facade**  
+   Single entry point: `ParseGBlocks(const Source: string): TGGraph`.
+
+---
+
+### 2. Token model (lexer output)
+
+Create a unit, e.g. `GrispTokens.pas`:
+
+```pascal
+unit GrispTokens;
+
+interface
+
+type
+  TTokenKind = (
+    tkEOF,
+    tkIdentifier,
+    tkNumber,
+    tkString,
+    tkBoolean,
+    tkKeywordNode,
+    tkKeywordArray,
+    tkLBrace,    // {
+    tkRBrace,    // }
+    tkLBracket,  // [
+    tkRBracket,  // ]
+    tkLess,      // <
+    tkGreater,   // >
+    tkColon,     // :
+    tkEquals,    // =
+    tkComma      // ,
+  );
+
+  TToken = record
+    Kind: TTokenKind;
+    Lexeme: string;
+    Line: Integer;
+    Column: Integer;
+  end;
+
+implementation
+
+end.
+```
+
+---
+
+### 3. Lexer architecture
+
+Create `GrispLexer.pas`:
+
+```pascal
+unit GrispLexer;
+
+interface
+
+uses
+  GrispTokens, System.SysUtils;
+
+type
+  TGrispLexer = class
+  private
+    FSource: string;
+    FPos: Integer;
+    FLine: Integer;
+    FCol: Integer;
+  public
+    constructor Create(const ASource: string);
+    function NextToken: TToken;
+  end;
+
+implementation
+
+{ TGrispLexer }
+
+constructor TGrispLexer.Create(const ASource: string);
+begin
+  inherited Create;
+  FSource := ASource;
+  FPos := 1;
+  FLine := 1;
+  FCol := 1;
+end;
+
+function TGrispLexer.NextToken: TToken;
+begin
+  // To be implemented:
+  // - skip whitespace
+  // - recognize identifiers / keywords (node, array, true, false)
+  // - recognize numbers
+  // - recognize strings
+  // - recognize symbols: { } [ ] < > : = ,
+  // - return tkEOF at end
+end;
+
+end.
+```
+
+---
+
+### 4. Parser architecture
+
+Create `GrispParser.pas`:
+
+- The parser **directly builds** a `TGGraph` using `TGNode`, `TGValue`, etc.
+- It consumes tokens from `TGrispLexer`.
+
+```pascal
+unit GrispParser;
+
+interface
+
+uses
+  GrispTokens,
+  GrispLexer,
+  GrispGraph; // TGGraph, TGNode, TGValue
+
+type
+  EGrispParseError = class(Exception);
+
+  TGrispParser = class
+  private
+    FLexer: TGrispLexer;
+    FCurrent: TToken;
+    FGraph: TGGraph;
+
+    procedure Advance;
+    procedure Expect(AKind: TTokenKind; const Msg: string);
+
+    procedure ParseNodeDecl;
+    procedure ParseNodeBody(ANode: TGNode);
+
+    function ParseTypeName: string;
+    function ParseValue(const ATypeName: string): TGValue;
+  public
+    constructor Create(const ASource: string);
+    destructor Destroy; override;
+
+    function Parse: TGGraph;
+  end;
+
+implementation
+
+{ TGrispParser }
+
+constructor TGrispParser.Create(const ASource: string);
+begin
+  inherited Create;
+  FLexer := TGrispLexer.Create(ASource);
+  FGraph := TGGraph.Create;
+  Advance;
+end;
+
+destructor TGrispParser.Destroy;
+begin
+  FLexer.Free;
+  // FGraph is returned from Parse, caller owns it
+  inherited;
+end;
+
+procedure TGrispParser.Advance;
+begin
+  FCurrent := FLexer.NextToken;
+end;
+
+procedure TGrispParser.Expect(AKind: TTokenKind; const Msg: string);
+begin
+  if FCurrent.Kind <> AKind then
+    raise EGrispParseError.CreateFmt('%s at line %d, col %d (found %s)',
+      [Msg, FCurrent.Line, FCurrent.Column, FCurrent.Lexeme]);
+  Advance;
+end;
+
+function TGrispParser.Parse: TGGraph;
+begin
+  // source_file := { node_decl }
+  while FCurrent.Kind <> tkEOF do
+  begin
+    // Only "node" blocks for v1
+    if FCurrent.Kind = tkKeywordNode then
+      ParseNodeDecl
+    else
+      raise EGrispParseError.CreateFmt('Unexpected token %s at line %d',
+        [FCurrent.Lexeme, FCurrent.Line]);
+  end;
+  Result := FGraph;
+end;
+
+procedure TGrispParser.ParseNodeDecl;
+var
+  NodeName: string;
+  Node: TGNode;
+begin
+  // node <Name> { ... }
+  Expect(tkKeywordNode, '"node" expected');
+  if FCurrent.Kind <> tkIdentifier then
+    raise EGrispParseError.Create('"node" name expected');
+  NodeName := FCurrent.Lexeme;
+  Advance;
+
+  Node := FGraph.AddNode(NodeName, 'node');
+
+  Expect(tkLBrace, '"{" expected after node name');
+  ParseNodeBody(Node);
+  Expect(tkRBrace, '"}" expected at end of node');
+end;
+
+procedure TGrispParser.ParseNodeBody(ANode: TGNode);
+var
+  Key: string;
+  TypeName: string;
+  Value: TGValue;
+begin
+  // <EdgeName>: <Type> = <Value>
+  while (FCurrent.Kind <> tkRBrace) and (FCurrent.Kind <> tkEOF) do
+  begin
+    if FCurrent.Kind <> tkIdentifier then
+      raise EGrispParseError.Create('Attribute name expected');
+    Key := FCurrent.Lexeme;
+    Advance;
+
+    Expect(tkColon, '":" expected after attribute name');
+    TypeName := ParseTypeName;
+    Expect(tkEquals, '"=" expected after type');
+
+    Value := ParseValue(TypeName);
+    ANode.SetAttribute(Key, Value);
+  end;
+end;
+
+function TGrispParser.ParseTypeName: string;
+begin
+  // For v1: identifier or array<identifier> or "node"
+  if FCurrent.Kind <> tkIdentifier then
+    raise EGrispParseError.Create('Type name expected');
+  Result := FCurrent.Lexeme;
+  Advance;
+
+  // array<T> form
+  // if Result = 'array' then parse "<Type>"
+end;
+
+function TGrispParser.ParseValue(const ATypeName: string): TGValue;
+begin
+  // Implement:
+  // - if ATypeName = 'number' → parse number literal
+  // - if 'string' → parse string
+  // - if 'boolean' → parse true/false
+  // - if 'identifier' → parse identifier
+  // - if 'array<...>' → parse [ ... ]
+  // - if 'node' → parse nested { ... } as inline TGNode/TGValue
+  Result := nil;
+end;
+
+end.
+```
+
+---
+
+### 5. Facade function
+
+Create `GrispGBlocks.pas` as a simple entry point:
+
+```pascal
+unit GrispGBlocks;
+
+interface
+
+uses
+  GrispParser,
+  GrispGraph;
+
+function ParseGBlocks(const Source: string): TGGraph;
+
+implementation
+
+function ParseGBlocks(const Source: string): TGGraph;
+var
+  Parser: TGrispParser;
+begin
+  Parser := TGrispParser.Create(Source);
+  try
+    Result := Parser.Parse;
+  finally
+    Parser.Free;
+  end;
+end;
+
+end.
+```
+
+---
+
+### 6. What Anti Gravity 2.0 must generate
+
+So for the **parser architecture**, Anti Gravity 2.0 should generate:
+
+- `GrispTokens.pas` — token kinds + token record  
+- `GrispLexer.pas` — `TGrispLexer` with `NextToken`  
+- `GrispParser.pas` — `TGrispParser` that builds `TGGraph`  
+- `GrispGBlocks.pas` — `ParseGBlocks` facade  
+
+The **implementation details** of `NextToken` and `ParseValue` can be generated in a second pass; the architecture above is the skeleton Anti Gravity 2.0 should treat as the contract.

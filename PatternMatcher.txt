@@ -1,0 +1,318 @@
+### 1. Goal of the pattern matcher
+
+The pattern matcher is the part of GRISP that answers one question:
+
+> “Does this **rule’s `match` graph** occur somewhere inside the **main graph**, and if so, with which variable bindings?”
+
+It must:
+
+- Work on `TGGraph`, `TGNode`, `TGEdge`, `TGValue`
+- Understand G‑Blocks patterns (`match: node = { ... }`)
+- Produce **bindings** like `X → TGNode`, `value → TGValue`
+- Be reusable by the runtime and the rewrite engine
+
+---
+
+### 2. Matching model
+
+At a high level:
+
+- A **pattern** is a small graph (built from the `match: node = { ... }` block)
+- The **target** is the main `TGGraph`
+- Matching is **structural**:
+  - Node names/types
+  - Attributes (keys, types, values)
+  - Nested nodes
+- Variables are **identifiers** in the pattern that stand for “some node/value” in the target
+
+Example pattern (G‑Blocks):
+
+```text
+match: node = {
+    X: node = {
+        value: number = 2
+        next: identifier = Y
+    }
+    Y: node = {
+        value: number = 1
+    }
+}
+```
+
+This means:
+
+- Find two nodes `X` and `Y` in the graph such that:
+  - `X.value = 2`
+  - `X.next = Y`
+  - `Y.value = 1`
+
+---
+
+### 3. Data structures for matching
+
+Create a new unit `GrispPattern.pas`.
+
+#### 3.1 Variable binding
+
+```pascal
+type
+  TNodeBinding = record
+    Name: string;   // variable name in pattern, e.g. 'X'
+    Node: TGNode;   // matched node in graph
+  end;
+
+  TValueBinding = record
+    Name: string;   // variable name in pattern, e.g. 'v'
+    Value: TGValue; // matched value in graph
+  end;
+```
+
+#### 3.2 Match result
+
+```pascal
+type
+  TMatchResult = class
+  public
+    Success: Boolean;
+    NodeBindings: TList<TNodeBinding>;
+    ValueBindings: TList<TValueBinding>;
+
+    constructor Create;
+    destructor Destroy; override;
+
+    procedure AddNodeBinding(const AName: string; ANode: TGNode);
+    procedure AddValueBinding(const AName: string; AValue: TGValue);
+    function TryGetNode(const AName: string; out ANode: TGNode): Boolean;
+    function TryGetValue(const AName: string; out AValue: TGValue): Boolean;
+  end;
+```
+
+---
+
+### 4. Pattern representation
+
+For v1, we can treat the `match: node = { ... }` block as a **mini graph** stored in a `TGNode`:
+
+- The rule node (`rule.*`) has an attribute `match` of type `node`
+- That `TGValue.NodeValue` is the **root pattern node**
+- Inside it, attributes like `X`, `Y`, `op`, `left`, `right` describe the pattern
+
+So the matcher will:
+
+- Take `RuleMatchRoot: TGNode` (pattern root)
+- Try to match it against parts of `Graph: TGGraph`
+
+---
+
+### 5. Matching algorithm (conceptual)
+
+1. For each candidate node in `Graph.Nodes`:
+   - Try to match `PatternRoot` against that node
+2. Matching a pattern node `P` against a target node `T`:
+   - If `P` is a **variable node** (e.g. key `X: node = { ... }`):
+     - Bind `X → T`
+     - Check inner constraints (attributes)
+   - For each attribute in `P.Attributes`:
+     - If it’s a literal → compare
+     - If it’s a nested node → recurse
+     - If it’s an identifier variable → bind
+3. If all attributes match and no conflict in bindings → success
+
+---
+
+### 6. Delphi skeleton: `TGrispPatternMatcher`
+
+```pascal
+unit GrispPattern;
+
+interface
+
+uses
+  System.Generics.Collections,
+  GrispGraph;
+
+type
+  TNodeBinding = record
+    Name: string;
+    Node: TGNode;
+  end;
+
+  TValueBinding = record
+    Name: string;
+    Value: TGValue;
+  end;
+
+  TMatchResult = class
+  public
+    Success: Boolean;
+    NodeBindings: TList<TNodeBinding>;
+    ValueBindings: TList<TValueBinding>;
+
+    constructor Create;
+    destructor Destroy; override;
+
+    procedure AddNodeBinding(const AName: string; ANode: TGNode);
+    procedure AddValueBinding(const AName: string; AValue: TGValue);
+    function TryGetNode(const AName: string; out ANode: TGNode): Boolean;
+    function TryGetValue(const AName: string; out AValue: TGValue): Boolean;
+  end;
+
+  TGrispPatternMatcher = class
+  private
+    FGraph: TGGraph;
+
+    function MatchNodePattern(PatternNode, TargetNode: TGNode; Match: TMatchResult): Boolean;
+    function MatchAttributePattern(const Key: string; PatternValue, TargetValue: TGValue; Match: TMatchResult): Boolean;
+  public
+    constructor Create(AGraph: TGGraph);
+
+    // Try to match the pattern rooted at PatternRoot somewhere in the graph.
+    // Returns a TMatchResult (Success = True if matched).
+    function MatchPattern(PatternRoot: TGNode): TMatchResult;
+  end;
+
+implementation
+
+{ TMatchResult }
+
+constructor TMatchResult.Create;
+begin
+  inherited Create;
+  NodeBindings := TList<TNodeBinding>.Create;
+  ValueBindings := TList<TValueBinding>.Create;
+  Success := False;
+end;
+
+destructor TMatchResult.Destroy;
+begin
+  NodeBindings.Free;
+  ValueBindings.Free;
+  inherited;
+end;
+
+procedure TMatchResult.AddNodeBinding(const AName: string; ANode: TGNode);
+var
+  B: TNodeBinding;
+begin
+  B.Name := AName;
+  B.Node := ANode;
+  NodeBindings.Add(B);
+end;
+
+procedure TMatchResult.AddValueBinding(const AName: string; AValue: TGValue);
+var
+  B: TValueBinding;
+begin
+  B.Name := AName;
+  B.Value := AValue;
+  ValueBindings.Add(B);
+end;
+
+function TMatchResult.TryGetNode(const AName: string; out ANode: TGNode): Boolean;
+var
+  B: TNodeBinding;
+begin
+  for B in NodeBindings do
+    if B.Name = AName then
+    begin
+      ANode := B.Node;
+      Exit(True);
+    end;
+  ANode := nil;
+  Result := False;
+end;
+
+function TMatchResult.TryGetValue(const AName: string; out AValue: TGValue): Boolean;
+var
+  B: TValueBinding;
+begin
+  for B in ValueBindings do
+    if B.Name = AName then
+    begin
+      AValue := B.Value;
+      Exit(True);
+    end;
+  AValue := nil;
+  Result := False;
+end;
+
+{ TGrispPatternMatcher }
+
+constructor TGrispPatternMatcher.Create(AGraph: TGGraph);
+begin
+  inherited Create;
+  FGraph := AGraph;
+end;
+
+function TGrispPatternMatcher.MatchPattern(PatternRoot: TGNode): TMatchResult;
+var
+  Candidate: TGNode;
+begin
+  Result := TMatchResult.Create;
+
+  for Candidate in FGraph.Nodes do
+  begin
+    Result.NodeBindings.Clear;
+    Result.ValueBindings.Clear;
+
+    if MatchNodePattern(PatternRoot, Candidate, Result) then
+    begin
+      Result.Success := True;
+      Exit;
+    end;
+  end;
+
+  Result.Success := False;
+end;
+
+function TGrispPatternMatcher.MatchNodePattern(PatternNode, TargetNode: TGNode; Match: TMatchResult): Boolean;
+var
+  Key: string;
+  PatternVal, TargetVal: TGValue;
+begin
+  // Simplest v1: ignore NodeType, focus on attributes
+  for Key in PatternNode.Attributes.Keys do
+  begin
+    PatternVal := PatternNode.GetAttribute(Key);
+    TargetVal := TargetNode.GetAttribute(Key);
+    if (TargetVal = nil) then
+      Exit(False);
+
+    if not MatchAttributePattern(Key, PatternVal, TargetVal, Match) then
+      Exit(False);
+  end;
+
+  Result := True;
+end;
+
+function TGrispPatternMatcher.MatchAttributePattern(
+  const Key: string; PatternValue, TargetValue: TGValue; Match: TMatchResult): Boolean;
+begin
+  // v1 idea:
+  // - if PatternValue is a literal → compare
+  // - if PatternValue.Kind = vkNode and Key looks like a variable (e.g. 'X', 'Y') → bind node
+  // - if PatternValue.Kind = vkNode → recurse into nested node
+  // - if PatternValue.Kind = vkIdentifier and looks like variable → bind value
+  // - else → strict equality
+  Result := False; // to be implemented
+end;
+
+end.
+```
+
+---
+
+### 7. How Anti Gravity 2.0 should treat this
+
+For the **pattern matcher architecture**, Anti Gravity 2.0 should:
+
+- Generate `GrispPattern.pas` with:
+  - `TMatchResult`
+  - `TGrispPatternMatcher`
+  - Skeletons for `MatchPattern`, `MatchNodePattern`, `MatchAttributePattern`
+- Ensure it integrates with:
+  - `GrispGraph.pas` (TGGraph, TGNode, TGValue)
+  - The rule loader (which extracts `match: node = { ... }` into a pattern root)
+
+The **detailed matching logic** inside `MatchAttributePattern` can be generated in a second pass, once you decide exactly how you want to treat variables vs literals vs nested nodes.
+

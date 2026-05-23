@@ -1,0 +1,275 @@
+### 1. Goal of the rewrite engine
+
+The rewrite engine is the part of GRISP that answers:
+
+> “Given a **rule** and a **successful match**, how do we **modify the graph**?”
+
+It:
+
+- Takes a `rule.*` node (with `match` + `rewrite`)
+- Uses a `TMatchResult` from the pattern matcher
+- Builds a **replacement subgraph** from the `rewrite` template
+- Splices it into the main `TGGraph`
+
+It does **not** search for matches—that’s the matcher’s job.
+
+---
+
+### 2. Rule structure recap
+
+A rule node in G‑Blocks:
+
+```text
+node rule.simplify.add.zero {
+    match: node = {
+        op: identifier = add
+        left: identifier = x
+        right: number = 0
+    }
+
+    rewrite: node = {
+        value: identifier = x
+    }
+}
+```
+
+In memory:
+
+- `RuleNode: TGNode`
+- `RuleNode.Attributes['match']` → `TGValue` of kind `vkNode` → `PatternRoot: TGNode`
+- `RuleNode.Attributes['rewrite']` → `TGValue` of kind `vkNode` → `RewriteRoot: TGNode`
+
+The matcher works on `PatternRoot`.  
+The rewriter works on `RewriteRoot` + `TMatchResult`.
+
+---
+
+### 3. Responsibilities of the rewrite engine
+
+1. **Extract rule parts**
+   - `PatternRoot` from `match`
+   - `RewriteRoot` from `rewrite`
+
+2. **Given a match:**
+   - Use `TMatchResult` bindings (`X → TGNode`, `v → TGValue`)
+   - Traverse `RewriteRoot`
+   - For each variable reference in the rewrite template:
+     - Reuse existing nodes/values from bindings
+   - For each literal/new node:
+     - Create new `TGNode` / `TGValue`
+
+3. **Splice into graph**
+   - Decide what to replace:
+     - Typically the subgraph that matched `PatternRoot`
+   - Remove or detach old nodes/edges if needed
+   - Attach new nodes/edges
+   - Keep `TGGraph.NodeIndex`, `Nodes`, `Edges` consistent
+
+---
+
+### 4. High-level flow
+
+`ApplyRuleOnce(RuleNode, Graph, Matcher)`:
+
+1. Get `PatternRoot` from `RuleNode.match`
+2. Call `Matcher.MatchPattern(PatternRoot)` → `TMatchResult`
+3. If `Success = False` → return `False`
+4. Get `RewriteRoot` from `RuleNode.rewrite`
+5. Build replacement subgraph:
+   - `BuildRewriteSubgraph(RewriteRoot, MatchResult, Graph)`
+6. Splice:
+   - `ApplyRewriteToGraph(...)`
+7. Return `True` (rule applied)
+
+---
+
+### 5. Delphi skeleton: `GrispRewrite.pas`
+
+```pascal
+unit GrispRewrite;
+
+interface
+
+uses
+  System.Generics.Collections,
+  GrispGraph,
+  GrispPattern;
+
+type
+  TGrispRewriter = class
+  private
+    FGraph: TGGraph;
+
+    function GetMatchRoot(ARule: TGNode): TGNode;
+    function GetRewriteRoot(ARule: TGNode): TGNode;
+
+    function BuildRewriteSubgraph(RewriteRoot: TGNode; Match: TMatchResult;
+      out NewNodes: TList<TGNode>; out NewEdges: TList<TGEdge>): Boolean;
+
+    procedure ApplyRewriteToGraph(ARule: TGNode; Match: TMatchResult;
+      NewNodes: TList<TGNode>; NewEdges: TList<TGEdge>);
+  public
+    constructor Create(AGraph: TGGraph);
+
+    // Try to apply a single rule once.
+    // Returns True if the graph was modified.
+    function ApplyRuleOnce(ARule: TGNode; Matcher: TGrispPatternMatcher): Boolean;
+  end;
+
+implementation
+
+{ TGrispRewriter }
+
+constructor TGrispRewriter.Create(AGraph: TGGraph);
+begin
+  inherited Create;
+  FGraph := AGraph;
+end;
+
+function TGrispRewriter.GetMatchRoot(ARule: TGNode): TGNode;
+var
+  V: TGValue;
+begin
+  Result := nil;
+  V := ARule.GetAttribute('match');
+  if (V <> nil) and (V.Kind = vkNode) then
+    Result := V.NodeValue;
+end;
+
+function TGrispRewriter.GetRewriteRoot(ARule: TGNode): TGNode;
+var
+  V: TGValue;
+begin
+  Result := nil;
+  V := ARule.GetAttribute('rewrite');
+  if (V <> nil) and (V.Kind = vkNode) then
+    Result := V.NodeValue;
+end;
+
+function TGrispRewriter.ApplyRuleOnce(ARule: TGNode; Matcher: TGrispPatternMatcher): Boolean;
+var
+  MatchRoot, RewriteRoot: TGNode;
+  Match: TMatchResult;
+  NewNodes: TList<TGNode>;
+  NewEdges: TList<TGEdge>;
+begin
+  Result := False;
+
+  MatchRoot := GetMatchRoot(ARule);
+  RewriteRoot := GetRewriteRoot(ARule);
+  if (MatchRoot = nil) or (RewriteRoot = nil) then
+    Exit;
+
+  Match := Matcher.MatchPattern(MatchRoot);
+  try
+    if not Match.Success then
+      Exit;
+
+    NewNodes := TList<TGNode>.Create;
+    NewEdges := TList<TGEdge>.Create;
+    try
+      if not BuildRewriteSubgraph(RewriteRoot, Match, NewNodes, NewEdges) then
+        Exit;
+
+      ApplyRewriteToGraph(ARule, Match, NewNodes, NewEdges);
+      Result := True;
+    finally
+      NewEdges.Free;
+      NewNodes.Free;
+    end;
+  finally
+    Match.Free;
+  end;
+end;
+
+function TGrispRewriter.BuildRewriteSubgraph(
+  RewriteRoot: TGNode; Match: TMatchResult;
+  out NewNodes: TList<TGNode>; out NewEdges: TList<TGEdge>): Boolean;
+begin
+  // TODO v1:
+  // - Traverse RewriteRoot.Attributes
+  // - For each attribute:
+  //   - If it refers to a variable bound in Match → reuse existing node/value
+  //   - If it is a literal → create new TGValue
+  //   - If it is a nested node → create new TGNode and recurse
+  // - Add created nodes to FGraph via FGraph.AddNode
+  // - Add edges as needed
+  Result := True;
+end;
+
+procedure TGrispRewriter.ApplyRewriteToGraph(
+  ARule: TGNode; Match: TMatchResult;
+  NewNodes: TList<TGNode>; NewEdges: TList<TGEdge>);
+begin
+  // TODO v1:
+  // Strategy depends on semantics:
+  // - Identify the "root" node(s) of the matched subgraph (e.g. from MatchRoot)
+  // - Decide whether to:
+  //   - replace attributes on existing nodes
+  //   - rewire edges
+  //   - delete some nodes
+  //   - or attach new nodes alongside old ones
+  //
+  // Minimal v1:
+  // - For simple rules (like changing attributes), just update attributes
+  //   on matched nodes using values from NewNodes/NewEdges/Match.
+end;
+
+end.
+```
+
+---
+
+### 6. How this fits into the runtime
+
+The runtime loop (later) will do something like:
+
+```pascal
+function Run(Graph: TGGraph; MaxSteps: Integer): Integer;
+var
+  Matcher: TGrispPatternMatcher;
+  Rewriter: TGrispRewriter;
+  Step: Integer;
+  Rule: TGNode;
+  Changed: Boolean;
+begin
+  Matcher := TGrispPatternMatcher.Create(Graph);
+  Rewriter := TGrispRewriter.Create(Graph);
+  try
+    Step := 0;
+    repeat
+      Changed := False;
+      for Rule in Graph.Rules do
+        if Rewriter.ApplyRuleOnce(Rule, Matcher) then
+        begin
+          Changed := True;
+          Inc(Step);
+          if Step >= MaxSteps then
+            Break;
+        end;
+    until (not Changed) or (Step >= MaxSteps);
+    Result := Step;
+  finally
+    Rewriter.Free;
+    Matcher.Free;
+  end;
+end;
+```
+
+---
+
+### 7. What Anti Gravity 2.0 must generate for the rewrite engine
+
+- `GrispRewrite.pas` with:
+  - `TGrispRewriter`
+  - `ApplyRuleOnce`
+  - `GetMatchRoot`, `GetRewriteRoot`
+  - `BuildRewriteSubgraph` (skeleton)
+  - `ApplyRewriteToGraph` (skeleton)
+
+The **exact semantics** of how much of the matched subgraph is replaced vs updated can be refined later—but this architecture gives you clean separation:
+
+- Matcher: finds where  
+- Rewriter: changes what  
+- Runtime: decides when  
+

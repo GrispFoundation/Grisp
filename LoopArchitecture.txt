@@ -1,0 +1,136 @@
+### 1. Goal of the runtime loop
+
+The runtime loop is the **orchestrator** of GRISP:
+
+> “Given a graph and a set of rules, keep applying rules until nothing changes (or a limit is reached).”
+
+It ties together:
+
+- `TGGraph` (data + rules)
+- `TGrispPatternMatcher` (finds matches)
+- `TGrispRewriter` (applies changes)
+
+---
+
+### 2. Responsibilities
+
+The runtime loop must:
+
+- Initialize matcher + rewriter for a given `TGGraph`
+- Iterate over all rules in `Graph.Rules`
+- For each rule:
+  - Try to apply it once
+  - Track whether any rule changed the graph
+- Stop when:
+  - No rule applies in a full pass, or
+  - A maximum number of steps is reached
+
+It should also:
+
+- Return how many rewrite steps were performed
+- Optionally allow hooks/logging later
+
+---
+
+### 3. High-level behavior
+
+Pseudocode:
+
+```text
+steps := 0
+repeat
+  changed := false
+  for each rule in Graph.Rules:
+    if ApplyRuleOnce(rule):
+      changed := true
+      steps++
+      if steps >= MaxSteps: stop
+until not changed or steps >= MaxSteps
+return steps
+```
+
+---
+
+### 4. Delphi skeleton: `GrispRuntime.pas`
+
+```pascal
+unit GrispRuntime;
+
+interface
+
+uses
+  GrispGraph,
+  GrispPattern,
+  GrispRewrite;
+
+type
+  TGrispRuntime = class
+  public
+    // Run all rules on the graph until no more changes or MaxSteps reached.
+    // Returns the number of successful rewrite steps.
+    class function Run(Graph: TGGraph; MaxSteps: Integer = 1000): Integer;
+  end;
+
+implementation
+
+class function TGrispRuntime.Run(Graph: TGGraph; MaxSteps: Integer): Integer;
+var
+  Matcher: TGrispPatternMatcher;
+  Rewriter: TGrispRewriter;
+  Step: Integer;
+  Changed: Boolean;
+  Rule: TGNode;
+begin
+  Result := 0;
+  if Graph = nil then
+    Exit;
+
+  Matcher := TGrispPatternMatcher.Create(Graph);
+  Rewriter := TGrispRewriter.Create(Graph);
+  try
+    Step := 0;
+    repeat
+      Changed := False;
+
+      for Rule in Graph.Rules do
+      begin
+        if Rewriter.ApplyRuleOnce(Rule, Matcher) then
+        begin
+          Inc(Step);
+          Changed := True;
+          if Step >= MaxSteps then
+            Break;
+        end;
+      end;
+
+    until (not Changed) or (Step >= MaxSteps);
+
+    Result := Step;
+  finally
+    Rewriter.Free;
+    Matcher.Free;
+  end;
+end;
+
+end.
+```
+
+---
+
+### 5. How Anti Gravity 2.0 should see this
+
+For the **Execution Loop Architecture**, Anti Gravity 2.0 should:
+
+- Generate `GrispRuntime.pas` with:
+  - `TGrispRuntime.Run(Graph, MaxSteps)`
+- Assume:
+  - `Graph.Rules` is already populated (e.g. during parsing or a separate rule-registration pass)
+  - `TGrispPatternMatcher` and `TGrispRewriter` are available
+
+This gives you a clean, single call:
+
+```pascal
+Steps := TGrispRuntime.Run(Graph, 1000);
+```
+
+That’s the GRISP 1.0 “engine start” button.
