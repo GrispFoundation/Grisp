@@ -7,16 +7,15 @@ uses
   System.Classes,
   System.IOUtils,
   System.Generics.Collections,
-  unit_GrispTokens_version_001 in 'unit_GrispTokens_version_001.pas',
-  unit_GrispLexer_version_001 in 'unit_GrispLexer_version_001.pas',
-  unit_GrispGraph_version_001 in 'unit_GrispGraph_version_001.pas',
-  unit_GrispParser_version_001 in 'unit_GrispParser_version_001.pas',
-  unit_GrispPattern_version_001 in 'unit_GrispPattern_version_001.pas',
-  unit_GrispRewrite_version_001 in 'unit_GrispRewrite_version_001.pas',
-  unit_GrispRuntime_version_001 in 'unit_GrispRuntime_version_001.pas';
+  unit_GrispTokens_version_001,
+  unit_GrispLexer_version_001,
+  unit_GrispGraph_version_001,
+  unit_GrispParser_version_001,
+  unit_GrispPattern_version_001,
+  unit_GrispRewrite_version_001;
 
 const
-  GRISP_VERSION = '0.01';
+  GRISP_VERSION = '0.02';
   GRISP_DATE = '24 May 2026';
 
 {
@@ -34,7 +33,7 @@ begin
   Writeln(' GRISP - Graph Rewrite Information Symbolic Processor ');
   Writeln(' Deterministic Graph Execution Engine                 ');
   Writeln(Format(' Version %s %s', [GRISP_VERSION, GRISP_DATE]));
-  //       123456789012345678901234567890098765432109876543210987654321
+  //       123456789012345678901234567765432109876543210987654321
   Writeln('======================================================');
   Writeln;
 end;
@@ -61,7 +60,7 @@ begin
   Writeln(' Deterministic Graph Execution Engine                 ');
   Writeln(Format(' Version %s %s', [GRISP_VERSION, GRISP_DATE]));
 
-  //       123456789012345678901234567890098765432109876543210987654321
+  //       123456789012345678901234567765432109876543210987654321
   Writeln('======================================================');
   Writeln;
 end;
@@ -80,19 +79,16 @@ begin
   First := True;
   for Node in Graph.Nodes do
   begin
-    if Node.Name.StartsWith('rule.') then
-      Continue;
-    if not First then
-      Write(' ');
-    First := False;
+    if Node.Name.StartsWith('rule.') then Continue;
+    if Node.Name.StartsWith('#') then Continue;
 
-	Val := Node.GetAttribute('value');
-    if Assigned(Val) and (Val.Kind = vkNumber) then
-      Write(Trunc(Val.NumberValue))
-    else if Node.Name <> '' then
-      Write(Node.Name)
-    else
-      Write('#', Node.Id);
+    Val := Node.GetAttribute('value');
+    if not Assigned(Val) then Continue;
+    if Val.Kind <> vkNumber then Continue;
+
+    if not First then Write(' ');
+    First := False;
+    Write(Trunc(Val.NumberValue));
   end;
   Writeln;
 end;
@@ -100,8 +96,8 @@ end;
 procedure RunFile(const FileName: string);
 var
   Source: string;
-  Parser: TGrispParser;
   Graph: TGGraph;
+  Parser: TGrispParser;
   Matcher: TGrispPatternMatcher;
   Rewriter: TGrispRewriter;
   Rule: TGNode;
@@ -116,48 +112,52 @@ begin
 
   Source := TFile.ReadAllText(FileName);
 
-  Parser := TGrispParser.Create(Source);
+  Graph := TGGraph.Create;
   try
-    Graph := Parser.Parse;
-  finally
-    Parser.Free;
-  end;
+    Parser := TGrispParser.Create(Source, Graph);
+    try
+      Parser.ParseFile;
+    finally
+      Parser.Free;
+	end;
 
-  if Graph = nil then
-    raise Exception.Create('Parse failed');
+    Graph.RegisterEdgesFromIdentifiers;
 
-  Matcher := TGrispPatternMatcher.Create(Graph);
-  Rewriter := TGrispRewriter.Create(Graph);
-  try
-    Writeln('Initial state:');
-    PrintGraph(Graph);
-    Writeln;
+    Matcher := TGrispPatternMatcher.Create(Graph);
+    Rewriter := TGrispRewriter.Create(Graph);
+    try
+      Writeln('Initial state:');
+      PrintGraph(Graph);
+      Writeln;
 
-    Steps := 0;
-    repeat
-      Changed := False;
-      for Rule in Graph.Rules do
-      begin
-        if Rewriter.ApplyRuleOnce(Rule, Matcher, nil) then
+      Steps := 0;
+	  repeat
+        Changed := False;
+        for Rule in Graph.Rules do
         begin
-          Inc(Steps);
-          Writeln(Format('Step %d: %s', [Steps, Rule.Name]));
-          PrintGraph(Graph);
-          Changed := True;
-          Break;
+          Matcher.SetCurrentRule(Rule);
+          if Rewriter.ApplyRuleOnce(Rule, Matcher, nil) then
+          begin
+            Inc(Steps);
+            Writeln(Format('Step %d: %s', [Steps, Rule.Name]));
+            PrintGraph(Graph);
+            Changed := True;
+			Break;
+          end;
         end;
-      end;
-    until not Changed;
+      until not Changed;
 
-    Writeln;
-    Writeln('----------------------------------------');
-    Writeln(Format('Stable after %d steps.', [Steps]));
-    Writeln('Final state:');
-    PrintGraph(Graph);
-    Writeln('----------------------------------------');
+      Writeln;
+      Writeln('----------------------------------------');
+      Writeln(Format('Stable after %d steps.', [Steps]));
+      Writeln('Final state:');
+      PrintGraph(Graph);
+      Writeln('----------------------------------------');
+    finally
+      Rewriter.Free;
+      Matcher.Free;
+    end;
   finally
-    Rewriter.Free;
-    Matcher.Free;
     Graph.Free;
   end;
 end;
@@ -184,3 +184,5 @@ begin
     end;
   end;
 end.
+
+

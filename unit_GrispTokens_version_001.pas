@@ -16,20 +16,22 @@ type
     tkKeywordOr,
     tkKeywordNot,
     tkKeywordMod,
-    tkLBrace, // {
-    tkRBrace, // }
-    tkLBracket, // [
-    tkRBracket, // ]
-    tkLParen, // (
-    tkRParen, // )
-    tkLess, // <
-    tkGreater, // >
-    tkLessEqual, // <=
-    tkGreaterEqual, // >=
-    tkNotEqual, // <>
-    tkColon, // :
-    tkEquals, // =
-    tkComma //,
+    tkLBrace,        // {
+    tkRBrace,        // }
+    tkLBracket,      // [
+    tkRBracket,      // ]
+    tkLParen,        // (
+    tkRParen,        // )
+    tkLess,          // <
+    tkGreater,       // >
+    tkLessEqual,     // <=
+    tkGreaterEqual,  // >=
+    tkNotEqual,      // != or <>
+    tkColon,         // :
+    tkEquals,        // =
+    tkComma,         // ,
+    tkSemicolon,     // ;
+    tkOperator       // + - * /
   );
 
   TToken = record

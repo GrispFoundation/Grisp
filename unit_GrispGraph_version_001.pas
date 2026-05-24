@@ -31,7 +31,7 @@ type
   TGrispExpression = class
   public
     Kind: TGrispExpressionKind;
-    Value: TObject; // will be TGValue, declared after TGValue
+    Value: TObject; // TGValue
     Name: string;
     OperatorSymbol: string;
     Left: TGrispExpression;
@@ -39,6 +39,7 @@ type
     Arguments: TObjectList<TGrispExpression>;
     constructor Create(AKind: TGrispExpressionKind);
     destructor Destroy; override;
+    function Clone: TGrispExpression;
   end;
 
   TGValue = class
@@ -87,10 +88,14 @@ type
     NodeType: string;
     Attributes: TObjectDictionary<string, TGValue>;
     Outgoing: TObjectList<TGEdge>;
+    Incoming: TObjectList<TGEdge>;
     constructor Create(AId: Integer; const AName: string; const ANodeType: string);
     destructor Destroy; override;
     function GetAttribute(const Key: string): TGValue;
     procedure SetAttribute(const Key: string; AValue: TGValue);
+    function GetNumber(const Key: string; Default: Double = 0): Double;
+    function GetIdentifier(const Key: string): string;
+    function HasAttribute(const Key: string): Boolean;
     function ToString: string; override;
   end;
 
@@ -108,6 +113,8 @@ type
     function AddEdge(ASource: TGNode; ATarget: TGNode; const ALabel: string; const AEdgeType: string = ''): TGEdge;
     function FindNode(const AName: string): TGNode;
     procedure RegisterRule(ANode: TGNode);
+    procedure RegisterEdgesFromIdentifiers;
+    function GetNodesByType(const ANodeType: string): TArray<TGNode>;
     function ToDOT: string;
   end;
 
@@ -127,9 +134,24 @@ begin
   Arguments.Free;
   Left.Free;
   Right.Free;
-  if Assigned(Value) then
-    TGValue(Value).Free;
+  Value.Free;
   inherited Destroy;
+end;
+
+function TGrispExpression.Clone: TGrispExpression;
+var Arg: TGrispExpression;
+begin
+  Result := TGrispExpression.Create(Kind);
+  Result.Name := Name;
+  Result.OperatorSymbol := OperatorSymbol;
+  if Assigned(Value) then
+    Result.Value := TGValue(Value).Clone;
+  if Assigned(Left) then
+    Result.Left := Left.Clone;
+  if Assigned(Right) then
+    Result.Right := Right.Clone;
+  for Arg in Arguments do
+    Result.Arguments.Add(Arg.Clone);
 end;
 
 { TGValue }
@@ -144,16 +166,13 @@ end;
 
 destructor TGValue.Destroy;
 begin
-  if Assigned(ArrayValue) then
-    ArrayValue.Free;
-  if Assigned(ExpressionValue) then
-    ExpressionValue.Free;
+  ArrayValue.Free;
+  ExpressionValue.Free;
   inherited Destroy;
 end;
 
 function TGValue.Clone: TGValue;
-var
-  E: TGValue;
+var E: TGValue;
 begin
   Result := TGValue.Create(Kind);
   Result.NumberValue := NumberValue;
@@ -166,29 +185,23 @@ begin
       Result.ArrayValue.Add(E.Clone);
   if Kind = vkExpression then
     if Assigned(ExpressionValue) then
-      Result.ExpressionValue := ExpressionValue; // shallow, expressions immutable
+      Result.ExpressionValue := ExpressionValue.Clone;
 end;
 
 function TGValue.ToString: string;
 begin
   case Kind of
-    vkNumber:
-      Result := FloatToStr(NumberValue);
-    vkString:
-      Result := '"' + StringValue + '"';
-    vkBoolean:
-      Result := BoolToStr(BoolValue, True);
-    vkIdentifier:
-      Result := IdentifierValue;
-    vkArray:
-      Result := '[...]';
+    vkNumber: Result := FloatToStr(NumberValue);
+    vkString: Result := '"' + StringValue + '"';
+    vkBoolean: Result := BoolToStr(BoolValue, True);
+    vkIdentifier: Result := IdentifierValue;
+    vkArray: Result := '[...]';
     vkNode:
       if Assigned(NodeValue) then
-        Result := Format('node(%d)', [NodeValue.Id])
+        Result := Format('node(%d:%s)', [NodeValue.Id, NodeValue.Name])
       else
         Result := 'node(nil)';
-    vkExpression:
-      Result := '<expr>';
+    vkExpression: Result := '<expr>';
   else
     Result := 'nil';
   end;
@@ -198,14 +211,13 @@ end;
 
 class function TGrispExpressionEvaluator.Evaluate(Expression: TGrispExpression; Bindings: TDictionary<string, TGValue>): TGValue;
 begin
-  if Expression = nil then
-    Exit(nil);
+  if Expression = nil then Exit(nil);
   case Expression.Kind of
-    ekLiteral:  Result := EvaluateLiteral(Expression);
+    ekLiteral: Result := EvaluateLiteral(Expression);
     ekVariable: Result := EvaluateVariable(Expression, Bindings);
-    ekUnary:    Result := EvaluateUnary(Expression, Bindings);
-    ekBinary:   Result := EvaluateBinary(Expression, Bindings);
-    ekCall:     Result := EvaluateCall(Expression, Bindings);
+    ekUnary: Result := EvaluateUnary(Expression, Bindings);
+    ekBinary: Result := EvaluateBinary(Expression, Bindings);
+    ekCall: Result := EvaluateCall(Expression, Bindings);
   else
     Result := nil;
   end;
@@ -220,8 +232,7 @@ begin
 end;
 
 class function TGrispExpressionEvaluator.EvaluateVariable(Expression: TGrispExpression; Bindings: TDictionary<string, TGValue>): TGValue;
-var
-  BoundValue: TGValue;
+var BoundValue: TGValue;
 begin
   if not Assigned(Bindings) then
     raise Exception.Create('No variable bindings supplied');
@@ -232,8 +243,7 @@ begin
 end;
 
 class function TGrispExpressionEvaluator.EvaluateUnary(Expression: TGrispExpression; Bindings: TDictionary<string, TGValue>): TGValue;
-var
-  Operand: TGValue;
+var Operand: TGValue;
 begin
   Operand := Evaluate(Expression.Left, Bindings);
   try
@@ -256,10 +266,7 @@ begin
 end;
 
 class function TGrispExpressionEvaluator.EvaluateBinary(Expression: TGrispExpression; Bindings: TDictionary<string, TGValue>): TGValue;
-var
-  LeftValue, RightValue: TGValue;
-  RightNumber: Double;
-  LeftBool, RightBool: Boolean;
+var LeftValue, RightValue: TGValue; RightNumber: Double; LeftBool, RightBool: Boolean;
 begin
   LeftValue := Evaluate(Expression.Left, Bindings);
   RightValue := Evaluate(Expression.Right, Bindings);
@@ -285,8 +292,7 @@ begin
     if Expression.OperatorSymbol = '/' then
     begin
       RightNumber := RequireNumber(RightValue, '/');
-      if RightNumber = 0 then
-        raise Exception.Create('Division by zero');
+      if RightNumber = 0 then raise Exception.Create('Division by zero');
       Result := TGValue.Create(vkNumber);
       Result.NumberValue := RequireNumber(LeftValue, '/') / RightNumber;
       Exit;
@@ -357,9 +363,7 @@ begin
 end;
 
 class function TGrispExpressionEvaluator.EvaluateCall(Expression: TGrispExpression; Bindings: TDictionary<string, TGValue>): TGValue;
-var
-  Arg0, Arg1, Arg2: TGValue;
-  N0, N1, N2: Double;
+var Arg0, Arg1, Arg2: TGValue; N0, N1, N2: Double;
 begin
   if SameText(Expression.Name, 'min') then
   begin
@@ -369,10 +373,7 @@ begin
     try
       Result := TGValue.Create(vkNumber);
       Result.NumberValue := Min(RequireNumber(Arg0, 'min'), RequireNumber(Arg1, 'min'));
-    finally
-      Arg0.Free;
-      Arg1.Free;
-    end;
+    finally Arg0.Free; Arg1.Free; end;
     Exit;
   end;
   if SameText(Expression.Name, 'max') then
@@ -383,10 +384,7 @@ begin
     try
       Result := TGValue.Create(vkNumber);
       Result.NumberValue := Max(RequireNumber(Arg0, 'max'), RequireNumber(Arg1, 'max'));
-    finally
-      Arg0.Free;
-      Arg1.Free;
-    end;
+    finally Arg0.Free; Arg1.Free; end;
     Exit;
   end;
   if SameText(Expression.Name, 'mid') then
@@ -396,16 +394,10 @@ begin
     Arg1 := Evaluate(Expression.Arguments[1], Bindings);
     Arg2 := Evaluate(Expression.Arguments[2], Bindings);
     try
-      N0 := RequireNumber(Arg0, 'mid');
-      N1 := RequireNumber(Arg1, 'mid');
-      N2 := RequireNumber(Arg2, 'mid');
+      N0 := RequireNumber(Arg0, 'mid'); N1 := RequireNumber(Arg1, 'mid'); N2 := RequireNumber(Arg2, 'mid');
       Result := TGValue.Create(vkNumber);
       Result.NumberValue := N0 + N1 + N2 - Min(Min(N0, N1), N2) - Max(Max(N0, N1), N2);
-    finally
-      Arg0.Free;
-      Arg1.Free;
-      Arg2.Free;
-    end;
+    finally Arg0.Free; Arg1.Free; Arg2.Free; end;
     Exit;
   end;
   raise Exception.CreateFmt('Unknown function "%s"', [Expression.Name]);
@@ -453,10 +445,12 @@ begin
   NodeType := ANodeType;
   Attributes := TObjectDictionary<string, TGValue>.Create([doOwnsValues]);
   Outgoing := TObjectList<TGEdge>.Create(False);
+  Incoming := TObjectList<TGEdge>.Create(False);
 end;
 
 destructor TGNode.Destroy;
 begin
+  Incoming.Free;
   Outgoing.Free;
   Attributes.Free;
   inherited Destroy;
@@ -464,8 +458,7 @@ end;
 
 function TGNode.GetAttribute(const Key: string): TGValue;
 begin
-  if not Attributes.TryGetValue(Key, Result) then
-    Result := nil;
+  if not Attributes.TryGetValue(Key, Result) then Result := nil;
 end;
 
 procedure TGNode.SetAttribute(const Key: string; AValue: TGValue);
@@ -473,9 +466,30 @@ begin
   Attributes.AddOrSetValue(Key, AValue);
 end;
 
+function TGNode.GetNumber(const Key: string; Default: Double): Double;
+var V: TGValue;
+begin
+  V := GetAttribute(Key);
+  if Assigned(V) and (V.Kind = vkNumber) then Exit(V.NumberValue);
+  Result := Default;
+end;
+
+function TGNode.GetIdentifier(const Key: string): string;
+var V: TGValue;
+begin
+  V := GetAttribute(Key);
+  if Assigned(V) and (V.Kind = vkIdentifier) then Exit(V.IdentifierValue);
+  Result := '';
+end;
+
+function TGNode.HasAttribute(const Key: string): Boolean;
+begin
+  Result := Attributes.ContainsKey(Key);
+end;
+
 function TGNode.ToString: string;
 begin
-  Result := Format('Node %d "%s"', [Id, Name]);
+  Result := Format('Node %d "%s" [%s]', [Id, Name, NodeType]);
 end;
 
 { TGGraph }
@@ -506,43 +520,66 @@ begin
   Result := TGNode.Create(FNextId, AName, ANodeType);
   Inc(FNextId);
   Nodes.Add(Result);
-  if AName <> '' then
-    NodeIndex.Add(AName, Result);
+  if AName <> '' then NodeIndex.Add(AName, Result);
 end;
 
 function TGGraph.AddEdge(ASource: TGNode; ATarget: TGNode; const ALabel: string; const AEdgeType: string): TGEdge;
 begin
   Result := TGEdge.Create(ASource, ATarget, ALabel, AEdgeType);
   Edges.Add(Result);
-  if Assigned(ASource) then
-    ASource.Outgoing.Add(Result);
+  if Assigned(ASource) then ASource.Outgoing.Add(Result);
+  if Assigned(ATarget) then ATarget.Incoming.Add(Result);
 end;
 
 function TGGraph.FindNode(const AName: string): TGNode;
 begin
-  if not NodeIndex.TryGetValue(AName, Result) then
-    Result := nil;
+  if not NodeIndex.TryGetValue(AName, Result) then Result := nil;
 end;
 
 procedure TGGraph.RegisterRule(ANode: TGNode);
 begin
-  if Rules.IndexOf(ANode) < 0 then
-    Rules.Add(ANode);
+  if Rules.IndexOf(ANode) < 0 then Rules.Add(ANode);
+end;
+
+procedure TGGraph.RegisterEdgesFromIdentifiers;
+var N: TGNode; Key: string; Val: TGValue; Target: TGNode;
+begin
+  for N in Nodes do
+    for Key in N.Attributes.Keys do
+    begin
+      Val := N.GetAttribute(Key);
+      if Assigned(Val) and (Val.Kind = vkIdentifier) then
+      begin
+        Target := FindNode(Val.IdentifierValue);
+        if Assigned(Target) then
+          AddEdge(N, Target, Key, 'ref');
+      end;
+    end;
+end;
+
+function TGGraph.GetNodesByType(const ANodeType: string): TArray<TGNode>;
+var N: TGNode; List: TList<TGNode>;
+begin
+  List := TList<TGNode>.Create;
+  try
+    for N in Nodes do
+      if SameText(N.NodeType, ANodeType) then List.Add(N);
+    Result := List.ToArray;
+  finally
+    List.Free;
+  end;
 end;
 
 function TGGraph.ToDOT: string;
-var
-  N: TGNode;
-  E: TGEdge;
+var N: TGNode; E: TGEdge;
 begin
-  Result := 'digraph G {' + #10;
+  Result := 'digraph G {' + sLineBreak;
   for N in Nodes do
-    Result := Result + Format(' %d [label="%s"];', [N.Id, N.Name]) + #10;
+    Result := Result + Format(' %d [label="%s"];', [N.Id, N.Name]) + sLineBreak;
   for E in Edges do
     if Assigned(E.Source) and Assigned(E.Target) then
-      Result := Result + Format(' %d -> %d [label="%s"];', [E.Source.Id, E.Target.Id, E.LabelName]) + #10;
+      Result := Result + Format(' %d -> %d [label="%s"];', [E.Source.Id, E.Target.Id, E.LabelName]) + sLineBreak;
   Result := Result + '}';
 end;
 
 end.
-

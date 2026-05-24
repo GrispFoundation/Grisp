@@ -46,13 +46,8 @@ begin
       Inc(FLine);
       FCol := 1;
     end
-    else
-    begin
-      if FSource[FPos] <> #13 then
-      begin
-        Inc(FCol);
-      end;
-    end;
+    else if FSource[FPos] <> #13 then
+      Inc(FCol);
     Inc(FPos);
   end;
 end;
@@ -60,13 +55,9 @@ end;
 function TGrispLexer.PeekChar(Offset: Integer): Char;
 begin
   if FPos + Offset <= Length(FSource) then
-  begin
-    Result := FSource[FPos + Offset];
-  end
+    Result := FSource[FPos + Offset]
   else
-  begin
     Result := #0;
-  end;
 end;
 
 procedure TGrispLexer.SkipWhitespaceAndComments;
@@ -78,36 +69,29 @@ begin
       AdvanceChar;
       Continue;
     end;
-    if FSource[FPos] = '/' then
+    // // line comment
+    if (FSource[FPos] = '/') and (PeekChar(1) = '/') then
+	begin
+      AdvanceChar; AdvanceChar;
+      while (FPos <= Length(FSource)) and not CharInSet(FSource[FPos], [#10,#13]) do
+        AdvanceChar;
+      Continue;
+    end;
+    // /* block comment */
+    if (FSource[FPos] = '/') and (PeekChar(1) = '*') then
     begin
-      if PeekChar(1) = '/' then
+      AdvanceChar; AdvanceChar;
+      while FPos <= Length(FSource) do
       begin
-        AdvanceChar;
-        AdvanceChar;
-        while (FPos <= Length(FSource)) and not CharInSet(FSource[FPos], [#10, #13]) do
+        if (FSource[FPos] = '*') and (PeekChar(1) = '/') then
         begin
-		  AdvanceChar;
-        end;
-        Continue;
+          AdvanceChar; AdvanceChar;
+          Break;
+        end
+        else
+          AdvanceChar;
       end;
-      if PeekChar(1) = '*' then
-      begin
-        AdvanceChar;
-        while FPos <= Length(FSource) do
-        begin
-          if (FSource[FPos] = '*') and (PeekChar(1) = '/') then
-          begin
-            AdvanceChar;
-            AdvanceChar;
-            Break;
-          end
-          else
-          begin
-            AdvanceChar;
-          end;
-        end;
-        Continue;
-      end;
+      Continue;
     end;
     Break;
   end;
@@ -115,14 +99,12 @@ end;
 
 function TGrispLexer.ReadString: TToken;
 var
-  Line: Integer;
-  Col: Integer;
+  Line, Col: Integer;
   Quote: Char;
   Esc: Boolean;
   SB: string;
 begin
-  Line := FLine;
-  Col := FCol;
+  Line := FLine; Col := FCol;
   Quote := FSource[FPos];
   AdvanceChar;
   SB := '';
@@ -158,28 +140,19 @@ end;
 
 function TGrispLexer.ReadNumber: TToken;
 var
-  Start: Integer;
-  Line: Integer;
-  Col: Integer;
+  Start, Line, Col: Integer;
 begin
-  Line := FLine;
-  Col := FCol;
+  Line := FLine; Col := FCol;
   Start := FPos;
-  if CharInSet(FSource[FPos], ['+', '-']) then
-  begin
+  if CharInSet(FSource[FPos], ['+','-']) then
     AdvanceChar;
-  end;
   while (FPos <= Length(FSource)) and CharInSet(FSource[FPos], ['0'..'9']) do
-  begin
     AdvanceChar;
-  end;
   if (FSource[FPos] = '.') and CharInSet(PeekChar(1), ['0'..'9']) then
   begin
     AdvanceChar;
     while (FPos <= Length(FSource)) and CharInSet(FSource[FPos], ['0'..'9']) do
-    begin
       AdvanceChar;
-    end;
   end;
   Result.Kind := tkNumber;
   Result.Lexeme := Copy(FSource, Start, FPos - Start);
@@ -189,87 +162,28 @@ end;
 
 function TGrispLexer.ReadIdentifier: TToken;
 var
-  Start: Integer;
-  Line: Integer;
-  Col: Integer;
+  Start, Line, Col: Integer;
   S: string;
 begin
-  Line := FLine;
-  Col := FCol;
+  Line := FLine; Col := FCol;
   Start := FPos;
   AdvanceChar;
-  while FPos <= Length(FSource) do
-  begin
-    if CharInSet(FSource[FPos], ['a'..'z', 'A'..'Z', '0'..'9', '_', '.']) then
-    begin
-      AdvanceChar;
-    end
-    else
-    begin
-      Break;
-    end;
-  end;
+  while (FPos <= Length(FSource)) and CharInSet(FSource[FPos], ['a'..'z','A'..'Z','0'..'9','_','.']) do
+    AdvanceChar;
   S := Copy(FSource, Start, FPos - Start);
   Result.Lexeme := S;
   Result.Line := Line;
   Result.Column := Col;
-  if SameText(S, 'node') then
-  begin
-    Result.Kind := tkKeywordNode;
-  end
-  else
-  begin
-    if SameText(S, 'array') then
-    begin
-      Result.Kind := tkKeywordArray;
-    end
-    else
-    begin
-      if SameText(S, 'where') then
-      begin
-        Result.Kind := tkKeywordWhere;
-      end
-      else
-      begin
-        if SameText(S, 'and') then
-        begin
-          Result.Kind := tkKeywordAnd;
-        end
-        else
-        begin
-          if SameText(S, 'or') then
-          begin
-            Result.Kind := tkKeywordOr;
-          end
-          else
-          begin
-            if SameText(S, 'not') then
-            begin
-              Result.Kind := tkKeywordNot;
-            end
-            else
-            begin
-              if SameText(S, 'mod') then
-              begin
-                Result.Kind := tkKeywordMod;
-              end
-              else
-              begin
-                if SameText(S, 'true') or SameText(S, 'false') then
-                begin
-                  Result.Kind := tkBoolean;
-                end
-                else
-                begin
-                  Result.Kind := tkIdentifier;
-                end;
-              end;
-            end;
-          end;
-        end;
-      end;
-    end;
-  end;
+
+  if SameText(S,'node') then Result.Kind := tkKeywordNode
+  else if SameText(S,'array') then Result.Kind := tkKeywordArray
+  else if SameText(S,'where') then Result.Kind := tkKeywordWhere
+  else if SameText(S,'and') then Result.Kind := tkKeywordAnd
+  else if SameText(S,'or') then Result.Kind := tkKeywordOr
+  else if SameText(S,'not') then Result.Kind := tkKeywordNot
+  else if SameText(S,'mod') then Result.Kind := tkKeywordMod
+  else if SameText(S,'true') or SameText(S,'false') then Result.Kind := tkBoolean
+  else Result.Kind := tkIdentifier;
 end;
 
 function TGrispLexer.NextToken: TToken;
@@ -285,134 +199,73 @@ begin
     Result.Lexeme := '';
     Exit;
   end;
+
   C := FSource[FPos];
   case C of
-    '{':
+    '{': begin Result.Kind := tkLBrace; Result.Lexeme := '{'; AdvanceChar; Exit; end;
+	'}': begin Result.Kind := tkRBrace; Result.Lexeme := '}'; AdvanceChar; Exit; end;
+    '[': begin Result.Kind := tkLBracket; Result.Lexeme := '['; AdvanceChar; Exit; end;
+    ']': begin Result.Kind := tkRBracket; Result.Lexeme := ']'; AdvanceChar; Exit; end;
+    '(': begin Result.Kind := tkLParen; Result.Lexeme := '('; AdvanceChar; Exit; end;
+    ')': begin Result.Kind := tkRParen; Result.Lexeme := ')'; AdvanceChar; Exit; end;
+    ':': begin Result.Kind := tkColon; Result.Lexeme := ':'; AdvanceChar; Exit; end;
+    '=': begin Result.Kind := tkEquals; Result.Lexeme := '='; AdvanceChar; Exit; end;
+    ',': begin Result.Kind := tkComma; Result.Lexeme := ','; AdvanceChar; Exit; end;
+    ';': begin Result.Kind := tkSemicolon; Result.Lexeme := ';'; AdvanceChar; Exit; end;
+    '+','-','*':
       begin
-        Result.Kind := tkLBrace;
-        Result.Lexeme := '{';
+        Result.Kind := tkOperator;
+        Result.Lexeme := C;
         AdvanceChar;
         Exit;
       end;
-    '}':
+    '/':
       begin
-        Result.Kind := tkRBrace;
-        Result.Lexeme := '}';
+        // '/' alone is operator, '//' and '/*' were stripped in SkipWhitespaceAndComments
+        Result.Kind := tkOperator;
+        Result.Lexeme := '/';
         AdvanceChar;
         Exit;
       end;
-    '[':
-      begin
-        Result.Kind := tkLBracket;
-        Result.Lexeme := '[';
-        AdvanceChar;
-        Exit;
-      end;
-    ']':
-      begin
-        Result.Kind := tkRBracket;
-        Result.Lexeme := ']';
-        AdvanceChar;
-        Exit;
-      end;
-    '(':
-      begin
-        Result.Kind := tkLParen;
-        Result.Lexeme := '(';
-        AdvanceChar;
-        Exit;
-      end;
-    ')':
-      begin
-        Result.Kind := tkRParen;
-        Result.Lexeme := ')';
-        AdvanceChar;
-        Exit;
-      end;
-    ':':
-      begin
-        Result.Kind := tkColon;
-        Result.Lexeme := ':';
-        AdvanceChar;
-        Exit;
-      end;
-    '=':
-      begin
-        Result.Kind := tkEquals;
-        Result.Lexeme := '=';
-        AdvanceChar;
-        Exit;
-      end;
-    ',':
-      begin
-        Result.Kind := tkComma;
-        Result.Lexeme := ',';
-        AdvanceChar;
-        Exit;
-      end;
-	'<':
+    '<':
       begin
         if PeekChar(1) = '=' then
-        begin
-          Result.Kind := tkLessEqual;
-          Result.Lexeme := '<=';
-          AdvanceChar;
-          AdvanceChar;
-          Exit;
-        end
+        begin Result.Kind := tkLessEqual; Result.Lexeme := '<='; AdvanceChar; AdvanceChar; Exit; end
+        else if PeekChar(1) = '>' then
+        begin Result.Kind := tkNotEqual; Result.Lexeme := '<>'; AdvanceChar; AdvanceChar; Exit; end
         else
-        begin
-          if PeekChar(1) = '>' then
-          begin
-            Result.Kind := tkNotEqual;
-            Result.Lexeme := '<>';
-            AdvanceChar;
-            AdvanceChar;
-            Exit;
-          end
-          else
-          begin
-            Result.Kind := tkLess;
-            Result.Lexeme := '<';
-            AdvanceChar;
-            Exit;
-          end;
-        end;
+        begin Result.Kind := tkLess; Result.Lexeme := '<'; AdvanceChar; Exit; end;
       end;
     '>':
       begin
         if PeekChar(1) = '=' then
-        begin
-          Result.Kind := tkGreaterEqual;
-          Result.Lexeme := '>=';
-          AdvanceChar;
-          AdvanceChar;
-          Exit;
-        end
+        begin Result.Kind := tkGreaterEqual; Result.Lexeme := '>='; AdvanceChar; AdvanceChar; Exit; end
         else
-        begin
-          Result.Kind := tkGreater;
-          Result.Lexeme := '>';
-          AdvanceChar;
-          Exit;
-        end;
+        begin Result.Kind := tkGreater; Result.Lexeme := '>'; AdvanceChar; Exit; end;
       end;
-    '''', '"':
-      begin
-        Result := ReadString;
-        Exit;
-      end;
+    '''','"':
+      begin Result := ReadString; Exit; end;
   end;
-  if CharInSet(C, ['0'..'9', '+', '-']) then
+
+  if CharInSet(C, ['0'..'9']) then
   begin
     Result := ReadNumber;
     Exit;
   end;
-  if CharInSet(C, ['a'..'z', 'A'..'Z', '_']) then
+
+  if CharInSet(C, ['a'..'z','A'..'Z','_']) then
   begin
     Result := ReadIdentifier;
     Exit;
   end;
+
+  // allow leading + / - for numbers
+  if CharInSet(C, ['+','-']) and CharInSet(PeekChar(1), ['0'..'9']) then
+  begin
+    Result := ReadNumber;
+    Exit;
+  end;
+
   raise EGrispLexerError.CreateFmt('Invalid character "%s" at %d:%d', [C, FLine, FCol]);
 end;
 

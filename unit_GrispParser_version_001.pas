@@ -18,6 +18,7 @@ type
     FLexer: TGrispLexer;
     FCurrent: TToken;
     FGraph: TGGraph;
+    FAnonId: Integer;
     procedure Advance;
     procedure Expect(AKind: TTokenKind; const Msg: string);
     procedure ParseNodeDecl;
@@ -37,18 +38,19 @@ type
     procedure RegisterEdgesForNode(ANode: TGNode);
     procedure RegisterEdgesForAllNodes;
   public
-    constructor Create(const ASource: string);
+    constructor Create(const ASource: string; AGraph: TGGraph);
     destructor Destroy; override;
-    function Parse: TGGraph;
+    procedure ParseFile;
   end;
 
 implementation
 
-constructor TGrispParser.Create(const ASource: string);
+constructor TGrispParser.Create(const ASource: string; AGraph: TGGraph);
 begin
   inherited Create;
   FLexer := TGrispLexer.Create(ASource);
-  FGraph := TGGraph.Create;
+  FGraph := AGraph;
+  FAnonId := 0;
   Advance;
 end;
 
@@ -98,7 +100,8 @@ var
   Key, TypeName: string;
   Value: TGValue;
 begin
-  while (FCurrent.Kind <> tkRBrace) and (FCurrent.Kind <> tkEOF) do
+  while (FCurrent.Kind <> tkRBrace) and (FCurrent.Kind <> tkEOF) and
+        (FCurrent.Kind <> tkKeywordWhere) do
   begin
     if not (FCurrent.Kind in [tkIdentifier, tkKeywordNode, tkKeywordArray]) then
       raise EGrispParseError.CreateFmt('Attribute name expected at %d:%d', [FCurrent.Line, FCurrent.Column]);
@@ -109,6 +112,8 @@ begin
     Expect(tkEquals, '"=" expected');
     Value := ParseValue(TypeName);
     ANode.SetAttribute(Key, Value);
+    if FCurrent.Kind = tkSemicolon then
+      Advance;
   end;
 end;
 
@@ -142,12 +147,24 @@ var
   Node: TGNode;
   InnerType: string;
 begin
+  // Pattern variable support: bare identifier for scalar types
+  if FCurrent.Kind = tkIdentifier then
+  begin
+    if not SameText(ATypeName, 'node') and not StartsText('array<', ATypeName) then
+    begin
+      Result := TGValue.Create(vkIdentifier);
+      Result.IdentifierValue := FCurrent.Lexeme;
+      Advance;
+      Exit;
+    end;
+  end;
+
   if StartsText('array<', ATypeName) then
   begin
     InnerType := InnerArrayType(ATypeName);
     Expect(tkLBracket, '"[" expected');
     Result := TGValue.Create(vkArray);
-    while FCurrent.Kind <> tkRBracket do
+    while (FCurrent.Kind <> tkRBracket) and (FCurrent.Kind <> tkEOF) do
     begin
       Result.ArrayValue.Add(ParseValue(InnerType));
       if FCurrent.Kind = tkComma then Advance else Break;
@@ -196,7 +213,8 @@ begin
   if SameText(ATypeName, 'node') then
   begin
     Expect(tkLBrace, '"{" expected');
-    Node := FGraph.AddNode('', 'node');
+    Inc(FAnonId);
+    Node := FGraph.AddNode('#' + IntToStr(FAnonId), 'pattern');
     ParseNodeBody(Node);
     Expect(tkRBrace, '"}" expected');
     Result := TGValue.Create(vkNode);
@@ -363,10 +381,10 @@ begin
       Result := TGrispExpression.Create(ekCall);
       Result.Name := Name;
       Advance;
-      while FCurrent.Kind <> tkRParen do
+      while (FCurrent.Kind <> tkRParen) and (FCurrent.Kind <> tkEOF) do
       begin
         Result.Arguments.Add(ParseExpr);
-        if FCurrent.Kind = tkComma then Advance;
+        if FCurrent.Kind = tkComma then Advance else Break;
       end;
       Expect(tkRParen, '")" expected');
       Exit;
@@ -402,12 +420,12 @@ begin
     case Val.Kind of
       vkNode:
         if Assigned(Val.NodeValue) then
-          FGraph.AddEdge(ANode, Val.NodeValue, Key);
+          FGraph.AddEdge(ANode, Val.NodeValue, Key, '');
       vkIdentifier:
         begin
           Target := FGraph.FindNode(Val.IdentifierValue);
           if Assigned(Target) then
-            FGraph.AddEdge(ANode, Target, Key);
+            FGraph.AddEdge(ANode, Target, Key, '');
         end;
       vkArray:
         for Elem in Val.ArrayValue do
@@ -415,13 +433,13 @@ begin
           if Elem.Kind = vkNode then
           begin
             if Assigned(Elem.NodeValue) then
-              FGraph.AddEdge(ANode, Elem.NodeValue, Key);
+              FGraph.AddEdge(ANode, Elem.NodeValue, Key, '');
           end
           else if Elem.Kind = vkIdentifier then
           begin
             Target := FGraph.FindNode(Elem.IdentifierValue);
             if Assigned(Target) then
-              FGraph.AddEdge(ANode, Target, Key);
+              FGraph.AddEdge(ANode, Target, Key, '');
           end;
         end;
     end;
@@ -436,12 +454,11 @@ begin
     RegisterEdgesForNode(Node);
 end;
 
-function TGrispParser.Parse: TGGraph;
+procedure TGrispParser.ParseFile;
 begin
   while FCurrent.Kind <> tkEOF do
     ParseNodeDecl;
   RegisterEdgesForAllNodes;
-  Result := FGraph;
 end;
 
 end.
