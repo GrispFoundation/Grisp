@@ -13,13 +13,21 @@ implementation
 function ParseGBlocks(const Source: string): TGGraph;
 var
   Parser: TGrispParser;
+  Graph: TGGraph;
 begin
-  Parser := TGrispParser.Create(Source);
+  Graph := TGGraph.Create;
+  Parser := TGrispParser.Create(Source, Graph);
   try
-    Result := Parser.Parse;
-  finally
+    Parser.ParseFile;
+    // Parser already registered edges, but it's safe to ensure:
+    Graph.RegisterEdgesFromIdentifiers;
+    Result := Graph;
+  except
     Parser.Free;
+    Graph.Free;
+    raise;
   end;
+  Parser.Free;
 end;
 
 end.

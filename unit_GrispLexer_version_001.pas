@@ -71,7 +71,7 @@ begin
     end;
     // // line comment
     if (FSource[FPos] = '/') and (PeekChar(1) = '/') then
-	begin
+    begin
       AdvanceChar; AdvanceChar;
       while (FPos <= Length(FSource)) and not CharInSet(FSource[FPos], [#10,#13]) do
         AdvanceChar;
@@ -203,7 +203,7 @@ begin
   C := FSource[FPos];
   case C of
     '{': begin Result.Kind := tkLBrace; Result.Lexeme := '{'; AdvanceChar; Exit; end;
-	'}': begin Result.Kind := tkRBrace; Result.Lexeme := '}'; AdvanceChar; Exit; end;
+    '}': begin Result.Kind := tkRBrace; Result.Lexeme := '}'; AdvanceChar; Exit; end;
     '[': begin Result.Kind := tkLBracket; Result.Lexeme := '['; AdvanceChar; Exit; end;
     ']': begin Result.Kind := tkRBracket; Result.Lexeme := ']'; AdvanceChar; Exit; end;
     '(': begin Result.Kind := tkLParen; Result.Lexeme := '('; AdvanceChar; Exit; end;
@@ -212,18 +212,26 @@ begin
     '=': begin Result.Kind := tkEquals; Result.Lexeme := '='; AdvanceChar; Exit; end;
     ',': begin Result.Kind := tkComma; Result.Lexeme := ','; AdvanceChar; Exit; end;
     ';': begin Result.Kind := tkSemicolon; Result.Lexeme := ';'; AdvanceChar; Exit; end;
-    '+','-','*':
+    '+','-':
+      begin
+        // signed number vs operator
+        if CharInSet(PeekChar(1), ['0'..'9']) then
+        begin
+          Result := ReadNumber;
+          Exit;
+        end
+        else
+        begin
+          Result.Kind := tkOperator;
+          Result.Lexeme := C;
+          AdvanceChar;
+          Exit;
+        end;
+      end;
+    '*','/':
       begin
         Result.Kind := tkOperator;
         Result.Lexeme := C;
-        AdvanceChar;
-        Exit;
-      end;
-    '/':
-      begin
-        // '/' alone is operator, '//' and '/*' were stripped in SkipWhitespaceAndComments
-        Result.Kind := tkOperator;
-        Result.Lexeme := '/';
         AdvanceChar;
         Exit;
       end;
@@ -256,13 +264,6 @@ begin
   if CharInSet(C, ['a'..'z','A'..'Z','_']) then
   begin
     Result := ReadIdentifier;
-    Exit;
-  end;
-
-  // allow leading + / - for numbers
-  if CharInSet(C, ['+','-']) and CharInSet(PeekChar(1), ['0'..'9']) then
-  begin
-    Result := ReadNumber;
     Exit;
   end;
 

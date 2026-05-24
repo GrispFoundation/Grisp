@@ -524,7 +524,14 @@ begin
 end;
 
 function TGGraph.AddEdge(ASource: TGNode; ATarget: TGNode; const ALabel: string; const AEdgeType: string): TGEdge;
+var
+  E: TGEdge;
 begin
+  // idempotent: return existing edge if already present
+  for E in Edges do
+    if (E.Source = ASource) and (E.Target = ATarget) and SameText(E.LabelName, ALabel) then
+      Exit(E);
+
   Result := TGEdge.Create(ASource, ATarget, ALabel, AEdgeType);
   Edges.Add(Result);
   if Assigned(ASource) then ASource.Outgoing.Add(Result);

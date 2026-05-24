@@ -37,6 +37,7 @@ type
     function InnerArrayType(const ATypeName: string): string;
     procedure RegisterEdgesForNode(ANode: TGNode);
     procedure RegisterEdgesForAllNodes;
+    function EdgeExists(ASource, ATarget: TGNode; const ALabel: string): Boolean;
   public
     constructor Create(const ASource: string; AGraph: TGGraph);
     destructor Destroy; override;
@@ -297,7 +298,7 @@ var
   Op: string;
 begin
   Left := ParseMulExpr;
-  while (FCurrent.Lexeme = '+') or (FCurrent.Lexeme = '-') do
+  while (FCurrent.Kind = tkOperator) and ((FCurrent.Lexeme = '+') or (FCurrent.Lexeme = '-')) do
   begin
     Op := FCurrent.Lexeme;
     Advance;
@@ -317,7 +318,8 @@ var
   Op: string;
 begin
   Left := ParseUnaryExpr;
-  while (FCurrent.Lexeme = '*') or (FCurrent.Lexeme = '/') or (FCurrent.Kind = tkKeywordMod) do
+  while ((FCurrent.Kind = tkOperator) and ((FCurrent.Lexeme = '*') or (FCurrent.Lexeme = '/'))) or
+        (FCurrent.Kind = tkKeywordMod) do
   begin
     Op := FCurrent.Lexeme;
     Advance;
@@ -341,7 +343,7 @@ begin
     Result.Left := ParseUnaryExpr;
     Exit;
   end;
-  if FCurrent.Lexeme = '-' then
+  if (FCurrent.Kind = tkOperator) and (FCurrent.Lexeme = '-') then
   begin
     Advance;
     Result := TGrispExpression.Create(ekUnary);
@@ -406,6 +408,16 @@ begin
   raise EGrispParseError.Create('Expression expected');
 end;
 
+function TGrispParser.EdgeExists(ASource, ATarget: TGNode; const ALabel: string): Boolean;
+var
+  E: TGEdge;
+begin
+  for E in FGraph.Edges do
+    if (E.Source = ASource) and (E.Target = ATarget) and SameText(E.LabelName, ALabel) then
+      Exit(True);
+  Result := False;
+end;
+
 procedure TGrispParser.RegisterEdgesForNode(ANode: TGNode);
 var
   Key: string;
@@ -419,12 +431,12 @@ begin
     if Val = nil then Continue;
     case Val.Kind of
       vkNode:
-        if Assigned(Val.NodeValue) then
+        if Assigned(Val.NodeValue) and not EdgeExists(ANode, Val.NodeValue, Key) then
           FGraph.AddEdge(ANode, Val.NodeValue, Key, '');
       vkIdentifier:
         begin
           Target := FGraph.FindNode(Val.IdentifierValue);
-          if Assigned(Target) then
+          if Assigned(Target) and not EdgeExists(ANode, Target, Key) then
             FGraph.AddEdge(ANode, Target, Key, '');
         end;
       vkArray:
@@ -432,13 +444,13 @@ begin
         begin
           if Elem.Kind = vkNode then
           begin
-            if Assigned(Elem.NodeValue) then
+            if Assigned(Elem.NodeValue) and not EdgeExists(ANode, Elem.NodeValue, Key) then
               FGraph.AddEdge(ANode, Elem.NodeValue, Key, '');
           end
           else if Elem.Kind = vkIdentifier then
           begin
             Target := FGraph.FindNode(Elem.IdentifierValue);
-            if Assigned(Target) then
+            if Assigned(Target) and not EdgeExists(ANode, Target, Key) then
               FGraph.AddEdge(ANode, Target, Key, '');
           end;
         end;
