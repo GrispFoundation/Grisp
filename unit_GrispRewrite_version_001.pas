@@ -4,6 +4,7 @@ interface
 
 uses
   System.SysUtils,
+  System.Classes,
   System.Generics.Collections,
   unit_GrispGraph_version_001,
   unit_GrispPattern_version_001;
@@ -25,17 +26,20 @@ type
       NodeVarMap: TDictionary<string, TGNode>;
       NewNodes: TList<TGNode>): TGValue;
 
-    function BuildRewriteSubgraph(RewriteRoot: TGNode; Match: TMatchResult;
-      out NewNodes: TList<TGNode>; out NewEdges: TList<TGEdge>): Boolean;
+    function BuildRewriteSubgraph(
+      RewriteRoot: TGNode;
+      Match: TMatchResult;
+      out NewNodes: TList<TGNode>;
+      out NewEdges: TList<TGEdge>): Boolean;
 
-    procedure ApplyRewriteToGraph(ARule: TGNode; Match: TMatchResult;
-      NewNodes: TList<TGNode>; NewEdges: TList<TGEdge>);
+    procedure ApplyRewriteToGraph(
+      ARule: TGNode;
+      Match: TMatchResult;
+      NewNodes: TList<TGNode>;
+      NewEdges: TList<TGEdge>);
   public
     constructor Create(AGraph: TGGraph);
-
-    // Try to apply a single rule once.
-    // Returns True if the graph was modified.
-    function ApplyRuleOnce(ARule: TGNode; Matcher: TGrispPatternMatcher): Boolean;
+    function ApplyRuleOnce(ARule: TGNode; Matcher: TGrispPatternMatcher; Trace: TStrings = nil): Boolean;
   end;
 
 implementation
@@ -89,7 +93,9 @@ begin
       for Elem in AValue.ArrayValue do
         Result.ArrayValue.Add(CloneValue(Elem));
     vkNode:
-      Result.NodeValue := AValue.NodeValue;
+	  Result.NodeValue := AValue.NodeValue;
+    vkExpression:
+      Result.ExpressionValue := AValue.ExpressionValue;
   end;
 end;
 
@@ -103,29 +109,23 @@ begin
 
   ToRemove := TList<TGEdge>.Create;
   try
-    // Find matching edges in the node's outgoing list
+    // collect from node's outgoing
     for Edge in ANode.Outgoing do
-    begin
       if SameText(Edge.LabelName, AttrKey) then
         ToRemove.Add(Edge);
-    end;
 
-    // Find matching edges in the graph's list to be thorough
+    // collect from global edge list (ensure we don't miss any)
     for Edge in FGraph.Edges do
-    begin
       if (Edge.Source = ANode) and SameText(Edge.LabelName, AttrKey) then
-      begin
         if ToRemove.IndexOf(Edge) < 0 then
           ToRemove.Add(Edge);
-      end;
-    end;
 
-    // Safe extraction and deletion to avoid double-freeing
+    // remove safely from both lists
     for Edge in ToRemove do
     begin
       if Assigned(Edge.Source) then
         Edge.Source.Outgoing.Extract(Edge);
-      FGraph.Edges.Remove(Edge); // This frees the TGEdge object
+      FGraph.Edges.Remove(Edge); // frees edge
     end;
   finally
     ToRemove.Free;
@@ -159,13 +159,13 @@ begin
         Result.StringValue := TemplateVal.StringValue;
       end;
     vkBoolean:
-      begin
+	  begin
         Result := TGValue.Create(vkBoolean);
         Result.BoolValue := TemplateVal.BoolValue;
       end;
     vkIdentifier:
       begin
-        // 1. Is it a node variable?
+        // node variable?
         if Match.TryGetNode(TemplateVal.IdentifierValue, BoundNode) then
         begin
           Result := TGValue.Create(vkIdentifier);
@@ -176,12 +176,12 @@ begin
           Result := TGValue.Create(vkIdentifier);
           Result.IdentifierValue := BoundNode.Name;
         end
-        // 2. Is it a value variable?
+        // value variable?
         else if Match.TryGetValue(TemplateVal.IdentifierValue, BoundVal) then
         begin
           Result := CloneValue(BoundVal);
         end
-        // 3. Otherwise literal
+        // literal identifier
         else
         begin
           Result := TGValue.Create(vkIdentifier);
@@ -192,25 +192,20 @@ begin
       begin
         Result := TGValue.Create(vkArray);
         for Elem in TemplateVal.ArrayValue do
-        begin
           Result.ArrayValue.Add(EvaluateValue(Elem, Match, NodeVarMap, NewNodes));
-        end;
       end;
     vkNode:
       begin
+        // inline node template
         NewInlineNode := FGraph.AddNode('', 'node');
         NewNodes.Add(NewInlineNode);
 
         if Assigned(TemplateVal.NodeValue) then
-        begin
           for AttrKey in TemplateVal.NodeValue.Attributes.Keys do
-          begin
             NewInlineNode.SetAttribute(
               AttrKey,
               EvaluateValue(TemplateVal.NodeValue.GetAttribute(AttrKey), Match, NodeVarMap, NewNodes)
             );
-          end;
-        end;
 
         Result := TGValue.Create(vkNode);
         Result.NodeValue := NewInlineNode;
@@ -221,8 +216,10 @@ begin
 end;
 
 function TGrispRewriter.BuildRewriteSubgraph(
-  RewriteRoot: TGNode; Match: TMatchResult;
-  out NewNodes: TList<TGNode>; out NewEdges: TList<TGEdge>): Boolean;
+  RewriteRoot: TGNode;
+  Match: TMatchResult;
+  out NewNodes: TList<TGNode>;
+  out NewEdges: TList<TGEdge>): Boolean;
 var
   NodeVarMap: TDictionary<string, TGNode>;
   AttrKey, Key: string;
@@ -237,19 +234,16 @@ begin
 
   NodeVarMap := TDictionary<string, TGNode>.Create;
   try
-    // Phase 1: Match or create node variables from the RewriteRoot template attributes
+    // Phase 1: bind or create node variables
     for AttrKey in RewriteRoot.Attributes.Keys do
     begin
       AttrVal := RewriteRoot.GetAttribute(AttrKey);
       if (AttrVal <> nil) and (AttrVal.Kind = vkNode) then
       begin
         if Match.TryGetNode(AttrKey, BoundNode) then
-        begin
-          NodeVarMap.Add(AttrKey, BoundNode);
-        end
+          NodeVarMap.Add(AttrKey, BoundNode)
         else
         begin
-          // Create new node for previously unbound node variables
           NewNode := FGraph.AddNode('', 'node');
           NewNodes.Add(NewNode);
           NodeVarMap.Add(AttrKey, NewNode);
@@ -257,7 +251,7 @@ begin
       end;
     end;
 
-    // Phase 2: For each node variable, evaluate and update attributes and edges
+    // Phase 2: apply attributes and splice edges
     for AttrKey in RewriteRoot.Attributes.Keys do
     begin
       AttrVal := RewriteRoot.GetAttribute(AttrKey);
@@ -272,7 +266,7 @@ begin
           begin
             EvaluatedVal := EvaluateValue(InlineTemplate.GetAttribute(Key), Match, NodeVarMap, NewNodes);
 
-            // If updating 'name', keep NodeIndex updated explicitly
+            // keep NodeIndex in sync when renaming
             if SameText(Key, 'name') and (EvaluatedVal <> nil) and (EvaluatedVal.Kind = vkIdentifier) then
             begin
               if BoundNode.Name <> '' then
@@ -282,13 +276,12 @@ begin
                 FGraph.NodeIndex.AddOrSetValue(BoundNode.Name, BoundNode);
             end;
 
-            // Update attribute directly
             BoundNode.SetAttribute(Key, EvaluatedVal);
 
-            // Splicing: remove old edges for this attribute key
+            // remove old edges for this attribute
             SafeRemoveEdgesForAttribute(BoundNode, Key);
 
-            // Splicing: add new edge if the attribute value represents a node Target
+            // add new edges based on evaluated value
             if Assigned(EvaluatedVal) then
             begin
               if EvaluatedVal.Kind = vkNode then
@@ -298,7 +291,7 @@ begin
               end
               else if EvaluatedVal.Kind = vkIdentifier then
               begin
-                NewNode := FGraph.FindNode(EvaluatedVal.IdentifierValue);
+				NewNode := FGraph.FindNode(EvaluatedVal.IdentifierValue);
                 if Assigned(NewNode) then
                   NewEdges.Add(FGraph.AddEdge(BoundNode, NewNode, Key));
               end;
@@ -315,13 +308,16 @@ begin
 end;
 
 procedure TGrispRewriter.ApplyRewriteToGraph(
-  ARule: TGNode; Match: TMatchResult;
-  NewNodes: TList<TGNode>; NewEdges: TList<TGEdge>);
+  ARule: TGNode;
+  Match: TMatchResult;
+  NewNodes: TList<TGNode>;
+  NewEdges: TList<TGEdge>);
 begin
-  // Splice / updates were completed during the build phase in a transactional manner.
+  // All splicing is already done in BuildRewriteSubgraph.
+  // This hook is here if you later want to do extra bookkeeping.
 end;
 
-function TGrispRewriter.ApplyRuleOnce(ARule: TGNode; Matcher: TGrispPatternMatcher): Boolean;
+function TGrispRewriter.ApplyRuleOnce(ARule: TGNode; Matcher: TGrispPatternMatcher; Trace: TStrings): Boolean;
 var
   MatchRoot, RewriteRoot: TGNode;
   Match: TMatchResult;
@@ -340,12 +336,15 @@ begin
     if not Match.Success then
       Exit;
 
-    NewNodes := TList<TGNode>.Create;
-    NewEdges := TList<TGEdge>.Create;
-    try
-      if not BuildRewriteSubgraph(RewriteRoot, Match, NewNodes, NewEdges) then
-        Exit;
+    if Assigned(Trace) then
+      Trace.Add(Format('Rule %s matched', [ARule.Name]));
 
+    NewNodes := nil;
+    NewEdges := nil;
+    if not BuildRewriteSubgraph(RewriteRoot, Match, NewNodes, NewEdges) then
+      Exit;
+
+    try
       ApplyRewriteToGraph(ARule, Match, NewNodes, NewEdges);
       Result := True;
     finally
@@ -358,3 +357,4 @@ begin
 end;
 
 end.
+

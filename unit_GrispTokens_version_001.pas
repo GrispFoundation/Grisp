@@ -11,15 +11,25 @@ type
     tkBoolean,
     tkKeywordNode,
     tkKeywordArray,
-    tkLBrace,    // {
-    tkRBrace,    // }
-    tkLBracket,  // [
-    tkRBracket,  // ]
-    tkLess,      // <
-    tkGreater,   // >
-    tkColon,     // :
-    tkEquals,    // =
-    tkComma      // ,
+    tkKeywordWhere,
+    tkKeywordAnd,
+    tkKeywordOr,
+    tkKeywordNot,
+    tkKeywordMod,
+    tkLBrace, // {
+    tkRBrace, // }
+    tkLBracket, // [
+    tkRBracket, // ]
+    tkLParen, // (
+    tkRParen, // )
+    tkLess, // <
+    tkGreater, // >
+    tkLessEqual, // <=
+    tkGreaterEqual, // >=
+    tkNotEqual, // <>
+    tkColon, // :
+    tkEquals, // =
+    tkComma //,
   );
 
   TToken = record
