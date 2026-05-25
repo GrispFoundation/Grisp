@@ -35,7 +35,6 @@ uses
   unit_Token_TGrispTokenKind_version_001 in 'unit_Token_TGrispTokenKind_version_001.pas';
 
 const
-  // Global debug flag - set to True to enable detailed parser debugging
   GRISP_DEBUG_ENABLED = True;
 
 type
@@ -61,11 +60,10 @@ type
     procedure Summary;
   end;
 
-  // Test fixtures
   TTestFixtures = class
   public
     class function CreateSimpleGraph: TGrispGraph;
-    class function CreateRuleGraph: TGrispGraph;
+	class function CreateRuleGraph: TGrispGraph;
     class function CreateListGraph(Count: Integer): TGrispGraph;
     class function CreateLinkedList(const Values: array of Double): TGrispGraph;
     class procedure CleanupGraph(var Graph: TGrispGraph);
@@ -81,7 +79,6 @@ begin
   FTotalFailed := 0;
   FTotalTime := 0;
 
-  // Initialize debug system
   if GRISP_DEBUG_ENABLED then
   begin
     TGrispDebug.Enable;
@@ -117,7 +114,7 @@ begin
   if Passed then
     Writeln(Format('  [PASS] %s (%.3f ms)', [Name, DurationMs / 1000]))
   else
-	Writeln(Format('  [FAIL] %s: %s (%.3f ms)', [Name, Msg, DurationMs / 1000]));
+    Writeln(Format('  [FAIL] %s: %s (%.3f ms)', [Name, Msg, DurationMs / 1000]));
 end;
 
 procedure TTestHarness.RunTest(const Name: string; TestProc: TProc);
@@ -194,10 +191,10 @@ var
   MatchNode, RewriteNode: TGrispNode;
   MatchVal, RewriteVal: TGrispValue;
   XNode, YNode: TGrispNode;
+  Rule: TGrispNode;
 begin
   Graph := TGrispGraph.Create;
 
-  // Create data nodes
   Graph.AddNode('A', 'node');
   Graph.FindNode('A').SetValueAttribute('value', TGrispValue.Create(gvkNumber));
   Graph.FindNode('A').GetValueAttribute('value').NumberValue := 5;
@@ -208,11 +205,9 @@ begin
 
   Graph.AddEdge(Graph.FindNode('A'), Graph.FindNode('B'), 'next');
 
-  // Create rule node
-  var Rule := Graph.AddNode('rule.swap', 'rule');
+  Rule := Graph.AddNode('rule.swap', 'rule');
   Graph.RegisterRule(Rule);
 
-  // Create match pattern
   MatchNode := Graph.AddNode('', 'pattern');
   XNode := Graph.AddNode('', 'pattern');
   YNode := Graph.AddNode('', 'pattern');
@@ -237,7 +232,6 @@ begin
   MatchVal.SetNodeReference(MatchNode.Id, MatchNode.Name);
   Rule.SetValueAttribute('match', MatchVal);
 
-  // Create rewrite pattern (simplified)
   RewriteNode := Graph.AddNode('', 'pattern');
   RewriteVal := TGrispValue.Create(gvkNode);
   RewriteVal.SetNodeReference(RewriteNode.Id, RewriteNode.Name);
@@ -270,13 +264,14 @@ class function TTestFixtures.CreateLinkedList(const Values: array of Double): TG
 var
   i: Integer;
   PrevNode, CurrNode: TGrispNode;
+  Val: TGrispValue;
 begin
   Result := TGrispGraph.Create;
   PrevNode := nil;
   for i := 0 to High(Values) do
   begin
     CurrNode := Result.AddNode('N' + IntToStr(i+1), 'node');
-    var Val := TGrispValue.Create(gvkNumber);
+    Val := TGrispValue.Create(gvkNumber);
     Val.NumberValue := Values[i];
     CurrNode.SetValueAttribute('value', Val);
 
@@ -292,7 +287,6 @@ begin
   FreeAndNil(Graph);
 end;
 
-{ Helper function to create parser with debug enabled }
 function CreateParserWithDebug(const Source: string; Graph: TGrispGraph): TGrispUnifiedParser;
 var
   Parser: TGrispUnifiedParser;
@@ -303,7 +297,219 @@ begin
   Result := Parser;
 end;
 
-{ Test Procedures }
+{ ========== FIXED STRATEGY BUILDER TESTS ========== }
+{ These tests work with the corrected backward-wrapping builder }
+
+procedure TestStrategyBuilderBasic;
+var
+  Builder: TGrispStrategyBuilder;
+  Strategy: TGrispStrategy;
+begin
+  Builder := TGrispStrategyBuilder.Create;
+  try
+	Builder.EnableDebug;
+
+    // Test 1: Single rule
+    Builder.Clear;
+    Strategy := Builder.Rule('test').Build;
+    try
+      Assert(Strategy.Kind = gskRule, 'Single rule should be rule');
+      Assert(Strategy.RuleName = 'test', 'Rule name mismatch');
+    finally
+      Strategy.Free;
+    end;
+
+    // Test 2: Multiple rules become sequence
+    Builder.Clear;
+    Strategy := Builder.Rule('A').Rule('B').Rule('C').Build;
+    try
+      Assert(Strategy.Kind = gskSequence, 'Multiple rules should be sequence');
+      Assert(Strategy.Strategies.Count = 3, 'Sequence count mismatch');
+      Assert(Strategy.Strategies[0].RuleName = 'A', 'First rule');
+      Assert(Strategy.Strategies[1].RuleName = 'B', 'Second rule');
+      Assert(Strategy.Strategies[2].RuleName = 'C', 'Third rule');
+    finally
+      Strategy.Free;
+    end;
+  finally
+    Builder.Free;
+  end;
+end;
+
+procedure TestStrategyBuilderWrappers;
+var
+  Builder: TGrispStrategyBuilder;
+  Strategy: TGrispStrategy;
+begin
+  Builder := TGrispStrategyBuilder.Create;
+  try
+	Builder.EnableDebug;
+
+	// Test Repeat wrapper (wraps previous strategy)
+	Builder.Clear;
+    Strategy := Builder.Rule('inner').RepeatStrategy.Build;
+    try
+      Assert(Strategy.Kind = gskRepeat, 'Repeat root');
+      Assert(Strategy.Strategies.Count = 1, 'Repeat child count');
+      Assert(Strategy.Strategies[0].Kind = gskRule, 'Repeat child type');
+      Assert(Strategy.Strategies[0].RuleName = 'inner', 'Repeat child name');
+    finally
+      Strategy.Free;
+    end;
+
+    // Test Sequence with Repeat wrapper at the end
+    Builder.Clear;
+    Strategy := Builder.Sequence.Rule('rule1').Rule('rule2').Rule('rule3').RepeatStrategy.Build;
+    try
+      Assert(Strategy.Kind = gskSequence, 'Root sequence');
+      Assert(Strategy.Strategies.Count = 3, 'Sequence count');
+      Assert(Strategy.Strategies[0].RuleName = 'rule1', 'First rule');
+	  Assert(Strategy.Strategies[1].RuleName = 'rule2', 'Second rule');
+      Assert(Strategy.Strategies[2].Kind = gskRepeat, 'Third is Repeat');
+      Assert(Strategy.Strategies[2].Strategies[0].RuleName = 'rule3', 'Repeat wraps rule3');
+    finally
+      Strategy.Free;
+    end;
+
+    // Test Try wrapper
+    Builder.Clear;
+    Strategy := Builder.Rule('inner').TryStrategy.Build;
+    try
+      Assert(Strategy.Kind = gskTry, 'Try root');
+      Assert(Strategy.Strategies[0].RuleName = 'inner', 'Try child');
+    finally
+      Strategy.Free;
+    end;
+
+    // Test Choice wrapper
+    Builder.Clear;
+    Strategy := Builder.Rule('inner').Choice.Build;
+    try
+      Assert(Strategy.Kind = gskChoice, 'Choice root');
+      Assert(Strategy.Strategies[0].RuleName = 'inner', 'Choice child');
+    finally
+      Strategy.Free;
+    end;
+
+    // Test Phase wrapper
+    Builder.Clear;
+    Strategy := Builder.Rule('inner').Phase(5).Build;
+    try
+      Assert(Strategy.Kind = gskPhase, 'Phase root');
+      Assert(Strategy.Phase = 5, 'Phase number');
+      Assert(Strategy.Strategies[0].RuleName = 'inner', 'Phase child');
+    finally
+      Strategy.Free;
+    end;
+  finally
+    Builder.Free;
+  end;
+end;
+
+procedure TestStrategyBuilderNested;
+var
+  Builder: TGrispStrategyBuilder;
+  Strategy: TGrispStrategy;
+begin
+  Builder := TGrispStrategyBuilder.Create;
+  try
+	Builder.EnableDebug;
+
+    // Nested: Try(Repeat(Rule))
+    Builder.Clear;
+    Strategy := Builder.Rule('deep').RepeatStrategy.TryStrategy.Build;
+    try
+      Assert(Strategy.Kind = gskTry, 'Outer wrapper');
+      Assert(Strategy.Strategies.Count = 1, 'Try child count');
+      Assert(Strategy.Strategies[0].Kind = gskRepeat, 'Middle wrapper');
+      Assert(Strategy.Strategies[0].Strategies[0].RuleName = 'deep', 'Inner rule');
+    finally
+      Strategy.Free;
+    end;
+
+    // Complex nested with sequence
+    Builder.Clear;
+    Strategy := Builder.Sequence.Rule('init').Rule('process').RepeatStrategy.Rule('cleanup').Build;
+    try
+      Assert(Strategy.Kind = gskSequence, 'Root sequence');
+	  Assert(Strategy.Strategies.Count = 3, 'Sequence count');
+      Assert(Strategy.Strategies[0].RuleName = 'init', 'First');
+      Assert(Strategy.Strategies[1].Kind = gskRepeat, 'Second is Repeat');
+      Assert(Strategy.Strategies[1].Strategies[0].RuleName = 'process', 'Repeat wraps process');
+      Assert(Strategy.Strategies[2].RuleName = 'cleanup', 'Third');
+    finally
+      Strategy.Free;
+    end;
+  finally
+    Builder.Free;
+  end;
+end;
+
+procedure TestStrategyBuilderErrorCases;
+var
+  Builder: TGrispStrategyBuilder;
+begin
+  Builder := TGrispStrategyBuilder.Create;
+  try
+	Builder.EnableDebug;
+
+    // Empty build should raise exception
+    Builder.Clear;
+    try
+      Builder.Build;
+      Assert(False, 'Should raise exception for empty build');
+    except
+      on E: Exception do
+        Assert(E.Message = 'No strategies to build', 'Expected: No strategies to build, Got: ' + E.Message);
+    end;
+
+    // Repeat without preceding strategy
+    Builder.Clear;
+    try
+      Builder.RepeatStrategy.Build;
+      Assert(False, 'Should raise exception for Repeat without preceding strategy');
+    except
+      on E: Exception do
+        Assert(E.Message = 'RepeatStrategy requires a preceding strategy', 'Expected: RepeatStrategy requires a preceding strategy, Got: ' + E.Message);
+    end;
+
+    // Try without preceding strategy
+    Builder.Clear;
+    try
+      Builder.TryStrategy.Build;
+      Assert(False, 'Should raise exception for Try without preceding strategy');
+    except
+      on E: Exception do
+        Assert(E.Message = 'TryStrategy requires a preceding strategy', 'Expected: TryStrategy requires a preceding strategy, Got: ' + E.Message);
+    end;
+
+    // Choice without preceding strategy
+    Builder.Clear;
+    try
+      Builder.Choice.Build;
+      Assert(False, 'Should raise exception for Choice without preceding strategy');
+    except
+      on E: Exception do
+        Assert(E.Message = 'Choice requires a preceding strategy', 'Expected: Choice requires a preceding strategy, Got: ' + E.Message);
+    end;
+
+    // Phase without preceding strategy
+    Builder.Clear;
+    try
+      Builder.Phase(1).Build;
+      Assert(False, 'Should raise exception for Phase without preceding strategy');
+    except
+      on E: Exception do
+		Assert(E.Message = 'Phase requires a preceding strategy', 'Expected: Phase requires a preceding strategy, Got: ' + E.Message);
+    end;
+  finally
+    Builder.Free;
+  end;
+end;
+
+{ ========== ORIGINAL BROKEN BUILDER TEST ========== }
+{ This test demonstrates the crash in the original builder }
+{ It is kept for reference but the fixed tests above should be used }
 
 procedure TestOriginalBuilderDebug;
 var
@@ -335,7 +541,6 @@ begin
       Writeln;
       Writeln('If you see this, the build succeeded (unexpected!)');
       Strategy.Free;
-
     except
       on E: Exception do
       begin
@@ -344,7 +549,6 @@ begin
         Writeln('!!! This confirms the original builder crashes !!!');
       end;
     end;
-
   finally
     Builder.Free;
   end;
@@ -352,6 +556,8 @@ begin
   Writeln;
   Writeln('========================================');
 end;
+
+{ ========== OTHER TESTS ========== }
 
 procedure TestLexerBasics;
 var
@@ -426,7 +632,7 @@ begin
     Tok := Lexer.NextToken;
     Assert(Tok.Kind = tkOperator, 'Should recognize "+"');
 
-    Tok := Lexer.NextToken;
+	Tok := Lexer.NextToken;
     Assert(Tok.Kind = tkOperator, 'Should recognize "-"');
 
     Tok := Lexer.NextToken;
@@ -480,6 +686,8 @@ var
   Source: string;
   Node: TGrispNode;
   Parser: TGrispUnifiedParser;
+  CountVal: TGrispValue;
+  NameVal: TGrispValue;
 begin
   Source :=
     'node MyNode {' + sLineBreak +
@@ -490,7 +698,7 @@ begin
   Graph := TGrispGraph.Create;
   try
     Parser := CreateParserWithDebug(Source, Graph);
-    try
+	try
       if GRISP_DEBUG_ENABLED then
         Writeln('[DEBUG] Testing simple node parsing');
       Parser.ParseFile;
@@ -501,12 +709,12 @@ begin
       Assert(Node <> nil, 'Node "MyNode" should exist');
       Assert(Node.NodeType = 'node', 'Node type should be "node"');
 
-      var CountVal := Node.GetValueAttribute('count');
+      CountVal := Node.GetValueAttribute('count');
       Assert(CountVal <> nil, 'Attribute "count" should exist');
       Assert(CountVal.Kind = gvkNumber, '"count" should be number');
       Assert(CountVal.NumberValue = 42, '"count" should be 42');
 
-      var NameVal := Node.GetValueAttribute('name');
+      NameVal := Node.GetValueAttribute('name');
       Assert(NameVal <> nil, 'Attribute "name" should exist');
       Assert(NameVal.Kind = gvkString, '"name" should be string');
       Assert(NameVal.StringValue = 'test', '"name" should be "test"');
@@ -525,6 +733,7 @@ var
   Node: TGrispNode;
   ArrVal: TGrispValue;
   Parser: TGrispUnifiedParser;
+  i: Integer;
 begin
   Source :=
     'node Data {' + sLineBreak +
@@ -547,7 +756,7 @@ begin
       Assert(ArrVal.Kind = gvkArray, 'Should be array type');
       Assert(ArrVal.ArrayValue.Count = 5, 'Array should have 5 elements');
 
-      for var i := 0 to 4 do
+      for i := 0 to 4 do
         Assert(ArrVal.ArrayValue[i].NumberValue = i + 1, Format('Element %d should be %d', [i, i+1]));
     finally
       Parser.Free;
@@ -565,6 +774,9 @@ var
   NestedVal: TGrispValue;
   NodeId: Integer;
   NodeName: string;
+  ChildNode: TGrispNode;
+  NameVal: TGrispValue;
+  ValueVal: TGrispValue;
   Parser: TGrispUnifiedParser;
 begin
   Source :=
@@ -591,19 +803,19 @@ begin
       Assert(NestedVal.Kind = gvkNode, 'Should be node type');
 
       NestedVal.GetNodeReference(NodeId, NodeName);
-      var ChildNode := Graph.FindNode(NodeName);
+      ChildNode := Graph.FindNode(NodeName);
       Assert(ChildNode <> nil, 'Child node should exist');
 
-      var NameVal := ChildNode.GetValueAttribute('name');
+      NameVal := ChildNode.GetValueAttribute('name');
       Assert(NameVal <> nil, 'Child name attribute should exist');
       Assert(NameVal.StringValue = 'ChildNode', 'Child name should match');
 
-      var ValueVal := ChildNode.GetValueAttribute('value');
+      ValueVal := ChildNode.GetValueAttribute('value');
       Assert(ValueVal <> nil, 'Child value attribute should exist');
       Assert(ValueVal.NumberValue = 99, 'Child value should be 99');
     finally
       Parser.Free;
-	end;
+    end;
   finally
     Graph.Free;
   end;
@@ -618,7 +830,7 @@ begin
   Graph := TGrispGraph.Create;
   try
     NodeA := Graph.AddNode('A', 'node');
-    NodeB := Graph.AddNode('B', 'node');
+	NodeB := Graph.AddNode('B', 'node');
     NodeC := Graph.AddNode('C', 'node');
 
     Assert(Graph.Nodes.Count = 3, 'Should have 3 nodes');
@@ -653,6 +865,9 @@ var
   NodeId: Integer;
   NodeName: string;
   Source: string;
+  MatchVal: TGrispValue;
+  XNode: TGrispNode;
+  YNode: TGrispNode;
 begin
   Source :=
     'node A { value: number = 10; next: identifier = B }' + sLineBreak +
@@ -674,7 +889,7 @@ begin
       RuleNode := Graph.Rules[0];
       Matcher.SetCurrentRule(RuleNode);
 
-      var MatchVal := RuleNode.GetValueAttribute('match');
+      MatchVal := RuleNode.GetValueAttribute('match');
       Assert(MatchVal <> nil, 'Match attribute should exist');
       Assert(MatchVal.Kind = gvkNode, 'Match should be node');
 
@@ -684,13 +899,11 @@ begin
 
       MatchResult := Matcher.MatchPattern(MatchRoot);
       try
-		Assert(MatchResult.Success, 'Pattern should match');
+        Assert(MatchResult.Success, 'Pattern should match');
 
-        var XNode: TGrispNode;
         Assert(MatchResult.TryGetNode('X', XNode), 'Should bind X');
         Assert(XNode.Name = 'A', 'X should be A');
 
-        var YNode: TGrispNode;
         Assert(MatchResult.TryGetNode('Y', YNode), 'Should bind Y');
         Assert(YNode.Name = 'B', 'Y should be B');
       finally
@@ -714,6 +927,10 @@ var
   Source: string;
   NodeId: Integer;
   NodeName: string;
+  MatchVal: TGrispValue;
+  i: Integer;
+  XNode: TGrispNode;
+  YNode: TGrispNode;
 begin
   Source :=
     'node N1 { value: number = 5; next: identifier = N2 }' + sLineBreak +
@@ -736,7 +953,7 @@ begin
       RuleNode := Graph.Rules[0];
       Matcher.SetCurrentRule(RuleNode);
 
-      var MatchVal := RuleNode.GetValueAttribute('match');
+      MatchVal := RuleNode.GetValueAttribute('match');
       MatchVal.GetNodeReference(NodeId, NodeName);
       MatchRoot := Graph.FindNode(NodeName);
 
@@ -744,10 +961,8 @@ begin
       try
         Assert(Matches.Count = 3, Format('Should find 3 matches, found %d', [Matches.Count]));
 
-        for var i := 0 to Matches.Count - 1 do
-        begin
-          var XNode: TGrispNode;
-          var YNode: TGrispNode;
+        for i := 0 to Matches.Count - 1 do
+		begin
           Assert(Matches[i].TryGetNode('X', XNode), Format('Match %d should bind X', [i]));
           Assert(Matches[i].TryGetNode('Y', YNode), Format('Match %d should bind Y', [i]));
           Assert(XNode.Outgoing.Count > 0, 'X should have outgoing edge');
@@ -846,7 +1061,7 @@ begin
       Values[i] := Trunc(Graph.FindNode('N' + IntToStr(i)).GetValueAttribute('value').NumberValue);
 
     for i := 1 to 9 do
-	  Assert(Values[i] <= Values[i+1], Format('Array should be sorted at position %d', [i]));
+      Assert(Values[i] <= Values[i+1], Format('Array should be sorted at position %d', [i]));
 
     Assert(Values[1] = 0, 'Minimum should be 0');
     Assert(Values[10] = 9, 'Maximum should be 9');
@@ -855,44 +1070,17 @@ begin
   end;
 end;
 
-procedure TestStrategyBuilder;
-var
-  Builder: TGrispStrategyBuilder;
-  Strategy: TGrispStrategy;
-begin
-  Builder := TGrispStrategyBuilder.Create;
-  try
-    Strategy := Builder
-      .Sequence
-      .Rule('rule1')
-      .Rule('rule2')
-      .RepeatStrategy
-      .Rule('rule3')
-      .Build;
-
-    Assert(Strategy <> nil, 'Strategy should be created');
-    Assert(Strategy.Kind = gskSequence, 'Root should be sequence');
-    Assert(Strategy.Strategies.Count = 3, 'Sequence should have 3 strategies');
-    Assert(Strategy.Strategies[0].Kind = gskRule, 'First should be rule');
-    Assert(Strategy.Strategies[0].RuleName = 'rule1', 'First rule name');
-    Assert(Strategy.Strategies[1].Kind = gskRule, 'Second should be rule');
-    Assert(Strategy.Strategies[1].RuleName = 'rule2', 'Second rule name');
-    Assert(Strategy.Strategies[2].Kind = gskRepeat, 'Third should be repeat');
-    Assert(Strategy.Strategies[2].Strategies[0].RuleName = 'rule3', 'Nested rule name');
-  finally
-    Builder.Free;
-  end;
-end;
-
 procedure TestExpressionEvaluator;
 var
   Bindings: TDictionary<string, TGrispValue>;
   Expr: TGrispExpression;
   Result: TGrispValue;
+  VarVal: TGrispValue;
+  Left: TGrispExpression;
+  Right: TGrispExpression;
 begin
   Bindings := TDictionary<string, TGrispValue>.Create;
   try
-    // Test literal
     Expr := TGrispExpression.Create(gekLiteral);
     Expr.Value := TGrispValue.Create(gvkNumber);
     TGrispValue(Expr.Value).NumberValue := 42;
@@ -904,10 +1092,9 @@ begin
     end;
     Expr.Free;
 
-    // Test variable
-    var VarVal := TGrispValue.Create(gvkNumber);
+    VarVal := TGrispValue.Create(gvkNumber);
     VarVal.NumberValue := 100;
-    Bindings.Add('x', VarVal);
+	Bindings.Add('x', VarVal);
 
     Expr := TGrispExpression.Create(gekVariable);
     Expr.Name := 'x';
@@ -919,12 +1106,11 @@ begin
     end;
     Expr.Free;
 
-    // Test binary addition
-    var Left := TGrispExpression.Create(gekLiteral);
+    Left := TGrispExpression.Create(gekLiteral);
     Left.Value := TGrispValue.Create(gvkNumber);
     TGrispValue(Left.Value).NumberValue := 5;
 
-    var Right := TGrispExpression.Create(gekLiteral);
+    Right := TGrispExpression.Create(gekLiteral);
     Right.Value := TGrispValue.Create(gvkNumber);
     TGrispValue(Right.Value).NumberValue := 3;
 
@@ -949,7 +1135,9 @@ procedure TestTypeSystem;
 var
   Graph: TGrispGraph;
   Source: string;
-  NumberType, StringType: TGrispType;
+  NumberType: TGrispType;
+  StringType: TGrispType;
+  ListNode: TGrispNode;
 begin
   Source :=
     'type Counter = number' + sLineBreak +
@@ -973,7 +1161,7 @@ begin
     Assert(StringType <> nil, 'Message type should exist');
     Assert(StringType.Kind = gtkString, 'Message should be string');
 
-    var ListNode := Graph.FindNode('Test');
+    ListNode := Graph.FindNode('Test');
     Assert(ListNode <> nil, 'Test node should exist');
     Assert(ListNode.GetValueAttribute('count').NumberValue = 10, 'Count should be 10');
     Assert(ListNode.GetValueAttribute('msg').StringValue = 'hello', 'Msg should be hello');
@@ -989,6 +1177,8 @@ var
   Source: string;
   Steps: Integer;
   Config: TGrispRuntimeConfig;
+  NodeA: TGrispNode;
+  NodeB: TGrispNode;
 begin
   Source :=
     'node A { value: number = 5; phase: number = 1 }' + sLineBreak +
@@ -1008,15 +1198,15 @@ begin
 
   Graph := BuildGraphFromSource(Source);
   try
-	Config.SetDefaults;
+    Config.SetDefaults;
     Config.MaxPhases := 2;
     Config.MaxStepsPerPhase := 10;
 
     Steps := TGrispRuntime.RunWithPhases(Graph, 2, 10);
     Assert(Steps > 0, 'Should apply some rewrites');
 
-    var NodeA := Graph.FindNode('A');
-    var NodeB := Graph.FindNode('B');
+    NodeA := Graph.FindNode('A');
+    NodeB := Graph.FindNode('B');
 
     Assert(NodeA.GetValueAttribute('value').NumberValue = 12, 'A should be 12');
     Assert(NodeB.GetValueAttribute('value').NumberValue = 8, 'B should be 8');
@@ -1030,18 +1220,19 @@ var
   Graph: TGrispGraph;
   Source: string;
   OrphanCount: Integer;
+  Node: TGrispNode;
 begin
   Source :=
     'node Root { next: identifier = Child }' + sLineBreak +
     'node Child { value: number = 42 }' + sLineBreak +
-    'node Orphan { value: number = 99 }  // This node is unreachable' + sLineBreak +
-    '' + sLineBreak +
+    'node Orphan { value: number = 99 }' + sLineBreak +
+	'' + sLineBreak +
     'node rule.test { match: node = Root rewrite: node = Root }';
 
   Graph := BuildGraphFromSource(Source);
   try
     OrphanCount := 0;
-    for var Node in Graph.Nodes do
+    for Node in Graph.Nodes do
       if Node.Name = 'Orphan' then
         Inc(OrphanCount);
 
@@ -1050,7 +1241,7 @@ begin
     Graph.GarbageCollect;
 
     OrphanCount := 0;
-    for var Node in Graph.Nodes do
+    for Node in Graph.Nodes do
       if Node.Name = 'Orphan' then
         Inc(OrphanCount);
 
@@ -1084,29 +1275,32 @@ begin
   end;
 end;
 
+{ MAIN PROGRAM }
+
 var
   Harness: TTestHarness;
 begin
   Harness := TTestHarness.Create;
   try
-	if GRISP_DEBUG_ENABLED then
+    if GRISP_DEBUG_ENABLED then
       Writeln('[DEBUG] ========================================');
 
-    // Run the original builder debug test first to see the crash
-    Harness.RunSuite('Original Builder Debug Test', procedure
-    begin
-      Harness.RunTest('Original Builder Crash Test', TestOriginalBuilderDebug);
-    end);
+{
+	// This test demonstrates the crash in the original builder
+	// It is kept for reference and debugging only
+	Harness.RunSuite('Original Builder Debug Test', procedure
+	begin
+	  Harness.RunTest('Original Builder Crash Test', TestOriginalBuilderDebug);
+	end);
+}
 
-    // Lexer Tests
-    Harness.RunSuite('Lexer Tests', procedure
+	Harness.RunSuite('Lexer Tests', procedure
     begin
       Harness.RunTest('Basic tokens', TestLexerBasics);
       Harness.RunTest('Operators', TestLexerOperators);
       Harness.RunTest('Numbers', TestLexerNumbers);
     end);
 
-    // Parser Tests
     Harness.RunSuite('Parser Tests', procedure
     begin
       Harness.RunTest('Simple node', TestParserSimpleNode);
@@ -1114,7 +1308,6 @@ begin
       Harness.RunTest('Nested node', TestParserNestedNode);
     end);
 
-    // Graph Tests
     Harness.RunSuite('Graph Tests', procedure
     begin
       Harness.RunTest('Graph operations', TestGraphOperations);
@@ -1122,45 +1315,42 @@ begin
       Harness.RunTest('Garbage collection', TestGarbageCollection);
     end);
 
-    // Pattern Matching Tests
     Harness.RunSuite('Pattern Matching Tests', procedure
     begin
       Harness.RunTest('Basic pattern matching', TestPatternMatching);
       Harness.RunTest('Find all matches', TestFindAllMatches);
     end);
 
-    // Rewrite Tests
     Harness.RunSuite('Rewrite Tests', procedure
     begin
       Harness.RunTest('Rewrite operation', TestRewriteOperation);
       Harness.RunTest('Bubble sort', TestBubbleSort);
     end);
 
-    // Strategy Tests
-    Harness.RunSuite('Strategy Tests', procedure
+    // FIXED STRATEGY TESTS - These use the corrected builder
+    Harness.RunSuite('Strategy Tests (Fixed Builder)', procedure
     begin
-      Harness.RunTest('Strategy builder', TestStrategyBuilder);
+      Harness.RunTest('Builder basic', TestStrategyBuilderBasic);
+      Harness.RunTest('Builder wrappers', TestStrategyBuilderWrappers);
+      Harness.RunTest('Builder nested', TestStrategyBuilderNested);
+      Harness.RunTest('Builder error cases', TestStrategyBuilderErrorCases);
     end);
 
-    // Expression Tests
     Harness.RunSuite('Expression Tests', procedure
     begin
       Harness.RunTest('Expression evaluator', TestExpressionEvaluator);
     end);
 
-    // Type System Tests
     Harness.RunSuite('Type System Tests', procedure
     begin
       Harness.RunTest('Type declarations', TestTypeSystem);
     end);
 
-    // Runtime Tests
     Harness.RunSuite('Runtime Tests', procedure
     begin
       Harness.RunTest('Runtime phases', TestRuntimePhases);
     end);
 
-    // Summary
     Harness.Summary;
 
     if Harness.FTotalFailed > 0 then
