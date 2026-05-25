@@ -3,7 +3,12 @@ unit unit_Debug_TGrispDebug_version_001;
 interface
 
 uses
-  System.SysUtils;
+  System.SysUtils,
+  System.TypInfo,
+  unit_Token_TGrispTokenKind_version_001,
+  unit_Token_TGrispToken_version_001,
+  unit_Core_TGrispValueBase_version_001,
+  unit_Graph_TGrispEdge_TGrispNode_version_001;
 
 type
   TGrispDebug = class
@@ -20,7 +25,7 @@ type
     class procedure LogExit(const MethodName: string);
     class procedure LogToken(const Prefix: string; const Token: TGrispToken);
     class procedure LogValue(const Prefix: string; const Value: TGrispValue);
-	class procedure LogNode(const Prefix: string; const Node: TGrispNode);
+    class procedure LogNode(const Prefix: string; const Node: TGrispNode);
   end;
 
 implementation
@@ -97,6 +102,6 @@ begin
 end;
 
 initialization
-  FEnabled := False;
-  FIndentLevel := 0;
+  TGrispDebug.FEnabled := False;
+  TGrispDebug.FIndentLevel := 0;
 end.

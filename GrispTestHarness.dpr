@@ -11,6 +11,7 @@ uses
   unit_Core_TGrispExpressionEvaluator_version_001 in 'unit_Core_TGrispExpressionEvaluator_version_001.pas',
   unit_Core_TGrispType_version_001 in 'unit_Core_TGrispType_version_001.pas',
   unit_Core_TGrispValueBase_version_001 in 'unit_Core_TGrispValueBase_version_001.pas',
+  unit_Debug_TGrispDebug_version_001 in 'unit_Debug_TGrispDebug_version_001.pas',
   unit_Graph_TGrispEdge_TGrispNode_version_001 in 'unit_Graph_TGrispEdge_TGrispNode_version_001.pas',
   unit_Graph_TGrispGraph_version_001 in 'unit_Graph_TGrispGraph_version_001.pas',
   unit_Lexer_TGrispLexer_version_001 in 'unit_Lexer_TGrispLexer_version_001.pas',
@@ -36,8 +37,11 @@ uses
   unit_Strategy_TGrispStrategyKind_version_001 in 'unit_Strategy_TGrispStrategyKind_version_001.pas',
   unit_Token_TGrispToken_version_001 in 'unit_Token_TGrispToken_version_001.pas',
   unit_Token_TGrispTokenHelper_version_001 in 'unit_Token_TGrispTokenHelper_version_001.pas',
-  unit_Token_TGrispTokenKind_version_001 in 'unit_Token_TGrispTokenKind_version_001.pas',
-  unit_Debug_TGrispDebug_version_001 in 'unit_Debug_TGrispDebug_version_001.pas';
+  unit_Token_TGrispTokenKind_version_001 in 'unit_Token_TGrispTokenKind_version_001.pas';
+
+const
+  // Global debug flag - set to True to enable detailed parser debugging
+  GRISP_DEBUG_ENABLED = True;
 
 type
   TTestResult = record
@@ -49,7 +53,7 @@ type
 
   TTestHarness = class
   private
-    FResults: TList<TTestResult>;
+	FResults: TList<TTestResult>;
     FTotalPassed: Integer;
     FTotalFailed: Integer;
     FTotalTime: Integer;
@@ -59,17 +63,17 @@ type
     destructor Destroy; override;
     procedure RunTest(const Name: string; TestProc: TProc);
     procedure RunSuite(const SuiteName: string; SuiteProc: TProc);
-    procedure Summary;
+	procedure Summary;
   end;
 
   // Test fixtures
   TTestFixtures = class
   public
-	class function CreateSimpleGraph: TGrispGraph;
+    class function CreateSimpleGraph: TGrispGraph;
     class function CreateRuleGraph: TGrispGraph;
     class function CreateListGraph(Count: Integer): TGrispGraph;
     class function CreateLinkedList(const Values: array of Double): TGrispGraph;
-	class procedure CleanupGraph(var Graph: TGrispGraph);
+    class procedure CleanupGraph(var Graph: TGrispGraph);
   end;
 
 { TTestHarness }
@@ -81,10 +85,19 @@ begin
   FTotalPassed := 0;
   FTotalFailed := 0;
   FTotalTime := 0;
+
+  // Initialize debug system
+  if GRISP_DEBUG_ENABLED then
+  begin
+    TGrispDebug.Enable;
+    Writeln('[DEBUG] Debug logging enabled');
+  end;
 end;
 
 destructor TTestHarness.Destroy;
 begin
+  if GRISP_DEBUG_ENABLED then
+    TGrispDebug.Disable;
   FResults.Free;
   inherited Destroy;
 end;
@@ -267,7 +280,7 @@ begin
   PrevNode := nil;
   for i := 0 to High(Values) do
   begin
-	CurrNode := Result.AddNode('N' + IntToStr(i+1), 'node');
+    CurrNode := Result.AddNode('N' + IntToStr(i+1), 'node');
     var Val := TGrispValue.Create(gvkNumber);
     Val.NumberValue := Values[i];
     CurrNode.SetValueAttribute('value', Val);
@@ -284,6 +297,17 @@ begin
   FreeAndNil(Graph);
 end;
 
+{ Helper function to create parser with debug enabled }
+function CreateParserWithDebug(const Source: string; Graph: TGrispGraph): TGrispUnifiedParser;
+var
+  Parser: TGrispUnifiedParser;
+begin
+  Parser := TGrispUnifiedParser.Create(Source, Graph);
+  if GRISP_DEBUG_ENABLED then
+    Parser.EnableDebug;
+  Result := Parser;
+end;
+
 { Actual Test Procedures }
 
 procedure TestLexerBasics;
@@ -293,7 +317,7 @@ var
 begin
   Lexer := TGrispLexer.Create('node test { key: string = "hello" }');
   try
-    Tok := Lexer.NextToken;
+	Tok := Lexer.NextToken;
     Assert(Tok.Kind = tkKeywordNode, 'Should recognize "node"');
 
     Tok := Lexer.NextToken;
@@ -359,13 +383,13 @@ begin
     Tok := Lexer.NextToken;
     Assert(Tok.Kind = tkOperator, 'Should recognize "+"');
 
-    Tok := Lexer.NextToken;
+	Tok := Lexer.NextToken;
     Assert(Tok.Kind = tkOperator, 'Should recognize "-"');
 
     Tok := Lexer.NextToken;
     Assert(Tok.Kind = tkOperator, 'Should recognize "*"');
 
-    Tok := Lexer.NextToken;
+	Tok := Lexer.NextToken;
     Assert(Tok.Kind = tkOperator, 'Should recognize "/"');
   finally
     Lexer.Free;
@@ -399,7 +423,7 @@ begin
     Assert(Tok.Kind = tkNumber, 'Should recognize scientific notation');
     Assert(Tok.Lexeme = '1e10', 'Scientific');
 
-	Tok := Lexer.NextToken;
+    Tok := Lexer.NextToken;
     Assert(Tok.Kind = tkNumber, 'Should recognize negative exponent');
     Assert(Tok.Lexeme = '2.5e-3', 'Negative exponent');
   finally
@@ -412,6 +436,7 @@ var
   Graph: TGrispGraph;
   Source: string;
   Node: TGrispNode;
+  Parser: TGrispUnifiedParser;
 begin
   Source :=
     'node MyNode {' + sLineBreak +
@@ -419,24 +444,32 @@ begin
     '  name: string = "test"' + sLineBreak +
     '}';
 
-  Graph := BuildGraphFromSource(Source);
+  Graph := TGrispGraph.Create;
   try
-    Assert(Graph <> nil, 'Graph should be created');
-    Assert(Graph.Nodes.Count = 1, 'Should have 1 node');
+    Parser := CreateParserWithDebug(Source, Graph);
+    try
+      if GRISP_DEBUG_ENABLED then
+		Writeln('[DEBUG] Testing simple node parsing');
+      Parser.ParseFile;
 
-    Node := Graph.FindNode('MyNode');
-    Assert(Node <> nil, 'Node "MyNode" should exist');
-    Assert(Node.NodeType = 'node', 'Node type should be "node"');
+      Assert(Graph.Nodes.Count = 1, 'Should have 1 node');
 
-    var CountVal := Node.GetValueAttribute('count');
-    Assert(CountVal <> nil, 'Attribute "count" should exist');
-    Assert(CountVal.Kind = gvkNumber, '"count" should be number');
-    Assert(CountVal.NumberValue = 42, '"count" should be 42');
+      Node := Graph.FindNode('MyNode');
+	  Assert(Node <> nil, 'Node "MyNode" should exist');
+      Assert(Node.NodeType = 'node', 'Node type should be "node"');
 
-    var NameVal := Node.GetValueAttribute('name');
-    Assert(NameVal <> nil, 'Attribute "name" should exist');
-    Assert(NameVal.Kind = gvkString, '"name" should be string');
-    Assert(NameVal.StringValue = 'test', '"name" should be "test"');
+      var CountVal := Node.GetValueAttribute('count');
+      Assert(CountVal <> nil, 'Attribute "count" should exist');
+      Assert(CountVal.Kind = gvkNumber, '"count" should be number');
+      Assert(CountVal.NumberValue = 42, '"count" should be 42');
+
+      var NameVal := Node.GetValueAttribute('name');
+      Assert(NameVal <> nil, 'Attribute "name" should exist');
+      Assert(NameVal.Kind = gvkString, '"name" should be string');
+      Assert(NameVal.StringValue = 'test', '"name" should be "test"');
+    finally
+      Parser.Free;
+    end;
   finally
     Graph.Free;
   end;
@@ -448,24 +481,34 @@ var
   Source: string;
   Node: TGrispNode;
   ArrVal: TGrispValue;
+  Parser: TGrispUnifiedParser;
 begin
   Source :=
     'node Data {' + sLineBreak +
     '  values: array<number> = [1, 2, 3, 4, 5]' + sLineBreak +
     '}';
 
-  Graph := BuildGraphFromSource(Source);
+  Graph := TGrispGraph.Create;
   try
-    Node := Graph.FindNode('Data');
-    Assert(Node <> nil, 'Node should exist');
+    Parser := CreateParserWithDebug(Source, Graph);
+    try
+      if GRISP_DEBUG_ENABLED then
+        Writeln('[DEBUG] Testing array attribute parsing');
+      Parser.ParseFile;
 
-    ArrVal := Node.GetValueAttribute('values');
-    Assert(ArrVal <> nil, 'Array attribute should exist');
-    Assert(ArrVal.Kind = gvkArray, 'Should be array type');
-    Assert(ArrVal.ArrayValue.Count = 5, 'Array should have 5 elements');
+      Node := Graph.FindNode('Data');
+      Assert(Node <> nil, 'Node should exist');
 
-    for var i := 0 to 4 do
-      Assert(ArrVal.ArrayValue[i].NumberValue = i + 1, Format('Element %d should be %d', [i, i+1]));
+      ArrVal := Node.GetValueAttribute('values');
+      Assert(ArrVal <> nil, 'Array attribute should exist');
+      Assert(ArrVal.Kind = gvkArray, 'Should be array type');
+      Assert(ArrVal.ArrayValue.Count = 5, 'Array should have 5 elements');
+
+      for var i := 0 to 4 do
+        Assert(ArrVal.ArrayValue[i].NumberValue = i + 1, Format('Element %d should be %d', [i, i+1]));
+    finally
+      Parser.Free;
+    end;
   finally
     Graph.Free;
   end;
@@ -479,6 +522,7 @@ var
   NestedVal: TGrispValue;
   NodeId: Integer;
   NodeName: string;
+  Parser: TGrispUnifiedParser;
 begin
   Source :=
     'node Parent {' + sLineBreak +
@@ -488,26 +532,35 @@ begin
     '  }' + sLineBreak +
     '}';
 
-  Graph := BuildGraphFromSource(Source);
+  Graph := TGrispGraph.Create;
   try
-    Node := Graph.FindNode('Parent');
-    Assert(Node <> nil, 'Parent node should exist');
+    Parser := CreateParserWithDebug(Source, Graph);
+    try
+      if GRISP_DEBUG_ENABLED then
+        Writeln('[DEBUG] Testing nested node parsing');
+      Parser.ParseFile;
 
-    NestedVal := Node.GetValueAttribute('child');
-    Assert(NestedVal <> nil, 'Child attribute should exist');
-    Assert(NestedVal.Kind = gvkNode, 'Should be node type');
+      Node := Graph.FindNode('Parent');
+      Assert(Node <> nil, 'Parent node should exist');
 
-    NestedVal.GetNodeReference(NodeId, NodeName);
-    var ChildNode := Graph.FindNode(NodeName);
-    Assert(ChildNode <> nil, 'Child node should exist');
+      NestedVal := Node.GetValueAttribute('child');
+      Assert(NestedVal <> nil, 'Child attribute should exist');
+      Assert(NestedVal.Kind = gvkNode, 'Should be node type');
 
-    var NameVal := ChildNode.GetValueAttribute('name');
-    Assert(NameVal <> nil, 'Child name attribute should exist');
-    Assert(NameVal.StringValue = 'ChildNode', 'Child name should match');
+      NestedVal.GetNodeReference(NodeId, NodeName);
+      var ChildNode := Graph.FindNode(NodeName);
+      Assert(ChildNode <> nil, 'Child node should exist');
 
-    var ValueVal := ChildNode.GetValueAttribute('value');
-    Assert(ValueVal <> nil, 'Child value attribute should exist');
-    Assert(ValueVal.NumberValue = 99, 'Child value should be 99');
+      var NameVal := ChildNode.GetValueAttribute('name');
+      Assert(NameVal <> nil, 'Child name attribute should exist');
+      Assert(NameVal.StringValue = 'ChildNode', 'Child name should match');
+
+      var ValueVal := ChildNode.GetValueAttribute('value');
+      Assert(ValueVal <> nil, 'Child value attribute should exist');
+      Assert(ValueVal.NumberValue = 99, 'Child value should be 99');
+    finally
+      Parser.Free;
+    end;
   finally
     Graph.Free;
   end;
@@ -528,7 +581,7 @@ begin
     Assert(Graph.Nodes.Count = 3, 'Should have 3 nodes');
     Assert(Graph.FindNode('A') = NodeA, 'FindNode should return correct node');
 
-    Graph.AddEdge(NodeA, NodeB, 'next');
+	Graph.AddEdge(NodeA, NodeB, 'next');
     Graph.AddEdge(NodeB, NodeC, 'next');
 
     Assert(Graph.Edges.Count = 2, 'Should have 2 edges');
@@ -540,7 +593,7 @@ begin
     Assert(Edge.Target = NodeB, 'Edge should point to B');
 
     Graph.RemoveEdge(Edge);
-	Assert(Graph.Edges.Count = 1, 'Should have 1 edge after removal');
+    Assert(Graph.Edges.Count = 1, 'Should have 1 edge after removal');
     Assert(NodeA.Outgoing.Count = 0, 'NodeA should have 0 outgoing edges');
   finally
     Graph.Free;
@@ -594,7 +647,7 @@ begin
         Assert(MatchResult.TryGetNode('X', XNode), 'Should bind X');
         Assert(XNode.Name = 'A', 'X should be A');
 
-        var YNode: TGrispNode;
+		var YNode: TGrispNode;
         Assert(MatchResult.TryGetNode('Y', YNode), 'Should bind Y');
         Assert(YNode.Name = 'B', 'Y should be B');
       finally
@@ -660,7 +713,7 @@ begin
       finally
         Matches.Free;
       end;
-    finally
+	finally
       Matcher.Free;
     end;
   finally
@@ -726,7 +779,7 @@ begin
     'node N6  { value: number = 2; next: identifier = N7 }' + sLineBreak +
     'node N7  { value: number = 5; next: identifier = N8 }' + sLineBreak +
     'node N8  { value: number = 4; next: identifier = N9 }' + sLineBreak +
-    'node N9  { value: number = 6; next: identifier = N10 }' + sLineBreak +
+	'node N9  { value: number = 6; next: identifier = N10 }' + sLineBreak +
     'node N10 { value: number = 0 }' + sLineBreak +
     '' + sLineBreak +
     'node rule.bubble_swap {' + sLineBreak +
@@ -738,7 +791,7 @@ begin
     '    X: node = { value: number = VY; next: identifier = Y }' + sLineBreak +
     '    Y: node = { value: number = VX }' + sLineBreak +
     '  }' + sLineBreak +
-	'  where VX > VY' + sLineBreak +
+    '  where VX > VY' + sLineBreak +
     '}';
 
   Graph := BuildGraphFromSource(Source);
@@ -804,7 +857,7 @@ begin
     try
       Assert(Result.NumberValue = 42, 'Literal should be 42');
     finally
-	  Result.Free;
+      Result.Free;
     end;
     Expr.Free;
 
@@ -843,7 +896,6 @@ begin
     finally
       Result.Free;
     end;
-    // Don't free Left/Right - they are owned by Expr
     Expr.Free;
   finally
     Bindings.Free;
@@ -859,7 +911,7 @@ begin
   Source :=
     'type Counter = number' + sLineBreak +
     'type Message = string' + sLineBreak +
-    'type Flag = boolean' + sLineBreak +
+	'type Flag = boolean' + sLineBreak +
     'type NodeList = array<node>' + sLineBreak +
     '' + sLineBreak +
     'node Test {' + sLineBreak +
@@ -870,7 +922,7 @@ begin
 
   Graph := BuildGraphFromSource(Source);
   try
-	NumberType := Graph.FindType('Counter');
+    NumberType := Graph.FindType('Counter');
     Assert(NumberType <> nil, 'Counter type should exist');
     Assert(NumberType.Kind = gtkNumber, 'Counter should be number');
 
@@ -925,7 +977,7 @@ begin
 
     // Phase 1: increment (5 -> 6, 3 -> 4)
     // Phase 2: double (6 -> 12, 4 -> 8)
-    Assert(NodeA.GetValueAttribute('value').NumberValue = 12, 'A should be 12');
+	Assert(NodeA.GetValueAttribute('value').NumberValue = 12, 'A should be 12');
     Assert(NodeB.GetValueAttribute('value').NumberValue = 8, 'B should be 8');
   finally
     Graph.Free;
@@ -983,9 +1035,9 @@ begin
 
     JSON := Graph.ToJSON;
     Assert(JSON.Contains('"nodes"'), 'JSON should contain nodes');
-    Assert(JSON.Contains('"edges"'), 'JSON should contain edges');
+	Assert(JSON.Contains('"edges"'), 'JSON should contain edges');
     Assert(JSON.Contains('"source"'), 'JSON should contain source');
-    Assert(JSON.Contains('"target"'), 'JSON should contain target');
+	Assert(JSON.Contains('"target"'), 'JSON should contain target');
   finally
     Graph.Free;
   end;
@@ -996,6 +1048,9 @@ var
 begin
   Harness := TTestHarness.Create;
   try
+    if GRISP_DEBUG_ENABLED then
+      Writeln('[DEBUG] ========================================');
+
     // Lexer Tests
     Harness.RunSuite('Lexer Tests', procedure
     begin
@@ -1004,7 +1059,7 @@ begin
       Harness.RunTest('Numbers', TestLexerNumbers);
 	end);
 
-    // Parser Tests
+    // Parser Tests (now with debug output when enabled)
     Harness.RunSuite('Parser Tests', procedure
     begin
       Harness.RunTest('Simple node', TestParserSimpleNode);
