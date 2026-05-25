@@ -48,7 +48,7 @@ type
 
   TTestHarness = class
   private
-	FResults: TList<TTestResult>;
+    FResults: TList<TTestResult>;
     FTotalPassed: Integer;
     FTotalFailed: Integer;
     FTotalTime: Integer;
@@ -58,7 +58,7 @@ type
     destructor Destroy; override;
     procedure RunTest(const Name: string; TestProc: TProc);
     procedure RunSuite(const SuiteName: string; SuiteProc: TProc);
-	procedure Summary;
+    procedure Summary;
   end;
 
   // Test fixtures
@@ -117,7 +117,7 @@ begin
   if Passed then
     Writeln(Format('  [PASS] %s (%.3f ms)', [Name, DurationMs / 1000]))
   else
-    Writeln(Format('  [FAIL] %s: %s (%.3f ms)', [Name, Msg, DurationMs / 1000]));
+	Writeln(Format('  [FAIL] %s: %s (%.3f ms)', [Name, Msg, DurationMs / 1000]));
 end;
 
 procedure TTestHarness.RunTest(const Name: string; TestProc: TProc);
@@ -303,7 +303,55 @@ begin
   Result := Parser;
 end;
 
-{ Actual Test Procedures }
+{ Test Procedures }
+
+procedure TestOriginalBuilderDebug;
+var
+  Builder: TGrispStrategyBuilder;
+  Strategy: TGrispStrategy;
+begin
+  Writeln;
+  Writeln('========================================');
+  Writeln('Testing ORIGINAL Builder with Debug');
+  Writeln('========================================');
+
+  Builder := TGrispStrategyBuilder.Create;
+  try
+    Builder.EnableDebug;
+
+    Writeln;
+    Writeln('Building: Sequence -> Rule(rule1) -> Rule(rule2) -> RepeatStrategy -> Rule(rule3)');
+    Writeln;
+
+    try
+      Strategy := Builder
+        .Sequence
+        .Rule('rule1')
+        .Rule('rule2')
+        .RepeatStrategy
+        .Rule('rule3')
+        .Build;
+
+      Writeln;
+      Writeln('If you see this, the build succeeded (unexpected!)');
+      Strategy.Free;
+
+    except
+      on E: Exception do
+      begin
+        Writeln;
+        Writeln(Format('!!! Expected exception caught: %s', [E.Message]));
+        Writeln('!!! This confirms the original builder crashes !!!');
+      end;
+    end;
+
+  finally
+    Builder.Free;
+  end;
+
+  Writeln;
+  Writeln('========================================');
+end;
 
 procedure TestLexerBasics;
 var
@@ -378,13 +426,13 @@ begin
     Tok := Lexer.NextToken;
     Assert(Tok.Kind = tkOperator, 'Should recognize "+"');
 
-	Tok := Lexer.NextToken;
+    Tok := Lexer.NextToken;
     Assert(Tok.Kind = tkOperator, 'Should recognize "-"');
 
     Tok := Lexer.NextToken;
     Assert(Tok.Kind = tkOperator, 'Should recognize "*"');
 
-	Tok := Lexer.NextToken;
+    Tok := Lexer.NextToken;
     Assert(Tok.Kind = tkOperator, 'Should recognize "/"');
   finally
     Lexer.Free;
@@ -444,13 +492,13 @@ begin
     Parser := CreateParserWithDebug(Source, Graph);
     try
       if GRISP_DEBUG_ENABLED then
-		Writeln('[DEBUG] Testing simple node parsing');
+        Writeln('[DEBUG] Testing simple node parsing');
       Parser.ParseFile;
 
       Assert(Graph.Nodes.Count = 1, 'Should have 1 node');
 
       Node := Graph.FindNode('MyNode');
-	  Assert(Node <> nil, 'Node "MyNode" should exist');
+      Assert(Node <> nil, 'Node "MyNode" should exist');
       Assert(Node.NodeType = 'node', 'Node type should be "node"');
 
       var CountVal := Node.GetValueAttribute('count');
@@ -555,7 +603,7 @@ begin
       Assert(ValueVal.NumberValue = 99, 'Child value should be 99');
     finally
       Parser.Free;
-    end;
+	end;
   finally
     Graph.Free;
   end;
@@ -576,7 +624,7 @@ begin
     Assert(Graph.Nodes.Count = 3, 'Should have 3 nodes');
     Assert(Graph.FindNode('A') = NodeA, 'FindNode should return correct node');
 
-	Graph.AddEdge(NodeA, NodeB, 'next');
+    Graph.AddEdge(NodeA, NodeB, 'next');
     Graph.AddEdge(NodeB, NodeC, 'next');
 
     Assert(Graph.Edges.Count = 2, 'Should have 2 edges');
@@ -636,13 +684,13 @@ begin
 
       MatchResult := Matcher.MatchPattern(MatchRoot);
       try
-        Assert(MatchResult.Success, 'Pattern should match');
+		Assert(MatchResult.Success, 'Pattern should match');
 
         var XNode: TGrispNode;
         Assert(MatchResult.TryGetNode('X', XNode), 'Should bind X');
         Assert(XNode.Name = 'A', 'X should be A');
 
-		var YNode: TGrispNode;
+        var YNode: TGrispNode;
         Assert(MatchResult.TryGetNode('Y', YNode), 'Should bind Y');
         Assert(YNode.Name = 'B', 'Y should be B');
       finally
@@ -708,7 +756,7 @@ begin
       finally
         Matches.Free;
       end;
-	finally
+    finally
       Matcher.Free;
     end;
   finally
@@ -748,7 +796,6 @@ begin
     Assert(NodeB.GetValueAttribute('value').NumberValue = 3, 'B value should be 3');
 
     Steps := TGrispRuntime.Run(Graph, 10);
-    // One match = two node updates (X.value and Y.value)
     Assert(Steps = 2, Format('Should apply 2 node updates, applied %d', [Steps]));
 
     Assert(NodeA.GetValueAttribute('value').NumberValue = 3, 'A value should become 3');
@@ -775,7 +822,7 @@ begin
     'node N6  { value: number = 2; next: identifier = N7 }' + sLineBreak +
     'node N7  { value: number = 5; next: identifier = N8 }' + sLineBreak +
     'node N8  { value: number = 4; next: identifier = N9 }' + sLineBreak +
-	'node N9  { value: number = 6; next: identifier = N10 }' + sLineBreak +
+    'node N9  { value: number = 6; next: identifier = N10 }' + sLineBreak +
     'node N10 { value: number = 0 }' + sLineBreak +
     '' + sLineBreak +
     'node rule.bubble_swap {' + sLineBreak +
@@ -799,7 +846,7 @@ begin
       Values[i] := Trunc(Graph.FindNode('N' + IntToStr(i)).GetValueAttribute('value').NumberValue);
 
     for i := 1 to 9 do
-      Assert(Values[i] <= Values[i+1], Format('Array should be sorted at position %d', [i]));
+	  Assert(Values[i] <= Values[i+1], Format('Array should be sorted at position %d', [i]));
 
     Assert(Values[1] = 0, 'Minimum should be 0');
     Assert(Values[10] = 9, 'Maximum should be 9');
@@ -907,7 +954,7 @@ begin
   Source :=
     'type Counter = number' + sLineBreak +
     'type Message = string' + sLineBreak +
-	'type Flag = boolean' + sLineBreak +
+    'type Flag = boolean' + sLineBreak +
     'type NodeList = array<node>' + sLineBreak +
     '' + sLineBreak +
     'node Test {' + sLineBreak +
@@ -961,7 +1008,7 @@ begin
 
   Graph := BuildGraphFromSource(Source);
   try
-    Config.SetDefaults;
+	Config.SetDefaults;
     Config.MaxPhases := 2;
     Config.MaxStepsPerPhase := 10;
 
@@ -971,9 +1018,7 @@ begin
     var NodeA := Graph.FindNode('A');
     var NodeB := Graph.FindNode('B');
 
-    // Phase 1: increment (5 -> 6, 3 -> 4)
-    // Phase 2: double (6 -> 12, 4 -> 8)
-	Assert(NodeA.GetValueAttribute('value').NumberValue = 12, 'A should be 12');
+    Assert(NodeA.GetValueAttribute('value').NumberValue = 12, 'A should be 12');
     Assert(NodeB.GetValueAttribute('value').NumberValue = 8, 'B should be 8');
   finally
     Graph.Free;
@@ -1031,9 +1076,9 @@ begin
 
     JSON := Graph.ToJSON;
     Assert(JSON.Contains('"nodes"'), 'JSON should contain nodes');
-	Assert(JSON.Contains('"edges"'), 'JSON should contain edges');
+    Assert(JSON.Contains('"edges"'), 'JSON should contain edges');
     Assert(JSON.Contains('"source"'), 'JSON should contain source');
-	Assert(JSON.Contains('"target"'), 'JSON should contain target');
+    Assert(JSON.Contains('"target"'), 'JSON should contain target');
   finally
     Graph.Free;
   end;
@@ -1044,8 +1089,14 @@ var
 begin
   Harness := TTestHarness.Create;
   try
-    if GRISP_DEBUG_ENABLED then
+	if GRISP_DEBUG_ENABLED then
       Writeln('[DEBUG] ========================================');
+
+    // Run the original builder debug test first to see the crash
+    Harness.RunSuite('Original Builder Debug Test', procedure
+    begin
+      Harness.RunTest('Original Builder Crash Test', TestOriginalBuilderDebug);
+    end);
 
     // Lexer Tests
     Harness.RunSuite('Lexer Tests', procedure
@@ -1053,9 +1104,9 @@ begin
       Harness.RunTest('Basic tokens', TestLexerBasics);
       Harness.RunTest('Operators', TestLexerOperators);
       Harness.RunTest('Numbers', TestLexerNumbers);
-	end);
+    end);
 
-    // Parser Tests (now with debug output when enabled)
+    // Parser Tests
     Harness.RunSuite('Parser Tests', procedure
     begin
       Harness.RunTest('Simple node', TestParserSimpleNode);

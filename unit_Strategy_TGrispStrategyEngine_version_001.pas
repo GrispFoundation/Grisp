@@ -16,7 +16,7 @@ uses
 type
   TGrispStrategyEngine = class
   private
-    FGraph: TGrispGraph;
+	FGraph: TGrispGraph;
     FMatcher: TGrispPatternMatcher;
     FRewriter: TGrispRewriter;
     FStrategies: TDictionary<string, TGrispStrategy>;  // Non-owning reference
