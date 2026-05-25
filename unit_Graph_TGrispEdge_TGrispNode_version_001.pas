@@ -17,7 +17,7 @@ type
     LabelName: string;
     EdgeType: string;
     Source: TGrispNode;
-    Target: TGrispNode;
+	Target: TGrispNode;
     constructor Create(ASource: TGrispNode; ATarget: TGrispNode; const ALabel: string; const AEdgeType: string);
   end;
 
@@ -45,7 +45,7 @@ type
 
     // Attribute operations
 	function GetValueAttribute(const Key: string): TGrispValue;
-    procedure SetValueAttribute(const Key: string; AValue: TGrispValue);
+	procedure SetValueAttribute(const Key: string; AValue: TGrispValue);
     procedure RemoveAttribute(const Key: string);
     function HasAttribute(const Key: string): Boolean;
     function GetNumber(const Key: string; Default: Double = 0): Double;
@@ -103,9 +103,13 @@ end;
 
 procedure TGrispNode.SetValueAttribute(const Key: string; AValue: TGrispValue);
 begin
+  // Do NOT mutate the incoming value - it may be shared or already correct
+  // If we need to store a copy, clone it first
+  var ValueToStore := AValue;
   if (AValue <> nil) and (AValue.Kind = gvkNode) then
-    AValue.SetNodeReference(FId, FName);
-  FAttributes.AddOrSetValue(Key, AValue);
+	ValueToStore := AValue.Clone;  // Store a clone to avoid mutation side effects
+
+  FAttributes.AddOrSetValue(Key, ValueToStore);
 end;
 
 procedure TGrispNode.RemoveAttribute(const Key: string);

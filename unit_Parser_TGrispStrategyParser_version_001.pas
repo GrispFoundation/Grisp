@@ -6,13 +6,12 @@ uses
   System.SysUtils,
   System.StrUtils,
   System.Generics.Collections,
-  unit_Token_TGrispTokenKind_version_001,      // Changed
-  unit_Token_TGrispToken_version_001,          // Changed
-  unit_Lexer_TGrispLexer_version_001,          // Changed
+  unit_Token_TGrispTokenKind_version_001,
+  unit_Token_TGrispToken_version_001,
+  unit_Lexer_TGrispLexer_version_001,
   unit_Graph_TGrispGraph_version_001,
-  unit_Strategy_TGrispStrategyKind_version_001, // Added
+  unit_Strategy_TGrispStrategyKind_version_001,
   unit_Strategy_TGrispStrategy_version_001,
-  unit_Strategy_TGrispStrategyEngine_version_001, // Added for FStrategyEngine
   unit_Parser_TGrispParserBase_version_001;
 
 type
@@ -20,11 +19,23 @@ type
   private
     function ParseStrategy: TGrispStrategy;
   public
+    constructor Create(const ASource: string; AGraph: TGrispGraph);
+    constructor CreateShared(Parent: TGrispParserBase); override;
     procedure ParseStrategyDecl;
     procedure ParseFile; override;
   end;
 
 implementation
+
+constructor TGrispStrategyParser.Create(const ASource: string; AGraph: TGrispGraph);
+begin
+  inherited Create(ASource, AGraph);
+end;
+
+constructor TGrispStrategyParser.CreateShared(Parent: TGrispParserBase);
+begin
+  inherited CreateShared(Parent);
+end;
 
 function TGrispStrategyParser.ParseStrategy: TGrispStrategy;
 begin
@@ -73,6 +84,9 @@ begin
     begin
       Result.Phase := Trunc(StrToFloat(FCurrent.Lexeme));
       Advance;
+      // FIX: Consume the comma after the phase number if present
+      if FCurrent.Kind = tkComma then
+        Advance;
     end;
     while FCurrent.Kind <> tkRParen do
     begin
@@ -101,23 +115,15 @@ begin
   Expect(tkIdentifier, 'name expected');
   Expect(tkEquals, '"=" expected');
   Strat := ParseStrategy;
-  FStrategyEngine.AddStrategy(StrategyName, Strat);
+  // Store strategy on the graph, not in a parser-owned engine
+  FGraph.AddStrategy(StrategyName, Strat);
 end;
 
 procedure TGrispStrategyParser.ParseFile;
 begin
-  while FCurrent.Kind <> tkEOF do
-  begin
-    case FCurrent.Kind of
-      tkKeywordStrategy:
-        ParseStrategyDecl;
-      tkKeywordNode, tkKeywordType:
-        // Skip node and type declarations - handled by other parsers
-        Advance;
-      else
-        raise EGrispParseError.Create('Expected strategy declaration');
-    end;
-  end;
+  // This method should not be called when in shared mode
+  // The full parser handles the main loop
+  raise EGrispParseError.Create('ParseFile should not be called on shared parser - use TGrispFullParser instead');
 end;
 
 end.

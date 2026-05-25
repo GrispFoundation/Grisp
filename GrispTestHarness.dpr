@@ -15,7 +15,6 @@ uses
   unit_Graph_TGrispEdge_TGrispNode_version_001 in 'unit_Graph_TGrispEdge_TGrispNode_version_001.pas',
   unit_Graph_TGrispGraph_version_001 in 'unit_Graph_TGrispGraph_version_001.pas',
   unit_Lexer_TGrispLexer_version_001 in 'unit_Lexer_TGrispLexer_version_001.pas',
-  unit_Parser_TGrispFullParser_version_001 in 'unit_Parser_TGrispFullParser_version_001.pas',
   unit_Parser_TGrispNodeParser_version_001 in 'unit_Parser_TGrispNodeParser_version_001.pas',
   unit_Parser_TGrispParserBase_version_001 in 'unit_Parser_TGrispParserBase_version_001.pas',
   unit_Parser_TGrispStrategyParser_version_001 in 'unit_Parser_TGrispStrategyParser_version_001.pas',
@@ -753,7 +752,8 @@ begin
     Assert(NodeB.GetValueAttribute('value').NumberValue = 3, 'B value should be 3');
 
     Steps := TGrispRuntime.Run(Graph, 10);
-    Assert(Steps = 1, Format('Should apply 1 rewrite, applied %d', [Steps]));
+    // One match = two node updates (X.value and Y.value)
+    Assert(Steps = 2, Format('Should apply 2 node updates, applied %d', [Steps]));
 
     Assert(NodeA.GetValueAttribute('value').NumberValue = 3, 'A value should become 3');
     Assert(NodeB.GetValueAttribute('value').NumberValue = 5, 'B value should become 5');

@@ -5,7 +5,7 @@ interface
 uses
   System.SysUtils,
   System.StrUtils,
-  System.TypInfo,  // <- for GetEnumName
+  System.TypInfo,
   System.Generics.Collections,
   unit_Token_TGrispTokenKind_version_001,
   unit_Token_TGrispToken_version_001,
@@ -18,8 +18,7 @@ uses
   unit_Core_TGrispType_version_001,
   unit_Strategy_TGrispStrategyKind_version_001,
   unit_Strategy_TGrispStrategy_version_001,
-  unit_Strategy_TGrispStrategyEngine_version_001,
-  unit_Debug_TGrispDebug_version_001;
+  unit_Debug_TGrispDebug_version_001;  // Remove StrategyEngine from uses
 
 type
   EGrispParseError = class(Exception);
@@ -29,7 +28,6 @@ type
     FLexer: TGrispLexer;
     FCurrent: TGrispToken;
     FGraph: TGrispGraph;
-    FStrategyEngine: TGrispStrategyEngine;
     FAnonId: Integer;
     FDebugEnabled: Boolean;
 
@@ -64,7 +62,7 @@ type
     function ParseStrategy: TGrispStrategy;
 
     function EdgeExists(ASource, ATarget: TGrispNode; const ALabel: string): Boolean;
-	procedure RegisterEdgesForNode(ANode: TGrispNode);
+    procedure RegisterEdgesForNode(ANode: TGrispNode);
     procedure RegisterEdgesForAllNodes;
 
   public
@@ -90,7 +88,6 @@ begin
   FDebugEnabled := False;
   FLexer := TGrispLexer.Create(ASource);
   FGraph := AGraph;
-  FStrategyEngine := TGrispStrategyEngine.Create(AGraph);
   FAnonId := 0;
   Advance;
   Debug('Parser created');
@@ -99,7 +96,6 @@ end;
 destructor TGrispUnifiedParser.Destroy;
 begin
   Debug('Parser destroyed');
-  FStrategyEngine.Free;
   FLexer.Free;
   inherited Destroy;
 end;
@@ -250,7 +246,7 @@ begin
   end
   else if SameText(FCurrent.Lexeme, 'array') then
   begin
-	Debug('Type: array');
+    Debug('Type: array');
     Advance;
     Expect(tkLess, '"<" expected');
     InnerType := ParseType;
@@ -370,18 +366,38 @@ begin
 
   if SameText(ATypeName, 'node') then
   begin
-    Debug('Parsing nested node');
-    Expect(tkLBrace, '"{" expected');
-    Inc(FAnonId);
-    Node := FGraph.AddNode('#' + IntToStr(FAnonId), 'pattern');
-    DebugNode('Created nested node', Node);
-    ParseNodeBody(Node);
-    Expect(tkRBrace, '"}" expected');
-    Result := TGrispValue.Create(gvkNode);
-    Result.SetNodeReference(Node.Id, Node.Name);
-    DebugValue('Created node reference', Result);
-    DebugExit('ParseValue');
-    Exit;
+    Debug('Parsing node value');
+
+    // Case 1: Inline node literal
+    if FCurrent.Kind = tkLBrace then
+    begin
+      Debug('Inline node literal');
+      Expect(tkLBrace, '"{" expected');
+      Inc(FAnonId);
+      Node := FGraph.AddNode('#' + IntToStr(FAnonId), 'pattern');
+      DebugNode('Created nested node', Node);
+      ParseNodeBody(Node);
+      Expect(tkRBrace, '"}" expected');
+      Result := TGrispValue.Create(gvkNode);
+      Result.SetNodeReference(Node.Id, Node.Name);
+      DebugValue('Created node reference', Result);
+      DebugExit('ParseValue');
+      Exit;
+    end;
+
+    // Case 2: Reference to existing node by identifier
+    if FCurrent.Kind = tkIdentifier then
+    begin
+      Debug('Node reference: ' + FCurrent.Lexeme);
+      Result := TGrispValue.Create(gvkIdentifier);
+      Result.IdentifierValue := FCurrent.Lexeme;
+      Advance;
+      DebugValue('Created node reference', Result);
+      DebugExit('ParseValue');
+      Exit;
+    end;
+
+    raise EGrispParseError.Create('"{" or identifier expected for node value');
   end;
 
   Debug('Unknown type: ' + ATypeName);
@@ -580,7 +596,7 @@ begin
     Advance;
     Result := TGrispExpression.Create(gekUnary);
     Result.OperatorSymbol := '-';
-	Result.Left := ParseUnaryExpr;
+    Result.Left := ParseUnaryExpr;
     DebugExit('ParseUnaryExpr');
     Exit;
   end;
@@ -712,9 +728,12 @@ begin
     Result := TGrispStrategy.Create(gskPhase);
     if FCurrent.Kind = tkNumber then
     begin
-	  Result.Phase := Trunc(StrToFloat(FCurrent.Lexeme));
+      Result.Phase := Trunc(StrToFloat(FCurrent.Lexeme));
       Debug('Phase number: ' + IntToStr(Result.Phase));
       Advance;
+      // FIX: Consume comma if present
+      if FCurrent.Kind = tkComma then
+        Advance;
     end;
     while FCurrent.Kind <> tkRParen do
     begin
@@ -769,16 +788,29 @@ begin
       gvkNode:
         begin
           Val.GetNodeReference(NodeId, NodeName);
-          Target := FGraph.FindNode(NodeName);
+          // Find by ID first, then by name as fallback
+          Target := nil;
+          for var Node in FGraph.Nodes do
+            if Node.Id = NodeId then
+            begin
+              Target := Node;
+              Break;
+            end;
+          // Fallback to name lookup if ID not found
+          if Target = nil then
+            Target := FGraph.FindNode(NodeName);
+
           if Assigned(Target) and not EdgeExists(ANode, Target, Key) then
           begin
-            Debug(Format('Adding edge: %s -%s-> %s', [ANode.Name, Key, Target.Name]));
+            Debug(Format('Adding edge: %s -%s-> %s (ID: %d)', [ANode.Name, Key, Target.Name, Target.Id]));
             FGraph.AddEdge(ANode, Target, Key, '');
-          end;
+          end
+          else if Target = nil then
+            Debug(Format('Target node not found: ID=%d, Name=%s', [NodeId, NodeName]));
         end;
       gvkIdentifier:
         begin
-		  Target := FGraph.FindNode(Val.IdentifierValue);
+          Target := FGraph.FindNode(Val.IdentifierValue);
           if Assigned(Target) and not EdgeExists(ANode, Target, Key) then
           begin
             Debug(Format('Adding edge: %s -%s-> %s', [ANode.Name, Key, Target.Name]));
@@ -791,21 +823,25 @@ begin
           if Elem.Kind = gvkNode then
           begin
             Elem.GetNodeReference(NodeId, NodeName);
-            Target := FGraph.FindNode(NodeName);
+            // Find by ID
+            Target := nil;
+            for var Node in FGraph.Nodes do
+              if Node.Id = NodeId then
+              begin
+                Target := Node;
+                Break;
+              end;
+            if Target = nil then
+              Target := FGraph.FindNode(NodeName);
+
             if Assigned(Target) and not EdgeExists(ANode, Target, Key) then
-            begin
-              Debug(Format('Adding edge (array): %s -%s-> %s', [ANode.Name, Key, Target.Name]));
               FGraph.AddEdge(ANode, Target, Key, '');
-            end;
           end
           else if Elem.Kind = gvkIdentifier then
           begin
             Target := FGraph.FindNode(Elem.IdentifierValue);
             if Assigned(Target) and not EdgeExists(ANode, Target, Key) then
-            begin
-              Debug(Format('Adding edge (array ident): %s -%s-> %s', [ANode.Name, Key, Target.Name]));
               FGraph.AddEdge(ANode, Target, Key, '');
-            end;
           end;
         end;
     end;
@@ -928,8 +964,9 @@ begin
   Expect(tkIdentifier, 'name expected');
   Expect(tkEquals, '"=" expected');
   Strat := ParseStrategy;
-  FStrategyEngine.AddStrategy(StrategyName, Strat);
-  Debug('Strategy added to engine');
+  // Store strategy directly on the graph
+  FGraph.AddStrategy(StrategyName, Strat);
+  Debug('Strategy added to graph');
 
   DebugExit('ParseStrategyDecl');
 end;

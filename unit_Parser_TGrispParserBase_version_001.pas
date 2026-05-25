@@ -10,9 +10,8 @@ uses
   unit_Token_TGrispToken_version_001,
   unit_Lexer_TGrispLexer_version_001,
   unit_Graph_TGrispGraph_version_001,
-  unit_Strategy_TGrispStrategyEngine_version_001,
-  unit_Core_TGrispExpression_version_001,      // ADDED: for TGrispExpression
-  unit_Core_TGrispValueBase_version_001;       // ADDED: for TGrispValue
+  unit_Core_TGrispExpression_version_001,
+  unit_Core_TGrispValueBase_version_001;
 
 type
   EGrispParseError = class(Exception);
@@ -22,8 +21,9 @@ type
     FLexer: TGrispLexer;
     FCurrent: TGrispToken;
     FGraph: TGrispGraph;
-    FStrategyEngine: TGrispStrategyEngine;
     FAnonId: Integer;
+    FOwnsLexer: Boolean;
+
     procedure Advance;
     procedure Expect(AKind: TGrispTokenKind; const Msg: string);
     function ParseTypeName: string;
@@ -39,6 +39,7 @@ type
     function ExprToValue(Expr: TGrispExpression): TGrispValue;
   public
     constructor Create(const ASource: string; AGraph: TGrispGraph);
+    constructor CreateShared(Parent: TGrispParserBase); virtual;
     destructor Destroy; override;
     procedure ParseFile; virtual;
   end;
@@ -50,15 +51,26 @@ begin
   inherited Create;
   FLexer := TGrispLexer.Create(ASource);
   FGraph := AGraph;
-  FStrategyEngine := TGrispStrategyEngine.Create(AGraph);
   FAnonId := 0;
+  FOwnsLexer := True;
   Advance;
+end;
+
+constructor TGrispParserBase.CreateShared(Parent: TGrispParserBase);
+begin
+  inherited Create;
+  FLexer := Parent.FLexer;
+  FCurrent := Parent.FCurrent;
+  FGraph := Parent.FGraph;
+  FAnonId := Parent.FAnonId;
+  FOwnsLexer := False;
+  // DON'T call Advance() - token stream is already positioned
 end;
 
 destructor TGrispParserBase.Destroy;
 begin
-  FStrategyEngine.Free;
-  FLexer.Free;
+  if FOwnsLexer then
+    FLexer.Free;
   inherited Destroy;
 end;
 
@@ -153,7 +165,7 @@ begin
   while FCurrent.Kind in [tkEquals, tkNotEqual, tkLess, tkGreater, tkLessEqual, tkGreaterEqual] do
   begin
     Op := FCurrent.Lexeme;
-	Advance;
+    Advance;
     Right := ParseAddExpr;
     Result := TGrispExpression.Create(gekBinary);
     Result.OperatorSymbol := Op;
@@ -219,7 +231,7 @@ begin
   begin
     Advance;
     Result := TGrispExpression.Create(gekUnary);
-	Result.OperatorSymbol := '-';
+    Result.OperatorSymbol := '-';
     Result.Left := ParseUnaryExpr;
     Exit;
   end;

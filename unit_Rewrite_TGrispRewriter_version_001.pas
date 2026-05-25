@@ -36,7 +36,7 @@ type
       NewNodes: TList<TGrispNode>;
       Operations: TList<TGrispRewriteOperation>);
     procedure ApplyOperations(Operations: TList<TGrispRewriteOperation>);
-    procedure RemoveEdge(Source: TGrispNode; const LabelName: string; Target: TGrispNode);
+	procedure RemoveEdge(Source: TGrispNode; const LabelName: string; Target: TGrispNode);
     procedure RemoveNode(Node: TGrispNode);
     function SelectNonOverlappingMatches(Matches: TList<TGrispMatchResult>): TList<TGrispMatchResult>;
 
@@ -241,61 +241,21 @@ var
 begin
   if (Source = nil) or (Target = nil) then Exit;
 
-  for i := Source.Outgoing.Count - 1 downto 0 do
-  begin
-    Edge := Source.Outgoing[i];
-    if (Edge.LabelName = LabelName) and (Edge.Target = Target) then
-    begin
-      Source.Outgoing.Delete(i);
-      Break;
-    end;
-  end;
-
-  for i := Target.Incoming.Count - 1 downto 0 do
-  begin
-    Edge := Target.Incoming[i];
-    if (Edge.LabelName = LabelName) and (Edge.Source = Source) then
-    begin
-      Target.Incoming.Delete(i);
-      Break;
-    end;
-  end;
-
   for i := FGraph.Edges.Count - 1 downto 0 do
   begin
-    Edge := FGraph.Edges[i];
-    if (Edge.Source = Source) and (Edge.LabelName = LabelName) and (Edge.Target = Target) then
-    begin
-      FGraph.Edges.Delete(i);
-      Edge.Free;
-      Break;
-    end;
+	Edge := FGraph.Edges[i];
+	if (Edge.Source = Source) and (Edge.Target = Target) and SameText(Edge.LabelName, LabelName) then
+	begin
+	  FGraph.RemoveEdge(Edge);  // <- Use graph's method, don't manually delete
+	  Break;
+	end;
   end;
 end;
 
 procedure TGrispRewriter.RemoveNode(Node: TGrispNode);
-var
-  Edge: TGrispEdge;
 begin
   if Node = nil then Exit;
-
-  while Node.Outgoing.Count > 0 do
-  begin
-    Edge := Node.Outgoing[0];
-    RemoveEdge(Edge.Source, Edge.LabelName, Edge.Target);
-  end;
-
-  while Node.Incoming.Count > 0 do
-  begin
-    Edge := Node.Incoming[0];
-    RemoveEdge(Edge.Source, Edge.LabelName, Edge.Target);
-  end;
-
-  if Node.Name <> '' then
-    FGraph.NodeIndex.Remove(Node.Name);
-
-  FGraph.Nodes.Remove(Node);
-  Node.Free;
+  FGraph.RemoveNode(Node);  // <- Use graph's method
 end;
 
 function TGrispRewriter.SelectNonOverlappingMatches(Matches: TList<TGrispMatchResult>): TList<TGrispMatchResult>;

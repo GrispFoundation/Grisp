@@ -7,7 +7,7 @@ uses
   System.Classes,
   System.Generics.Collections,
   unit_Graph_TGrispGraph_version_001,
-  unit_Graph_TGrispEdge_TGrispNode_version_001,  // ADDED: for TGrispNode
+  unit_Graph_TGrispEdge_TGrispNode_version_001,
   unit_Pattern_TGrispPatternMatcher_version_001,
   unit_Rewrite_TGrispRewriter_version_001,
   unit_Strategy_TGrispStrategyKind_version_001,
@@ -19,7 +19,7 @@ type
     FGraph: TGrispGraph;
     FMatcher: TGrispPatternMatcher;
     FRewriter: TGrispRewriter;
-    FStrategies: TDictionary<string, TGrispStrategy>;
+    FStrategies: TDictionary<string, TGrispStrategy>;  // Non-owning reference
     FTrace: TStrings;
     FMaxSteps: Integer;
     FCurrentSteps: Integer;
@@ -31,7 +31,6 @@ type
     constructor Create(Graph: TGrispGraph);
     destructor Destroy; override;
 
-    procedure AddStrategy(const Name: string; Strategy: TGrispStrategy);
     function Execute(const StrategyName: string; MaxSteps: Integer = 1000): Integer;
     function ExecuteWithTrace(const StrategyName: string; Trace: TStrings; MaxSteps: Integer = 1000): Integer;
 
@@ -42,22 +41,26 @@ type
 implementation
 
 constructor TGrispStrategyEngine.Create(Graph: TGrispGraph);
+var
+  Pair: TPair<string, TGrispStrategy>;
 begin
   inherited Create;
   FGraph := Graph;
   FMatcher := TGrispPatternMatcher.Create(Graph);
   FRewriter := TGrispRewriter.Create(Graph);
   FStrategies := TDictionary<string, TGrispStrategy>.Create;
+
+  // Load strategies from the graph (non-owning references)
+  for Pair in Graph.Strategies do
+    FStrategies.Add(Pair.Key, Pair.Value);
+
   FMaxSteps := 1000;
   FCurrentSteps := 0;
 end;
 
 destructor TGrispStrategyEngine.Destroy;
-var
-  Strategy: TGrispStrategy;
 begin
-  for Strategy in FStrategies.Values do
-    Strategy.Free;
+  // Do NOT free the strategies - they are owned by the graph
   FStrategies.Free;
   FRewriter.Free;
   FMatcher.Free;
@@ -145,12 +148,12 @@ begin
       begin
         for i := 0 to Strategy.Strategies.Count - 1 do
         begin
-          SubStrategy := Strategy.Strategies[i];
+		  SubStrategy := Strategy.Strategies[i];
           if ExecuteStrategy(SubStrategy) then
           begin
             Result := True;
             Break;
-		  end;
+          end;
         end;
       end;
 
@@ -184,11 +187,6 @@ begin
         end;
       end;
   end;
-end;
-
-procedure TGrispStrategyEngine.AddStrategy(const Name: string; Strategy: TGrispStrategy);
-begin
-  FStrategies.AddOrSetValue(Name, Strategy);
 end;
 
 function TGrispStrategyEngine.Execute(const StrategyName: string; MaxSteps: Integer): Integer;

@@ -6,11 +6,11 @@ uses
   System.SysUtils,
   System.StrUtils,
   System.Generics.Collections,
-  unit_Token_TGrispTokenKind_version_001,      // Changed
-  unit_Token_TGrispToken_version_001,          // Changed
-  unit_Lexer_TGrispLexer_version_001,          // Changed
+  unit_Token_TGrispTokenKind_version_001,
+  unit_Token_TGrispToken_version_001,
+  unit_Lexer_TGrispLexer_version_001,
   unit_Graph_TGrispGraph_version_001,
-  unit_Strategy_TGrispStrategyKind_version_001, // Added
+  unit_Strategy_TGrispStrategyKind_version_001,
   unit_Strategy_TGrispStrategy_version_001,
   unit_Parser_TGrispParserBase_version_001,
   unit_Parser_TGrispNodeParser_version_001,
@@ -34,9 +34,10 @@ implementation
 constructor TGrispFullParser.Create(const ASource: string; AGraph: TGrispGraph);
 begin
   inherited Create(ASource, AGraph);
-  FNodeParser := TGrispNodeParser.Create(ASource, AGraph);
-  FTypeParser := TGrispTypeParser.Create(ASource, AGraph);
-  FStrategyParser := TGrispStrategyParser.Create(ASource, AGraph);
+  // Create child parsers in shared mode to use the same lexer
+  FNodeParser := TGrispNodeParser.CreateShared(Self);
+  FTypeParser := TGrispTypeParser.CreateShared(Self);
+  FStrategyParser := TGrispStrategyParser.CreateShared(Self);
 end;
 
 destructor TGrispFullParser.Destroy;
@@ -62,8 +63,10 @@ begin
         raise EGrispParseError.Create('Expected node, type, or strategy declaration');
     end;
   end;
+
   // Register edges after all nodes are parsed
-  FNodeParser.ParseFile;  // This will call RegisterEdgesForAllNodes
+  // FIX: Call RegisterEdgesForAllNodes, not ParseFile again
+  FNodeParser.RegisterEdgesForAllNodes;
 end;
 
 end.

@@ -9,7 +9,8 @@ uses
   unit_Core_TGrispExpression_version_001,
   unit_Core_TGrispExpressionEvaluator_version_001,
   unit_Core_TGrispType_version_001,
-  unit_Graph_TGrispEdge_TGrispNode_version_001;  // Use combined unit
+  unit_Graph_TGrispEdge_TGrispNode_version_001,
+  unit_Strategy_TGrispStrategy_version_001;  // Added for TGrispStrategy
 
 type
   TGrispGraph = class
@@ -20,6 +21,7 @@ type
     FNodeIndex: TObjectDictionary<string, TGrispNode>;
     FRules: TObjectList<TGrispNode>;
     FTypes: TObjectDictionary<string, TGrispType>;
+    FStrategies: TObjectDictionary<string, TGrispStrategy>;  // NEW: owns strategies
     FModified: Boolean;
 
     procedure MarkReachable(Node: TGrispNode);
@@ -38,11 +40,16 @@ type
     procedure RemoveEdgesBetween(Source, Target: TGrispNode; const ALabel: string = '');
 
     procedure RegisterRule(ANode: TGrispNode);
-	property Rules: TObjectList<TGrispNode> read FRules;
+    property Rules: TObjectList<TGrispNode> read FRules;
 
-	procedure AddType(const Name: string; TypeObj: TGrispType);
-	function FindType(const Name: string): TGrispType;
+    procedure AddType(const Name: string; TypeObj: TGrispType);
+    function FindType(const Name: string): TGrispType;
     property Types: TObjectDictionary<string, TGrispType> read FTypes;
+
+    // NEW: Strategy management
+    procedure AddStrategy(const Name: string; Strategy: TGrispStrategy);
+    function GetStrategy(const Name: string): TGrispStrategy;
+    property Strategies: TObjectDictionary<string, TGrispStrategy> read FStrategies;
 
     property Nodes: TObjectList<TGrispNode> read FNodes;
     property Edges: TObjectList<TGrispEdge> read FEdges;
@@ -56,7 +63,7 @@ type
     function ToDOT: string;
     function ToJSON: string;
 
-    property Modified: Boolean read FModified write FModified;
+	property Modified: Boolean read FModified write FModified;
   end;
 
 implementation
@@ -69,12 +76,14 @@ begin
   FNodeIndex := TObjectDictionary<string, TGrispNode>.Create;
   FRules := TObjectList<TGrispNode>.Create(False);
   FTypes := TObjectDictionary<string, TGrispType>.Create([doOwnsValues]);
+  FStrategies := TObjectDictionary<string, TGrispStrategy>.Create([doOwnsValues]);  // NEW: owns strategies
   FNextId := 1;
   FModified := False;
 end;
 
 destructor TGrispGraph.Destroy;
 begin
+  FStrategies.Free;  // NEW: free strategies
   FRules.Free;
   FTypes.Free;
   FNodeIndex.Free;
@@ -101,11 +110,11 @@ var
 begin
   if Node = nil then Exit;
 
-  // Remove all outgoing edges
+  // Remove all outgoing edges (they will free themselves via RemoveEdge)
   for i := Node.Outgoing.Count - 1 downto 0 do
   begin
     Edge := Node.Outgoing[i];
-    RemoveEdge(Edge);
+	RemoveEdge(Edge);
   end;
 
   // Remove all incoming edges
@@ -118,8 +127,8 @@ begin
   if Node.Name <> '' then
     FNodeIndex.Remove(Node.Name);
   FRules.Remove(Node);
-  FNodes.Remove(Node);
-  Node.Free;
+  FNodes.Remove(Node);  // <- This frees Node
+  // NO Node.Free here!
   FModified := True;
 end;
 
@@ -161,8 +170,8 @@ begin
   if Assigned(Edge.Target) then
     Edge.Target.RemoveIncomingEdge(Edge);
 
-  FEdges.Remove(Edge);
-  Edge.Free;
+  FEdges.Remove(Edge);  // <- This frees Edge (OwnsObjects = True)
+  // NO Edge.Free here!
   FModified := True;
 end;
 
@@ -194,6 +203,17 @@ end;
 function TGrispGraph.FindType(const Name: string): TGrispType;
 begin
   if not FTypes.TryGetValue(Name, Result) then Result := nil;
+end;
+
+// NEW: Strategy management
+procedure TGrispGraph.AddStrategy(const Name: string; Strategy: TGrispStrategy);
+begin
+  FStrategies.AddOrSetValue(Name, Strategy);
+end;
+
+function TGrispGraph.GetStrategy(const Name: string): TGrispStrategy;
+begin
+  if not FStrategies.TryGetValue(Name, Result) then Result := nil;
 end;
 
 procedure TGrispGraph.RegisterEdgesFromIdentifiers;
