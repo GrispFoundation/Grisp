@@ -5,7 +5,7 @@ interface
 uses
   System.SysUtils,
   System.IOUtils,
-  unit_Parser_TGrispFullParser_version_001,
+  unit_Parser_TGrispUnifiedParser_version_001,  // <- CHANGED: use unified parser
   unit_Graph_TGrispGraph_version_001;
 
 type
@@ -13,9 +13,9 @@ type
 
   TGrispGraphBuilder = class
   private
-    FSource: string;
-    FGraph: TGrispGraph;
-    FParser: TGrispFullParser;
+	FSource: string;
+	FGraph: TGrispGraph;
+	FParser: TGrispUnifiedParser;  // <- CHANGED: use unified parser
     FFileName: string;
 
     procedure Initialize;
@@ -80,7 +80,7 @@ end;
 procedure TGrispGraphBuilder.Initialize;
 begin
   FGraph := TGrispGraph.Create;
-  FParser := TGrispFullParser.Create(FSource, FGraph);
+  FParser := TGrispUnifiedParser.Create(FSource, FGraph);  // <- CHANGED
 end;
 
 procedure TGrispGraphBuilder.Cleanup;
@@ -96,6 +96,10 @@ begin
 
   try
     FParser.ParseFile;
+    // Note: RegisterEdgesFromIdentifiers is now called inside ParseFile
+    // or you can keep it here. The unified parser calls RegisterEdgesForAllNodes
+    // at the end of ParseFile, which handles edges from node attributes.
+    // You may still need RegisterEdgesFromIdentifiers for identifier-based edges.
     FGraph.RegisterEdgesFromIdentifiers;
     Result := FGraph;
     // Detach so it doesn't get freed with the builder
