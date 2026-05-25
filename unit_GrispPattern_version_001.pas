@@ -263,15 +263,20 @@ var
   TargetNodeRef: TGNode;
   I: Integer;
 begin
+  Result := False;
+
   if (PatternValue = nil) or (TargetValue = nil) then
     Exit((PatternValue = nil) and (TargetValue = nil));
 
+  // Handle pattern identifier (variable or literal)
   if (PatternValue.Kind = vkIdentifier) then
   begin
     IdStr := PatternValue.IdentifierValue;
 
+    // Node variable (single uppercase letter like X, Y)
     if (Length(IdStr) = 1) and CharInSet(IdStr[1], ['A'..'Z']) then
     begin
+      // Target should be a node (either as identifier or node value)
       if TargetValue.Kind = vkIdentifier then
       begin
         TargetNodeRef := FGraph.FindNode(TargetValue.IdentifierValue);
@@ -293,26 +298,37 @@ begin
       else
         Exit(False);
     end
+
+    // Value variable (starts with V followed by uppercase, like VX, VY)
     else if (Length(IdStr) >= 2) and (IdStr[1] = 'V') and CharInSet(IdStr[2], ['A'..'Z']) then
     begin
+      // Check if this variable is already bound
       if Match.TryGetValue(IdStr, BoundValue) then
       begin
+        // Already bound - verify equality
         Result := ValuesEqual(BoundValue, TargetValue);
+        Exit;
       end
       else
       begin
+        // Not bound yet - bind it if target is a number or boolean
         if (TargetValue.Kind = vkNumber) or (TargetValue.Kind = vkBoolean) then
         begin
           Match.AddValueBinding(IdStr, TargetValue.Clone);
           Result := True;
+          Exit;
         end
         else
-          Result := False;
+        begin
+          // Value variable cannot bind to non-number/boolean
+          Exit(False);
+        end;
       end;
-      Exit;
     end
+
+    // Literal identifier (not a variable)
     else
-	begin
+    begin
       if TargetValue.Kind = vkIdentifier then
         Result := IdStr = TargetValue.IdentifierValue
       else
@@ -321,25 +337,39 @@ begin
     end;
   end;
 
+  // Pattern is not an identifier - compare kinds
   if PatternValue.Kind <> TargetValue.Kind then
     Exit(False);
 
+  // Compare based on kind
   case PatternValue.Kind of
-    vkNumber: Result := PatternValue.NumberValue = TargetValue.NumberValue;
-    vkString: Result := PatternValue.StringValue = TargetValue.StringValue;
-    vkBoolean: Result := PatternValue.BoolValue = TargetValue.BoolValue;
-    vkIdentifier: Result := PatternValue.IdentifierValue = TargetValue.IdentifierValue;
+    vkNumber:
+      Result := PatternValue.NumberValue = TargetValue.NumberValue;
+
+    vkString:
+      Result := PatternValue.StringValue = TargetValue.StringValue;
+
+    vkBoolean:
+      Result := PatternValue.BoolValue = TargetValue.BoolValue;
+
+    vkIdentifier:
+      Result := PatternValue.IdentifierValue = TargetValue.IdentifierValue;
+
     vkArray:
       begin
-        if PatternValue.ArrayValue.Count <> TargetValue.ArrayValue.Count then Exit(False);
+        if PatternValue.ArrayValue.Count <> TargetValue.ArrayValue.Count then
+          Exit(False);
         for I := 0 to PatternValue.ArrayValue.Count - 1 do
-          if not MatchValue(PatternValue.ArrayValue[I], TargetValue.ArrayValue[I], Match) then Exit(False);
+          if not MatchValue(PatternValue.ArrayValue[I], TargetValue.ArrayValue[I], Match) then
+            Exit(False);
         Result := True;
       end;
+
     vkNode:
       Result := MatchNodeConstraints(PatternValue.NodeValue, TargetValue.NodeValue, Match);
-  else
-    Result := False;
+
+    vkExpression:
+      Result := False;  // Expressions are not directly comparable
   end;
 end;
 
@@ -436,6 +466,7 @@ var
   Bindings: TDictionary<string, TGValue>;
   Res: TGValue;
   B: TValueBinding;
+  BNode: TNodeBinding;
   Pair: TPair<string, TGValue>;
 begin
   Result := True;
@@ -445,12 +476,40 @@ begin
 
   Bindings := TDictionary<string, TGValue>.Create;
   try
+    // Add value bindings (VX, VY, etc.) - these are numbers
     for B in Match.ValueBindings do
-      Bindings.Add(B.Name, B.Value.Clone);
+    begin
+      if Assigned(B.Value) then
+        Bindings.Add(B.Name, B.Value.Clone)
+      else
+        Bindings.Add(B.Name, TGValue.Create(vkNumber));
+    end;
+
+    // Add node bindings as identifiers for WHERE clause
+    for BNode in Match.NodeBindings do
+    begin
+      if Assigned(BNode.Node) then
+      begin
+        var NodeVal := TGValue.Create(vkIdentifier);
+        NodeVal.IdentifierValue := BNode.Node.Name;
+        Bindings.Add(BNode.Name, NodeVal);
+      end;
+    end;
+
+    // Debug output (uncomment to debug)
+    // Writeln('EvalWhere: Expression = ', V.ExpressionValue.Name);
+    // for Pair in Bindings do
+    //   Writeln('  Binding: ', Pair.Key, ' = ', Pair.Value.ToString);
 
     Res := TGrispExpressionEvaluator.Evaluate(V.ExpressionValue, Bindings);
     try
-      Result := Assigned(Res) and (Res.Kind = vkBoolean) and Res.BoolValue;
+      if Assigned(Res) then
+      begin
+        Result := (Res.Kind = vkBoolean) and Res.BoolValue;
+        // Writeln('EvalWhere result = ', BoolToStr(Result, True));
+      end
+      else
+        Result := False;
     finally
       Res.Free;
     end;
@@ -620,15 +679,13 @@ var
 
 begin
   ResultList := TList<TMatchResult>.Create;
-
-  // Initialize result
   Result := ResultList;
 
   FPatternVariables.Clear;
   FNodeVars.Clear;
 
   if PatternRoot = nil then
-    Exit;  // Returns empty list
+    Exit;
 
   CollectVariables(PatternRoot);
 

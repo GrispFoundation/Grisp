@@ -29,7 +29,7 @@ type
       Match: TMatchResult;
       NodeVarMap: TDictionary<string, TGNode>;
       NewNodes: TList<TGNode>): TGValue;
-    procedure CollectRewriteOperations(
+	procedure CollectRewriteOperations(
       RewriteRoot: TGNode;
       Match: TMatchResult;
       NewNodes: TList<TGNode>;
@@ -235,12 +235,20 @@ begin
           begin
             EvaluatedVal := EvaluateValue(InlineTemplate.GetAttribute(Key), Match, NodeVarMap, NewNodes);
 
+            // Skip 'next' attribute if it would create a self-reference or cycle
+            if (Key = 'next') and (EvaluatedVal <> nil) and (EvaluatedVal.Kind = vkIdentifier) then
+            begin
+              var TargetNode := FGraph.FindNode(EvaluatedVal.IdentifierValue);
+              if Assigned(TargetNode) and (TargetNode = BoundNode) then
+                Continue; // Skip self-reference
+            end;
+
             if SameText(Key, 'name') and (EvaluatedVal <> nil) and (EvaluatedVal.Kind = vkIdentifier) then
             begin
               // Handle name change
               Op.Attributes.AddOrSetValue(Key, EvaluatedVal);
             end
-			else
+            else
             begin
               Op.Attributes.AddOrSetValue(Key, EvaluatedVal);
 
@@ -270,7 +278,14 @@ begin
             end;
           end;
 
-          Operations.Add(Op);
+          // Only add operation if it has meaningful changes
+          if (Op.Attributes.Count > 0) or (Op.EdgesToAdd.Count > 0) then
+            Operations.Add(Op)
+          else
+          begin
+            Op.Attributes.Free;
+            Op.EdgesToAdd.Free;
+          end;
         end;
       end;
     end;
@@ -288,30 +303,30 @@ var
 begin
   for Op in Operations do
   begin
-    // Apply attribute changes
-    for AttrKey in Op.Attributes.Keys do
-    begin
-      AttrVal := Op.Attributes[AttrKey];
+	// Apply attribute changes
+	for AttrKey in Op.Attributes.Keys do
+	begin
+	  AttrVal := Op.Attributes[AttrKey];
 
-      // Handle name change
-      if SameText(AttrKey, 'name') and (AttrVal <> nil) and (AttrVal.Kind = vkIdentifier) then
-      begin
-        if Op.TargetNode.Name <> '' then
-          FGraph.NodeIndex.Remove(Op.TargetNode.Name);
-        Op.TargetNode.Name := AttrVal.IdentifierValue;
-        if Op.TargetNode.Name <> '' then
-          FGraph.NodeIndex.AddOrSetValue(Op.TargetNode.Name, Op.TargetNode);
-      end;
+	  // Handle name change
+	  if SameText(AttrKey, 'name') and (AttrVal <> nil) and (AttrVal.Kind = vkIdentifier) then
+	  begin
+		if Op.TargetNode.Name <> '' then
+		  FGraph.NodeIndex.Remove(Op.TargetNode.Name);
+		Op.TargetNode.Name := AttrVal.IdentifierValue;
+		if Op.TargetNode.Name <> '' then
+		  FGraph.NodeIndex.AddOrSetValue(Op.TargetNode.Name, Op.TargetNode);
+	  end;
 
-      Op.TargetNode.SetAttribute(AttrKey, AttrVal);
-    end;
+	  Op.TargetNode.SetAttribute(AttrKey, AttrVal);
+	end;
 
 	// Remove old edges and add new ones
-    for Pair in Op.EdgesToAdd do
-    begin
-      // Note: Edge removal would need to be handled here
-      FGraph.AddEdge(Op.TargetNode, Pair.Value, Pair.Key);
-    end;
+	for Pair in Op.EdgesToAdd do
+	begin
+	  // Note: Edge removal would need to be handled here
+	  FGraph.AddEdge(Op.TargetNode, Pair.Value, Pair.Key);
+	end;
   end;
 end;
 
@@ -319,57 +334,103 @@ function TGrispRewriter.ApplyAllMatches(ARule: TGNode; Matcher: TGrispPatternMat
 var
   MatchRoot, RewriteRoot: TGNode;
   MatchResults: TList<TMatchResult>;
-  M: TMatchResult;
   NewNodes: TList<TGNode>;
   AllOperations: TList<TRewriteOperation>;
   Op: TRewriteOperation;
+  TotalApplied: Integer;
+  i: Integer;
+  M: TMatchResult;
+  HasOverlap: Boolean;
+  UsedNodes: THashSet<TGNode>;
+  SelectedMatches: TList<TMatchResult>;
+  BNode: TNodeBinding;
 begin
   Result := 0;
+  TotalApplied := 0;
 
   MatchRoot := GetMatchRoot(ARule);
   RewriteRoot := GetRewriteRoot(ARule);
   if (MatchRoot = nil) or (RewriteRoot = nil) then
     Exit;
 
-  MatchResults := Matcher.FindAllMatches(MatchRoot);
-  try
-    if MatchResults.Count = 0 then
-      Exit;
-
-    if Assigned(Trace) then
-      Trace.Add(Format('Found %d matches for rule %s', [MatchResults.Count, ARule.Name]));
-
-    NewNodes := TList<TGNode>.Create;
-    AllOperations := TList<TRewriteOperation>.Create;
+  // Keep finding and applying matches until no more
+  repeat
+    MatchResults := Matcher.FindAllMatches(MatchRoot);
     try
-      // Collect all operations from all matches
-      for M in MatchResults do
-      begin
-        CollectRewriteOperations(RewriteRoot, M, NewNodes, AllOperations);
-      end;
+      if MatchResults.Count = 0 then
+        Break;
 
-      // Apply all operations at once
-      if AllOperations.Count > 0 then
-      begin
-        ApplyOperations(AllOperations);
-        Result := AllOperations.Count;
+      if Assigned(Trace) then
+        Trace.Add(Format('Found %d matches for rule %s', [MatchResults.Count, ARule.Name]));
+
+      // Select non-overlapping matches
+      UsedNodes := THashSet<TGNode>.Create;
+      SelectedMatches := TList<TMatchResult>.Create;
+      try
+        for M in MatchResults do
+        begin
+          // Check if this match overlaps with already selected ones
+          HasOverlap := False;
+          for BNode in M.NodeBindings do
+          begin
+            if UsedNodes.Contains(BNode.Node) then
+            begin
+              HasOverlap := True;
+              Break;
+            end;
+          end;
+
+          if not HasOverlap then
+          begin
+            SelectedMatches.Add(M);
+            for BNode in M.NodeBindings do
+              UsedNodes.Add(BNode.Node);
+          end;
+        end;
+
+        if SelectedMatches.Count = 0 then
+          Break;
+
         if Assigned(Trace) then
-          Trace.Add(Format('Applied %d rewrites', [Result]));
+          Trace.Add(Format('Selected %d non-overlapping matches', [SelectedMatches.Count]));
+
+        // Build operations for selected matches
+        NewNodes := TList<TGNode>.Create;
+        AllOperations := TList<TRewriteOperation>.Create;
+        try
+          for i := 0 to SelectedMatches.Count - 1 do
+          begin
+            M := SelectedMatches[i];
+            CollectRewriteOperations(RewriteRoot, M, NewNodes, AllOperations);
+          end;
+
+          // Apply all operations
+          if AllOperations.Count > 0 then
+          begin
+            ApplyOperations(AllOperations);
+            Inc(TotalApplied, AllOperations.Count);
+            if Assigned(Trace) then
+              Trace.Add(Format('Applied %d rewrites (total: %d)', [AllOperations.Count, TotalApplied]));
+          end;
+        finally
+          for Op in AllOperations do
+          begin
+            Op.Attributes.Free;
+            Op.EdgesToAdd.Free;
+          end;
+          AllOperations.Free;
+          NewNodes.Free;
+        end;
+      finally
+        SelectedMatches.Free;
+        UsedNodes.Free;
       end;
     finally
-      for Op in AllOperations do
-      begin
-        Op.Attributes.Free;
-        Op.EdgesToAdd.Free;
-      end;
-      AllOperations.Free;
-      NewNodes.Free;
+      MatchResults.Free;
     end;
-  finally
-    for M in MatchResults do
-      M.Free;
-    MatchResults.Free;
-  end;
+  until False;  // Continue until no matches found
+
+  Result := TotalApplied;
 end;
 
 end.
