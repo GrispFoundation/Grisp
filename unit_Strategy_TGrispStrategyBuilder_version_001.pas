@@ -13,14 +13,19 @@ uses
 type
   TGrispStrategyBuilder = class
   private
-    FStrategies: TList<TGrispStrategy>;
+    FRoot: TGrispStrategy;
+    FCurrentParent: TGrispStrategy;
+    FScopeStack: TStack<TGrispStrategy>;
     FDebugEnabled: Boolean;
 
     procedure Debug(const Msg: string);
     procedure DebugEnter(const Method: string);
     procedure DebugExit(const Method: string);
-    procedure DumpStrategyList(const Prefix: string);
     procedure DumpStrategy(Strategy: TGrispStrategy; Indent: Integer = 0);
+    procedure DumpState(const Prefix: string);
+
+    procedure AddStrategy(Strategy: TGrispStrategy);
+	procedure WrapLastStrategy(Kind: TGrispStrategyKind; PhaseNum: Integer = 0);
   public
     constructor Create;
     destructor Destroy; override;
@@ -30,6 +35,7 @@ type
 
     function Rule(const RuleName: string): TGrispStrategyBuilder;
     function Sequence: TGrispStrategyBuilder;
+    function EndScope: TGrispStrategyBuilder;
     function RepeatStrategy: TGrispStrategyBuilder;
     function TryStrategy: TGrispStrategyBuilder;
     function Choice: TGrispStrategyBuilder;
@@ -44,14 +50,16 @@ implementation
 constructor TGrispStrategyBuilder.Create;
 begin
   inherited Create;
-  FStrategies := TList<TGrispStrategy>.Create;
+  FRoot := nil;
+  FCurrentParent := nil;
+  FScopeStack := TStack<TGrispStrategy>.Create;
   FDebugEnabled := False;
 end;
 
 destructor TGrispStrategyBuilder.Destroy;
 begin
   Clear;
-  FStrategies.Free;
+  FScopeStack.Free;
   inherited Destroy;
 end;
 
@@ -130,32 +138,121 @@ begin
   end;
 end;
 
-procedure TGrispStrategyBuilder.DumpStrategyList(const Prefix: string);
-var
-  i: Integer;
-  S: TGrispStrategy;
+procedure TGrispStrategyBuilder.DumpState(const Prefix: string);
 begin
   if not FDebugEnabled then Exit;
-
-  Debug(Format('%s FStrategies has %d items:', [Prefix, FStrategies.Count]));
-  for i := 0 to FStrategies.Count - 1 do
-  begin
-    S := FStrategies[i];
-    if S <> nil then
-      DumpStrategy(S, 1)
-    else
-      Debug(Format('  [%d] NIL', [i]));
-  end;
+  Debug(Format('%s Root: %s, CurrentParent: %s, ScopeStack depth: %d', [
+    Prefix,
+    BoolToStr(FRoot <> nil, True),
+    BoolToStr(FCurrentParent <> nil, True),
+    FScopeStack.Count
+  ]));
+  if FRoot <> nil then
+    DumpStrategy(FRoot, 1);
 end;
 
 procedure TGrispStrategyBuilder.Clear;
 begin
   DebugEnter('Clear');
-  for var S in FStrategies do
-    S.Free;
-  FStrategies.Clear;
-  DumpStrategyList('After Clear');
+  FRoot.Free;
+  FRoot := nil;
+  FCurrentParent := nil;
+  FScopeStack.Clear;
+  DumpState('After Clear');
   DebugExit('Clear');
+end;
+
+procedure TGrispStrategyBuilder.AddStrategy(Strategy: TGrispStrategy);
+begin
+  if FRoot = nil then
+  begin
+    FRoot := Strategy;
+    FCurrentParent := Strategy;
+    Debug('Added as root');
+  end
+  else if (FRoot.Kind = gskRule) and (FCurrentParent = FRoot) then
+  begin
+    // Multiple root rules - wrap in sequence
+    Debug('Multiple root rules detected - wrapping in sequence');
+    var NewSequence := TGrispStrategy.Create(gskSequence);
+    NewSequence.Strategies.Add(FRoot);
+    NewSequence.Strategies.Add(Strategy);
+    FRoot := NewSequence;
+    FCurrentParent := NewSequence;
+    Debug('Created sequence with both rules');
+  end
+  else if FCurrentParent <> nil then
+  begin
+    FCurrentParent.Strategies.Add(Strategy);
+    Debug(Format('Added to parent %s', [GetEnumName(TypeInfo(TGrispStrategyKind), Ord(FCurrentParent.Kind))]));
+  end
+  else
+  begin
+    Debug('ERROR: No current parent for strategy');
+    Strategy.Free;
+    raise Exception.Create('No current parent for strategy');
+  end;
+end;
+
+procedure TGrispStrategyBuilder.WrapLastStrategy(Kind: TGrispStrategyKind; PhaseNum: Integer = 0);
+var
+  Last: TGrispStrategy;
+  Wrapper: TGrispStrategy;
+begin
+  Debug(Format('Wrapping last strategy with %s', [GetEnumName(TypeInfo(TGrispStrategyKind), Ord(Kind))]));
+
+  if FRoot = nil then
+  begin
+    case Kind of
+      gskRepeat:
+        raise Exception.Create('RepeatStrategy requires a preceding strategy');
+      gskTry:
+        raise Exception.Create('TryStrategy requires a preceding strategy');
+      gskChoice:
+        raise Exception.Create('Choice requires a preceding strategy');
+      gskPhase:
+        raise Exception.Create('Phase requires a preceding strategy');
+    else
+      raise Exception.Create('No strategy to wrap');
+    end;
+  end;
+
+  // If current parent has children, wrap the last child
+  if (FCurrentParent <> nil) and (FCurrentParent.Strategies.Count > 0) then
+  begin
+    Last := FCurrentParent.Strategies.Last;
+    Debug(Format('Wrapping child strategy: %s', [GetEnumName(TypeInfo(TGrispStrategyKind), Ord(Last.Kind))]));
+
+    Wrapper := TGrispStrategy.Create(Kind);
+    if Kind = gskPhase then
+      Wrapper.Phase := PhaseNum;
+    Wrapper.Strategies.Add(Last);
+
+    FCurrentParent.Strategies.Delete(FCurrentParent.Strategies.Count - 1);
+    FCurrentParent.Strategies.Add(Wrapper);
+    Debug('Created wrapper and replaced child');
+  end
+  // Otherwise, wrap the root itself
+  else if FRoot <> nil then
+  begin
+    Debug('Wrapping root strategy');
+    Last := FRoot;
+    Debug(Format('Root strategy: %s', [GetEnumName(TypeInfo(TGrispStrategyKind), Ord(Last.Kind))]));
+
+    Wrapper := TGrispStrategy.Create(Kind);
+    if Kind = gskPhase then
+      Wrapper.Phase := PhaseNum;
+    Wrapper.Strategies.Add(Last);
+
+    FRoot := Wrapper;
+    FCurrentParent := Wrapper;
+    Debug('Created wrapper and replaced root');
+  end
+  else
+  begin
+    // This case should never be reached because FRoot is checked above
+    raise Exception.Create('No strategy to wrap');
+  end;
 end;
 
 function TGrispStrategyBuilder.Rule(const RuleName: string): TGrispStrategyBuilder;
@@ -166,140 +263,97 @@ begin
   Debug(Format('Adding rule: %s', [RuleName]));
   Strategy := TGrispStrategy.Create(gskRule);
   Strategy.RuleName := RuleName;
-  FStrategies.Add(Strategy);
-  DumpStrategyList('After Rule');
+  AddStrategy(Strategy);
+  DumpState('After Rule');
   DebugExit('Rule');
   Result := Self;
 end;
 
 function TGrispStrategyBuilder.Sequence: TGrispStrategyBuilder;
+var
+  Strategy: TGrispStrategy;
 begin
   DebugEnter('Sequence');
-  Debug('Adding sequence');
-  FStrategies.Add(TGrispStrategy.Create(gskSequence));
-  DumpStrategyList('After Sequence');
+  Debug('Adding sequence - opening new scope');
+
+  Strategy := TGrispStrategy.Create(gskSequence);
+
+  FScopeStack.Push(FCurrentParent);
+
+  if FRoot = nil then
+  begin
+    FRoot := Strategy;
+    FCurrentParent := Strategy;
+    Debug('Sequence is root');
+  end
+  else if FCurrentParent <> nil then
+  begin
+    FCurrentParent.Strategies.Add(Strategy);
+    FCurrentParent := Strategy;
+    Debug('Sequence added as child and becomes current parent');
+  end
+  else
+  begin
+    Debug('ERROR: Cannot add sequence - no context');
+    Strategy.Free;
+    raise Exception.Create('Cannot add sequence - no context');
+  end;
+
+  DumpState('After Sequence');
   DebugExit('Sequence');
   Result := Self;
 end;
 
-function TGrispStrategyBuilder.RepeatStrategy: TGrispStrategyBuilder;
-var
-  LastIdx: Integer;
-  Last: TGrispStrategy;
-  Wrapper: TGrispStrategy;
+function TGrispStrategyBuilder.EndScope: TGrispStrategyBuilder;
 begin
-  DebugEnter('RepeatStrategy');
+  DebugEnter('EndScope');
 
-  if FStrategies.Count = 0 then
+  if FScopeStack.Count = 0 then
   begin
-    Debug('ERROR: RepeatStrategy requires a preceding strategy');
-    raise Exception.Create('RepeatStrategy requires a preceding strategy');
+    Debug('ERROR: EndScope called with no open scope');
+    raise Exception.Create('EndScope called with no open scope');
   end;
 
-  LastIdx := FStrategies.Count - 1;
-  Last := FStrategies[LastIdx];
-  Debug(Format('Wrapping strategy at index %d: %s', [LastIdx,
-    GetEnumName(TypeInfo(TGrispStrategyKind), Ord(Last.Kind))]));
+  FCurrentParent := FScopeStack.Pop;
+  Debug('Closed scope');
+  DumpState('After EndScope');
+  DebugExit('EndScope');
+  Result := Self;
+end;
 
-  Wrapper := TGrispStrategy.Create(gskRepeat);
-  Wrapper.Strategies.Add(Last);
-
-  FStrategies[LastIdx] := Wrapper;
-  Debug('Created Repeat wrapper and replaced original');
-  DumpStrategyList('After RepeatStrategy');
-
+function TGrispStrategyBuilder.RepeatStrategy: TGrispStrategyBuilder;
+begin
+  DebugEnter('RepeatStrategy');
+  WrapLastStrategy(gskRepeat);
+  DumpState('After RepeatStrategy');
   DebugExit('RepeatStrategy');
   Result := Self;
 end;
 
 function TGrispStrategyBuilder.TryStrategy: TGrispStrategyBuilder;
-var
-  LastIdx: Integer;
-  Last: TGrispStrategy;
-  Wrapper: TGrispStrategy;
 begin
   DebugEnter('TryStrategy');
-
-  if FStrategies.Count = 0 then
-  begin
-    Debug('ERROR: TryStrategy requires a preceding strategy');
-    raise Exception.Create('TryStrategy requires a preceding strategy');
-  end;
-
-  LastIdx := FStrategies.Count - 1;
-  Last := FStrategies[LastIdx];
-  Debug(Format('Wrapping strategy at index %d: %s', [LastIdx,
-    GetEnumName(TypeInfo(TGrispStrategyKind), Ord(Last.Kind))]));
-
-  Wrapper := TGrispStrategy.Create(gskTry);
-  Wrapper.Strategies.Add(Last);
-
-  FStrategies[LastIdx] := Wrapper;
-  Debug('Created Try wrapper and replaced original');
-  DumpStrategyList('After TryStrategy');
-
+  WrapLastStrategy(gskTry);
+  DumpState('After TryStrategy');
   DebugExit('TryStrategy');
   Result := Self;
 end;
 
 function TGrispStrategyBuilder.Choice: TGrispStrategyBuilder;
-var
-  LastIdx: Integer;
-  Last: TGrispStrategy;
-  Wrapper: TGrispStrategy;
 begin
   DebugEnter('Choice');
-
-  if FStrategies.Count = 0 then
-  begin
-    Debug('ERROR: Choice requires a preceding strategy');
-    raise Exception.Create('Choice requires a preceding strategy');
-  end;
-
-  LastIdx := FStrategies.Count - 1;
-  Last := FStrategies[LastIdx];
-  Debug(Format('Wrapping strategy at index %d: %s', [LastIdx,
-    GetEnumName(TypeInfo(TGrispStrategyKind), Ord(Last.Kind))]));
-
-  Wrapper := TGrispStrategy.Create(gskChoice);
-  Wrapper.Strategies.Add(Last);
-
-  FStrategies[LastIdx] := Wrapper;
-  Debug('Created Choice wrapper and replaced original');
-  DumpStrategyList('After Choice');
-
+  WrapLastStrategy(gskChoice);
+  DumpState('After Choice');
   DebugExit('Choice');
   Result := Self;
 end;
 
 function TGrispStrategyBuilder.Phase(PhaseNum: Integer): TGrispStrategyBuilder;
-var
-  LastIdx: Integer;
-  Last: TGrispStrategy;
-  Wrapper: TGrispStrategy;
 begin
   DebugEnter('Phase');
   Debug(Format('Phase number: %d', [PhaseNum]));
-
-  if FStrategies.Count = 0 then
-  begin
-    Debug('ERROR: Phase requires a preceding strategy');
-    raise Exception.Create('Phase requires a preceding strategy');
-  end;
-
-  LastIdx := FStrategies.Count - 1;
-  Last := FStrategies[LastIdx];
-  Debug(Format('Wrapping strategy at index %d: %s', [LastIdx,
-    GetEnumName(TypeInfo(TGrispStrategyKind), Ord(Last.Kind))]));
-
-  Wrapper := TGrispStrategy.Create(gskPhase);
-  Wrapper.Phase := PhaseNum;
-  Wrapper.Strategies.Add(Last);
-
-  FStrategies[LastIdx] := Wrapper;
-  Debug('Created Phase wrapper and replaced original');
-  DumpStrategyList('After Phase');
-
+  WrapLastStrategy(gskPhase, PhaseNum);
+  DumpState('After Phase');
   DebugExit('Phase');
   Result := Self;
 end;
@@ -307,30 +361,25 @@ end;
 function TGrispStrategyBuilder.Build: TGrispStrategy;
 begin
   DebugEnter('Build');
-  DumpStrategyList('Before Build');
+  DumpState('Before Build');
 
-  if FStrategies.Count = 0 then
+  if FRoot = nil then
   begin
-    Debug('ERROR: No strategies to build');
-    raise Exception.Create('No strategies to build');
+	Debug('ERROR: No strategies to build');
+	raise Exception.Create('No strategies to build');
   end;
 
-  if FStrategies.Count = 1 then
+  if FScopeStack.Count > 0 then
   begin
-    Result := FStrategies[0];
-    Debug(Format('Single strategy result: %s', [
-      GetEnumName(TypeInfo(TGrispStrategyKind), Ord(Result.Kind))]));
-    FStrategies.Clear;
-  end
-  else
-  begin
-    Debug(Format('Multiple strategies (%d) - wrapping in Sequence', [FStrategies.Count]));
-    Result := TGrispStrategy.Create(gskSequence);
-    for var S in FStrategies do
-      Result.Strategies.Add(S);
-    FStrategies.Clear;
-    Debug('Created Sequence with all strategies');
+    Debug('WARNING: Unclosed scopes exist');
+	while FScopeStack.Count > 0 do
+	  EndScope;
   end;
+
+  Result := FRoot;
+  FRoot := nil;
+  FCurrentParent := nil;
+  FScopeStack.Clear;
 
   Debug('Final strategy tree:');
   DumpStrategy(Result, 1);
