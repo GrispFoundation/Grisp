@@ -83,8 +83,18 @@ begin
   NodeName := FCurrent.Lexeme;
   Expect(tkIdentifier, 'name expected');
   Node := FGraph.AddNode(NodeName, 'node');
+
+//  if StartsText('rule.', NodeName) then
+//	FGraph.RegisterRule(Node);
+
+// Register rules (case-insensitive)
+//  if NodeName.StartsWith('rule.', True) then
+//	FGraph.RegisterRule(Node);
+
+  // Register as rule if name starts with "rule." (case-insensitive)
   if StartsText('rule.', NodeName) then
-    FGraph.RegisterRule(Node);
+	FGraph.RegisterRule(Node);
+
   Expect(tkLBrace, '{ expected');
   ParseNodeBody(Node);
   if FCurrent.Kind = tkKeywordWhere then

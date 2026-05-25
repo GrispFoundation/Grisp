@@ -7,12 +7,14 @@ uses
   System.Classes,
   System.IOUtils,
   System.Generics.Collections,
-  unit_GrispTokens_version_001,
-  unit_GrispLexer_version_001,
-  unit_GrispGraph_version_001,
-  unit_GrispParser_version_001,
-  unit_GrispPattern_version_001,
-  unit_GrispRewrite_version_001;
+  unit_GrispGBlocks_version_001 in 'unit_GrispGBlocks_version_001.pas',
+  unit_GrispGraph_version_001 in 'unit_GrispGraph_version_001.pas',
+  unit_GrispLexer_version_001 in 'unit_GrispLexer_version_001.pas',
+  unit_GrispParser_version_001 in 'unit_GrispParser_version_001.pas',
+  unit_GrispPattern_version_001 in 'unit_GrispPattern_version_001.pas',
+  unit_GrispRewrite_version_001 in 'unit_GrispRewrite_version_001.pas',
+  unit_GrispRuntime_version_001 in 'unit_GrispRuntime_version_001.pas',
+  unit_GrispTokens_version_001 in 'unit_GrispTokens_version_001.pas';
 
 const
   GRISP_VERSION = '0.02';
@@ -98,11 +100,8 @@ var
   Source: string;
   Graph: TGGraph;
   Parser: TGrispParser;
-  Matcher: TGrispPatternMatcher;
-  Rewriter: TGrispRewriter;
-  Rule: TGNode;
-  Changed: Boolean;
   Steps: Integer;
+  Trace: TStringList;
 begin
   if not TFile.Exists(FileName) then
     raise Exception.CreateFmt('File not found: %s', [FileName]);
@@ -119,44 +118,31 @@ begin
       Parser.ParseFile;
     finally
       Parser.Free;
-	end;
+    end;
 
     Graph.RegisterEdgesFromIdentifiers;
 
-    Matcher := TGrispPatternMatcher.Create(Graph);
-    Rewriter := TGrispRewriter.Create(Graph);
+    Writeln('Initial state:');
+    PrintGraph(Graph);
+    Writeln;
+
+    Trace := TStringList.Create;
     try
-      Writeln('Initial state:');
-      PrintGraph(Graph);
-      Writeln;
+      Steps := TGrispRuntime.Run(Graph, 1000, Trace);
 
-      Steps := 0;
-	  repeat
-        Changed := False;
-        for Rule in Graph.Rules do
-        begin
-          Matcher.SetCurrentRule(Rule);
-          if Rewriter.ApplyRuleOnce(Rule, Matcher, nil) then
-          begin
-            Inc(Steps);
-            Writeln(Format('Step %d: %s', [Steps, Rule.Name]));
-            PrintGraph(Graph);
-            Changed := True;
-			Break;
-          end;
-        end;
-      until not Changed;
-
-      Writeln;
-      Writeln('----------------------------------------');
-      Writeln(Format('Stable after %d steps.', [Steps]));
-      Writeln('Final state:');
-      PrintGraph(Graph);
-      Writeln('----------------------------------------');
+      // Optional: print trace if needed
+      // for var I := 0 to Trace.Count - 1 do
+      //   Writeln(Trace[I]);
     finally
-      Rewriter.Free;
-      Matcher.Free;
+      Trace.Free;
     end;
+
+    Writeln;
+    Writeln('----------------------------------------');
+    Writeln(Format('Stable after %d steps.', [Steps]));
+    Writeln('Final state:');
+    PrintGraph(Graph);
+    Writeln('----------------------------------------');
   finally
     Graph.Free;
   end;
@@ -164,21 +150,21 @@ end;
 
 begin
   try
-    PrintBanner;
+	PrintBanner;
 
-    if ParamCount = 0 then
-    begin
-      PrintUsage;
-      ExitCode := 1;
-      Exit;
-    end;
+	if ParamCount = 0 then
+	begin
+	  PrintUsage;
+	  ExitCode := 1;
+	  Exit;
+	end;
 
-    RunFile(ParamStr(1));
-    ExitCode := 0;
+	RunFile(ParamStr(1));
+	ExitCode := 0;
   except
-    on E: Exception do
-    begin
-      Writeln;
+	on E: Exception do
+	begin
+	  Writeln;
       Writeln('Error: ', E.Message);
       ExitCode := 2;
     end;

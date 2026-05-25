@@ -24,35 +24,39 @@ var
   Step: Integer;
   Changed: Boolean;
   Rule: TGNode;
+  Applied: Integer;
 begin
   Result := 0;
   if Graph = nil then
-  begin
     Exit;
-  end;
+
   Matcher := TGrispPatternMatcher.Create(Graph);
   Rewriter := TGrispRewriter.Create(Graph);
   try
     Step := 0;
     repeat
       Changed := False;
+
       for Rule in Graph.Rules do
       begin
-        if Rewriter.ApplyRuleOnce(Rule, Matcher, Trace) then
+        Matcher.SetCurrentRule(Rule);
+        Applied := Rewriter.ApplyAllMatches(Rule, Matcher, Trace);
+
+        if Applied > 0 then
         begin
-          Inc(Step);
+          Inc(Step, Applied);
           Changed := True;
+
           if Assigned(Trace) then
-          begin
-            Trace.Add(Format('Step %d: applied %s', [Step, Rule.Name]));
-          end;
+            Trace.Add(Format('Step %d: applied %s (%d matches)', [Step, Rule.Name, Applied]));
+
           if Step >= MaxSteps then
-          begin
             Break;
-          end;
         end;
       end;
+
     until (not Changed) or (Step >= MaxSteps);
+
     Result := Step;
   finally
     Rewriter.Free;
