@@ -52,7 +52,7 @@ type
     function ParseExpr: TGrispExpression;
     function ParseOrExpr: TGrispExpression;
     function ParseAndExpr: TGrispExpression;
-    function ParseCompareExpr: TGrispExpression;
+	function ParseCompareExpr: TGrispExpression;
     function ParseAddExpr: TGrispExpression;
     function ParseMulExpr: TGrispExpression;
     function ParseUnaryExpr: TGrispExpression;
