@@ -5,14 +5,32 @@ program GrispTestProject;
 uses
   System.SysUtils,
   System.Generics.Collections,
-  unit_GrispTokens_version_001 in 'unit_GrispTokens_version_001.pas',
-  unit_GrispLexer_version_001 in 'unit_GrispLexer_version_001.pas',
-  unit_GrispGraph_version_001 in 'unit_GrispGraph_version_001.pas',
-  unit_GrispParser_version_001 in 'unit_GrispParser_version_001.pas',
-  unit_GrispGBlocks_version_001 in 'unit_GrispGBlocks_version_001.pas',
-  unit_GrispPattern_version_001 in 'unit_GrispPattern_version_001.pas',
-  unit_GrispRewrite_version_001 in 'unit_GrispRewrite_version_001.pas',
-  unit_GrispRuntime_version_001 in 'unit_GrispRuntime_version_001.pas';
+  unit_Token_TGrispTokenKind_version_001,
+  unit_Token_TGrispToken_version_001,
+  unit_Token_TGrispTokenHelper_version_001,
+  unit_Lexer_TGrispLexer_version_001,
+  unit_Graph_TGrispGraph_version_001,
+  unit_Graph_TGrispEdge_TGrispNode_version_001,
+  unit_Core_TGrispValueBase_version_001,
+  unit_Core_TGrispExpression_version_001,
+  unit_Core_TGrispExpressionEvaluator_version_001,
+  unit_Core_TGrispType_version_001,
+  unit_Parser_TGrispParserBase_version_001,
+  unit_Parser_TGrispNodeParser_version_001,
+  unit_Parser_TGrispTypeParser_version_001,
+  unit_Parser_TGrispStrategyParser_version_001,
+  unit_Parser_TGrispFullParser_version_001,
+  unit_Builder_TGrispGraphBuilder_version_001,
+  unit_Pattern_TGrispNodeBinding_version_001,
+  unit_Pattern_TGrispValueBinding_version_001,
+  unit_Pattern_TGrispMatchResult_version_001,
+  unit_Pattern_TGrispNodeVarInfo_version_001,
+  unit_Pattern_TGrispPatternMatcher_version_001,
+  unit_Rewrite_TGrispRewriteOperation_version_001,
+  unit_Rewrite_TGrispRewriter_version_001,
+  unit_Runtime_TGrispRuntimeConfig_version_001,
+  unit_Runtime_TGrispRuntimeEngine_version_001,
+  unit_Runtime_TGrispRuntime_version_001;
 
 var
   TestsPassed: Integer = 0;
@@ -34,7 +52,7 @@ end;
 
 procedure AssertEquals(Expected, Actual: Double; const Msg: string);
 begin
-  AssertTrue(Abs(Expected - Actual) < 0.0001, Format('%s (Expected %f, Got %f)', [Msg, Expected, Actual]));
+  AssertTrue(Abs(Expected - Actual) < 0.0001, Format('%s (Expected %.2f, Got %.2f)', [Msg, Expected, Actual]));
 end;
 
 procedure AssertEqualsStr(const Expected, Actual: string; const Msg: string);
@@ -45,7 +63,7 @@ end;
 procedure TestLexer;
 var
   Lexer: TGrispLexer;
-  Tok: TToken;
+  Tok: TGrispToken;
   Source: string;
 begin
   Writeln('Running Lexer Tests...');
@@ -54,33 +72,33 @@ begin
   try
     Tok := Lexer.NextToken;
     AssertTrue(Tok.Kind = tkKeywordNode, 'Recognized "node" keyword');
-    
+
     Tok := Lexer.NextToken;
     AssertTrue(Tok.Kind = tkIdentifier, 'Recognized "rule.swap_if_greater" identifier');
     AssertEqualsStr('rule.swap_if_greater', Tok.Lexeme, 'Identifier lexeme matches');
-    
+
     Tok := Lexer.NextToken;
     AssertTrue(Tok.Kind = tkLBrace, 'Recognized "{" brace');
-    
+
     Tok := Lexer.NextToken;
     AssertTrue(Tok.Kind = tkIdentifier, 'Recognized attribute name "val"');
-    
+
     Tok := Lexer.NextToken;
     AssertTrue(Tok.Kind = tkColon, 'Recognized ":" colon');
-    
+
     Tok := Lexer.NextToken;
     AssertTrue(Tok.Kind = tkIdentifier, 'Recognized type name "number"');
-    
+
     Tok := Lexer.NextToken;
     AssertTrue(Tok.Kind = tkEquals, 'Recognized "=" equals');
-    
+
     Tok := Lexer.NextToken;
     AssertTrue(Tok.Kind = tkNumber, 'Recognized negative floating number');
     AssertEqualsStr('-123.45', Tok.Lexeme, 'Number lexeme matches');
-    
+
     Tok := Lexer.NextToken;
     AssertTrue(Tok.Kind = tkRBrace, 'Recognized "}" brace');
-    
+
     Tok := Lexer.NextToken;
     AssertTrue(Tok.Kind = tkEOF, 'Reached EOF');
   finally
@@ -90,14 +108,14 @@ end;
 
 procedure TestParser;
 var
-  Graph: TGGraph;
+  Graph: TGrispGraph;
   Source: string;
-  NodeA, NodeB: TGNode;
-  ValAttr: TGValue;
-  Edge: TGEdge;
+  NodeA, NodeB: TGrispNode;
+  ValAttr: TGrispValue;
+  Edge: TGrispEdge;
 begin
   Writeln('Running Parser Tests...');
-  Source := 
+  Source :=
     '// Simple comment' + #13#10 +
     '/* Multi-line comment' + #13#10 +
     '   here */' + #13#10 +
@@ -109,32 +127,30 @@ begin
     '  arr: array<number> = [1, 2, 3]' + #13#10 +
     '}';
 
-  Graph := ParseGBlocks(Source);
+  Graph := BuildGraphFromSource(Source);
   try
     AssertTrue(Graph <> nil, 'Parser successfully created a graph');
     AssertEquals(2, Graph.Nodes.Count, 'Graph contains 2 nodes');
-    
+
     NodeA := Graph.FindNode('A');
     AssertTrue(NodeA <> nil, 'Node "A" exists');
     AssertEqualsStr('node', NodeA.NodeType, 'Node "A" type is "node"');
-    
-    ValAttr := NodeA.GetAttribute('value');
-    AssertTrue((ValAttr <> nil) and (ValAttr.Kind = vkNumber), 'Attribute "value" of "A" is a number');
+
+    ValAttr := NodeA.GetValueAttribute('value');
+    AssertTrue((ValAttr <> nil) and (ValAttr.Kind = gvkNumber), 'Attribute "value" of "A" is a number');
     AssertEquals(10, ValAttr.NumberValue, 'Attribute "value" of "A" equals 10');
-    
+
     NodeB := Graph.FindNode('B');
     AssertTrue(NodeB <> nil, 'Node "B" exists');
-    
-    // Check edge created from next: identifier = B
+
     AssertEquals(1, Graph.Edges.Count, 'One edge registered in graph');
     Edge := Graph.Edges[0];
     AssertTrue(Edge.Source = NodeA, 'Edge source is A');
     AssertTrue(Edge.Target = NodeB, 'Edge target is B');
     AssertEqualsStr('next', Edge.LabelName, 'Edge label is "next"');
-    
-    // Check array attribute on node B
-    ValAttr := NodeB.GetAttribute('arr');
-    AssertTrue((ValAttr <> nil) and (ValAttr.Kind = vkArray), 'Attribute "arr" on "B" is an array');
+
+    ValAttr := NodeB.GetValueAttribute('arr');
+    AssertTrue((ValAttr <> nil) and (ValAttr.Kind = gvkArray), 'Attribute "arr" on "B" is an array');
     AssertEquals(3, ValAttr.ArrayValue.Count, 'Array "arr" has 3 elements');
   finally
     Graph.Free;
@@ -143,67 +159,68 @@ end;
 
 procedure TestPatternMatcher;
 var
-  Graph: TGGraph;
-  PatternGraph: TGGraph;
+  Graph: TGrispGraph;
+  PatternGraph: TGrispGraph;
   Matcher: TGrispPatternMatcher;
-  Match: TMatchResult;
-  NodeA, NodeB: TGNode;
+  Match: TGrispMatchResult;
+  NodeA, NodeB: TGrispNode;
+  PatRoot: TGrispNode;
+  PatX, PatY, PatXLink: TGrispValue;
+  PatXNode, PatYNode: TGrispNode;
 begin
   Writeln('Running Pattern Matcher Tests...');
-  
-  // Construct a small graph manually
-  Graph := TGGraph.Create;
+
+  Graph := TGrispGraph.Create;
   try
     NodeA := Graph.AddNode('A', 'node');
     NodeB := Graph.AddNode('B', 'node');
-    
-    // Set value attributes
-    NodeA.SetAttribute('val', TGValue.Create(vkNumber));
-    NodeA.GetAttribute('val').NumberValue := 100;
-    NodeB.SetAttribute('val', TGValue.Create(vkNumber));
-    NodeB.GetAttribute('val').NumberValue := 200;
-    
+
+    NodeA.SetValueAttribute('val', TGrispValue.Create(gvkNumber));
+    NodeA.GetValueAttribute('val').NumberValue := 100;
+    NodeB.SetValueAttribute('val', TGrispValue.Create(gvkNumber));
+    NodeB.GetValueAttribute('val').NumberValue := 200;
+
     Graph.AddEdge(NodeA, NodeB, 'link');
 
-    // Create a pattern graph representing: Match a node X with val = 100 pointing to Y with val = 200
-    PatternGraph := TGGraph.Create;
+    PatternGraph := TGrispGraph.Create;
     try
-      // A pattern is just a pattern root with attributes matching node vars
-      // We will construct this mimicking parser output:
-      // node PatternRoot {
-      //   X: node = { val: number = 100, link: identifier = Y }
-      //   Y: node = { val: number = 200 }
-      // }
-      var PatRoot := PatternGraph.AddNode('PatternRoot', 'node');
-      
-      var PatX := TGValue.Create(vkNode);
-      PatX.NodeValue := PatternGraph.AddNode('', 'node');
-      PatX.NodeValue.SetAttribute('val', TGValue.Create(vkNumber));
-      PatX.NodeValue.GetAttribute('val').NumberValue := 100;
-      
-      var PatXLink := TGValue.Create(vkIdentifier);
+      PatRoot := PatternGraph.AddNode('PatternRoot', 'node');
+
+      // Create pattern node X
+      PatXNode := PatternGraph.AddNode('', 'pattern');
+      PatXNode.SetValueAttribute('val', TGrispValue.Create(gvkNumber));
+      PatXNode.GetValueAttribute('val').NumberValue := 100;
+
+      PatX := TGrispValue.Create(gvkNode);
+      PatX.SetNodeReference(PatXNode.Id, PatXNode.Name);
+
+      // Create link from X to Y
+      PatXLink := TGrispValue.Create(gvkIdentifier);
       PatXLink.IdentifierValue := 'Y';
-      PatX.NodeValue.SetAttribute('link', PatXLink);
+      PatXNode.SetValueAttribute('link', PatXLink);
 
-      var PatY := TGValue.Create(vkNode);
-      PatY.NodeValue := PatternGraph.AddNode('', 'node');
-      PatY.NodeValue.SetAttribute('val', TGValue.Create(vkNumber));
-      PatY.NodeValue.GetAttribute('val').NumberValue := 200;
+      // Create pattern node Y
+      PatYNode := PatternGraph.AddNode('', 'pattern');
+      PatYNode.SetValueAttribute('val', TGrispValue.Create(gvkNumber));
+      PatYNode.GetValueAttribute('val').NumberValue := 200;
 
-      PatRoot.SetAttribute('X', PatX);
-      PatRoot.SetAttribute('Y', PatY);
+      PatY := TGrispValue.Create(gvkNode);
+      PatY.SetNodeReference(PatYNode.Id, PatYNode.Name);
+
+      PatRoot.SetValueAttribute('X', PatX);
+      PatRoot.SetValueAttribute('Y', PatY);
 
       Matcher := TGrispPatternMatcher.Create(Graph);
       try
         Match := Matcher.MatchPattern(PatRoot);
         try
           AssertTrue(Match.Success, 'Pattern matched successfully');
-          
-          var BoundX: TGNode := nil;
-          var BoundY: TGNode := nil;
+
+          var BoundX: TGrispNode := nil;
+          var BoundY: TGrispNode := nil;
           AssertTrue(Match.TryGetNode('X', BoundX), 'Variable "X" is bound');
           AssertTrue(Match.TryGetNode('Y', BoundY), 'Variable "Y" is bound');
-          
+
           AssertTrue(BoundX = NodeA, 'Variable "X" bound to Node A');
           AssertTrue(BoundY = NodeB, 'Variable "Y" bound to Node B');
         finally
@@ -222,17 +239,21 @@ end;
 
 procedure TestSwapIfGreater;
 var
-  Graph: TGGraph;
+  Graph: TGrispGraph;
   Source: string;
-  NodeA, NodeB: TGNode;
-  RuleNode, PatternRoot: TGNode;
+  NodeA, NodeB: TGrispNode;
+  RuleNode: TGrispNode;
+  PatternRoot: TGrispNode;
   Matcher: TGrispPatternMatcher;
-  Match: TMatchResult;
+  Match: TGrispMatchResult;
   StepsRun: Integer;
+  MatchValue: TGrispValue;
+  NodeId: Integer;
+  NodeName: string;
 begin
   Writeln('Running Minimal Swap-If-Greater Integration Test...');
-  
-  Source := 
+
+  Source :=
     'node A {' + #13#10 +
     '    value: number = 1' + #13#10 +
     '    next: identifier = B' + #13#10 +
@@ -264,62 +285,59 @@ begin
     '    }' + #13#10 +
     '}';
 
-  Graph := ParseGBlocks(Source);
+  Graph := BuildGraphFromSource(Source);
   try
     AssertTrue(Graph <> nil, 'Swap-if-greater source successfully parsed');
     AssertEquals(1, Graph.Rules.Count, '1 rule registered in the graph');
-    
+
     RuleNode := Graph.Rules[0];
     AssertEqualsStr('rule.swap_if_greater', RuleNode.Name, 'Rule name is "rule.swap_if_greater"');
-    
-    PatternRoot := RuleNode.GetAttribute('match').NodeValue;
-    
+
+    // Fixed: Get the match value and extract the node reference properly
+    MatchValue := RuleNode.GetValueAttribute('match');
+    if (MatchValue <> nil) and (MatchValue.Kind = gvkNode) then
+    begin
+      MatchValue.GetNodeReference(NodeId, NodeName);
+      PatternRoot := Graph.FindNode(NodeName);
+    end
+    else
+      PatternRoot := nil;
+
     Matcher := TGrispPatternMatcher.Create(Graph);
     try
-      // 1. Initial State: A = 1, B = 2. A -> B.
-      // The pattern requires X (with value = 2) to point to Y (with value = 1).
-      // Since B has 2 but no next, and A has 1 but points to B, there should be NO match!
       Match := Matcher.MatchPattern(PatternRoot);
       try
         AssertTrue(not Match.Success, 'Pattern does not match in initial configuration (A=1, B=2)');
       finally
         Match.Free;
       end;
-      
-      // Call runtime loop in initial state
+
       StepsRun := TGrispRuntime.Run(Graph, 10);
       AssertEquals(0, StepsRun, 'Runtime execution run 0 steps in initial configuration');
 
-      // 2. Swapped State (A = 2, B = 1).
-      // Now A (value 2) points to B (value 1). So X matches A, Y matches B.
-      // This should successfully match and trigger the rule!
       NodeA := Graph.FindNode('A');
       NodeB := Graph.FindNode('B');
-      
-      // Update values manually to simulate swap
-      NodeA.GetAttribute('value').NumberValue := 2;
-      NodeB.GetAttribute('value').NumberValue := 1;
-      
+
+      NodeA.GetValueAttribute('value').NumberValue := 2;
+      NodeB.GetValueAttribute('value').NumberValue := 1;
+
       Match := Matcher.MatchPattern(PatternRoot);
       try
         AssertTrue(Match.Success, 'Pattern matches after manually swapping values (A=2, B=1)');
-        
-        var BoundX, BoundY: TGNode;
+
+        var BoundX, BoundY: TGrispNode;
         AssertTrue(Match.TryGetNode('X', BoundX) and (BoundX = NodeA), 'X bound to A');
         AssertTrue(Match.TryGetNode('Y', BoundY) and (BoundY = NodeB), 'Y bound to B');
       finally
         Match.Free;
       end;
 
-      // Run the runtime execution loop (deterministic)
       StepsRun := TGrispRuntime.Run(Graph, 10);
       AssertEquals(1, StepsRun, 'Runtime successfully ran exactly 1 rewrite step');
-      
-      // Verify values are swapped back to A=1, B=2 by the rewrite engine
-      AssertEquals(1, NodeA.GetAttribute('value').NumberValue, 'Node A value restored to 1');
-      AssertEquals(2, NodeB.GetAttribute('value').NumberValue, 'Node B value restored to 2');
-      
-      // Verify edge structure remains intact (A next -> B)
+
+      AssertEquals(1, NodeA.GetValueAttribute('value').NumberValue, 'Node A value restored to 1');
+      AssertEquals(2, NodeB.GetValueAttribute('value').NumberValue, 'Node B value restored to 2');
+
       AssertEquals(1, NodeA.Outgoing.Count, 'Node A still has exactly 1 outgoing edge');
       AssertEqualsStr('next', NodeA.Outgoing[0].LabelName, 'Outgoing edge label is "next"');
       AssertTrue(NodeA.Outgoing[0].Target = NodeB, 'Outgoing edge still points to Node B');
@@ -336,29 +354,29 @@ begin
   try
     Writeln('=== GRISP 1.0 TEST SUITE ===');
     Writeln;
-    
+
     TestLexer;
     Writeln;
-    
+
     TestParser;
     Writeln;
-    
+
     TestPatternMatcher;
     Writeln;
-    
+
     TestSwapIfGreater;
     Writeln;
-    
+
     Writeln('===================================');
     Writeln(Format('TOTAL PASSED: %d', [TestsPassed]));
     Writeln(Format('TOTAL FAILED: %d', [TestsFailed]));
     Writeln('===================================');
-    
+
     if TestsFailed > 0 then
       ExitCode := 1
     else
       ExitCode := 0;
-      
+
   except
     on E: Exception do
     begin

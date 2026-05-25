@@ -8,7 +8,8 @@ uses
   System.Generics.Collections,
   unit_GrispTokens_version_001,
   unit_GrispLexer_version_001,
-  unit_GrispGraph_version_001;
+  unit_GrispGraph_version_001,
+  unit_GrispStrategy_version_001;
 
 type
   EGrispParseError = class(Exception);
@@ -18,11 +19,16 @@ type
     FLexer: TGrispLexer;
     FCurrent: TToken;
     FGraph: TGGraph;
+    FStrategyEngine: TGrispStrategyEngine;
     FAnonId: Integer;
     procedure Advance;
     procedure Expect(AKind: TTokenKind; const Msg: string);
     procedure ParseNodeDecl;
     procedure ParseNodeBody(ANode: TGNode);
+    procedure ParseTypeDecl;
+    procedure ParseStrategyDecl;
+    function ParseStrategy: TStrategy;
+    function ParseType: TGrispType;
     function ParseTypeName: string;
     function ParseValue(const ATypeName: string): TGValue;
     function ParseExpr: TGrispExpression;
@@ -51,12 +57,14 @@ begin
   inherited Create;
   FLexer := TGrispLexer.Create(ASource);
   FGraph := AGraph;
+  FStrategyEngine := TGrispStrategyEngine.Create(AGraph);
   FAnonId := 0;
   Advance;
 end;
 
 destructor TGrispParser.Destroy;
 begin
+  FStrategyEngine.Free;
   FLexer.Free;
   inherited Destroy;
 end;
@@ -78,31 +86,49 @@ var
   NodeName: string;
   Node: TGNode;
   WhereExpr: TGrispExpression;
+  TempExpr: TGrispExpression;
+  PhaseNum: Double;
 begin
   Expect(tkKeywordNode, '"node" expected');
   NodeName := FCurrent.Lexeme;
   Expect(tkIdentifier, 'name expected');
   Node := FGraph.AddNode(NodeName, 'node');
 
-//  if StartsText('rule.', NodeName) then
-//	FGraph.RegisterRule(Node);
-
-// Register rules (case-insensitive)
-//  if NodeName.StartsWith('rule.', True) then
-//	FGraph.RegisterRule(Node);
-
-  // Register as rule if name starts with "rule." (case-insensitive)
   if StartsText('rule.', NodeName) then
-	FGraph.RegisterRule(Node);
+    FGraph.RegisterRule(Node);
+
+  // Parse optional phase declaration
+  if (FCurrent.Kind = tkKeywordPhase) or ((FCurrent.Kind = tkIdentifier) and SameText(FCurrent.Lexeme, 'phase')) then
+  begin
+    if FCurrent.Kind = tkIdentifier then Advance;  // consume 'phase'
+    if FCurrent.Kind = tkNumber then
+    begin
+      PhaseNum := StrToFloat(FCurrent.Lexeme);
+      Node.SetAttribute('phase', TGValue.Create(vkNumber));
+      Node.GetAttribute('phase').NumberValue := PhaseNum;
+      Advance;
+    end;
+  end;
 
   Expect(tkLBrace, '{ expected');
   ParseNodeBody(Node);
+
+  // Parse optional temp section
+  if (FCurrent.Kind = tkKeywordTemp) or ((FCurrent.Kind = tkIdentifier) and SameText(FCurrent.Lexeme, 'temp')) then
+  begin
+    if FCurrent.Kind = tkIdentifier then Advance;  // consume 'temp'
+    Expect(tkEquals, '"=" expected');
+    TempExpr := ParseExpr;
+    Node.SetAttribute('temp', ExprToValue(TempExpr));
+  end;
+
   if FCurrent.Kind = tkKeywordWhere then
   begin
     Advance;
     WhereExpr := ParseExpr;
     Node.SetAttribute('where', ExprToValue(WhereExpr));
   end;
+
   Expect(tkRBrace, '} expected');
 end;
 
@@ -126,6 +152,147 @@ begin
     if FCurrent.Kind = tkSemicolon then
       Advance;
   end;
+end;
+
+procedure TGrispParser.ParseTypeDecl;
+var
+  TypeName: string;
+  Typ: TGrispType;
+begin
+  Expect(tkKeywordType, '"type" expected');
+  TypeName := FCurrent.Lexeme;
+  Expect(tkIdentifier, 'name expected');
+  Expect(tkEquals, '"=" expected');
+  Typ := ParseType;
+  FGraph.Types.AddOrSetValue(TypeName, Typ);
+end;
+
+function TGrispParser.ParseType: TGrispType;
+var
+  InnerType: TGrispType;
+begin
+  if SameText(FCurrent.Lexeme, 'number') then
+  begin
+    Result := TGrispType.Create(tpNumber);
+    Advance;
+  end
+  else if SameText(FCurrent.Lexeme, 'string') then
+  begin
+    Result := TGrispType.Create(tpString);
+    Advance;
+  end
+  else if SameText(FCurrent.Lexeme, 'boolean') then
+  begin
+    Result := TGrispType.Create(tpBoolean);
+    Advance;
+  end
+  else if SameText(FCurrent.Lexeme, 'identifier') then
+  begin
+    Result := TGrispType.Create(tpIdentifier);
+    Advance;
+  end
+  else if SameText(FCurrent.Lexeme, 'nil') then
+  begin
+    Result := TGrispType.Create(tpNil);
+    Advance;
+  end
+  else if SameText(FCurrent.Lexeme, 'array') then
+  begin
+    Advance;
+    Expect(tkLess, '"<" expected');
+    InnerType := ParseType;
+    Result := TGrispType.Create(tpArray);
+    Result.ElementType := InnerType;
+    Expect(tkGreater, '">" expected');
+  end
+  else if FCurrent.Kind = tkIdentifier then
+  begin
+    Result := TGrispType.Create(tpNode);
+    Result.NodeType := FCurrent.Lexeme;
+    Advance;
+  end
+  else
+    raise EGrispParseError.Create('Type expected');
+end;
+
+procedure TGrispParser.ParseStrategyDecl;
+var
+  StrategyName: string;
+  Strat: TStrategy;
+begin
+  Expect(tkKeywordStrategy, '"strategy" expected');
+  StrategyName := FCurrent.Lexeme;
+  Expect(tkIdentifier, 'name expected');
+  Expect(tkEquals, '"=" expected');
+  Strat := ParseStrategy;
+  FStrategyEngine.AddStrategy(StrategyName, Strat);
+end;
+
+function TGrispParser.ParseStrategy: TStrategy;
+var
+  Strat: TStrategy;
+begin
+  if FCurrent.Kind = tkKeywordRepeat then
+  begin
+    Advance;
+    Expect(tkLParen, '"(" expected');
+    Result := TStrategy.Create(skRepeat);
+    while FCurrent.Kind <> tkRParen do
+    begin
+      Result.Strategies.Add(ParseStrategy);
+      if FCurrent.Kind = tkComma then Advance;
+    end;
+    Expect(tkRParen, '")" expected');
+  end
+  else if FCurrent.Kind = tkKeywordTry then
+  begin
+    Advance;
+    Expect(tkLParen, '"(" expected');
+    Result := TStrategy.Create(skTry);
+    while FCurrent.Kind <> tkRParen do
+    begin
+      Result.Strategies.Add(ParseStrategy);
+      if FCurrent.Kind = tkComma then Advance;
+    end;
+    Expect(tkRParen, '")" expected');
+  end
+  else if FCurrent.Kind = tkKeywordChoice then
+  begin
+    Advance;
+    Expect(tkLParen, '"(" expected');
+    Result := TStrategy.Create(skChoice);
+    while FCurrent.Kind <> tkRParen do
+    begin
+      Result.Strategies.Add(ParseStrategy);
+      if FCurrent.Kind = tkComma then Advance;
+    end;
+    Expect(tkRParen, '")" expected');
+  end
+  else if (FCurrent.Kind = tkKeywordPhase) or ((FCurrent.Kind = tkIdentifier) and SameText(FCurrent.Lexeme, 'phase')) then
+  begin
+    if FCurrent.Kind = tkIdentifier then Advance;
+    Expect(tkLParen, '"(" expected');
+    Result := TStrategy.Create(skPhase);
+    if FCurrent.Kind = tkNumber then
+    begin
+      Result.Phase := Trunc(StrToFloat(FCurrent.Lexeme));
+      Advance;
+    end;
+    while FCurrent.Kind <> tkRParen do
+    begin
+      Result.Strategies.Add(ParseStrategy);
+      if FCurrent.Kind = tkComma then Advance;
+    end;
+    Expect(tkRParen, '")" expected');
+  end
+  else if FCurrent.Kind = tkIdentifier then
+  begin
+    Result := TStrategy.Create(skRule);
+    Result.RuleName := FCurrent.Lexeme;
+    Advance;
+  end
+  else
+    raise EGrispParseError.Create('Strategy expected');
 end;
 
 function TGrispParser.ParseTypeName: string;
@@ -332,7 +499,7 @@ begin
         (FCurrent.Kind = tkKeywordMod) do
   begin
     Op := FCurrent.Lexeme;
-    Advance;
+	Advance;
     Right := ParseUnaryExpr;
     Result := TGrispExpression.Create(ekBinary);
     Result.OperatorSymbol := Op;
@@ -413,7 +580,7 @@ begin
     Advance;
     Result := ParseExpr;
     Expect(tkRParen, '")" expected');
-    Exit;
+	Exit;
   end;
   raise EGrispParseError.Create('Expression expected');
 end;
@@ -479,7 +646,18 @@ end;
 procedure TGrispParser.ParseFile;
 begin
   while FCurrent.Kind <> tkEOF do
-    ParseNodeDecl;
+  begin
+    case FCurrent.Kind of
+      tkKeywordNode:
+        ParseNodeDecl;
+      tkKeywordType:
+        ParseTypeDecl;
+      tkKeywordStrategy:
+        ParseStrategyDecl;
+      else
+        raise EGrispParseError.Create('Expected node, type, or strategy declaration');
+    end;
+  end;
   RegisterEdgesForAllNodes;
 end;
 

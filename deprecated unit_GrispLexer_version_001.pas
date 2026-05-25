@@ -69,7 +69,6 @@ begin
       AdvanceChar;
       Continue;
     end;
-    // // line comment
     if (FSource[FPos] = '/') and (PeekChar(1) = '/') then
     begin
       AdvanceChar; AdvanceChar;
@@ -77,10 +76,9 @@ begin
         AdvanceChar;
       Continue;
     end;
-    // /* block comment */
     if (FSource[FPos] = '/') and (PeekChar(1) = '*') then
     begin
-      AdvanceChar; AdvanceChar;
+	  AdvanceChar; AdvanceChar;
       while FPos <= Length(FSource) do
       begin
         if (FSource[FPos] = '*') and (PeekChar(1) = '/') then
@@ -175,14 +173,23 @@ begin
   Result.Line := Line;
   Result.Column := Col;
 
-  if SameText(S,'node') then Result.Kind := tkKeywordNode
-  else if SameText(S,'array') then Result.Kind := tkKeywordArray
-  else if SameText(S,'where') then Result.Kind := tkKeywordWhere
-  else if SameText(S,'and') then Result.Kind := tkKeywordAnd
-  else if SameText(S,'or') then Result.Kind := tkKeywordOr
-  else if SameText(S,'not') then Result.Kind := tkKeywordNot
-  else if SameText(S,'mod') then Result.Kind := tkKeywordMod
-  else if SameText(S,'true') or SameText(S,'false') then Result.Kind := tkBoolean
+  if SameText(S, 'node') then Result.Kind := tkKeywordNode
+  else if SameText(S, 'array') then Result.Kind := tkKeywordArray
+  else if SameText(S, 'where') then Result.Kind := tkKeywordWhere
+  else if SameText(S, 'and') then Result.Kind := tkKeywordAnd
+  else if SameText(S, 'or') then Result.Kind := tkKeywordOr
+  else if SameText(S, 'not') then Result.Kind := tkKeywordNot
+  else if SameText(S, 'mod') then Result.Kind := tkKeywordMod
+  else if SameText(S, 'phase') then Result.Kind := tkKeywordPhase
+  else if SameText(S, 'temp') then Result.Kind := tkKeywordTemp
+  else if SameText(S, 'delete') then Result.Kind := tkKeywordDelete
+  else if SameText(S, 'remove') then Result.Kind := tkKeywordRemove
+  else if SameText(S, 'type') then Result.Kind := tkKeywordType
+  else if SameText(S, 'strategy') then Result.Kind := tkKeywordStrategy
+  else if SameText(S, 'repeat') then Result.Kind := tkKeywordRepeat
+  else if SameText(S, 'try') then Result.Kind := tkKeywordTry
+  else if SameText(S, 'choice') then Result.Kind := tkKeywordChoice
+  else if SameText(S, 'true') or SameText(S, 'false') then Result.Kind := tkBoolean
   else Result.Kind := tkIdentifier;
 end;
 
@@ -211,10 +218,32 @@ begin
     ':': begin Result.Kind := tkColon; Result.Lexeme := ':'; AdvanceChar; Exit; end;
     '=': begin Result.Kind := tkEquals; Result.Lexeme := '='; AdvanceChar; Exit; end;
     ',': begin Result.Kind := tkComma; Result.Lexeme := ','; AdvanceChar; Exit; end;
-    ';': begin Result.Kind := tkSemicolon; Result.Lexeme := ';'; AdvanceChar; Exit; end;
-    '+','-':
+	';': begin Result.Kind := tkSemicolon; Result.Lexeme := ';'; AdvanceChar; Exit; end;
+    '-':
       begin
-        // signed number vs operator
+        if PeekChar(1) = '>' then
+        begin
+          Result.Kind := tkArrow;
+          Result.Lexeme := '->';
+          AdvanceChar;
+          AdvanceChar;
+          Exit;
+        end
+        else if CharInSet(PeekChar(1), ['0'..'9']) then
+        begin
+          Result := ReadNumber;
+          Exit;
+        end
+        else
+        begin
+          Result.Kind := tkOperator;
+          Result.Lexeme := '-';
+          AdvanceChar;
+          Exit;
+        end;
+      end;
+    '+':
+      begin
         if CharInSet(PeekChar(1), ['0'..'9']) then
         begin
           Result := ReadNumber;
@@ -223,7 +252,7 @@ begin
         else
         begin
           Result.Kind := tkOperator;
-          Result.Lexeme := C;
+          Result.Lexeme := '+';
           AdvanceChar;
           Exit;
         end;
