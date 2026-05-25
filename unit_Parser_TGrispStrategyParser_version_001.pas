@@ -27,8 +27,6 @@ type
 implementation
 
 function TGrispStrategyParser.ParseStrategy: TGrispStrategy;
-var
-  Strat: TGrispStrategy;
 begin
   if FCurrent.Kind = tkKeywordRepeat then
   begin
@@ -63,7 +61,7 @@ begin
     begin
       Result.Strategies.Add(ParseStrategy);
       if FCurrent.Kind = tkComma then Advance;
-	end;
+    end;
     Expect(tkRParen, '")" expected');
   end
   else if (FCurrent.Kind = tkKeywordPhase) or ((FCurrent.Kind = tkIdentifier) and SameText(FCurrent.Lexeme, 'phase')) then

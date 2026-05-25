@@ -196,11 +196,9 @@ end;
 function TGrispLexer.ReadNumber: TGrispToken;
 var
   Start, Line, Col: Integer;
-  IsFloat: Boolean;
 begin
   Line := FLine; Col := FCol;
   Start := FPos;
-  IsFloat := False;
 
   // Handle optional sign
   if CharInSet(FSource[FPos], ['+', '-']) then
@@ -213,7 +211,6 @@ begin
   // Read fractional part
   if (FSource[FPos] = '.') and CharInSet(PeekChar(1), ['0'..'9']) then
   begin
-    IsFloat := True;
     AdvanceChar;
     while (FPos <= Length(FSource)) and CharInSet(FSource[FPos], ['0'..'9']) do
       AdvanceChar;
@@ -222,7 +219,6 @@ begin
   // Read exponent
   if CharInSet(FSource[FPos], ['e', 'E']) and CharInSet(PeekChar(1), ['0'..'9', '+', '-']) then
   begin
-    IsFloat := True;
     AdvanceChar;
     if CharInSet(FSource[FPos], ['+', '-']) then
       AdvanceChar;

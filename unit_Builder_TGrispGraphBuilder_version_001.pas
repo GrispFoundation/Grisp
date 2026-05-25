@@ -22,7 +22,6 @@ type
     procedure Cleanup;
   public
     constructor Create(const ASource: string);
-    constructor CreateFromFile(const AFileName: string);
     destructor Destroy; override;
 
     function Build: TGrispGraph;
@@ -53,14 +52,13 @@ end;
 
 function BuildGraphFromFile(const FileName: string): TGrispGraph;
 var
-  Builder: TGrispGraphBuilder;
+  Source: string;
 begin
-  Builder := TGrispGraphBuilder.CreateFromFile(FileName);
-  try
-    Result := Builder.Build;
-  finally
-    Builder.Free;
-  end;
+  if not TFile.Exists(FileName) then
+    raise EGrispGraphBuilderError.CreateFmt('File not found: %s', [FileName]);
+
+  Source := TFile.ReadAllText(FileName);
+  Result := BuildGraphFromSource(Source);
 end;
 
 { TGrispGraphBuilder }
@@ -70,17 +68,6 @@ begin
   inherited Create;
   FSource := ASource;
   FFileName := '';
-  Initialize;
-end;
-
-constructor TGrispGraphBuilder.CreateFromFile(const AFileName: string);
-begin
-  inherited Create;
-  if not TFile.Exists(AFileName) then
-    raise EGrispGraphBuilderError.CreateFmt('File not found: %s', [AFileName]);
-
-  FFileName := AFileName;
-  FSource := TFile.ReadAllText(AFileName);
   Initialize;
 end;
 
@@ -104,8 +91,6 @@ end;
 
 function TGrispGraphBuilder.Build: TGrispGraph;
 begin
-  Result := nil;
-
   if FSource.IsEmpty then
     raise EGrispGraphBuilderError.Create('Source is empty');
 

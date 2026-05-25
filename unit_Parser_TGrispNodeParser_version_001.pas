@@ -36,8 +36,6 @@ var
   D: Double;
   Node: TGrispNode;
   InnerType: string;
-  NodeId: Integer;
-  NodeName: string;
 begin
   // Pattern variable support: bare identifier for scalar types
   if FCurrent.Kind = tkIdentifier then
@@ -128,19 +126,19 @@ var
   Value: TGrispValue;
 begin
   while (FCurrent.Kind <> tkRBrace) and (FCurrent.Kind <> tkEOF) and
-        (FCurrent.Kind <> tkKeywordWhere) do
+		(FCurrent.Kind <> tkKeywordWhere) do
   begin
-    if not (FCurrent.Kind in [tkIdentifier, tkKeywordNode, tkKeywordArray]) then
-      raise EGrispParseError.CreateFmt('Attribute name expected at %d:%d', [FCurrent.Line, FCurrent.Column]);
-    Key := FCurrent.Lexeme;
-    Advance;
-    Expect(tkColon, '":" expected');
-    TypeName := ParseTypeName;
-    Expect(tkEquals, '"=" expected');
-    Value := ParseValue(TypeName);
-    ANode.SetValueAttribute(Key, Value);  // Changed: use SetValueAttribute
-    if FCurrent.Kind = tkSemicolon then
-      Advance;
+	if not (FCurrent.Kind in [tkIdentifier, tkKeywordNode, tkKeywordArray]) then
+	  raise EGrispParseError.CreateFmt('Attribute name expected at %d:%d', [FCurrent.Line, FCurrent.Column]);
+	Key := FCurrent.Lexeme;
+	Advance;
+	Expect(tkColon, '":" expected');
+	TypeName := ParseTypeName;
+	Expect(tkEquals, '"=" expected');
+	Value := ParseValue(TypeName);
+	ANode.SetValueAttribute(Key, Value);  // Changed: use SetValueAttribute
+	if FCurrent.Kind = tkSemicolon then
+	  Advance;
   end;
 end;
 
@@ -149,8 +147,8 @@ var
   E: TGrispEdge;
 begin
   for E in FGraph.Edges do
-    if (E.Source = ASource) and (E.Target = ATarget) and SameText(E.LabelName, ALabel) then
-      Exit(True);
+	if (E.Source = ASource) and (E.Target = ATarget) and SameText(E.LabelName, ALabel) then
+	  Exit(True);
   Result := False;
 end;
 
@@ -165,22 +163,22 @@ var
 begin
   for Key in ANode.GetAttributeKeys do
   begin
-    Val := ANode.GetValueAttribute(Key);
-    if Val = nil then Continue;
-    case Val.Kind of
-      gvkNode:
-        begin
-          Val.GetNodeReference(NodeId, NodeName);
-          Target := FGraph.FindNode(NodeName);
-          if Assigned(Target) and not EdgeExists(ANode, Target, Key) then
-            FGraph.AddEdge(ANode, Target, Key, '');
-        end;
-      gvkIdentifier:
-        begin
-          Target := FGraph.FindNode(Val.IdentifierValue);
-          if Assigned(Target) and not EdgeExists(ANode, Target, Key) then
-            FGraph.AddEdge(ANode, Target, Key, '');
-        end;
+	Val := ANode.GetValueAttribute(Key);
+	if Val = nil then Continue;
+	case Val.Kind of
+	  gvkNode:
+		begin
+		  Val.GetNodeReference(NodeId, NodeName);
+		  Target := FGraph.FindNode(NodeName);
+		  if Assigned(Target) and not EdgeExists(ANode, Target, Key) then
+			FGraph.AddEdge(ANode, Target, Key, '');
+		end;
+	  gvkIdentifier:
+		begin
+		  Target := FGraph.FindNode(Val.IdentifierValue);
+		  if Assigned(Target) and not EdgeExists(ANode, Target, Key) then
+			FGraph.AddEdge(ANode, Target, Key, '');
+		end;
       gvkArray:
         for Elem in Val.ArrayValue do
         begin

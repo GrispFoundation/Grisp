@@ -3,7 +3,7 @@ unit unit_Strategy_TGrispStrategyBuilder_version_001;
 interface
 
 uses
-  System.SysUtils,                              // Added for Exception
+  System.SysUtils,
   System.Generics.Collections,
   unit_Strategy_TGrispStrategyKind_version_001,
   unit_Strategy_TGrispStrategy_version_001;
@@ -96,7 +96,7 @@ end;
 function TGrispStrategyBuilder.Build: TGrispStrategy;
 var
   i: Integer;
-  Strategy, Current, Parent: TGrispStrategy;
+  Current, Parent: TGrispStrategy;
   Stack: TList<TGrispStrategy>;
 begin
   if FStrategies.Count = 0 then
