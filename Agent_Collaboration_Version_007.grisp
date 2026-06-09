@@ -1,0 +1,78 @@
+# ==================================================================================
+# GRISP - Agent Collaboration Protocol Version 0.07
+# Planner emits native nodes with lifecycle field; activation rules materialize plan
+# ==================================================================================
+
+namespace AgentCollaborationV007 {
+
+  # Core nodes with unified lifecycle idea introduced
+  node Agent {
+    id: identifier
+    role: ("Planner" | "Specialist")
+    capabilities: array<identifier>
+    capacity: number
+  }
+
+  node Goal {
+    id: identifier
+    description: string
+    phase: ("planned" | "active")    # planner writes planned goals as native Goal nodes
+    status: ("pending" | "in_progress" | "completed" | "failed")
+    created_at: number
+    updated_at: number
+    tags: array<identifier>
+    failure_policy: ("fail_fast" | "best_effort" | "majority")
+  }
+
+  node Task {
+    id: identifier
+    description: string
+    phase: ("planned" | "active")    # planner writes planned tasks as native Task nodes
+    status: ("pending" | "assigned" | "in_progress" | "waiting_tool" | "completed" | "failed")
+    priority: number
+    cost: number
+    retries: number
+    max_retries: number
+    tags: array<identifier>
+    created_at: number
+    updated_at: number
+  }
+
+  # Native edges used by both planner and executor
+  edge subgoal_of { from: Goal to: Goal }
+  edge belongs_to_goal { from: Task to: Goal }
+  edge depends_on { from: Task to: Task }
+  edge assigns { from: Agent to: Task }
+
+  # PlanningRequest and provenance
+  node PlanningRequest { id: identifier, goal: node<Goal>, status: ("pending"|"running"|"completed"|"failed"), created_at: number, hint: value? }
+  edge created_by_plan { from: Goal to: PlanningRequest }
+  edge created_by_plan { from: Task to: PlanningRequest }
+
+  # Key rules (pure graph rewrites)
+  # - Planner injects Goal(phase="planned") and Task(phase="planned") with native edges
+  # - PlanOptimization rules operate on phase="planned" nodes (MergeDuplicateTasks, DetectCycle, NormalizePlan)
+  # - ActivatePlannedTask flips phase planned -> active (activation only)
+  # - AssignPendingTask flips active/pending -> assigned (assignment only)
+  # - Execution rules operate on assigned/in_progress/waiting_tool nodes
+  # - Provenance edges link created nodes to PlanningRequest
+
+  # Strategy
+  strategy PlanOptimization { repeat { apply MergeDuplicateTasks; apply DetectCycle; apply NormalizePlan } }
+  strategy AgentLoop {
+    repeat {
+      phase 1 { apply PlanOptimization; apply ActivatePlannedGoal; apply ActivatePlannedTask; }
+      phase 2 { apply AssignPendingTask; }
+      phase 3 { apply StartAssignedTask; apply CreateToolRequest; }
+      phase 4 { apply MarkToolRunning; apply IntegrateToolResultSuccess; apply IntegrateToolResultFailure; }
+      phase 5 { apply ShouldFailGoal; apply SynthesizeLeafGoalResults; }
+    }
+  }
+
+  # Helper functions remain for runtime queries only
+  fn CanExecute(agent, task)
+  fn AvailableCapacity(agent)
+  fn AllDependenciesCompleted(task)
+  fn AllTasksCompleted(goal)
+  fn IsLeafGoal(goal)
+}

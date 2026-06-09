@@ -1,0 +1,918 @@
+# ==========================================================
+# GRISP - Agent Collaboration Protocol (Version 0.05)
+# Planning as a first-class action + capabilities + policies
+# ==========================================================
+
+namespace AgentCollaborationV005 {
+
+    # ======================
+    # Core Entity Types
+    # ======================
+
+    node Agent {
+        id: identifier
+        role: ("Planner" | "Specialist")
+        capabilities: array<identifier>      # e.g. ["plan", "code", "search", "execute", "tool_call"]
+        capacity: number                     # total capacity units
+    }
+
+    node Goal {
+        id: identifier
+        description: string
+        status: ("pending" | "in_progress" | "completed" | "failed")
+        created_at: number
+        updated_at: number
+        tags: array<identifier>              # e.g. ["complex", "compiler", "analysis"]
+        failure_policy: ("fail_fast" | "best_effort" | "majority")
+    }
+
+    node Task {
+        id: identifier
+        description: string
+        status: ("pending" | "assigned" | "in_progress" | "waiting_tool" | "completed" | "failed")
+        priority: number
+        created_at: number
+        updated_at: number
+        retries: number
+        max_retries: number
+        result: value?
+        error: string?
+        tags: array<identifier>              # e.g. ["code", "search", "analysis"]
+        cost: number                         # capacity units required
+    }
+
+    node Message {
+        id: identifier
+        type: identifier
+        from: node<Agent>
+        to: node<Agent>
+        payload: node<Task>?
+        goal: node<Goal>?
+    }
+
+    node ToolRequest {
+        id: identifier
+        kind: ("WebSearch" | "CodeExecution")
+        input: value
+        status: ("pending" | "running" | "completed" | "failed")
+        created_at: number
+        task: node<Task>
+    }
+
+    node ToolResult {
+        id: identifier
+        request: node<ToolRequest>
+        success: boolean
+        data: value?
+        error: string?
+    }
+
+    # NEW: planning as a first-class external action
+    node PlanningRequest {
+        id: identifier
+        goal: node<Goal>
+        status: ("pending" | "running" | "completed" | "failed")
+        created_at: number
+        # optional hints for the planner
+        hint: value?
+    }
+
+    node PlanningResult {
+        id: identifier
+        request: node<PlanningRequest>
+        success: boolean
+        # abstract plan structure; interpreted by ApplyPlanningResult
+        plan: value?
+        error: string?
+    }
+
+    node FinalAnswer {
+        id: identifier
+        goal: node<Goal>
+        content: value
+        confidence: number
+        source_tasks: array<node<Task>>
+    }
+
+    # ======================
+    # Structural Edges
+    # ======================
+
+    edge assigns {
+        from: Agent
+        to: Task
+        label: "assigned"
+        type: "agent_task"
+    }
+
+    edge belongs_to_goal {
+        from: Task
+        to: Goal
+        label: "belongs_to"
+        type: "task_goal"
+    }
+
+    edge subgoal_of {
+        from: Goal
+        to: Goal
+        label: "subgoal_of"
+        type: "goal_goal"
+    }
+
+    edge depends_on {
+        from: Task
+        to: Task
+        label: "depends_on"
+        type: "task_dependency"
+    }
+
+    edge communicates {
+        from: Agent
+        to: Message
+        label: "sends"
+        type: "agent_message"
+    }
+
+    edge about_task {
+        from: Message
+        to: Task
+        label: "about"
+        type: "message_task"
+    }
+
+    edge about_goal {
+        from: Message
+        to: Goal
+        label: "about_goal"
+        type: "message_goal"
+    }
+
+    edge tool_for_task {
+        from: ToolRequest
+        to: Task
+        label: "for"
+        type: "tool_task"
+    }
+
+    edge result_of_request {
+        from: ToolResult
+        to: ToolRequest
+        label: "result_of"
+        type: "tool_result"
+    }
+
+    edge planning_for_goal {
+        from: PlanningRequest
+        to: Goal
+        label: "for"
+        type: "planning_goal"
+    }
+
+    edge result_of_planning {
+        from: PlanningResult
+        to: PlanningRequest
+        label: "result_of"
+        type: "planning_result"
+    }
+
+    # ======================
+    # Planning as an external action
+    # ======================
+
+    # PR1: Request a plan for a complex goal
+    node rule.CreatePlanningRequest {
+        match: graph = {
+            Planner: node = {
+                role = "Planner"
+                capabilities contains "plan"
+            }
+
+            Goal: node = {
+                status = "pending"
+                tags contains "complex"
+            }
+
+            # avoid duplicate planning requests
+            not exists PR: node = PlanningRequest {
+                goal = Goal
+                status in ["pending", "running"]
+            }
+        }
+
+        rewrite: graph = {
+            Planner: node = {
+                role = "Planner"
+            }
+
+            Goal: node = {
+                status = "in_progress"
+                updated_at = Now()
+            }
+
+            PR: node = PlanningRequest {
+                id = NewId()
+                goal = Goal
+                status = "pending"
+                created_at = Now()
+                hint = Goal.tags
+            }
+
+            edge planning_for_goal {
+                from: PR
+                to: Goal
+            }
+        }
+    }
+
+    # PR2: Mark planning request as running (runtime boundary)
+    node rule.MarkPlanningRunning {
+        match: graph = {
+            PR: node = PlanningRequest {
+                status = "pending"
+            }
+        }
+
+        rewrite: graph = {
+            PR: node = PlanningRequest {
+                status = "running"
+            }
+        }
+    }
+
+    # PR3: Apply a successful planning result: create subgoals and/or tasks
+    # (plan structure is interpreted by helper functions)
+    node rule.ApplyPlanningResultSuccess {
+        match: graph = {
+            PR: node = PlanningRequest {
+                status = "completed"
+                goal = Goal
+            }
+
+            PlanRes: node = PlanningResult {
+                request = PR
+                success = true
+                plan = PlanData
+            }
+
+            Planner: node = {
+                role = "Planner"
+            }
+        }
+
+        rewrite: graph = {
+            Planner: node = {
+                role = "Planner"
+            }
+
+            Goal: node = {
+                status = "in_progress"
+                updated_at = Now()
+            }
+
+            edge result_of_planning {
+                from: PlanRes
+                to: PR
+            }
+
+            # Create subgoals and tasks according to the plan
+            # These helpers expand PlanData into concrete nodes/edges
+            call CreateSubGoalsFromPlan(Goal, PlanData);
+            call CreateTasksFromPlan(Goal, PlanData);
+        }
+    }
+
+    # PR4: Apply a failed planning result: mark goal failed (or retry later)
+    node rule.ApplyPlanningResultFailure {
+        match: graph = {
+            PR: node = PlanningRequest {
+                status = "completed"
+                goal = Goal
+            }
+
+            PlanRes: node = PlanningResult {
+                request = PR
+                success = false
+                error = Err
+            }
+
+            Planner: node = {
+                role = "Planner"
+            }
+        }
+
+        rewrite: graph = {
+            Planner: node = {
+                role = "Planner"
+            }
+
+            Goal: node = {
+                status = "failed"
+                updated_at = Now()
+            }
+
+            edge result_of_planning {
+                from: PlanRes
+                to: PR
+            }
+
+            Msg: node = {
+                type = "GoalFailed"
+                from = Planner
+                to = Planner
+                goal = Goal
+            }
+
+            edge about_goal {
+                from: Msg
+                to: Goal
+            }
+        }
+    }
+
+    # ======================
+    # Capability- and dependency-aware task execution
+    # ======================
+
+    # T1: Delegate a pending, dependency-satisfied task to a capable Specialist with enough capacity
+    node rule.DelegateTask {
+        match: graph = {
+            Planner: node = {
+                role = "Planner"
+            }
+
+            Goal: node = {
+                status in ["pending", "in_progress"]
+            }
+
+            Task: node = {
+                status = "pending"
+                retries <= max_retries
+            }
+
+            edge belongs_to_goal {
+                from: Task
+                to: Goal
+            }
+
+            # All dependencies of this task must be completed
+            condition AllDependenciesCompleted(Task) = true
+
+            Specialist: node = {
+                role = "Specialist"
+            }
+
+            # Capability-based routing
+            condition CanExecute(Specialist, Task) = true
+
+            # Capacity check
+            condition AvailableCapacity(Specialist) >= Task.cost
+        }
+
+        rewrite: graph = {
+            Planner: node = {
+                role = "Planner"
+            }
+
+            Goal: node = {
+                status = "in_progress"
+                updated_at = Now()
+            }
+
+            Task: node = {
+                status = "assigned"
+                updated_at = Now()
+            }
+
+            edge assigns {
+                from: Specialist
+                to: Task
+            }
+
+            Msg: node = {
+                type = "TaskAssigned"
+                from = Planner
+                to = Specialist
+                payload = Task
+                goal = Goal
+            }
+
+            edge communicates {
+                from: Planner
+                to: Msg
+            }
+
+            edge about_task {
+                from: Msg
+                to: Task
+            }
+
+            edge about_goal {
+                from: Msg
+                to: Goal
+            }
+        }
+    }
+
+    node rule.StartTaskWork {
+        match: graph = {
+            Specialist: node = {
+                role = "Specialist"
+            }
+
+            Task: node = {
+                status = "assigned"
+            }
+
+            edge assigns {
+                from: Specialist
+                to: Task
+            }
+        }
+
+        rewrite: graph = {
+            Specialist: node = {
+                role = "Specialist"
+            }
+
+            Task: node = {
+                status = "in_progress"
+                updated_at = Now()
+            }
+        }
+    }
+
+    node rule.CreateToolRequest {
+        match: graph = {
+            Specialist: node = {
+                role = "Specialist"
+                capabilities contains "tool_call"
+            }
+
+            Task: node = {
+                status = "in_progress"
+                description = Desc
+            }
+
+            edge assigns {
+                from: Specialist
+                to: Task
+            }
+
+            not exists ToolReq: node = ToolRequest {
+                task = Task
+                status in ["pending", "running"]
+            }
+        }
+
+        rewrite: graph = {
+            Specialist: node = {
+                role = "Specialist"
+            }
+
+            Task: node = {
+                status = "waiting_tool"
+                updated_at = Now()
+            }
+
+            ToolReq: node = ToolRequest {
+                id = NewId()
+                kind = DecideToolKind(Desc)
+                input = Desc
+                status = "pending"
+                created_at = Now()
+                task = Task
+            }
+
+            edge tool_for_task {
+                from: ToolReq
+                to: Task
+            }
+        }
+    }
+
+    node rule.MarkToolRunning {
+        match: graph = {
+            ToolReq: node = ToolRequest {
+                status = "pending"
+            }
+        }
+
+        rewrite: graph = {
+            ToolReq: node = ToolRequest {
+                status = "running"
+            }
+        }
+    }
+
+    node rule.IntegrateToolResultSuccess {
+        match: graph = {
+            ToolRes: node = ToolResult {
+                success = true
+                request = ToolReq
+            }
+
+            ToolReq: node = ToolRequest {
+                status = "completed"
+                task = Task
+            }
+
+            Task: node = {
+                status = "waiting_tool"
+            }
+
+            Specialist: node = {
+                role = "Specialist"
+            }
+
+            edge assigns {
+                from: Specialist
+                to: Task
+            }
+
+            Goal: node = {
+                status in ["pending", "in_progress"]
+            }
+
+            edge belongs_to_goal {
+                from: Task
+                to: Goal
+            }
+
+            Planner: node = {
+                role = "Planner"
+            }
+        }
+
+        rewrite: graph = {
+            Task: node = {
+                status = "completed"
+                result = ToolRes.data
+                updated_at = Now()
+                error = ""
+            }
+
+            Planner: node = {
+                role = "Planner"
+            }
+
+            Goal: node = {
+                status = Goal.status
+            }
+
+            edge result_of_request {
+                from: ToolRes
+                to: ToolReq
+            }
+
+            delete edge assigns {
+                from: Specialist
+                to: Task
+            }
+
+            Msg: node = {
+                type = "TaskCompleted"
+                from = Specialist
+                to = Planner
+                payload = Task
+                goal = Goal
+            }
+
+            edge communicates {
+                from: Specialist
+                to: Msg
+            }
+
+            edge about_task {
+                from: Msg
+                to: Task
+            }
+
+            edge about_goal {
+                from: Msg
+                to: Goal
+            }
+        }
+    }
+
+    node rule.IntegrateToolResultFailure {
+        match: graph = {
+            ToolRes: node = ToolResult {
+                success = false
+                request = ToolReq
+            }
+
+            ToolReq: node = ToolRequest {
+                status = "failed"
+                task = Task
+            }
+
+            Task: node = {
+                status = "waiting_tool"
+            }
+
+            Specialist: node = {
+                role = "Specialist"
+            }
+
+            edge assigns {
+                from: Specialist
+                to: Task
+            }
+
+            Goal: node = {
+                status in ["pending", "in_progress"]
+            }
+
+            edge belongs_to_goal {
+                from: Task
+                to: Goal
+            }
+
+            Planner: node = {
+                role = "Planner"
+            }
+        }
+
+        rewrite: graph = {
+            WillFail: value = (Task.retries + 1 > Task.max_retries)
+
+            Task: node = {
+                status = (WillFail ? "failed" : "pending")
+                retries = Task.retries + 1
+                error = ToolRes.error
+                updated_at = Now()
+            }
+
+            Planner: node = {
+                role = "Planner"
+            }
+
+            Goal: node = {
+                status = Goal.status
+            }
+
+            edge result_of_request {
+                from: ToolRes
+                to: ToolReq
+            }
+
+            maybe delete edge assigns {
+                from: Specialist
+                to: Task
+            } when WillFail = true
+
+            Msg: node = {
+                type = (WillFail ? "TaskFailed" : "TaskRetryScheduled")
+                from = Specialist
+                to = Planner
+                payload = Task
+                goal = Goal
+            }
+
+            edge communicates {
+                from: Specialist
+                to: Msg
+            }
+
+            edge about_task {
+                from: Msg
+                to: Task
+            }
+
+            edge about_goal {
+                from: Msg
+                to: Goal
+            }
+        }
+    }
+
+    # ======================
+    # Goal failure & synthesis with policy
+    # ======================
+
+    node rule.FailGoalWithPolicy {
+        match: graph = {
+            Goal: node = {
+                status in ["pending", "in_progress"]
+            }
+
+            Planner: node = {
+                role = "Planner"
+            }
+
+            condition ShouldFailGoal(Goal) = true
+        }
+
+        rewrite: graph = {
+            Goal: node = {
+                status = "failed"
+                updated_at = Now()
+            }
+
+            Planner: node = {
+                role = "Planner"
+            }
+
+            Msg: node = {
+                type = "GoalFailed"
+                from = Planner
+                to = Planner
+                goal = Goal
+            }
+
+            edge about_goal {
+                from: Msg
+                to: Goal
+            }
+        }
+    }
+
+    node rule.SynthesizeLeafGoalResults {
+        match: graph = {
+            Planner: node = {
+                role = "Planner"
+            }
+
+            Goal: node = {
+                status in ["pending", "in_progress"]
+            }
+
+            condition IsLeafGoal(Goal) = true
+            condition AllTasksCompleted(Goal) = true
+
+            CompletedTasks: many node = {
+                status = "completed"
+            }
+
+            edges: many belongs_to_goal {
+                from: CompletedTasks
+                to: Goal
+            }
+        }
+
+        rewrite: graph = {
+            Planner: node = {
+                role = "Planner"
+            }
+
+            Goal: node = {
+                status = "completed"
+                updated_at = Now()
+            }
+
+            Answer: node = FinalAnswer {
+                id = NewId()
+                goal = Goal
+                content = MergeResults(CompletedTasks)
+                confidence = CalculateConfidence(CompletedTasks)
+                source_tasks = CompletedTasks
+            }
+
+            Msg: node = {
+                type = "GoalCompleted"
+                from = Planner
+                to = Planner
+                goal = Goal
+            }
+
+            edge about_goal {
+                from: Msg
+                to: Goal
+            }
+        }
+    }
+
+    node rule.CompleteParentGoal {
+        match: graph = {
+            ParentGoal: node = {
+                status = "in_progress"
+            }
+
+            condition AllSubGoalsCompleted(ParentGoal) = true
+
+            Planner: node = {
+                role = "Planner"
+            }
+        }
+
+        rewrite: graph = {
+            ParentGoal: node = {
+                status = "completed"
+                updated_at = Now()
+            }
+
+            Planner: node = {
+                role = "Planner"
+            }
+
+            Msg: node = {
+                type = "GoalCompleted"
+                from = Planner
+                to = Planner
+                goal = ParentGoal
+            }
+
+            edge about_goal {
+                from: Msg
+                to: ParentGoal
+            }
+        }
+    }
+
+    node rule.PropagateGoalFailure {
+        match: graph = {
+            ParentGoal: node = {
+                status in ["pending", "in_progress"]
+            }
+
+            condition AnySubGoalFailed(ParentGoal) = true
+
+            Planner: node = {
+                role = "Planner"
+            }
+        }
+
+        rewrite: graph = {
+            ParentGoal: node = {
+                status = "failed"
+                updated_at = Now()
+            }
+
+            Planner: node = {
+                role = "Planner"
+            }
+
+            Msg: node = {
+                type = "GoalFailed"
+                from = Planner
+                to = Planner
+                goal = ParentGoal
+            }
+
+            edge about_goal {
+                from: Msg
+                to: ParentGoal
+            }
+        }
+    }
+
+    # ======================
+    # Strategy
+    # ======================
+
+    strategy AgentLoop {
+        repeat {
+            phase 1 {
+                apply CreatePlanningRequest;
+                apply MarkPlanningRunning;
+                apply ApplyPlanningResultSuccess;
+                apply ApplyPlanningResultFailure;
+            }
+            phase 2 {
+                apply DelegateTask;
+            }
+            phase 3 {
+                apply StartTaskWork;
+            }
+            phase 4 {
+                apply CreateToolRequest;
+            }
+            phase 5 {
+                apply MarkToolRunning;
+                apply IntegrateToolResultSuccess;
+                apply IntegrateToolResultFailure;
+            }
+            phase 6 {
+                apply FailGoalWithPolicy;
+                apply SynthesizeLeafGoalResults;
+                apply CompleteParentGoal;
+                apply PropagateGoalFailure;
+            }
+        }
+    }
+
+    # ======================
+    # Helper Functions (runtime / query layer)
+    # ======================
+
+    fn Now(): number
+    fn NewId(): identifier
+    fn DecideToolKind(desc: string): ("WebSearch" | "CodeExecution")
+
+    fn AllTasksCompleted(goal: node<Goal>): boolean
+    fn AllSubGoalsCompleted(goal: node<Goal>): boolean
+    fn AnySubGoalFailed(goal: node<Goal>): boolean
+    fn AllDependenciesCompleted(task: node<Task>): boolean
+    fn AvailableCapacity(agent: node<Agent>): number
+    fn IsLeafGoal(goal: node<Goal>): boolean
+
+    fn CanExecute(agent: node<Agent>, task: node<Task>): boolean
+    fn ShouldFailGoal(goal: node<Goal>): boolean
+
+    fn MergeResults(tasks: array<node<Task>>): value
+    fn CalculateConfidence(tasks: array<node<Task>>): number
+
+    # Planning result interpreters
+    fn CreateSubGoalsFromPlan(parent: node<Goal>, plan: value): void
+    fn CreateTasksFromPlan(parent: node<Goal>, plan: value): void
+}

@@ -1,0 +1,265 @@
+# ======================================================================
+# GRISP - Agent Collaboration Protocol Version 0.10
+# Single lifecycle, native planner output, deterministic execution
+# Clarified rewrite semantics, event snapshots, depends_on, after_commit
+# ======================================================================
+
+namespace AgentCollaborationV010 {
+
+  # Core nodes
+  node Agent {
+    id: identifier
+    role: ("Planner" | "Specialist")
+    capabilities: array<identifier>
+    capacity_total: number
+    capacity_used: number
+  }
+
+  node Goal {
+    id: identifier
+    description: string
+    lifecycle: ("planned" | "pending" | "in_progress" | "completed" | "failed")
+    created_at: number
+    updated_at: number
+    tags: array<identifier>
+    failure_policy: ("fail_fast" | "best_effort" | "majority")
+  }
+
+  node Task {
+    id: identifier
+    description: string
+    lifecycle: ("planned" | "pending" | "assigned" | "in_progress" | "waiting_tool" | "completed" | "failed")
+    priority: number
+    cost: number
+    retries: number
+    max_retries: number
+    tags: array<identifier>
+    created_at: number
+    updated_at: number
+  }
+
+  node PlanningRequest {
+    id: identifier
+    goal: node<Goal>
+    status: ("pending" | "running" | "completed" | "failed")
+    created_at: number
+    hint: value?
+    timeout_ms: number?
+    request_key: string?
+  }
+
+  node ToolRequest {
+    id: identifier
+    kind: ("WebSearch" | "CodeExecution")
+    input: value
+    status: ("pending" | "running" | "completed" | "failed")
+    created_at: number
+    task: node<Task>
+    timeout_ms: number?
+    request_key: string?
+  }
+
+  node ToolResult {
+    id: identifier
+    request: node<ToolRequest>
+    success: boolean
+    data: value?
+    error: string?
+    created_at: number
+  }
+
+  node Event {
+    id: identifier
+    type: identifier
+    timestamp: number
+    rule_id: identifier?
+    trace_id: identifier?
+    payload: value?
+    match_nodes: array<identifier>
+    match_edges: array<identifier>
+    written_nodes: array<identifier>
+    written_edges: array<identifier>
+  }
+
+  node FinalAnswer {
+    id: identifier
+    goal: node<Goal>
+    content: value
+    confidence: number
+    source_tasks: array<node<Task>>
+  }
+
+  # Native edges
+  edge subgoal_of { from: Goal to: Goal }
+  edge belongs_to_goal { from: Task to: Goal }
+  edge depends_on { from: Task to: Task }
+  edge assigns { from: Agent to: Task }
+  edge created_by_plan { from: Goal to: PlanningRequest }
+  edge created_by_plan { from: Task to: PlanningRequest }
+  edge tool_for_task { from: ToolRequest to: Task }
+  edge result_of_request { from: ToolResult to: ToolRequest }
+  edge event_for { from: Event to: node }
+
+  # Rule metadata model
+  # id, priority, idempotent, sideEffectFlags, timeout_ms, rate_limit, circuit_breaker, depends_on, after_commit
+  # reads and writes optional explicit lists to disambiguate complex rewrites
+
+  # Example rules with corrected semantics
+
+  node rule ActivatePlannedTask {
+    id = "ActivatePlannedTask"
+    priority = 90
+    idempotent = true
+    depends_on = ["MergeDuplicatePlannedTasks", "DetectPlannedCycle"]
+    match: graph = {
+      Task: node = { lifecycle = "planned" }
+      not exists Dep: node = Task {
+        edge depends_on { from: Task to: Dep }
+        Dep.lifecycle in ["pending","assigned","in_progress","waiting_tool"]
+      }
+    }
+    rewrite: graph = {
+      Task: node = { lifecycle = "pending", updated_at = Now() }
+    }
+  }
+
+  node rule AssignPendingTask {
+    id = "AssignPendingTask"
+    priority = 80
+    idempotent = false
+    depends_on = ["ActivatePlannedTask"]
+    match: graph = {
+      Task: node = { lifecycle = "pending", cost = Cost }
+      Specialist: node = { role = "Specialist", capacity_used = OldCapacity, capacity_total = Total }
+      condition CanExecute(Specialist, Task) = true
+      condition Total - OldCapacity >= Cost
+    }
+    rewrite: graph = {
+      let NewCapacity = OldCapacity + Cost
+      Task: node = { lifecycle = "assigned", updated_at = Now() }
+      Specialist: node = { capacity_used = NewCapacity }
+      edge assigns { from: Specialist to: Task }
+    }
+    timeout_ms = 1000
+  }
+
+  node rule StartAssignedTask {
+    id = "StartAssignedTask"
+    priority = 70
+    idempotent = true
+    depends_on = ["AssignPendingTask"]
+    match: graph = {
+      Task: node = { lifecycle = "assigned" }
+      edge assigns { from: Specialist to: Task }
+    }
+    rewrite: graph = {
+      Task: node = { lifecycle = "in_progress", updated_at = Now() }
+    }
+  }
+
+  node rule CreateToolRequest {
+    id = "CreateToolRequest"
+    priority = 60
+    idempotent = false
+    sideEffectFlags = ["creates_request","external_call"]
+    depends_on = ["StartAssignedTask"]
+    match: graph = {
+      Task: node = { lifecycle = "in_progress", description = Desc }
+      edge assigns { from: Specialist to: Task }
+      not exists TR: node = ToolRequest { task = Task, status in ["pending","running"] }
+    }
+    rewrite: graph = {
+      let RK = GenerateRequestKey(Task, Desc)
+      Task: node = { lifecycle = "waiting_tool", updated_at = Now() }
+      TR: node = ToolRequest {
+        id = NewId()
+        kind = DecideToolKind(Desc)
+        input = Desc
+        status = "pending"
+        created_at = Now()
+        task = Task
+        request_key = RK
+      }
+      edge tool_for_task { from: TR to: Task }
+    }
+    timeout_ms = 5000
+    after_commit = ["schedule_tool_request_timeout", "emit_tool_request_webhook"]
+  }
+
+  node rule IntegrateToolResultSuccess {
+    id = "IntegrateToolResultSuccess"
+    priority = 95
+    idempotent = true
+    depends_on = ["CreateToolRequest"]
+    match: graph = {
+      ToolRes: node = { success = true, request = TR }
+      TR: node = { status = "completed", task = Task }
+      Task: node = { lifecycle = "waiting_tool" }
+      edge tool_for_task { from: TR to: Task }
+    }
+    rewrite: graph = {
+      Task: node = { lifecycle = "completed", result = ToolRes.data, updated_at = Now() }
+      delete edge assigns { from: Specialist to: Task }  # engine treats missing edge as no-op
+      edge result_of_request { from: ToolRes to: TR }
+    }
+  }
+
+  node rule IntegrateToolResultFailure {
+    id = "IntegrateToolResultFailure"
+    priority = 90
+    idempotent = true
+    depends_on = ["CreateToolRequest"]
+    match: graph = {
+      ToolRes: node = { success = false, request = TR }
+      TR: node = { status = "failed", task = Task }
+      Task: node = { lifecycle = "waiting_tool", retries = R, max_retries = MaxR }
+      edge tool_for_task { from: TR to: Task }
+    }
+    rewrite: graph = {
+      let NewRetries = R + 1
+      let WillFail = NewRetries > MaxR
+      Task: node = { lifecycle = (WillFail ? "failed" : "planned"), retries = NewRetries, updated_at = Now(), error = ToolRes.error }
+      delete edge assigns { from: Specialist to: Task } when WillFail = true
+      edge result_of_request { from: ToolRes to: TR }
+    }
+  }
+
+  node rule SynthesizeLeafGoalResults {
+    id = "SynthesizeLeafGoalResults"
+    priority = 50
+    idempotent = true
+    depends_on = ["IntegrateToolResultSuccess", "ReleaseCapacityOnCompletion"]
+    match: graph = {
+      Goal: node = { lifecycle in ["pending","in_progress"] }
+      condition IsLeafGoal(Goal) = true
+      condition AllTasksCompleted(Goal) = true
+      CompletedTasks: many node = Task { lifecycle = "completed" }
+      edges: many belongs_to_goal { from: CompletedTasks to: Goal }
+    }
+    rewrite: graph = {
+      Goal: node = { lifecycle = "completed", updated_at = Now() }
+      Answer: node = FinalAnswer { id = NewId(), goal = Goal, content = MergeResults(CompletedTasks), confidence = CalculateConfidence(CompletedTasks), source_tasks = CompletedTasks }
+    }
+    timeout_ms = 5000
+  }
+
+  # Engine-enforced behaviors
+  # - Rules may declare timeout_ms and on_timeout policy; engine enforces timeouts.
+  # - delete edge is idempotent; conditional delete uses when clause.
+  # - after_commit hooks run after commit, outside locks, cannot modify core graph.
+  # - Functions must be annotated as @pure or @effect(idempotent=bool, timeout_ms=int).
+
+  # Helper function signatures
+  fn Now(): number
+  fn NewId(): identifier
+  fn DecideToolKind(desc: string): ("WebSearch" | "CodeExecution")  @pure
+  fn GenerateRequestKey(task: node<Task>, desc: string): string  @pure
+
+  fn CanExecute(agent: node<Agent>, task: node<Task>): boolean  @pure
+  fn AvailableCapacity(agent: node<Agent>): number  @pure
+  fn AllTasksCompleted(goal: node<Goal>): boolean  @pure
+  fn IsLeafGoal(goal: node<Goal>): boolean  @pure
+  fn MergeResults(tasks: array<node<Task>>): value  @effect(idempotent=true, timeout_ms=5000)
+  fn CalculateConfidence(tasks: array<node<Task>>): number  @pure
+
+}

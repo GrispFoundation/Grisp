@@ -1,0 +1,300 @@
+GRISP Version 0.13 Specification
+================================
+
+Overview
+--------
+GRISP v0.13 is an opinionated, production-ready language and runtime for deterministic, policy-driven agent collaboration. It preserves a small deterministic core (tick model, atomic transactions, canonical locking) and adds:
+- First-class, parameterized policy objects (timeouts, retries, rate limits, circuit breakers, retention).
+- Concise, unambiguous rule grammar with explicit binding rules for `when` and `then`.
+- Deterministic collection semantics for `many` with helpers.
+- Schema validation and type checking at manifest load and transaction commit.
+- Event contracts via `emits` declarations and retention policies.
+- A compact compatibility/transpiler model to map v0.13 to earlier versions when needed.
+
+Core runtime contract
+---------------------
+Tick model
+1. Collect — find matches for active rules.
+2. Score & Select — compute scores, apply priority bands, round-robin within bands, apply matchAge boosting, select non-conflicting matches deterministically.
+3. Apply Transactions — acquire canonical locks, apply rewrite atomically, validate schema, commit or rollback.
+4. Emit Events — create Event nodes for commits, failures, and hooks; perform checkpointing at configured intervals.
+
+Transactions and locking
+- Atomicity: each selected match is applied as an atomic transaction; commit or rollback emits an Event.
+- Lock key: canonical lock key = (type_hash, creation_timestamp, node_id).
+- Locks acquired in ascending lock key order to avoid deadlocks.
+- Lock timeouts cause transaction abort and follow rule policy for reschedule.
+
+Conflict detection and read/write inference
+- Primary conflict rule: write-set intersection prevents concurrent conflicting rewrites.
+- Engine infers read and write sets from `when` and `then`. If inference is ambiguous, manifest load fails unless explicit `reads`/`writes` are provided.
+- Escape hatch: `reads` and `writes` metadata allowed only to disambiguate; engine validates declared sets are a superset of inferred sets.
+
+Failure and retry semantics
+- Rule-level `on_timeout` and policy `retry` semantics are enforced by the engine. Policies define backoff and max attempts.
+- Circuit breaker tracked per rule id with CLOSED/OPEN/HALF_OPEN states; engine emits Event(type="CircuitOpen") and Event(type="CircuitClose").
+- Hook failures are logged as Event(type="HookFailure") and do not roll back the committed transaction.
+
+Language grammar and semantics
+------------------------------
+Top-level constructs
+- `policy <Name>(<params>?) { ... }` — reusable, parameterized policy objects.
+- `rule <Name> priority=<int> { metadata { ... } when { ... } then { ... } hooks { ... } }` — rule declaration.
+- `pure fn` and `effect(...) fn` — function declarations integrated into the type system.
+- `node` and `edge` type declarations are optional in authoring but required for schema validation.
+
+Metadata block
+- Fields: `idempotent`, `depends_on`, `use <Policy>(...)`, `emits = ["EVENT"]`, optional `reads`, optional `writes`.
+- Policy precedence: rule-level explicit fields override instantiated policy parameters; instantiated policy parameters override policy defaults; engine global defaults are lowest precedence.
+
+When block
+- Pattern lines: `<Var> where <predicate>` binds `<Var>` to a matched node. `where` may be omitted for simple equality patterns.
+- Let bindings: `let <name> = <pure_expr>` evaluated during matching; bound values are available to subsequent patterns and to `then`. `let` in `when` must use pure functions only.
+- Collections: `<Name> many <Type> where <predicate>` binds `<Name>` to an ordered array of matches. Order is deterministic: `created_at asc`, then `id asc`.
+- Existence operators: `exists <pattern>` and `not exists <pattern>` support node and edge patterns.
+- Count helper: `let n = count(<collection_or_pattern>)`.
+
+Then block
+- Actions: `let`, `update <Node> { ... }`, `create <NodeOrEdge>`, `delete <NodeOrEdge> [when <expr>]`, `emit Event(...)`, `for <elem> in <collection> { ... }`, `call <EffectFn>(...)`.
+- Let semantics: `let` in `then` may call effect functions but must respect effect annotations (timeouts, idempotency).
+- Conditional delete: `delete X when <expr>` deletes only if `<expr>` evaluates true; delete is idempotent and a no-op if target missing.
+- Collection operations: `count`, `first`, `last`, `nth`, `map`, `filter`, `reduce` are available for `many` collections.
+
+Hooks
+- `after_commit`: run after transaction commit and lock release; may emit events and schedule external work; cannot mutate core graph.
+- `on_failure`: run after transaction rollback; may emit events and schedule remediation.
+
+Function model
+- `pure fn` — deterministic, side-effect free, cacheable.
+- `effect(idempotent=bool, timeout_ms=int, on_timeout=...) fn` — effectful functions with enforced timeouts and `on_timeout` policy (`retry`, `fail`, `return_default`, `propagate`, `escalate`). Engine enforces timeouts and applies policy.
+
+Policies and observability
+--------------------------
+Policy objects
+- Definition: `policy Name(params?) { ... }` with fields such as `timeout_ms`, `on_timeout`, `retry { ... }`, `rate_limit { ... }`, `circuit_breaker { ... }`, `retention { ... }`.
+- Parameterization: policies accept parameters and can be instantiated per rule with overrides.
+- Composition: multiple `use` entries compose; conflicts resolved by precedence rules.
+
+Rate limiting
+- Enforcement: during selection; `max_per_tick` and `max_per_second` supported. Excess matches are deferred and age-boosted.
+- Per-rule counters: engine tracks counters and enforces circuit breaker interactions.
+
+Circuit breaker
+- Fields: `threshold`, `cooldown_ms`, `half_open_attempts`.
+- Behavior: failures increment counters; when threshold exceeded, rule enters OPEN state; after cooldown, HALF_OPEN attempts are allowed.
+
+Event model
+- Event node shape:
+  node Event {
+    id: identifier
+    type: identifier
+    timestamp: number
+    rule_id: identifier?
+    trace_id: identifier?
+    payload: value?
+    match_nodes: array<identifier>
+    match_edges: array<identifier>
+    written_nodes: array<identifier>
+    written_edges: array<identifier>
+  }
+- Emits declaration: rules may declare `emits = ["TYPE_A", ...]` in metadata; engine validates emitted types are declared.
+- Retention: policies control retention tiers (`audit`, `compact`, `prune`) and retention durations.
+
+Schema validation and type system
+--------------------------------
+Node and edge schemas
+- Declaration: node and edge types may be declared in the manifest or imported from a schema file. Declarations include required fields, types, and constraints.
+- Validation: `create` and `update` are validated at manifest load (static checks where possible) and at runtime commit. Violations cause transaction abort and Event(type="SchemaViolation").
+
+Type checking
+- Static checks: manifest compile validates that `then` assignments satisfy declared types where values are statically known.
+- Runtime checks: dynamic values validated at commit; failures produce diagnostics and rollback.
+
+Tooling, manifest, and migration
+--------------------------------
+Authoring and engine input
+- Authoring: YAML or `.grisp` authoring files for humans and LLMs.
+- Engine input: JSON produced by `manifest-compile` and validated against `GRISP_V0.13_rule_manifest_schema.json`.
+
+Toolchain
+- `manifest-lint` enforces style, required `emits` where used, and warns on missing `reads`/`writes` when inference ambiguous.
+- `manifest-compile` converts authoring format to engine JSON and runs schema validation.
+- `trace-compare` compares engine traces to canonical oracles for deterministic tests.
+- `transpiler` provides best-effort mapping V0.13 ? V0.12/V0.11 with a migration report.
+
+Compatibility model
+- Stable core: tick model, transaction semantics, Event shape, and lock key format are the compatibility anchors.
+- Transpiler: maps policy objects to older metadata fields where possible; emits warnings for constructs that cannot be mapped. The transpiler is a separate tool and not part of the engine.
+
+Implementation roadmap and deliverables
+---------------------------------------
+Phase 0 Design
+- Finalize grammar and JSON Schema for v0.13. Produce canonical examples and policy library.
+
+Phase 1 Prototype (2 weeks)
+- Implement `manifest-compile` and `manifest-lint`.
+- Build minimal single-node engine implementing the stable core: tick loop, deterministic selection, lock manager, atomic transactions, Event emission.
+
+Phase 2 Policies and Effects (2 weeks)
+- Implement policy runtime: timeouts, retries, circuit breaker counters, rate limiting.
+- Implement function runtime with effect timeouts and `on_timeout` policies.
+
+Phase 3 Validation and Tooling (2 weeks)
+- Create canonical Build Lexer trace and extended test scenarios.
+- Implement `trace-compare` and `transpiler`.
+- Add CI checks: manifest schema validation, deterministic trace regression tests.
+
+Example GRISP v0.13 file (authoring format)
+-------------------------------------------
+# File: grisp_v0.13_example.grisp
+
+policy TimeoutRetry3x {
+  timeout_ms = 5000
+  on_timeout = retry
+  retry { backoff = exponential; max_attempts = 3; initial_delay_ms = 100 }
+}
+
+policy RateLimitHigh { max_per_tick = 200; max_per_second = 1000 }
+
+policy CircuitBreakerDefault { threshold = 10; cooldown_ms = 60000; half_open_attempts = 2 }
+
+pure fn Now(): number
+pure fn NewId(): identifier
+pure fn Normalize(s: string): string
+pure fn CanExecute(agent: Agent, task: Task): boolean
+effect(idempotent=true, timeout_ms=5000, on_timeout="return_default")
+fn MergeResults(tasks: Task[]): Value
+
+rule MergeDuplicatePlannedTasks priority=95 {
+  metadata { idempotent = true; use RetentionAudit; emits = ["MERGE_TASKS"] }
+  when {
+    TaskA where lifecycle == "planned"
+    let NormA = Normalize(TaskA.description)
+    TaskB where lifecycle == "planned" and TaskB.id != TaskA.id and Normalize(TaskB.description) == NormA
+    condition SamePlanOrigin(TaskA, TaskB)
+  }
+  then {
+    let Keep = (TaskA.created_at <= TaskB.created_at ? TaskA : TaskB)
+    let Drop = (Keep == TaskA ? TaskB : TaskA)
+    update Keep { tags = Keep.tags + Drop.tags }
+    delete Drop
+    emit Event(type="MERGE_TASKS", payload={kept:Keep.id, dropped:Drop.id})
+  }
+}
+
+rule AssignPendingTask priority=80 {
+  metadata { idempotent = false; depends_on = ["ActivatePlannedTask"]; use TimeoutRetry3x; use RateLimitHigh; use CircuitBreakerDefault; emits = ["ASSIGN_TASK"] }
+  when {
+    Task where lifecycle == "pending" and cost = Cost
+    Specialist where role == "Specialist" and capacity_total - capacity_used >= Cost
+    condition CanExecute(Specialist, Task)
+  }
+  then {
+    let NewCapacity = Specialist.capacity_used + Cost
+    update Task { lifecycle = "assigned", updated_at = Now() }
+    update Specialist { capacity_used = NewCapacity }
+    create assigns(Specialist -> Task)
+    emit Event(type="ASSIGN_TASK", payload={task:Task.id, agent:Specialist.id})
+  }
+  hooks { after_commit: ["emit_assignment_webhook"] }
+}
+
+rule CreateToolRequest priority=60 {
+  metadata { idempotent = false; depends_on = ["StartAssignedTask"]; use RateLimitHigh; use CircuitBreakerDefault; emits = ["CREATE_TOOL_REQUEST"] }
+  when {
+    Task where lifecycle == "in_progress" and description = Desc
+    edge assigns(Agent -> Task)
+    not exists TR where TR.task == Task and TR.status in ["pending","running"]
+  }
+  then {
+    let RK = GenerateRequestKey(Task, Desc)
+    update Task { lifecycle = "waiting_tool", updated_at = Now() }
+    create TR: ToolRequest {
+      id = NewId()
+      kind = DecideToolKind(Desc)
+      input = Desc
+      status = "pending"
+      created_at = Now()
+      task = Task
+      request_key = RK
+    }
+    create tool_for_task(TR -> Task)
+    emit Event(type="CREATE_TOOL_REQUEST", payload={task:Task.id, request:TR.id})
+  }
+  hooks { after_commit: ["schedule_tool_request_timeout", "emit_tool_request_webhook"] }
+}
+
+rule IntegrateToolResultSuccess priority=95 {
+  metadata { idempotent = true; depends_on = ["CreateToolRequest"]; emits = ["TOOL_RESULT_SUCCESS"] }
+  when {
+    ToolRes where success == true and request = TR
+    TR where status == "completed" and TR.task = Task
+    Task where lifecycle == "waiting_tool"
+    edge tool_for_task(TR -> Task)
+  }
+  then {
+    update Task { lifecycle = "completed", result = ToolRes.data, updated_at = Now() }
+    delete assigns(Agent -> Task)
+    create result_of_request(ToolRes -> TR)
+    emit Event(type="TOOL_RESULT_SUCCESS", payload={task:Task.id, request:TR.id})
+  }
+}
+
+rule IntegrateToolResultFailure priority=90 {
+  metadata { idempotent = true; depends_on = ["CreateToolRequest"]; emits = ["TOOL_RESULT_FAILURE"] }
+  when {
+    ToolRes where success == false and request = TR
+    TR where status == "failed" and TR.task = Task
+    Task where lifecycle == "waiting_tool" and retries = R and max_retries = MaxR
+    edge tool_for_task(TR -> Task)
+  }
+  then {
+    let NewRetries = R + 1
+    let WillFail = NewRetries > MaxR
+    update Task { lifecycle = (WillFail ? "failed" : "planned"), retries = NewRetries, updated_at = Now(), error = ToolRes.error }
+    delete assigns(Agent -> Task) when WillFail == true
+    create result_of_request(ToolRes -> TR)
+    emit Event(type="TOOL_RESULT_FAILURE", payload={task:Task.id, request:TR.id, will_fail:WillFail})
+  }
+}
+
+rule ReleaseCapacityOnCompletion priority=85 {
+  metadata { idempotent = true; depends_on = ["IntegrateToolResultSuccess", "IntegrateToolResultFailure"]; emits = ["RELEASE_CAPACITY"] }
+  when {
+    Task where lifecycle in ["completed","failed"] and cost = Cost
+    edge assigns(Agent -> Task)
+  }
+  then {
+    update Agent { capacity_used = Agent.capacity_used - Cost }
+    delete assigns(Agent -> Task)
+    emit Event(type="RELEASE_CAPACITY", payload={task:Task.id, agent:Agent.id})
+  }
+}
+
+rule SynthesizeLeafGoalResults priority=50 {
+  metadata { idempotent = true; depends_on = ["IntegrateToolResultSuccess", "ReleaseCapacityOnCompletion"]; emits = ["SYNTHESIZE_GOAL"] }
+  when {
+    Goal where lifecycle in ["pending","in_progress"]
+    condition IsLeafGoal(Goal)
+    CompletedTasks many Task where lifecycle == "completed" and belongs_to_goal(CompletedTasks -> Goal)
+    let TaskCount = count(CompletedTasks)
+    condition TaskCount > 0
+  }
+  then {
+    let Result = MergeResults(CompletedTasks)
+    update Goal { lifecycle = "completed", updated_at = Now() }
+    create Answer: FinalAnswer { id = NewId(), goal = Goal, content = Result, confidence = CalculateConfidence(CompletedTasks), source_tasks = CompletedTasks }
+    emit Event(type="SYNTHESIZE_GOAL", payload={goal:Goal.id, answer:Answer.id, task_count:TaskCount})
+  }
+  hooks { after_commit: ["archive_goal_results"] }
+}
+
+Notes and filenames
+-------------------
+- Spec file suggestion: docs/specs/GRISP_V0.13_Spec.md
+- Authoring example: examples/grisp_v0.13_example.grisp
+- Authoring manifest (YAML): configs/GRISP_V0.13_manifest.yaml
+- Engine manifest (JSON): configs/GRISP_V0.13_manifest.json (produced by manifest-compile)
+- JSON Schema: docs/manifests/GRISP_V0.13_rule_manifest_schema.json
+
+End of GRISP v0.13 specification.

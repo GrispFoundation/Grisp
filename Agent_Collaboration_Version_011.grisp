@@ -1,0 +1,311 @@
+# ==========================================================
+# GRISP - Agent Collaboration Protocol Version 0.11
+# Backwards compatible with v0.10; adds on_timeout, circuit_breaker,
+# rate_limit, explicit reads/writes, and function on_timeout semantics.
+# ==========================================================
+
+namespace AgentCollaborationV011 {
+
+  # ----------------------
+  # Core node types (unchanged)
+  # ----------------------
+
+  node Agent {
+    id: identifier
+    role: ("Planner" | "Specialist")
+    capabilities: array<identifier>
+    capacity_total: number
+    capacity_used: number
+  }
+
+  node Goal {
+    id: identifier
+    description: string
+    lifecycle: ("planned" | "pending" | "in_progress" | "completed" | "failed")
+    created_at: number
+    updated_at: number
+    tags: array<identifier>
+    failure_policy: ("fail_fast" | "best_effort" | "majority")
+  }
+
+  node Task {
+    id: identifier
+    description: string
+    lifecycle: ("planned" | "pending" | "assigned" | "in_progress" | "waiting_tool" | "completed" | "failed")
+    priority: number
+    cost: number
+    retries: number
+    max_retries: number
+    tags: array<identifier>
+    created_at: number
+    updated_at: number
+  }
+
+  node PlanningRequest {
+    id: identifier
+    goal: node<Goal>
+    status: ("pending" | "running" | "completed" | "failed")
+    created_at: number
+    hint: value?
+    timeout_ms: number?
+    request_key: string?
+  }
+
+  node ToolRequest {
+    id: identifier
+    kind: ("WebSearch" | "CodeExecution")
+    input: value
+    status: ("pending" | "running" | "completed" | "failed")
+    created_at: number
+    task: node<Task>
+    timeout_ms: number?
+    request_key: string?
+  }
+
+  node ToolResult {
+    id: identifier
+    request: node<ToolRequest>
+    success: boolean
+    data: value?
+    error: string?
+    created_at: number
+  }
+
+  node Event {
+    id: identifier
+    type: identifier
+    timestamp: number
+    rule_id: identifier?
+    trace_id: identifier?
+    payload: value?
+    match_nodes: array<identifier>
+    match_edges: array<identifier>
+    written_nodes: array<identifier>
+    written_edges: array<identifier>
+  }
+
+  node FinalAnswer {
+    id: identifier
+    goal: node<Goal>
+    content: value
+    confidence: number
+    source_tasks: array<node<Task>>
+  }
+
+  # ----------------------
+  # Native edges (unchanged)
+  # ----------------------
+
+  edge subgoal_of { from: Goal to: Goal }
+  edge belongs_to_goal { from: Task to: Goal }
+  edge depends_on { from: Task to: Task }
+  edge assigns { from: Agent to: Task }
+  edge created_by_plan { from: Goal to: PlanningRequest }
+  edge created_by_plan { from: Task to: PlanningRequest }
+  edge tool_for_task { from: ToolRequest to: Task }
+  edge result_of_request { from: ToolResult to: ToolRequest }
+  edge event_for { from: Event to: node }
+
+  # ----------------------
+  # Rule metadata additions (v0.11)
+  # ----------------------
+  #
+  # New optional metadata fields available in rule declarations:
+  # - on_timeout: "retry" | "fail" | "escalate" | "ignore" | "return_default"
+  # - rate_limit: { max_per_tick: int?, max_per_second: int? }
+  # - circuit_breaker: { failure_threshold: int, cooldown_ms: int, half_open_attempts: int }
+  # - reads: array<string>  # explicit read set override
+  # - writes: array<string> # explicit write set override
+  #
+  # Semantics:
+  # - on_timeout is enforced by the engine when a rule transaction or an effectful function times out.
+  # - rate_limit is enforced during selection; excess matches are deferred and age-boosted.
+  # - circuit_breaker is tracked per rule id; engine emits Event(type="CircuitOpen") when opened.
+  # - reads/writes, if present, must be a superset of inferred sets; engine rejects manifest on mismatch.
+
+  # ----------------------
+  # Example corrected rules with v0.11 metadata
+  # ----------------------
+
+  node rule AssignPendingTask {
+    id = "AssignPendingTask"
+    priority = 80
+    idempotent = false
+    depends_on = ["ActivatePlannedTask"]
+    # v0.11 metadata
+    rate_limit = { max_per_tick = 200, max_per_second = 1000 }
+    circuit_breaker = { failure_threshold = 20, cooldown_ms = 60000, half_open_attempts = 3 }
+    on_timeout = "retry"  # engine will retry according to backoff policy
+    # Optional explicit read/write override (engine validates)
+    reads = ["Task.lifecycle", "Task.cost", "Agent.capacity_total", "Agent.capacity_used", "Agent.capabilities"]
+    writes = ["Task.lifecycle", "Agent.capacity_used", "assigns_edge"]
+
+    match: graph = {
+      Task: node = { lifecycle = "pending", cost = Cost }
+      Specialist: node = { role = "Specialist", capacity_used = OldCapacity, capacity_total = Total }
+      condition CanExecute(Specialist, Task) = true
+      condition Total - OldCapacity >= Cost
+    }
+    rewrite: graph = {
+      let NewCapacity = OldCapacity + Cost
+      Task: node = { lifecycle = "assigned", updated_at = Now() }
+      Specialist: node = { capacity_used = NewCapacity }
+      edge assigns { from: Specialist to: Task }
+    }
+    timeout_ms = 1000
+  }
+
+  node rule CreateToolRequest {
+    id = "CreateToolRequest"
+    priority = 60
+    idempotent = false
+    sideEffectFlags = ["creates_request","external_call"]
+    depends_on = ["StartAssignedTask"]
+    rate_limit = { max_per_tick = 200, max_per_second = 1000 }
+    circuit_breaker = { failure_threshold = 10, cooldown_ms = 120000, half_open_attempts = 2 }
+    on_timeout = "escalate"
+    reads = ["Task.lifecycle", "Task.description", "assigns"]
+    writes = ["ToolRequest.node", "Task.lifecycle", "tool_for_task_edge"]
+
+    match: graph = {
+      Task: node = { lifecycle = "in_progress", description = Desc }
+      edge assigns { from: Specialist to: Task }
+      not exists TR: node = ToolRequest { task = Task, status in ["pending","running"] }
+    }
+    rewrite: graph = {
+      let RK = GenerateRequestKey(Task, Desc)
+      Task: node = { lifecycle = "waiting_tool", updated_at = Now() }
+      TR: node = ToolRequest {
+        id = NewId()
+        kind = DecideToolKind(Desc)
+        input = Desc
+        status = "pending"
+        created_at = Now()
+        task = Task
+        request_key = RK
+      }
+      edge tool_for_task { from: TR to: Task }
+    }
+    timeout_ms = 5000
+    after_commit = ["schedule_tool_request_timeout", "emit_tool_request_webhook"]
+  }
+
+  node rule IntegrateToolResultSuccess {
+    id = "IntegrateToolResultSuccess"
+    priority = 95
+    idempotent = true
+    depends_on = ["CreateToolRequest"]
+    reads = ["ToolResult.success", "ToolResult.request", "ToolRequest.status", "Task.lifecycle", "assigns"]
+    writes = ["Task.lifecycle", "Task.result", "Agent.capacity_used", "assigns_edge"]
+    match: graph = {
+      ToolRes: node = { success = true, request = TR }
+      TR: node = { status = "completed", task = Task }
+      Task: node = { lifecycle = "waiting_tool" }
+      edge tool_for_task { from: TR to: Task }
+    }
+    rewrite: graph = {
+      Task: node = { lifecycle = "completed", result = ToolRes.data, updated_at = Now() }
+      delete edge assigns { from: Specialist to: Task }  # idempotent no-op if missing
+      edge result_of_request { from: ToolRes to: TR }
+    }
+    timeout_ms = 2000
+  }
+
+  node rule IntegrateToolResultFailure {
+    id = "IntegrateToolResultFailure"
+    priority = 90
+    idempotent = true
+    depends_on = ["CreateToolRequest"]
+    reads = ["ToolResult.success", "ToolResult.request", "ToolRequest.status", "Task.lifecycle", "Task.retries", "Task.max_retries"]
+    writes = ["Task.lifecycle", "Task.retries", "Task.error", "Agent.capacity_used", "assigns_edge"]
+    match: graph = {
+      ToolRes: node = { success = false, request = TR }
+      TR: node = { status = "failed", task = Task }
+      Task: node = { lifecycle = "waiting_tool", retries = R, max_retries = MaxR }
+      edge tool_for_task { from: TR to: Task }
+    }
+    rewrite: graph = {
+      let NewRetries = R + 1
+      let WillFail = NewRetries > MaxR
+      Task: node = { lifecycle = (WillFail ? "failed" : "planned"), retries = NewRetries, updated_at = Now(), error = ToolRes.error }
+      delete edge assigns { from: Specialist to: Task } when WillFail = true
+      edge result_of_request { from: ToolRes to: TR }
+    }
+    timeout_ms = 2000
+    on_timeout = "retry"
+  }
+
+  node rule SynthesizeLeafGoalResults {
+    id = "SynthesizeLeafGoalResults"
+    priority = 50
+    idempotent = true
+    depends_on = ["IntegrateToolResultSuccess", "ReleaseCapacityOnCompletion"]
+    sideEffectFlags = ["external_call"]
+    reads = ["Goal.lifecycle", "belongs_to_goal", "Task.lifecycle"]
+    writes = ["Goal.lifecycle", "FinalAnswer.node"]
+    match: graph = {
+      Goal: node = { lifecycle in ["pending","in_progress"] }
+      condition IsLeafGoal(Goal) = true
+      condition AllTasksCompleted(Goal) = true
+      CompletedTasks: many node = Task { lifecycle = "completed" }
+      edges: many belongs_to_goal { from: CompletedTasks to: Goal }
+    }
+    rewrite: graph = {
+      Goal: node = { lifecycle = "completed", updated_at = Now() }
+      Answer: node = FinalAnswer { id = NewId(), goal = Goal, content = MergeResults(CompletedTasks), confidence = CalculateConfidence(CompletedTasks), source_tasks = CompletedTasks }
+    }
+    timeout_ms = 5000
+    on_timeout = "escalate"
+  }
+
+  # ----------------------
+  # Function metadata additions
+  # ----------------------
+  #
+  # Functions must be annotated as @pure or @effect. v0.11 adds on_timeout to effect annotations.
+  #
+  # Example:
+  # fn MergeResults(tasks: array<node<Task>>): value
+  #   @effect(idempotent=true, timeout_ms=5000, on_timeout="return_default")
+  #
+  # Semantics:
+  # - If an effect function times out, engine applies the declared on_timeout policy:
+  #   - "return_default": function returns a default value (engine or rule-provided)
+  #   - "retry": engine retries the function according to rule backoff policy
+  #   - "fail": treat as function failure and follow rule failure semantics
+  #   - "propagate": bubble the failure to the rule and let rule handle it
+  #   - "escalate": emit Event(type="FunctionTimeout") and mark for human review
+
+  fn Now(): number  @pure
+  fn NewId(): identifier  @pure
+  fn DecideToolKind(desc: string): ("WebSearch" | "CodeExecution")  @pure
+  fn GenerateRequestKey(task: node<Task>, desc: string): string  @pure
+
+  fn CanExecute(agent: node<Agent>, task: node<Task>): boolean  @pure
+  fn AvailableCapacity(agent: node<Agent>): number  @pure
+  fn AllTasksCompleted(goal: node<Goal>): boolean  @pure
+  fn IsLeafGoal(goal: node<Goal>): boolean  @pure
+
+  fn MergeResults(tasks: array<node<Task>>): value
+    @effect(idempotent=true, timeout_ms=5000, on_timeout="return_default")
+
+  fn CalculateConfidence(tasks: array<node<Task>>): number  @pure
+
+  # ----------------------
+  # Engine enforcement notes
+  # ----------------------
+  #
+  # - on_timeout: engine enforces rule-level and function-level timeouts. For rule-level timeouts the engine follows the rule's on_timeout policy.
+  # - rate_limit: enforced during selection; matches exceeding limits are deferred and age-boosted.
+  # - circuit_breaker: engine tracks failures per rule id and transitions between CLOSED, OPEN, HALF_OPEN; emits Event(type="CircuitOpen"/"CircuitClose").
+  # - reads/writes: if present, engine validates declared sets are a superset of inferred sets; otherwise manifest load fails.
+  # - after_commit: hooks run after commit, outside locks, cannot mutate core graph; failures logged as Event(type="HookFailure").
+  # - delete edge: unconditional delete is idempotent; conditional delete uses when clause.
+  #
+  # ----------------------
+  # Backwards compatibility
+  # ----------------------
+  # - All new metadata fields are optional. Existing V0.10 manifests remain valid.
+  # - Engine should validate and warn on deprecated or unknown fields.
+
+}

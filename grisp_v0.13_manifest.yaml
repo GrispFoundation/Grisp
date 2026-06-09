@@ -1,0 +1,424 @@
+# File: GRISP_V0.13_manifest.yaml
+version: "v0.13"
+generated_by: "Skybuck"
+generated_at: "2026-06-09T23:50:00Z"
+
+policies:
+  - name: TimeoutRetry3x
+    params: []
+    body:
+      timeout_ms: 5000
+      on_timeout: retry
+      retry:
+        backoff: exponential
+        max_attempts: 3
+        initial_delay_ms: 100
+
+  - name: RateLimit
+    params:
+      - name: max_per_tick
+        type: integer
+      - name: max_per_second
+        type: integer
+    body: {}
+
+  - name: RateLimitHigh
+    params: []
+    body:
+      max_per_tick: 200
+      max_per_second: 1000
+
+  - name: CircuitBreakerDefault
+    params: []
+    body:
+      threshold: 10
+      cooldown_ms: 60000
+      half_open_attempts: 2
+
+  - name: RetentionAudit
+    params: []
+    body:
+      mode: audit
+      keep_days: 90
+
+functions:
+  - name: Now
+    signature: "() -> number"
+    kind: pure
+  - name: NewId
+    signature: "() -> identifier"
+    kind: pure
+  - name: Normalize
+    signature: "(s: string) -> string"
+    kind: pure
+  - name: DecideToolKind
+    signature: "(desc: string) -> string"
+    kind: pure
+  - name: GenerateRequestKey
+    signature: "(task: Task, desc: string) -> string"
+    kind: pure
+  - name: CanExecute
+    signature: "(agent: Agent, task: Task) -> boolean"
+    kind: pure
+  - name: MergeResults
+    signature: "(tasks: Task[]) -> value"
+    kind: effect
+    effect:
+      idempotent: true
+      timeout_ms: 5000
+      on_timeout: return_default
+  - name: CalculateConfidence
+    signature: "(tasks: Task[]) -> number"
+    kind: pure
+
+nodes:
+  - name: Agent
+    fields:
+      - name: id
+        type: identifier
+        required: true
+      - name: role
+        type: string
+        required: true
+      - name: capabilities
+        type: array
+        required: false
+      - name: capacity_total
+        type: number
+        required: true
+      - name: capacity_used
+        type: number
+        required: true
+
+  - name: Goal
+    fields:
+      - name: id
+        type: identifier
+        required: true
+      - name: description
+        type: string
+        required: true
+      - name: lifecycle
+        type: string
+        required: true
+      - name: created_at
+        type: number
+        required: true
+      - name: updated_at
+        type: number
+        required: false
+      - name: tags
+        type: array
+        required: false
+
+  - name: Task
+    fields:
+      - name: id
+        type: identifier
+        required: true
+      - name: description
+        type: string
+        required: true
+      - name: lifecycle
+        type: string
+        required: true
+      - name: priority
+        type: integer
+        required: false
+      - name: cost
+        type: number
+        required: false
+      - name: retries
+        type: integer
+        required: false
+      - name: max_retries
+        type: integer
+        required: false
+      - name: tags
+        type: array
+        required: false
+      - name: created_at
+        type: number
+        required: true
+      - name: updated_at
+        type: number
+        required: false
+
+  - name: ToolRequest
+    fields:
+      - name: id
+        type: identifier
+        required: true
+      - name: kind
+        type: string
+        required: true
+      - name: input
+        type: object
+        required: false
+      - name: status
+        type: string
+        required: true
+      - name: created_at
+        type: number
+        required: true
+      - name: task
+        type: Task
+        required: true
+      - name: request_key
+        type: string
+        required: false
+
+  - name: ToolResult
+    fields:
+      - name: id
+        type: identifier
+        required: true
+      - name: request
+        type: ToolRequest
+        required: true
+      - name: success
+        type: boolean
+        required: true
+      - name: data
+        type: object
+        required: false
+      - name: error
+        type: string
+        required: false
+      - name: created_at
+        type: number
+        required: true
+
+  - name: Event
+    fields:
+      - name: id
+        type: identifier
+        required: true
+      - name: type
+        type: string
+        required: true
+      - name: timestamp
+        type: number
+        required: true
+      - name: rule_id
+        type: string
+        required: false
+      - name: trace_id
+        type: string
+        required: false
+      - name: payload
+        type: object
+        required: false
+      - name: match_nodes
+        type: array
+        required: false
+      - name: match_edges
+        type: array
+        required: false
+      - name: written_nodes
+        type: array
+        required: false
+      - name: written_edges
+        type: array
+        required: false
+
+edges:
+  - name: subgoal_of
+    from: Goal
+    to: Goal
+  - name: belongs_to_goal
+    from: Task
+    to: Goal
+  - name: depends_on
+    from: Task
+    to: Task
+  - name: assigns
+    from: Agent
+    to: Task
+  - name: created_by_plan
+    from: Goal
+    to: ToolRequest
+  - name: tool_for_task
+    from: ToolRequest
+    to: Task
+  - name: result_of_request
+    from: ToolResult
+    to: ToolRequest
+  - name: event_for
+    from: Event
+    to: Task
+
+rules:
+  - id: MergeDuplicatePlannedTasks
+    name: MergeDuplicatePlannedTasks
+    priority: 95
+    description: "Detect and merge duplicate planned tasks with identical normalized descriptions."
+    metadata:
+      idempotent: true
+      use:
+        - policy: RetentionAudit
+      emits:
+        - MERGE_TASKS
+    when:
+      patterns:
+        - var: TaskA
+          type: Task
+          where: "lifecycle == 'planned'"
+        - var: TaskB
+          type: Task
+          where: "lifecycle == 'planned' and TaskB.id != TaskA.id"
+      lets:
+        - name: NormA
+          expr: "Normalize(TaskA.description)"
+      conditions:
+        - expr: "Normalize(TaskB.description) == NormA"
+        - expr: "SamePlanOrigin(TaskA, TaskB)"
+    then:
+      actions:
+        - let: Keep
+          expr: "(TaskA.created_at <= TaskB.created_at ? TaskA : TaskB)"
+        - let: Drop
+          expr: "(Keep == TaskA ? TaskB : TaskA)"
+        - update: "{{Keep}}"
+          fields:
+            tags: "Keep.tags + Drop.tags"
+        - delete: "{{Drop}}"
+        - emit:
+            type: MERGE_TASKS
+            payload:
+              kept: "Keep.id"
+              dropped: "Drop.id"
+
+  - id: ActivatePlannedTask
+    name: ActivatePlannedTask
+    priority: 90
+    description: "Flip planned tasks to pending when no blocking dependencies exist."
+    metadata:
+      idempotent: true
+      depends_on:
+        - MergeDuplicatePlannedTasks
+      emits:
+        - ACTIVATE_TASK
+    when:
+      patterns:
+        - var: Task
+          type: Task
+          where: "lifecycle == 'planned'"
+      conditions:
+        - expr: "not exists edge depends_on(Task -> Dep) where Dep.lifecycle in ['pending','assigned','in_progress','waiting_tool']"
+    then:
+      actions:
+        - update: Task
+          fields:
+            lifecycle: pending
+            updated_at: "Now()"
+        - emit:
+            type: ACTIVATE_TASK
+            payload:
+              task: "Task.id"
+
+  - id: AssignPendingTask
+    name: AssignPendingTask
+    priority: 80
+    description: "Assign pending tasks to capable specialists."
+    metadata:
+      idempotent: false
+      depends_on:
+        - ActivatePlannedTask
+      use:
+        - policy: TimeoutRetry3x
+        - policy: RateLimit
+          params:
+            max_per_tick: 200
+            max_per_second: 1000
+        - policy: CircuitBreakerDefault
+      emits:
+        - ASSIGN_TASK
+    when:
+      patterns:
+        - var: Task
+          type: Task
+          where: "lifecycle == 'pending' and cost = Cost"
+        - var: Specialist
+          type: Agent
+          where: "role == 'Specialist' and capacity_total - capacity_used >= Cost"
+      conditions:
+        - expr: "CanExecute(Specialist, Task)"
+    then:
+      actions:
+        - let: NewCapacity
+          expr: "Specialist.capacity_used + Cost"
+        - update: Task
+          fields:
+            lifecycle: assigned
+            updated_at: "Now()"
+        - update: Specialist
+          fields:
+            capacity_used: "NewCapacity"
+        - create: assigns
+          spec:
+            from: Specialist
+            to: Task
+        - emit:
+            type: ASSIGN_TASK
+            payload:
+              task: "Task.id"
+              agent: "Specialist.id"
+    hooks:
+      after_commit:
+        - emit_assignment_webhook
+
+  - id: CreateToolRequest
+    name: CreateToolRequest
+    priority: 60
+    description: "Create a ToolRequest for in-progress tasks when needed."
+    metadata:
+      idempotent: false
+      depends_on:
+        - StartAssignedTask
+      use:
+        - policy: RateLimit
+          params:
+            max_per_tick: 200
+            max_per_second: 1000
+        - policy: CircuitBreakerDefault
+      emits:
+        - CREATE_TOOL_REQUEST
+    when:
+      patterns:
+        - var: Task
+          type: Task
+          where: "lifecycle == 'in_progress' and description = Desc"
+      conditions:
+        - expr: "exists edge assigns(Agent -> Task)"
+        - expr: "not exists TR where TR.task == Task and TR.status in ['pending','running']"
+    then:
+      actions:
+        - let: RK
+          expr: "GenerateRequestKey(Task, Desc)"
+        - update: Task
+          fields:
+            lifecycle: waiting_tool
+            updated_at: "Now()"
+        - create: TR
+          spec:
+            id: "NewId()"
+            kind: "DecideToolKind(Desc)"
+            input: "Desc"
+            status: pending
+            created_at: "Now()"
+            task: Task
+            request_key: RK
+        - create: tool_for_task
+          spec:
+            from: TR
+            to: Task
+        - emit:
+            type: CREATE_TOOL_REQUEST
+            payload:
+              task: "Task.id"
+              request: "TR.id"
+    hooks:
+      after_commit:
+        - schedule_tool_request_timeout
+        - emit_tool_request_webhook

@@ -1,0 +1,267 @@
+# ============================================================
+# GRISP - Agent Collaboration Protocol Version 0.08
+# Planning and execution unified into a single graph lifecycle
+# ============================================================
+
+namespace AgentCollaborationV008 {
+
+  # Core nodes
+  node Agent {
+    id: identifier
+    role: ("Planner" | "Specialist")
+    capabilities: array<identifier>
+    capacity: number
+  }
+
+  node Goal {
+    id: identifier
+    description: string
+    lifecycle: ("planned" | "pending" | "in_progress" | "completed" | "failed")
+    created_at: number
+    updated_at: number
+    tags: array<identifier>
+    failure_policy: ("fail_fast" | "best_effort" | "majority")
+  }
+
+  node Task {
+    id: identifier
+    description: string
+    lifecycle: ("planned" | "pending" | "assigned" | "in_progress" | "waiting_tool" | "completed" | "failed")
+    priority: number
+    cost: number
+    retries: number
+    max_retries: number
+    tags: array<identifier>
+    created_at: number
+    updated_at: number
+  }
+
+  node PlanningRequest {
+    id: identifier
+    goal: node<Goal>
+    status: ("pending" | "running" | "completed" | "failed")
+    created_at: number
+    hint: value?
+  }
+
+  node ToolRequest {
+    id: identifier
+    kind: ("WebSearch" | "CodeExecution")
+    input: value
+    status: ("pending" | "running" | "completed" | "failed")
+    created_at: number
+    task: node<Task>
+  }
+
+  node ToolResult {
+    id: identifier
+    request: node<ToolRequest>
+    success: boolean
+    data: value?
+    error: string?
+  }
+
+  node Message {
+    id: identifier
+    type: identifier
+    from: node<Agent>
+    to: node<Agent>
+    payload: node<Task>?
+    goal: node<Goal>?
+  }
+
+  node FinalAnswer {
+    id: identifier
+    goal: node<Goal>
+    content: value
+    confidence: number
+    source_tasks: array<node<Task>>
+  }
+
+  # Native edges used by planner and executor
+  edge subgoal_of { from: Goal to: Goal }
+  edge belongs_to_goal { from: Task to: Goal }
+  edge depends_on { from: Task to: Task }
+  edge assigns { from: Agent to: Task }
+
+  # Provenance
+  edge created_by_plan { from: Goal to: PlanningRequest }
+  edge created_by_plan { from: Task to: PlanningRequest }
+
+  # Rule set examples (all rules are pure graph rewrites)
+
+  # Planner creates planned nodes externally (planner runtime or planner agent).
+  # Validation rules operate on lifecycle="planned"
+
+  node rule MergeDuplicatePlannedTasks {
+    match: graph = {
+      TaskA: node = { lifecycle = "planned", description = Desc }
+      TaskB: node = { lifecycle = "planned", description = Desc }
+      # optionally same created_by_plan or similar heuristics
+    }
+    rewrite: graph = {
+      # merge B into A: copy tags/costs, rewire depends_on and belongs_to_goal, delete B
+      TaskA: node = { tags = TaskA.tags + TaskB.tags, cost = Max(TaskA.cost, TaskB.cost) }
+      delete TaskB
+    }
+  }
+
+  node rule DetectPlannedCycle {
+    match: graph = {
+      T1: node = { lifecycle = "planned" }
+      T2: node = { lifecycle = "planned" }
+      edge depends_on { from: T1 to: T2 }
+      edge depends_on { from: T2 to: T1 }
+    }
+    rewrite: graph = {
+      # mark cycle for human review or break it by removing one dependency
+      T1: node = { tags = T1.tags + ["cycle_detected"] }
+    }
+  }
+
+  # Activation separate from assignment
+
+  node rule ActivatePlannedGoal {
+    match: graph = {
+      Goal: node = { lifecycle = "planned" }
+      condition AllPlannedSubGoalsReady(Goal) = true
+    }
+    rewrite: graph = {
+      Goal: node = { lifecycle = "pending", updated_at = Now() }
+    }
+  }
+
+  node rule ActivatePlannedTask {
+    match: graph = {
+      Task: node = { lifecycle = "planned" }
+      condition AllDependenciesCompletedOrPlannedToActivate(Task) = true
+    }
+    rewrite: graph = {
+      Task: node = { lifecycle = "pending", updated_at = Now() }
+    }
+  }
+
+  node rule AssignPendingTask {
+    match: graph = {
+      Task: node = { lifecycle = "pending", cost = Cost }
+      Specialist: node = { role = "Specialist" }
+      condition CanExecute(Specialist, Task) = true
+      condition AvailableCapacity(Specialist) >= Cost
+    }
+    rewrite: graph = {
+      Task: node = { lifecycle = "assigned", updated_at = Now() }
+      edge assigns { from: Specialist to: Task }
+    }
+  }
+
+  node rule StartAssignedTask {
+    match: graph = {
+      Task: node = { lifecycle = "assigned" }
+      edge assigns { from: Specialist to: Task }
+    }
+    rewrite: graph = {
+      Task: node = { lifecycle = "in_progress", updated_at = Now() }
+    }
+  }
+
+  node rule CreateToolRequest {
+    match: graph = {
+      Task: node = { lifecycle = "in_progress", description = Desc }
+      edge assigns { from: Specialist to: Task }
+      not exists ToolReq: node = ToolRequest { task = Task, status in ["pending","running"] }
+    }
+    rewrite: graph = {
+      Task: node = { lifecycle = "waiting_tool", updated_at = Now() }
+      ToolReq: node = ToolRequest { id = NewId(), kind = DecideToolKind(Desc), input = Desc, status = "pending", created_at = Now(), task = Task }
+      edge tool_for_task { from: ToolReq to: Task }
+    }
+  }
+
+  node rule IntegrateToolResultSuccess {
+    match: graph = {
+      ToolRes: node = { success = true, request = ToolReq }
+      ToolReq: node = { status = "completed", task = Task }
+      Task: node = { lifecycle = "waiting_tool" }
+      edge assigns { from: Specialist to: Task }
+    }
+    rewrite: graph = {
+      Task: node = { lifecycle = "completed", result = ToolRes.data, updated_at = Now() }
+      delete edge assigns { from: Specialist to: Task }
+      edge result_of_request { from: ToolRes to: ToolReq }
+    }
+  }
+
+  node rule IntegrateToolResultFailure {
+    match: graph = {
+      ToolRes: node = { success = false, request = ToolReq }
+      ToolReq: node = { status = "failed", task = Task }
+      Task: node = { lifecycle = "waiting_tool" }
+      edge assigns { from: Specialist to: Task }
+    }
+    rewrite: graph = {
+      WillFail: value = (Task.retries + 1 > Task.max_retries)
+      Task: node = { lifecycle = (WillFail ? "failed" : "planned"), retries = Task.retries + 1, updated_at = Now() }
+      maybe delete edge assigns { from: Specialist to: Task } when WillFail = true
+      edge result_of_request { from: ToolRes to: ToolReq }
+    }
+  }
+
+  # Goal failure policy and synthesis rules operate on lifecycle values
+  node rule ShouldFailGoal {
+    match: graph = {
+      Goal: node = { lifecycle in ["pending","in_progress"], failure_policy = Policy }
+    }
+    rewrite: graph = {
+      condition ShouldFailGoalByPolicy(Goal, Policy) = true
+      Goal: node = { lifecycle = "failed", updated_at = Now() }
+    }
+  }
+
+  node rule SynthesizeLeafGoalResults {
+    match: graph = {
+      Goal: node = { lifecycle in ["pending","in_progress"] }
+      condition IsLeafGoal(Goal) = true
+      condition AllTasksCompleted(Goal) = true
+      CompletedTasks: many node = { lifecycle = "completed" }
+      edges: many belongs_to_goal { from: CompletedTasks to: Goal }
+    }
+    rewrite: graph = {
+      Goal: node = { lifecycle = "completed", updated_at = Now() }
+      Answer: node = FinalAnswer { id = NewId(), goal = Goal, content = MergeResults(CompletedTasks), confidence = CalculateConfidence(CompletedTasks), source_tasks = CompletedTasks }
+    }
+  }
+
+  # Strategy examples
+  strategy PlanOptimization {
+    repeat {
+      apply MergeDuplicatePlannedTasks;
+      apply DetectPlannedCycle;
+      apply RemoveRedundantDependency;
+      apply NormalizePlan;
+    }
+  }
+
+  strategy AgentLoop {
+    repeat {
+      phase 1 { apply PlanOptimization; apply ActivatePlannedGoal; apply ActivatePlannedTask; }
+      phase 2 { apply AssignPendingTask; }
+      phase 3 { apply StartAssignedTask; apply CreateToolRequest; }
+      phase 4 { apply MarkToolRunning; apply IntegrateToolResultSuccess; apply IntegrateToolResultFailure; }
+      phase 5 { apply ShouldFailGoal; apply SynthesizeLeafGoalResults; }
+    }
+  }
+
+  # Helper functions (implemented in runtime)
+  fn Now(): number
+  fn NewId(): identifier
+  fn DecideToolKind(desc: string): ("WebSearch" | "CodeExecution")
+  fn CanExecute(agent: node<Agent>, task: node<Task>): boolean
+  fn AvailableCapacity(agent: node<Agent>): number
+  fn AllDependenciesCompletedOrPlannedToActivate(task: node<Task>): boolean
+  fn AllTasksCompleted(goal: node<Goal>): boolean
+  fn IsLeafGoal(goal: node<Goal>): boolean
+  fn ShouldFailGoalByPolicy(goal: node<Goal>, policy: string): boolean
+  fn MergeResults(tasks: array<node<Task>>): value
+  fn CalculateConfidence(tasks: array<node<Task>>): number
+
+}

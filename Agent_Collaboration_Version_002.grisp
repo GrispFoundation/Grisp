@@ -1,0 +1,542 @@
+# ===================================================
+# GRISP - Agent Collaboration Protocol (Version 0.02)
+# With goals, retries, and edge-based assignment
+# ===================================================
+
+namespace AgentCollaborationV002 {
+
+    # ======================
+    # Core Entity Types
+    # ======================
+
+    node Agent {
+        id: identifier
+        role: ("Planner" | "Specialist")
+        capabilities: array<identifier>      # e.g. ["plan", "code", "search", "execute"]
+        state: identifier                    # e.g. "idle", "busy"
+    }
+
+    node Goal {
+        id: identifier
+        description: string
+        status: ("pending" | "in_progress" | "completed" | "failed")
+        created_at: number
+        updated_at: number
+        tags: array<identifier>
+    }
+
+    node Task {
+        id: identifier
+        description: string
+        status: ("pending" | "assigned" | "in_progress" | "waiting_tool" | "completed" | "failed")
+        priority: number
+        created_at: number
+        updated_at: number
+        retries: number
+        max_retries: number
+        result: value?
+        error: string?
+        tags: array<identifier>
+    }
+
+    node Message {
+        id: identifier
+        type: identifier                      # "TaskAssigned" | "TaskCompleted" | "TaskFailed" | "GoalCompleted"
+        from: node<Agent>
+        to: node<Agent>
+        payload: node<Task>?
+        goal: node<Goal>?
+    }
+
+    node ToolRequest {
+        id: identifier
+        kind: ("WebSearch" | "CodeExecution")
+        input: value
+        status: ("pending" | "running" | "completed" | "failed")
+        created_at: number
+        task: node<Task>
+    }
+
+    node ToolResult {
+        id: identifier
+        request: node<ToolRequest>
+        success: boolean
+        data: value?
+        error: string?
+    }
+
+    node FinalAnswer {
+        id: identifier
+        goal: node<Goal>
+        content: value
+        confidence: number
+        source_tasks: array<node<Task>>
+    }
+
+    # ======================
+    # Structural Edges
+    # ======================
+
+    edge assigns {
+        from: Agent
+        to: Task
+        label: "assigned"
+        type: "agent_task"
+    }
+
+    edge belongs_to_goal {
+        from: Task
+        to: Goal
+        label: "belongs_to"
+        type: "task_goal"
+    }
+
+    edge communicates {
+        from: Agent
+        to: Message
+        label: "sends"
+        type: "agent_message"
+    }
+
+    edge about_task {
+        from: Message
+        to: Task
+        label: "about"
+        type: "message_task"
+    }
+
+    edge about_goal {
+        from: Message
+        to: Goal
+        label: "about_goal"
+        type: "message_goal"
+    }
+
+    edge tool_for_task {
+        from: ToolRequest
+        to: Task
+        label: "for"
+        type: "tool_task"
+    }
+
+    edge result_of_request {
+        from: ToolResult
+        to: ToolRequest
+        label: "result_of"
+        type: "tool_result"
+    }
+
+    # ======================
+    # Core Agentic Rules
+    # ======================
+
+    # Rule 1: Planner delegates a pending task of a goal to a capable Specialist
+    node rule.DelegateTask {
+        match: graph = {
+            Planner: node = {
+                role = "Planner"
+            }
+
+            Goal: node = {
+                status in ["pending", "in_progress"]
+            }
+
+            Task: node = {
+                status = "pending"
+                retries <= max_retries
+            }
+
+            edge belongs_to_goal {
+                from: Task
+                to: Goal
+            }
+
+            Specialist: node = {
+                role = "Specialist"
+                state = "idle"
+                capabilities contains "execute"
+            }
+        }
+
+        rewrite: graph = {
+            Planner: node = {
+                role = "Planner"
+            }
+
+            Specialist: node = {
+                role = "Specialist"
+                state = "busy"
+            }
+
+            Goal: node = {
+                status = "in_progress"
+                updated_at = Now()
+            }
+
+            Task: node = {
+                status = "assigned"
+                updated_at = Now()
+            }
+
+            edge assigns {
+                from: Specialist
+                to: Task
+            }
+
+            Msg: node = {
+                type = "TaskAssigned"
+                from = Planner
+                to = Specialist
+                payload = Task
+                goal = Goal
+            }
+
+            edge communicates {
+                from: Planner
+                to: Msg
+            }
+
+            edge about_task {
+                from: Msg
+                to: Task
+            }
+
+            edge about_goal {
+                from: Msg
+                to: Goal
+            }
+        }
+    }
+
+    # Rule 2: Specialist starts working on an assigned task
+    node rule.StartTaskWork {
+        match: graph = {
+            Specialist: node = {
+                role = "Specialist"
+                state = "busy"
+            }
+
+            Task: node = {
+                status = "assigned"
+            }
+
+            edge assigns {
+                from: Specialist
+                to: Task
+            }
+        }
+
+        rewrite: graph = {
+            Specialist: node = {
+                role = "Specialist"
+                state = "busy"
+            }
+
+            Task: node = {
+                status = "in_progress"
+                updated_at = Now()
+            }
+        }
+    }
+
+    # Rule 3: Specialist decides a tool is needed and creates a ToolRequest
+    node rule.CreateToolRequest {
+        match: graph = {
+            Specialist: node = {
+                role = "Specialist"
+                state = "busy"
+                capabilities contains "tool_call"
+            }
+
+            Task: node = {
+                status = "in_progress"
+                description = Desc
+            }
+
+            edge assigns {
+                from: Specialist
+                to: Task
+            }
+        }
+
+        rewrite: graph = {
+            Specialist: node = {
+                role = "Specialist"
+                state = "busy"
+            }
+
+            Task: node = {
+                status = "waiting_tool"
+                updated_at = Now()
+            }
+
+            ToolReq: node = ToolRequest {
+                id = NewId()
+                kind = DecideToolKind(Desc)
+                input = Desc
+                status = "pending"
+                created_at = Now()
+                task = Task
+            }
+
+            edge tool_for_task {
+                from: ToolReq
+                to: Task
+            }
+        }
+    }
+
+    # Rule 4: Runtime marks a pending ToolRequest as running (side-effect boundary)
+    node rule.MarkToolRunning {
+        match: graph = {
+            ToolReq: node = ToolRequest {
+                status = "pending"
+            }
+        }
+
+        rewrite: graph = {
+            ToolReq: node = ToolRequest {
+                status = "running"
+            }
+        }
+    }
+
+    # Rule 5: Integrate successful ToolResult, complete task, maybe complete goal
+    node rule.IntegrateToolResultSuccess {
+        match: graph = {
+            ToolRes: node = ToolResult {
+                success = true
+                request = ToolReq
+            }
+
+            ToolReq: node = ToolRequest {
+                status = "completed"
+                task = Task
+            }
+
+            Task: node = {
+                status = "waiting_tool"
+            }
+
+            Specialist: node = {
+                role = "Specialist"
+                state = "busy"
+            }
+
+            edge assigns {
+                from: Specialist
+                to: Task
+            }
+
+            Goal: node = {
+                status in ["pending", "in_progress"]
+            }
+
+            edge belongs_to_goal {
+                from: Task
+                to: Goal
+            }
+
+            Planner: node = {
+                role = "Planner"
+            }
+        }
+
+        rewrite: graph = {
+            Task: node = {
+                status = "completed"
+                result = ToolRes.data
+                updated_at = Now()
+                error = ""
+            }
+
+            Specialist: node = {
+                role = "Specialist"
+                state = "idle"
+            }
+
+            Planner: node = {
+                role = "Planner"
+            }
+
+            edge result_of_request {
+                from: ToolRes
+                to: ToolReq
+            }
+
+            Msg: node = {
+                type = "TaskCompleted"
+                from = Specialist
+                to = Planner
+                payload = Task
+                goal = Goal
+            }
+
+            edge communicates {
+                from: Specialist
+                to: Msg
+            }
+
+            edge about_task {
+                from: Msg
+                to: Task
+            }
+
+            edge about_goal {
+                from: Msg
+                to: Goal
+            }
+        }
+    }
+
+    # Rule 6: Integrate failed ToolResult, retry or fail task
+    node rule.IntegrateToolResultFailure {
+        match: graph = {
+            ToolRes: node = ToolResult {
+                success = false
+                request = ToolReq
+            }
+
+            ToolReq: node = ToolRequest {
+                status = "failed"
+                task = Task
+            }
+
+            Task: node = {
+                status = "waiting_tool"
+            }
+
+            Specialist: node = {
+                role = "Specialist"
+                state = "busy"
+            }
+
+            edge assigns {
+                from: Specialist
+                to: Task
+            }
+
+            Goal: node = {
+                status in ["pending", "in_progress"]
+            }
+
+            edge belongs_to_goal {
+                from: Task
+                to: Goal
+            }
+
+            Planner: node = {
+                role = "Planner"
+            }
+        }
+
+        rewrite: graph = {
+            Task: node = {
+                status = (Task.retries + 1 <= Task.max_retries) ? "pending" : "failed"
+                retries = Task.retries + 1
+                error = ToolRes.error
+                updated_at = Now()
+            }
+
+            Specialist: node = {
+                role = "Specialist"
+                state = (Task.retries + 1 <= Task.max_retries) ? "idle" : "idle"
+            }
+
+            Planner: node = {
+                role = "Planner"
+            }
+
+            edge result_of_request {
+                from: ToolRes
+                to: ToolReq
+            }
+
+            Msg: node = {
+                type = (Task.retries + 1 <= Task.max_retries) ? "TaskRetryScheduled" : "TaskFailed"
+                from = Specialist
+                to = Planner
+                payload = Task
+                goal = Goal
+            }
+
+            edge communicates {
+                from: Specialist
+                to: Msg
+            }
+
+            edge about_task {
+                from: Msg
+                to: Task
+            }
+
+            edge about_goal {
+                from: Msg
+                to: Goal
+            }
+        }
+    }
+
+    # Rule 7: Planner synthesizes results for a single goal into a FinalAnswer
+    node rule.SynthesizeGoalResults {
+        match: graph = {
+            Planner: node = {
+                role = "Planner"
+            }
+
+            Goal: node = {
+                status in ["in_progress", "pending"]
+            }
+
+            Tasks: many node = {
+                status = "completed"
+            }
+
+            edges: many belongs_to_goal {
+                from: Tasks
+                to: Goal
+            }
+        }
+
+        rewrite: graph = {
+            Planner: node = {
+                role = "Planner"
+            }
+
+            Goal: node = {
+                status = "completed"
+                updated_at = Now()
+            }
+
+            Answer: node = FinalAnswer {
+                id = NewId()
+                goal = Goal
+                content = MergeResults(Tasks)
+                confidence = CalculateConfidence(Tasks)
+                source_tasks = Tasks
+            }
+
+            Msg: node = {
+                type = "GoalCompleted"
+                from = Planner
+                to = Planner
+                goal = Goal
+            }
+
+            edge about_goal {
+                from: Msg
+                to: Goal
+            }
+        }
+    }
+
+    # ======================
+    # Pure Helper Functions
+    # ======================
+
+    fn Now(): number
+    fn NewId(): identifier
+    fn DecideToolKind(desc: string): ("WebSearch" | "CodeExecution")
+    fn MergeResults(tasks: array<node<Task>>): value
+    fn CalculateConfidence(tasks: array<node<Task>>): number
+}
