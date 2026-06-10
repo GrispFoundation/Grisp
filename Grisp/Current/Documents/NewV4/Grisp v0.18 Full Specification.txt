@@ -1,0 +1,233 @@
+SPEC 001 Canonical IR
+
+The Canonical IR is the sole executable representation of a GRISP manifest. All manifests must be compiled into Canonical IR before execution. Canonical IR is a fully explicit, fully typed, fully deterministic representation of rules, patterns, expressions, actions, and events. No implicit behavior is permitted. All field accesses, all collection operations, all function calls, and all action effects must appear explicitly in the IR.
+
+Canonical IR must serialize deterministically. All objects must serialize with lexicographically sorted keys. All lists must preserve their declared order. All integers must serialize without leading zeros. All strings must serialize as UTF‑8. No floating point values are permitted anywhere in the IR. All numeric values must be integers or fixed‑point integers represented as integers.
+
+Canonical IR must not contain runtime metadata, runtime handles, pointers, references, or nondeterministic values. Canonical IR must not contain engine‑specific structures. Canonical IR must not contain implicit defaults; all defaults must be explicitly represented.
+
+Canonical IR must be stable under round‑trip serialization. A manifest compiled to Canonical IR and then serialized and reloaded must produce identical Canonical IR.
+
+Canonical IR must contain only deterministic constructs. Any nondeterministic construct is a manifest error.
+
+SPEC 002 Expression AST
+
+Expressions represent pure computations over the current state and bindings. Expressions must be referentially transparent. Expressions must not mutate state. Expressions must not depend on nondeterministic values. Expressions must not access runtime metadata, runtime handles, or engine‑specific objects.
+
+All numeric operations must use integer or fixed‑point integer arithmetic. Floating point arithmetic is forbidden. Boolean expressions may short‑circuit at evaluation time, but dependency extraction must consider all branches of all expressions.
+
+Collection expressions enumerate instances of a node or edge type. A collection expression consists of a source type, an optional filter expression, an optional order_by list, and an optional limit. Collection evaluation proceeds as follows: enumerate all instances of the source type; apply the filter expression if present; sort the results according to the order_by list; if order_by is present, append node_id ascending as the final tie‑breaker; if no order_by is present, sort by node_id ascending; apply the limit if present; return the resulting list.
+
+Read inference for collection expressions is defined as follows: a collection over type T with filter F and order_by O reads T.id, all fields referenced in F, and all fields referenced in O. It does not read all fields of T. It does not read unrelated fields.
+
+Expressions must not contain implicit field accesses. All field accesses must be explicit. Expressions must not contain implicit ordering or implicit filtering. Expressions must not contain nondeterministic functions. Expressions must not contain effectful functions.
+
+SPEC 003 Node and Edge Model
+
+The logical state consists of a set of nodes, a set of edges, and version counters. Storage layout is implementation‑defined. The logical state must satisfy the following invariants: all node ids are unique; all edge ids are unique; no dangling edges exist; all field values are type‑valid; all constraints are satisfied.
+
+A node consists of id, type, fields, and version. Node ids must be deterministic and must not be generated from nondeterministic sources. Node version is a monotonically increasing integer. Node version increments by 1 on any field update, on any incident edge creation or deletion, and before node deletion.
+
+An edge consists of id, type, source, target, and version. Edge ids must be deterministic. Edge version is a monotonically increasing integer. Edge version increments by 1 on deletion. Edge creation and deletion increment the version of the source and target nodes.
+
+Runtime metadata may be associated with nodes or edges by an engine, but runtime metadata is outside deterministic semantics. Runtime metadata must not participate in matching, dependency extraction, selection, transaction execution, or event generation. Runtime metadata must not appear in golden files.
+
+SPEC 004 Type System
+
+The type system defines node types, edge types, and field types. All numeric types must be integers or fixed‑point integers represented as integers. Floating point types are forbidden. Field types must be deterministic and serializable. Field types must not include runtime handles, pointers, references, or nondeterministic values.
+
+SPEC 005 Pattern Model
+
+Patterns bind nodes and edges. A pattern binding with no where clause reads only the identifier of the bound node unless fields are explicitly referenced elsewhere. Pattern matching is deterministic. Pattern enumeration order is node_id ascending for nodes and edge_id ascending for edges. Pattern evaluation must not depend on runtime metadata or nondeterministic values.
+
+Understood, Skybuck — continuing with **STYLE 1**, plain text, no markup, no formatting, no markdown, no code fences, just clean specification text.
+
+Here is the next block of the GRISP v0.18 deterministic kernel specification.
+
+SPEC 006 Match Discovery Model
+
+Match discovery enumerates all possible matches for all rules in the manifest. Match discovery is performed once per tick and produces a deterministic snapshot. All subsequent selection and validation operations within the same tick must use this snapshot. Match discovery must not be repeated within the same tick.
+
+A match consists of a rule identifier and a set of bindings. Bindings map pattern variable names to node or edge identifiers. Match discovery must enumerate matches in deterministic order. Node bindings must be enumerated in ascending node_id order. Edge bindings must be enumerated in ascending edge_id order. Pattern constraints must be evaluated deterministically and must not depend on runtime metadata or nondeterministic values.
+
+Match identity is defined by match_key. The match_key is constructed by concatenating the rule identifier with a canonical serialization of all bindings. Binding pairs are of the form name=node_id. Binding pairs must be sorted lexicographically by binding name. The canonical serialization must be stable, deterministic, and independent of engine implementation details.
+
+Match discovery must not mutate state. Match discovery must not observe events, event queues, or runtime metadata. Match discovery must not depend on nondeterministic values. Match discovery must not perform writes. Match discovery must not allocate identifiers.
+
+Match discovery produces a complete list of matches. No rule may observe partial discovery results. No rule may observe matches discovered in previous ticks. Match discovery must not be interleaved with selection or validation.
+
+SPEC 011 State Model
+
+The logical state consists of a set of nodes, a set of edges, and version counters. The logical state must satisfy the following invariants: all node ids are unique; all edge ids are unique; no dangling edges exist; all field values are type‑valid; all constraints are satisfied.
+
+A node consists of id, type, fields, and version. Node ids must be deterministic. Node version is a monotonically increasing integer. Node version increments by 1 on any field update, on any incident edge creation or deletion, and before node deletion. After deletion, the node no longer exists in the logical state.
+
+An edge consists of id, type, source, target, and version. Edge ids must be deterministic. Edge version is a monotonically increasing integer. Edge version increments by 1 on deletion. Edge creation and deletion increment the version of the source and target nodes.
+
+The state must include deterministic version counters for dependency tracking. Version counters must be integers. Version counters must increment deterministically. Version counters must not wrap. Version counters must not be reused.
+
+Runtime metadata may be associated with nodes or edges by an engine, but runtime metadata is outside deterministic semantics. Runtime metadata must not participate in matching, dependency extraction, selection, transaction execution, or event generation. Runtime metadata must not appear in golden files. Runtime metadata must not affect deterministic behavior.
+
+Identifier allocation must be deterministic. Engines must not use nondeterministic sources to generate identifiers. Engines must not use random numbers, timestamps, or memory addresses to generate identifiers. Engines must not use hash functions to generate identifiers. Engines must not use nondeterministic ordering to generate identifiers.
+
+SPEC 014 Dependency Set Model
+
+Dependency sets define the deterministic conditions under which a match remains valid. Dependency sets are extracted from the rule’s expressions, patterns, and computations. Dependency extraction must be deterministic and complete with respect to the extraction rules defined in this specification.
+
+Dependencies must be extracted from all expressions evaluated before commit. Dependencies must be extracted from pattern expressions, when expressions, let expressions, and any other expression that reads state. Dependencies must not be extracted from actions, because actions represent writes, not reads.
+
+Dependency extraction must consider all branches of all expressions, regardless of runtime short‑circuit behavior. Dependency extraction must not depend on runtime metadata or nondeterministic values.
+
+The dependency model defines the following dependency types:
+
+Field(node_id, field_name)  
+Predicate(node_type, field_name)  
+Ordering(node_type, field_name)  
+Extent(node_type)  
+EdgeType(edge_type)  
+EdgeInstance(edge_id)  
+Adjacency(node_id, edge_type, direction)
+
+Field dependencies track reads of specific fields of specific nodes. Predicate dependencies track reads of fields used in filter expressions. Ordering dependencies track reads of fields used in order_by expressions. Extent dependencies track enumeration of all instances of a type. EdgeType dependencies track reads of all edges of a given type. EdgeInstance dependencies track reads of specific edges. Adjacency dependencies track reads of edges incident to a specific node.
+
+Dependency validation is the sole mechanism used to determine match validity. A match is valid if and only if all dependency snapshots match the current state. A dependency snapshot consists of the version counters associated with each dependency at match discovery time. A dependency is valid if the current version counter equals the snapshot version counter. If any dependency is invalid, the match is invalid.
+
+Engines must compute dependency sets according to the extraction rules defined in this specification. Engines must not omit required dependencies. Engines may include additional dependencies, but additional dependencies must not change deterministic behavior. Engines must not include nondeterministic dependencies.
+
+Conflict detection is removed from the deterministic kernel. Dependency validation replaces conflict detection entirely. Only one transaction may commit per tick. Dependency validation ensures correctness without requiring conflict detection.
+
+
+SPEC 007 Transaction Model
+
+A transaction represents the deterministic execution of a rule’s actions after a match has been selected and validated. Only one transaction may commit per tick. A transaction consists of the following phases: dependency validation, action evaluation, staging of writes, atomic commit, and event emission.
+
+Dependency validation is the sole mechanism for determining match validity. A match is valid if and only if all dependency snapshots match the current state. If any dependency is invalid, the match is discarded and the next candidate is considered. No conflict detection mechanism exists in the deterministic kernel. Dependency validation replaces conflict detection entirely.
+
+Action evaluation must be deterministic. Action evaluation must not mutate state directly. Action evaluation must not allocate identifiers. Action evaluation must not observe runtime metadata. Action evaluation must not depend on nondeterministic values. Action evaluation must not read or write events. Action evaluation may compute deterministic values for use in staged writes.
+
+Staged writes represent the set of changes that will be applied atomically if the transaction commits. Staged writes may include: creation of nodes, deletion of nodes, updates to node fields, creation of edges, deletion of edges. Staged writes must be deterministic. Staged writes must not contain nondeterministic values. Staged writes must not contain runtime metadata.
+
+Commit applies staged writes atomically. Commit must increment version counters deterministically. Commit must remove deleted nodes and edges from the logical state. Commit must apply field updates and edge updates. Commit must allocate deterministic identifiers for newly created nodes and edges. Commit must not partially apply changes; all changes must be applied atomically.
+
+After commit, events generated by the transaction become visible. Events must not become visible before commit. Events must not be visible if the transaction fails validation. Events must not be visible if the transaction is discarded.
+
+SPEC 008 Action Model
+
+Actions define deterministic state modifications. Actions must be pure in evaluation and effectful only at commit time. Actions must not depend on nondeterministic values. Actions must not access runtime metadata. Actions must not observe events. Actions must not mutate state during evaluation.
+
+The following action types are defined:
+
+CreateNode(type, fields)  
+DeleteNode(node_id)  
+UpdateField(node_id, field_name, value)  
+CreateEdge(type, source_id, target_id)  
+DeleteEdge(edge_id)  
+EmitEvent(rule_id, payload)
+
+CreateNode produces a staged write that allocates a new node with deterministic id, type, initial fields, and version 1. DeleteNode produces a staged write that removes the node and increments its version before deletion. UpdateField produces a staged write that updates the field and increments the node version. CreateEdge produces a staged write that allocates a new edge with deterministic id and increments the versions of the source and target nodes. DeleteEdge produces a staged write that removes the edge and increments the versions of the source and target nodes. EmitEvent produces a staged event that becomes visible only after commit.
+
+Actions must not perform reads that are not already captured in dependency extraction. Actions must not introduce new dependencies. Actions must not contain nondeterministic computations. Actions must not allocate identifiers during evaluation; identifier allocation occurs only at commit time.
+
+SPEC 009 Event Model
+
+Events represent deterministic outputs produced by committed transactions. Events must be deterministic. Events must not contain nondeterministic values. Events must not contain runtime metadata. Events must not contain node or edge references. Events must contain only canonical value types: integers, booleans, strings, lists, and maps. Events may contain node identifiers and edge identifiers, but not references.
+
+Events are write‑only outputs. Rules must not observe previously emitted events. Rules must not observe event queues. Rules must not observe event subscribers. Events must not influence deterministic execution.
+
+Event payload evaluation may read deterministic values from the binding environment. Event payload evaluation must not mutate state. Event payload evaluation must not create dependencies. Event payload evaluation must not invoke nondeterministic functions. Event payload evaluation must be referentially transparent.
+
+Events become visible only after successful commit. Engines may buffer events during action evaluation. Buffered events become visible atomically after commit. If a transaction fails validation, no events become visible.
+
+Deterministic events consist of rule_id and payload. Runtime events may include additional metadata such as event_id, timestamp, or engine‑specific annotations, but such metadata is outside deterministic semantics and must not appear in golden files.
+
+Continuing, Skybuck — STYLE 1, pure text, no markup, no markdown, no code fences, no formatting syntax.  
+Here is the next block of the GRISP v0.18 deterministic kernel specification.
+
+SPEC 015 Match Lifecycle Model
+
+The match lifecycle defines how matches are identified, persisted, aged, invalidated, and removed across ticks. The match lifecycle is deterministic and must not depend on runtime metadata or nondeterministic values.
+
+Match identity is defined by match_key. The match_key consists of the rule identifier followed by a canonical serialization of all bindings and let‑bound values that participate in match identity. Binding pairs are of the form name=node_id. Let‑bound values must be included only if they are deterministic, stable, and part of the rule’s logical identity. Binding pairs must be sorted lexicographically by binding name. The canonical serialization must be stable, deterministic, and independent of engine implementation details.
+
+Match persistence refers to the fact that a match_key may appear across multiple ticks. A match persists if the same rule and the same binding set produce the same match_key in subsequent ticks. Match persistence must be determined solely by match_key equality. Engines must not use runtime metadata to determine persistence.
+
+Match age is defined as the number of ticks since the match_key first appeared. Match age increments by 1 each tick in which the match_key appears in the discovery snapshot. Match age resets to 0 when the match_key appears for the first time. Match age must not increment for match_keys that do not appear in the current tick’s discovery snapshot.
+
+Match invalidation occurs when dependency validation fails. A match may be discovered but invalidated before commit. Invalidated matches do not commit and do not produce events. Invalidated matches do not affect match age. Invalidated matches remain eligible for rediscovery in future ticks if their match_key reappears.
+
+Match removal occurs when a match_key does not appear in the current tick’s discovery snapshot. Removed matches lose their age and must be treated as new matches if rediscovered in future ticks.
+
+Match lifecycle must not depend on nondeterministic values. Match lifecycle must not depend on runtime metadata. Match lifecycle must not depend on event history. Match lifecycle must not depend on engine‑specific structures.
+
+SPEC 013 Selection Model
+
+Selection determines which match will be executed in the current tick. Selection must be deterministic. Selection must not depend on nondeterministic values. Selection must not depend on runtime metadata. Selection must not depend on event history. Selection must not depend on engine‑specific structures.
+
+Selection uses a deterministic scoring function. The score is defined as:
+
+score = base_priority * priority_scale + fairness_boost * fairness_scale
+
+base_priority is a deterministic integer defined by the rule. fairness_boost is derived from match age. priority_scale and fairness_scale are deterministic integer constants defined by the specification. Scores must be computed using signed 64‑bit integer arithmetic. Overflow is a conformance failure.
+
+Selection ordering is defined as follows: first, sort matches by score descending; second, break ties by lexicographic ordering of match_key ascending. No hash functions may be used for tie‑breaking. No nondeterministic tie‑breakers may be used.
+
+Fairness behavior must be explicitly defined. If strict priority is desired, fairness_scale must be small enough that fairness_boost never overrides base_priority. If aging priority is desired, fairness_scale must be large enough that fairness_boost eventually overrides base_priority. The specification must define which behavior is normative.
+
+Selection must not modify state. Selection must not allocate identifiers. Selection must not observe events. Selection must not observe runtime metadata. Selection must not perform dependency validation; validation occurs in the transaction model.
+
+Selection must operate solely on the match discovery snapshot. Selection must not rediscover matches. Selection must not modify the match table. Selection must not observe matches from previous ticks.
+
+SPEC 012 Tick Model
+
+The tick model defines the deterministic execution loop. A tick consists of discovery, ranking, validation, commit, and event emission. Only one transaction may commit per tick.
+
+Tick execution proceeds as follows:
+
+1. Discover all matches.  
+2. Rank all matches using the selection model.  
+3. Iterate through ranked matches in deterministic order.  
+4. Validate the first candidate.  
+5. If validation fails, discard the candidate and continue to the next.  
+6. If validation succeeds, evaluate actions, stage writes, commit atomically, emit events, and end the tick.  
+7. If no candidate validates, the tick ends with no state changes.
+
+Match discovery must occur exactly once per tick. All selections and validations must use the same discovery snapshot. Match rediscovery within the same tick is forbidden. Engines must not modify the match table during the tick.
+
+Dependency validation is the sole mechanism for determining match validity. Conflict detection is removed from the deterministic kernel. Only one transaction may commit per tick. Dependency validation ensures correctness without requiring conflict detection.
+
+The tick counter is deterministic runtime state. The tick counter increments by 1 at the start of each tick. The tick counter contributes to match age computation. The absolute numeric value of the tick counter has no semantic meaning beyond deterministic bookkeeping.
+
+Tick execution must not depend on runtime metadata. Tick execution must not depend on nondeterministic values. Tick execution must not observe events. Tick execution must not allocate identifiers except during commit.
+
+SPEC 010 Golden File Model
+
+The Golden File Model defines how deterministic engine behavior is recorded and validated. Golden files must capture observable deterministic semantics only. Golden files must not capture internal implementation details, internal data structures, runtime metadata, or nondeterministic values. Golden files must be stable across all conformant engines.
+
+Golden files must use a canonical serialization format. Canonical serialization requires UTF‑8 encoding, LF line endings, lexicographic key ordering, deterministic integer encoding, and deterministic list ordering. Canonical serialization must not include floating point values. Canonical serialization must not include runtime metadata. Canonical serialization must not include nondeterministic values.
+
+Golden files must contain the following normative fields:
+
+initial_state  
+ticks[]  
+final_state
+
+Each tick entry must contain:
+
+tick_number  
+selected_match_key  
+committed_changes[]  
+events[]
+
+The selected_match_key is the canonical match identity of the match that committed. committed_changes is the list of deterministic state transitions applied during commit. events is the list of deterministic events emitted after commit.
+
+Golden files must not include staged writes, dependency sets, conflict detection details, or internal engine structures. Golden files must not include runtime metadata. Golden files must not include nondeterministic values. Golden files must not include implementation‑specific fields.
+
+Golden files may include an optional diagnostic section. Diagnostic sections are not normative and must be ignored for conformance. Diagnostic sections may contain discovered_matches, dependency_sets, scores, validation details, or other debugging information. Diagnostic sections must not affect deterministic semantics.
+
+Golden files validate deterministic execution semantics. A conformant engine must produce identical golden files for all normative fields. Informational fields must be ignored for conformance. Engines must not fail conformance due to differences in informational fields.
+
+Golden files must reflect only observable behavior: selected match, committed changes, emitted events, and final state. Golden files must not reflect internal algorithms, internal data structures, or internal execution order. Golden files must not reflect runtime metadata or nondeterministic values.
+
+Golden files must be stable under replay. Replaying a manifest and initial state must produce identical golden files. Golden files must not depend on system time, random numbers, memory layout, or engine‑specific behavior.
+
+
