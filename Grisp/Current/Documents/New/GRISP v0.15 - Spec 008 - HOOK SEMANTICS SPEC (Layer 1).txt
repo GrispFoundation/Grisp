@@ -1,0 +1,290 @@
+=====================================================================
+======  GRISP v0.15 - Spec 008 - HOOK SEMANTICS SPEC (Layer 1)  =====
+=====================================================================
+
+STATUS: Stable Draft
+LAYER: Post‑Transaction Effects (Layer 1)
+VERSION: grisp-hook-semantics-v0.15
+DEPENDENCIES:
+  - Canonical IR v0.15
+  - Transaction Model v0.15
+  - Runtime Profile v0.15
+  - Trust Model v0.15
+
+---------------------------------------------------------------------
+1. PURPOSE
+---------------------------------------------------------------------
+The Hook Semantics v0.15 specification defines the **precise behavior**
+of GRISP hooks:
+
+  - when they run
+  - what they can see
+  - what they are allowed to do
+  - how failures are handled
+  - how they interact with events and transactions
+
+Hooks are **not** part of the transaction itself.  
+They run *after* the transaction commits or fails.
+
+This spec ensures that all GRISP engines implement hooks in a
+deterministic, consistent, and safe manner.
+
+---------------------------------------------------------------------
+2. TYPES OF HOOKS
+---------------------------------------------------------------------
+GRISP defines two hook types:
+
+  - after_commit
+  - on_failure
+
+2.1 after_commit  
+Runs **after a successful transaction commit**.
+
+2.2 on_failure  
+Runs **after a transaction aborts**, but only if the rule defines them.
+
+Hooks NEVER run inside the transaction.
+
+---------------------------------------------------------------------
+3. HOOK DECLARATION
+---------------------------------------------------------------------
+Hooks are declared inside a rule:
+
+{
+  "hooks": {
+    "after_commit": [
+      { "id": "emit_assignment_webhook" }
+    ],
+    "on_failure": [
+      { "id": "log_failure" }
+    ]
+  }
+}
+
+Each hook entry contains:
+
+  - id: unique identifier
+  - args (optional): structured arguments
+  - meta (optional): debugging metadata
+
+---------------------------------------------------------------------
+4. HOOK EXECUTION ORDER
+---------------------------------------------------------------------
+Hook execution order is strictly defined:
+
+4.1 After Commit  
+Executed in the order they appear in the rule.
+
+4.2 On Failure  
+Executed in the order they appear in the rule.
+
+4.3 Across Rules  
+Hooks from different rule firings execute in **commit order**.
+
+4.4 No Interleaving  
+Hooks from one transaction MUST NOT interleave with hooks from another.
+
+---------------------------------------------------------------------
+5. HOOK EXECUTION CONTEXT
+---------------------------------------------------------------------
+Hooks run with the following context:
+
+{
+  "transaction_id": "string",
+  "rule_id": "string",
+  "rule_name": "string",
+  "bindings": { ... },
+  "committed_writes": { ... },
+  "events": [ ... ],
+  "graph_snapshot": { ... },
+  "trust_context": { ... }
+}
+
+5.1 graph_snapshot  
+A **read-only** snapshot of the graph *after* commit.
+
+5.2 committed_writes  
+The exact writes applied by the transaction.
+
+5.3 events  
+Events emitted by the transaction.
+
+5.4 trust_context  
+Trust metadata relevant to the transaction.
+
+---------------------------------------------------------------------
+6. HOOK CAPABILITIES
+---------------------------------------------------------------------
+Hooks MAY:
+
+  - emit external events
+  - log information
+  - call external systems
+  - enqueue asynchronous tasks
+  - update monitoring systems
+
+Hooks MUST NOT:
+
+  - modify the GRISP graph
+  - modify session state
+  - modify trust state
+  - modify runtime profile
+  - trigger new rule evaluations
+  - create new transactions
+
+Hooks are **side-effect only**.
+
+---------------------------------------------------------------------
+7. FAILURE SEMANTICS
+---------------------------------------------------------------------
+Hook failures MUST NOT affect:
+
+  - the committed transaction
+  - the graph state
+  - event emission
+  - other hooks
+
+Hook failures MUST be recorded:
+
+{
+  "hook_failure": {
+    "hook_id": "string",
+    "error": "string",
+    "timestamp": 1680000000
+  }
+}
+
+Engines MAY retry hooks, but retries MUST NOT affect determinism.
+
+---------------------------------------------------------------------
+8. HOOK TIMEOUTS
+---------------------------------------------------------------------
+Hooks MAY define timeouts:
+
+{
+  "id": "emit_webhook",
+  "timeout_ms": 5000
+}
+
+If a hook times out:
+
+  - it is marked as failed
+  - execution continues to next hook
+  - transaction remains committed
+
+Timeouts MUST NOT block the engine indefinitely.
+
+---------------------------------------------------------------------
+9. HOOK ISOLATION
+---------------------------------------------------------------------
+Hooks MUST run in isolation:
+
+  - no shared mutable state
+  - no access to in-flight transactions
+  - no access to uncommitted writes
+  - no ability to influence rule selection
+
+Isolation ensures deterministic engine behavior.
+
+---------------------------------------------------------------------
+10. HOOK SCHEDULING MODEL
+---------------------------------------------------------------------
+Hooks are scheduled by the engine in a FIFO queue:
+
+  - enqueue after commit or failure
+  - dequeue in order
+  - execute sequentially
+  - record results
+
+Engines MAY execute hooks asynchronously, but MUST preserve order.
+
+---------------------------------------------------------------------
+11. HOOKS AND TRUST MODEL
+---------------------------------------------------------------------
+Hooks MUST NOT:
+
+  - promote trust
+  - demote trust
+  - override trust gates
+  - modify trust metadata
+
+Hooks MAY:
+
+  - emit events containing trust metadata
+  - log trust violations
+  - notify external systems of trust issues
+
+---------------------------------------------------------------------
+12. HOOKS AND RESOLUTION TRACE
+---------------------------------------------------------------------
+Hooks MUST append entries to the resolution trace:
+
+  - hook_started
+  - hook_succeeded
+  - hook_failed
+  - hook_timeout
+
+Trace entries MUST include:
+
+  - hook_id
+  - rule_id
+  - transaction_id
+  - timestamp
+
+---------------------------------------------------------------------
+13. HOOKS AND PARTIAL RESULTS
+---------------------------------------------------------------------
+If a transaction ends with:
+
+  - status = partial  
+  - partial_reason = timeout | max_actions_reached | backpressure
+
+Then:
+
+  - after_commit hooks MUST run
+  - on_failure hooks MUST NOT run
+
+Partial results count as successful commits.
+
+---------------------------------------------------------------------
+14. HOOKS AND ENGINE FAILURE
+---------------------------------------------------------------------
+If the engine crashes:
+
+  - committed transactions MUST remain committed
+  - unexecuted hooks MAY be retried on restart
+  - hook retries MUST NOT affect graph state
+
+---------------------------------------------------------------------
+15. WHAT IS NOT IN HOOK SEMANTICS v0.15
+---------------------------------------------------------------------
+Not included:
+
+  - tool execution semantics
+  - AI substrate logic
+  - trust propagation rules
+  - rule matching
+  - transaction selection
+  - event schema definitions
+
+These are defined in other specs.
+
+---------------------------------------------------------------------
+16. SUMMARY
+---------------------------------------------------------------------
+Hook Semantics v0.15 defines:
+
+  - deterministic hook ordering
+  - strict isolation
+  - post-commit and post-failure behavior
+  - failure handling
+  - timeout behavior
+  - resolution trace integration
+  - trust-safe side effects
+
+Hooks provide a safe, deterministic way to integrate GRISP with the
+outside world without affecting core execution.
+
+=====================================================================
+=========  END OF GRISP v0.15 - Spec 008 - HOOK SEMANTICS  ==========
+=====================================================================

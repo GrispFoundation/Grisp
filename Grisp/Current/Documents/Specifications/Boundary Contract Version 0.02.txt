@@ -1,0 +1,380 @@
+Below is **Boundary Contract v0.2 — Trust-Aware Version**, rewritten as a *full, clean, formal specification* that integrates:
+
+- per-value trust (from your trust-model v0.1)  
+- expanded session state  
+- clarify as a first-class engine output  
+- rejection vs failure semantics  
+- scoring decomposition  
+- partial result semantics  
+- contract versioning  
+- trust-blocked actions  
+- resolution-trace threading  
+
+This is written as if it will live in `spec/boundary-contract-v0.2.md`.
+
+No fluff. No hand-waving. This is a real spec.
+
+---
+
+# **Boundary Contract v0.2 — Trust-Aware Version**  
+**Status:** Draft  
+**Layer:** Boundary between AI-IR (Layer 1) and GRISP Canonical IR (Layer 0)  
+**Depends on:** Canonical IR v1.2, Trust Model v0.1  
+**Author:** GRISP Project  
+**Date:** 2026-06-10  
+
+---
+
+# **1. Purpose**
+
+This document defines the **trust-aware boundary contract** between:
+
+- the **AI Substrate IR** (Layer 1), and  
+- the **GRISP Canonical IR Engine** (Layer 0).
+
+It specifies:
+
+- the structure of requests sent *into* the engine  
+- the structure of results returned *from* the engine  
+- how trust annotations are carried across the boundary  
+- how session state is maintained  
+- how clarify, rejection, partial results, and trust violations are represented  
+- versioning and compatibility rules  
+
+This contract is the **only legal interface** between the substrate and the deterministic GRISP engine.
+
+---
+
+# **2. Contract Versioning**
+
+Both request and result envelopes MUST contain:
+
+```json
+"contract_version": "grisp-boundary-v0.2"
+```
+
+Engines MUST reject requests with incompatible versions using the `rejection` mechanism (§7).
+
+---
+
+# **3. GrispExecutionRequest (AI-IR ? Engine)**
+
+### **3.1 Top-level Structure**
+
+```json
+{
+  "contract_version": "grisp-boundary-v0.2",
+  "request_id": "uuid",
+  "session": { ... },
+  "profile_id": "string",
+  "ruleset_id": "string",
+  "inputs": {
+    "facts": [ /* canonical IR fact objects with trust annotations */ ],
+    "events": [ /* canonical IR event objects with trust annotations */ ]
+  },
+  "context": { ... },
+  "constraints": { ... }
+}
+```
+
+---
+
+## **3.2 Session Object**
+
+The session object carries multi-turn state:
+
+```json
+"session": {
+  "session_id": "string",
+  "turn_index": 12,
+
+  "established_facts": ["fact_id_1", "fact_id_2"],
+  "pending_clarifications": ["clarify_id_1"],
+  "confirmed_actions": ["action_id_1"],
+  "capability_grants": ["cap_1"],
+
+  "resolution_trace_id": "trace-abc-123"
+}
+```
+
+**Semantics:**
+
+- `established_facts`: facts the engine already considers part of the working graph  
+- `pending_clarifications`: clarifications issued by the engine but not yet resolved  
+- `confirmed_actions`: actions already executed in this session  
+- `capability_grants`: human-confirmed capability expansions  
+- `resolution_trace_id`: the trace to which all trust decisions will be appended  
+
+---
+
+## **3.3 Inputs**
+
+### **3.3.1 Facts and Events**
+
+Each fact/event MUST be a valid Canonical IR v1.2 object and MAY include:
+
+- `_trust` (top-level trust annotation)  
+- `_field_trust` (per-field trust annotations)  
+
+These MUST follow the Trust Model v0.1.
+
+### **3.3.2 Trust Overrides**
+
+The substrate may override trust for specific fields:
+
+```json
+"context": {
+  "origin": "llm" | "tool" | "human",
+  "default_trust_level": "llm_asserted",
+  "trust_overrides": [
+    {
+      "fact_id": "task-001",
+      "field": "id",
+      "level": "tool_returned",
+      "source": "task-service"
+    }
+  ]
+}
+```
+
+Overrides apply **before** rule evaluation.
+
+---
+
+## **3.4 Constraints**
+
+```json
+"constraints": {
+  "max_actions": 32,
+  "max_depth": 8,
+  "time_budget_ms": 500
+}
+```
+
+Engines MUST enforce these limits and return `status: "partial"` if exceeded.
+
+---
+
+# **4. GrispExecutionResult (Engine ? AI-IR)**
+
+### **4.1 Top-level Structure**
+
+```json
+{
+  "contract_version": "grisp-boundary-v0.2",
+  "request_id": "uuid",
+  "session": { ... },
+  "status": "ok" | "failed" | "partial",
+  "partial_reason": "TIME_BUDGET" | "ACTION_LIMIT" | "DEPTH_LIMIT" | null,
+  "actions": [ ... ],
+  "errors": [ ... ],
+  "trust_violations": [ ... ],
+  "rejection": null | { ... },
+  "resolution_trace_id": "trace-abc-123"
+}
+```
+
+---
+
+# **5. Actions**
+
+Each action is a canonical IR action with additional metadata.
+
+### **5.1 Action Structure**
+
+```json
+{
+  "id": "action-uuid",
+  "type": "update" | "create" | "delete" | "call" | "emit" | "clarify",
+  "payload": { /* canonical IR action payload */ },
+
+  "trust_level": "llm_asserted" | "tool_returned" | "system_derived" | "human_confirmed",
+  "trust_blocked": false,
+
+  "scoring": {
+    "match_confidence": 0.94,
+    "rule_priority": 80,
+    "selection_score": 0.87
+  },
+
+  "rule_id": "AcquireLease",
+  "rule_version": "1.2.0"
+}
+```
+
+### **5.2 Clarify Actions**
+
+Clarify actions have a structured payload:
+
+```json
+{
+  "type": "clarify",
+  "payload": {
+    "clarify_id": "clarify-123",
+    "missing_fields": [
+      {
+        "path": "intent.target",
+        "description": "Target entity",
+        "examples": ["user_profile", "billing_profile"],
+        "sequence_id": 1
+      }
+    ],
+    "ambiguities": [
+      {
+        "path": "intent.target",
+        "options": ["user_profile", "billing_profile"],
+        "depends_on": "clarify-123",
+        "sequence_id": 2
+      }
+    ]
+  }
+}
+```
+
+Clarifications MUST be added to `session.pending_clarifications`.
+
+---
+
+# **6. Errors**
+
+Errors represent runtime failures *after* rule execution began.
+
+```json
+"errors": [
+  {
+    "code": "RULE_RUNTIME_ERROR" | "CONSTRAINT_EXCEEDED" | "UNKNOWN",
+    "message": "string",
+    "rule_id": "string | null",
+    "action_index": 2
+  }
+]
+```
+
+---
+
+# **7. Rejection (Malformed Request)**
+
+If the request cannot be executed at all, the engine MUST return:
+
+```json
+"rejection": {
+  "code": "MALFORMED_REQUEST" | "SCHEMA_VIOLATION" | "UNKNOWN_PROFILE" | "UNKNOWN_RULESET",
+  "message": "string",
+  "field_path": "string | null"
+}
+```
+
+When `rejection` is present:
+
+- `actions` MUST be empty  
+- `errors` MUST be empty  
+- `status` MUST be `"failed"`  
+
+---
+
+# **8. Trust Violations**
+
+Trust violations are distinct from runtime errors.
+
+```json
+"trust_violations": [
+  {
+    "rule_id": "AssignPendingTask",
+    "action_index": 2,
+    "violation_type": "INSUFFICIENT_TRUST" | "TAINT_BOUNDARY_VIOLATION" | "TRUST_PROMOTION_REJECTED",
+    "required_level": "tool_returned",
+    "actual_level": "llm_asserted",
+    "value_path": "Task.query_override",
+    "trace_id": "trace-abc-123"
+  }
+]
+```
+
+If an action is trust-blocked:
+
+- `trust_blocked` MUST be `true`  
+- The action MUST NOT be executed  
+- The substrate MUST decide whether to initiate a `confirm` flow  
+
+---
+
+# **9. Partial Results**
+
+If the engine stops early due to constraints:
+
+```json
+"status": "partial",
+"partial_reason": "TIME_BUDGET" | "ACTION_LIMIT" | "DEPTH_LIMIT"
+```
+
+Actions up to the stopping point MUST be included.
+
+No further rule evaluation occurs.
+
+---
+
+# **10. Session Updates (Engine ? Substrate)**
+
+The engine MUST update the session object:
+
+- Append new `established_facts`  
+- Append new `confirmed_actions`  
+- Append new `pending_clarifications`  
+- Append new `capability_grants` (if confirm actions succeeded)  
+- Update `resolution_trace_id`  
+
+The substrate MUST persist this updated session for the next turn.
+
+---
+
+# **11. Resolution Trace Integration**
+
+The engine MUST append entries to the resolution trace for:
+
+- trust assignments  
+- trust propagation  
+- trust gate checks  
+- trust promotions  
+- rule matches  
+- action execution  
+- clarify generation  
+
+The `resolution_trace_id` MUST be returned so the substrate can fetch the trace.
+
+---
+
+# **12. Compatibility Rules**
+
+- Engines MUST reject requests with missing or mismatched `contract_version`.  
+- Engines MUST ignore unknown fields (forward compatibility).  
+- Substrate MUST ignore unknown fields in results (forward compatibility).  
+
+---
+
+# **13. Summary Table**
+
+| Feature | v0.1 | v0.2 |
+|--------|------|------|
+| Clarify action | ? | ? |
+| Per-value trust | — | ? |
+| Trust violations | — | ? |
+| Rejection vs failure | — | ? |
+| Partial result semantics | — | ? |
+| Scoring decomposition | — | ? |
+| Session expansion | — | ? |
+| Contract versioning | — | ? |
+
+---
+
+# **14. End of Boundary Contract v0.2**
+
+---
+
+If you want, I can now generate:
+
+- **Boundary Contract v0.3** with streaming support  
+- **AI-IR ? GRISP-IR compiler spec**  
+- **Clarify Action v1.0** (full schema + examples)  
+- **Resolution Trace v1.0** (complete schema)  
+
+Which one should we tackle next?

@@ -1,0 +1,340 @@
+=====================================================================
+===========  GRISP v0.15 - Spec 001 - CANONICAL IR SPEC  ============
+=====================================================================
+
+STATUS: Stable Draft
+LAYER: Deterministic Engine Contract (Layer 0)
+VERSION: grisp-ir-v0.15
+DEPENDENCIES:
+  - Expression AST v0.15
+  - Transaction Model v0.15
+
+---------------------------------------------------------------------
+1. PURPOSE
+---------------------------------------------------------------------
+The GRISP Canonical IR v0.15 defines the stable, deterministic,
+language-agnostic representation of GRISP manifests. It is the only
+format executed by GRISP engines.
+
+This IR:
+  - Contains no syntactic sugar
+  - Contains no trust logic
+  - Contains no runtime policy
+  - Contains no AI substrate constructs
+  - Is fully normalized
+  - Is deterministic and stable across versions
+
+All compilers, parsers, and tools MUST target this IR.
+
+---------------------------------------------------------------------
+2. DESIGN PRINCIPLES
+---------------------------------------------------------------------
+- Minimality: Only what the engine needs to execute deterministically.
+- Normalization: All expressions are AST nodes; no strings or DSL.
+- Determinism: Canonical JSON, sorted keys, stable hashing.
+- Extensibility: Unknown fields in "custom" are ignored by engines.
+- Separation of Concerns: Trust, runtime policy, and AI substrate live
+  outside the canonical IR.
+
+---------------------------------------------------------------------
+3. TOP-LEVEL STRUCTURE
+---------------------------------------------------------------------
+The canonical IR is a JSON object with the following structure:
+
+{
+  "ir_version": "grisp-ir-v0.15",
+  "manifest_id": "string",
+  "manifest_version": "string",
+  "nodes": [ ... ],
+  "edges": [ ... ],
+  "functions": [ ... ],
+  "rules": [ ... ],
+  "runtime_profile_ref": "string | null",
+  "metadata": { ... },
+  "custom": { ... }
+}
+
+REQUIRED:
+  - ir_version
+  - manifest_id
+  - manifest_version
+  - nodes
+  - edges
+  - functions
+  - rules
+
+OPTIONAL:
+  - runtime_profile_ref
+  - metadata
+  - custom
+
+---------------------------------------------------------------------
+4. NODE DEFINITIONS
+---------------------------------------------------------------------
+Nodes define typed entities in the GRISP graph.
+
+Node object:
+
+{
+  "name": "Task",
+  "fields": {
+    "id": { "type": "identifier" },
+    "lifecycle": { "type": "string" },
+    "cost": { "type": "integer" }
+  },
+  "constraints": [],
+  "custom": {}
+}
+
+Field types include:
+  - identifier
+  - string
+  - number
+  - integer
+  - boolean
+  - enum([...])
+  - array<T>
+  - references to other node types
+
+Node constraints are reserved for future static validation.
+
+---------------------------------------------------------------------
+5. EDGE DEFINITIONS
+---------------------------------------------------------------------
+Edges define typed relationships between nodes.
+
+{
+  "name": "requires_capability",
+  "from": "Task",
+  "to": "Capability",
+  "acyclic": true,
+  "custom": {}
+}
+
+NOTES:
+  - acyclic=true allows engines to enforce DAG constraints.
+  - Edges are first-class graph elements.
+
+---------------------------------------------------------------------
+6. FUNCTION DEFINITIONS
+---------------------------------------------------------------------
+Functions represent pure or effectful operations referenced in
+expressions.
+
+{
+  "name": "NextLeaseEpoch",
+  "kind": "pure",
+  "signature": "(Task) -> integer",
+  "external": true,
+  "effect_meta": null,
+  "custom": {}
+}
+
+Kinds:
+  - pure
+  - effect
+  - nondeterministic
+
+Effect metadata:
+
+{
+  "idempotent": true,
+  "timeout_ms": 5000,
+  "on_timeout": "retry"
+}
+
+---------------------------------------------------------------------
+7. RULE DEFINITIONS
+---------------------------------------------------------------------
+Rules define pattern matching and actions.
+
+{
+  "id": "rule-uuid",
+  "name": "AssignTask",
+  "priority": 80,
+  "metadata": { ... },
+  "when": [ ... ],
+  "then": [ ... ],
+  "hooks": { ... },
+  "inferred_reads": [ ... ],
+  "inferred_writes": [ ... ],
+  "declared_reads": null,
+  "declared_writes": null,
+  "custom": {}
+}
+
+7.1 Rule Metadata
+
+{
+  "idempotent": false,
+  "depends_on": ["PlanTask"],
+  "emits": ["TASK_ASSIGNED"]
+}
+
+7.2 When-block Patterns
+Kinds:
+  - binding
+  - edge
+  - existence
+  - collection
+  - condition
+  - let
+
+Example:
+
+{
+  "kind": "binding",
+  "var": "Task",
+  "type": "Task",
+  "constraints": [
+    {
+      "field": "lifecycle",
+      "op": "eq",
+      "value": { "kind": "literal", "literal_type": "string", "value": "pending" }
+    }
+  ]
+}
+
+7.3 Then-block Actions
+Kinds:
+  - let
+  - update
+  - create
+  - delete
+  - emit
+  - call
+  - for
+  - if
+
+Example update:
+
+{
+  "kind": "update",
+  "target": "Task",
+  "assigns": [
+    {
+      "field": "lifecycle",
+      "value": { "kind": "literal", "literal_type": "string", "value": "assigned" }
+    }
+  ]
+}
+
+7.4 Hooks
+
+{
+  "after_commit": [ { "id": "emit_assignment_webhook" } ],
+  "on_failure": []
+}
+
+---------------------------------------------------------------------
+8. EXPRESSION AST
+---------------------------------------------------------------------
+All expressions MUST conform to the external document:
+
+GRISP v0.15 — Expression AST Specification
+
+This removes duplication from earlier versions.
+
+---------------------------------------------------------------------
+9. READ/WRITE INFERENCE
+---------------------------------------------------------------------
+The compiler MUST compute:
+  - inferred_reads
+  - inferred_writes
+
+These MUST be correct and complete.
+
+Used for:
+  - conflict detection
+  - transaction planning
+  - deterministic scheduling
+
+---------------------------------------------------------------------
+10. CANONICAL SERIALIZATION
+---------------------------------------------------------------------
+Canonical JSON rules:
+  - Sorted object keys
+  - No insignificant whitespace
+  - UTF-8 encoding
+  - Deterministic number formatting
+  - Arrays preserved in emitted order
+
+This ensures byte-for-byte reproducibility.
+
+---------------------------------------------------------------------
+11. GRAPH HASHING
+---------------------------------------------------------------------
+Procedure:
+  1. Extract nodes and edges
+  2. Sort nodes by (type, id)
+  3. Sort edges by (type, from, to)
+  4. Serialize using canonical JSON rules
+  5. Compute SHA-256
+  6. Encode as lowercase hex
+
+Used for:
+  - checkpoints
+  - conformance testing
+  - distributed validation
+
+---------------------------------------------------------------------
+12. CHECKPOINTS
+---------------------------------------------------------------------
+Example:
+
+{
+  "checkpoint": {
+    "tick": 12345,
+    "graph_hash": "a3f4...e9b2",
+    "created_at": 1680000000,
+    "manifest_version": "grisp-ir-v0.15"
+  }
+}
+
+---------------------------------------------------------------------
+13. VALIDATION RULES
+---------------------------------------------------------------------
+Compiler MUST validate:
+  - Node/edge types
+  - Function signatures
+  - Pattern normalization
+  - Expression AST correctness
+  - Read/write inference
+  - Rule metadata consistency
+
+Engine MUST validate:
+  - Lease invariants
+  - Transaction atomicity
+  - Conflict detection
+  - Event ordering
+
+---------------------------------------------------------------------
+14. NON-NORMATIVE EXTENSIONS
+---------------------------------------------------------------------
+The IR allows:
+
+"custom": { ... }
+
+Engines MUST ignore unknown fields.
+
+Used for:
+  - vendor extensions
+  - debugging metadata
+  - AI substrate annotations (outside canonical IR)
+
+---------------------------------------------------------------------
+15. WHAT IS NOT IN CANONICAL IR v0.15
+---------------------------------------------------------------------
+These belong to other documents:
+
+  - Trust Model v0.15
+  - Boundary Contract v0.15
+  - AI Substrate IR v0.15
+  - Runtime Profile v0.15
+  - Transaction Model v0.15
+
+Canonical IR v0.15 remains pure, deterministic, and minimal.
+
+=====================================================================
+=========  END OF GRISP v0.15 - Spec 001 - CANONICAL IR SPEC ========
+=====================================================================

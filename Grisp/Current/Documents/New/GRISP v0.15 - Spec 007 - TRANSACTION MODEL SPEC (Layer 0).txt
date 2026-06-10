@@ -1,0 +1,315 @@
+=====================================================================
+=====  GRISP v0.15 - Spec 007 - TRANSACTION MODEL SPEC (Layer 0)  ===
+=====================================================================
+
+STATUS: Stable Draft
+LAYER: Deterministic Execution (Layer 0)
+VERSION: grisp-transaction-model-v0.15
+DEPENDENCIES:
+  - Canonical IR v0.15
+  - Expression AST v0.15
+  - Runtime Profile v0.15
+  - Trust Model v0.15
+
+---------------------------------------------------------------------
+1. PURPOSE
+---------------------------------------------------------------------
+The Transaction Model v0.15 defines the **precise, deterministic,
+engine-level execution semantics** for GRISP.
+
+It answers the critical questions:
+
+  - When does a rule “fire”?
+  - What is a match?
+  - How are conflicts resolved?
+  - What is a transaction boundary?
+  - What is committed atomically?
+  - What is visible to subsequent rules?
+  - How are events and hooks ordered?
+
+This model ensures that **all GRISP engines behave identically**.
+
+---------------------------------------------------------------------
+2. DESIGN PRINCIPLES
+---------------------------------------------------------------------
+- **Determinism**: Same input → same output → same graph.
+- **Atomicity**: A rule firing is a single atomic transaction.
+- **Isolation**: No rule sees partial effects of another.
+- **Consistency**: Graph invariants must hold after each commit.
+- **Replayability**: Execution must be reproducible from logs.
+- **Minimality**: No hidden side effects.
+
+---------------------------------------------------------------------
+3. EXECUTION OVERVIEW
+---------------------------------------------------------------------
+Execution proceeds in discrete ticks.
+
+Each tick:
+
+  1. Evaluate rule matches
+  2. Score matches
+  3. Select a rule firing
+  4. Begin transaction
+  5. Validate reads
+  6. Apply writes
+  7. Commit transaction
+  8. Emit events
+  9. Schedule hooks
+
+This cycle repeats until:
+  - no rules match, or
+  - runtime profile halts execution.
+
+---------------------------------------------------------------------
+4. RULE MATCHING
+---------------------------------------------------------------------
+A rule match is a binding of pattern variables to graph facts.
+
+Match structure:
+
+{
+  "rule_id": "string",
+  "bindings": { "Task": "fact-123", "Agent": "fact-55" },
+  "reads": [ ... ],
+  "writes": [ ... ],
+  "score": 0.0
+}
+
+4.1 Pattern Evaluation
+Patterns are evaluated in order:
+
+  - binding patterns
+  - edge patterns
+  - existence patterns
+  - collection patterns
+  - condition patterns
+  - let patterns
+
+All expressions MUST be evaluated using Expression AST v0.15.
+
+4.2 Match Validity
+A match is valid if:
+  - all patterns succeed
+  - all referenced facts exist
+  - trust gates do not block required reads
+  - no inferred read/write conflicts exist within the match
+
+---------------------------------------------------------------------
+5. MATCH SCORING
+---------------------------------------------------------------------
+Matches are scored using:
+
+  - rule priority
+  - match age
+  - fairness window
+  - runtime profile overrides
+
+score = f(priority, age, fairness, profile)
+
+Scoring MUST be deterministic.
+
+---------------------------------------------------------------------
+6. RULE SELECTION
+---------------------------------------------------------------------
+The highest-scoring match is selected.
+
+Tie-breaking order:
+
+  1. runtime profile tie_breaker
+  2. rule name (lexicographic)
+  3. match key (sorted binding IDs)
+  4. deterministic hash
+
+Random tie-breakers are allowed ONLY in engine-specific mode.
+
+---------------------------------------------------------------------
+7. TRANSACTION BOUNDARY
+---------------------------------------------------------------------
+A rule firing is a single atomic transaction.
+
+Transaction phases:
+
+  1. Begin
+  2. Read validation
+  3. Action application
+  4. Write staging
+  5. Commit
+  6. Event emission
+  7. Hook scheduling
+
+No other rule may interleave effects.
+
+---------------------------------------------------------------------
+8. READ VALIDATION
+---------------------------------------------------------------------
+Before applying writes, the engine MUST validate:
+
+  - All facts referenced in inferred_reads still exist
+  - All fields read have not changed since match time
+  - Trust levels still satisfy trust gates
+
+If validation fails:
+  - transaction aborts
+  - match is discarded
+  - next match is selected
+
+---------------------------------------------------------------------
+9. ACTION APPLICATION
+---------------------------------------------------------------------
+Actions are applied in order:
+
+  1. let
+  2. update
+  3. create
+  4. delete
+  5. emit
+  6. call
+  7. for
+  8. if
+
+Actions produce staged writes.
+
+9.1 Update
+  - Modify fields of existing facts.
+
+9.2 Create
+  - Create new facts with temporary IDs.
+
+9.3 Delete
+  - Mark facts for removal.
+
+9.4 Emit
+  - Produce events (not committed yet).
+
+9.5 Call
+  - Schedule tool calls (not executed yet).
+
+---------------------------------------------------------------------
+10. WRITE STAGING
+---------------------------------------------------------------------
+Writes are staged in a transaction buffer.
+
+Staged writes MUST NOT be visible to:
+  - other rules
+  - other matches
+  - other transactions
+
+---------------------------------------------------------------------
+11. COMMIT PHASE
+---------------------------------------------------------------------
+Commit applies staged writes atomically:
+
+  - updates applied
+  - new facts inserted
+  - deleted facts removed
+  - graph hash updated
+
+Commit MUST be atomic and isolated.
+
+---------------------------------------------------------------------
+12. EVENT EMISSION
+---------------------------------------------------------------------
+After commit:
+
+  - events are emitted in action order
+  - events are appended to the event log
+  - events are visible to subscribers
+
+Event emission is NOT part of the transaction.
+
+---------------------------------------------------------------------
+13. HOOK SCHEDULING
+---------------------------------------------------------------------
+Hooks are scheduled AFTER commit.
+
+Hook types:
+  - after_commit
+  - on_failure
+
+Hooks MUST NOT affect transaction semantics.
+
+---------------------------------------------------------------------
+14. FAILURE SEMANTICS
+---------------------------------------------------------------------
+Failures may occur in:
+
+  - read validation
+  - action evaluation
+  - commit phase
+  - hook execution
+
+14.1 Transaction Failure
+If a transaction fails before commit:
+  - no writes are applied
+  - no events are emitted
+  - on_failure hooks are scheduled
+
+14.2 Hook Failure
+Hook failures MUST NOT affect graph state.
+
+---------------------------------------------------------------------
+15. CONFLICT DETECTION
+---------------------------------------------------------------------
+Conflicts occur when:
+
+  - two matches write the same field
+  - one match deletes a fact another reads
+  - trust gates block a write
+
+Conflicts MUST be detected BEFORE commit.
+
+---------------------------------------------------------------------
+16. VISIBILITY RULES
+---------------------------------------------------------------------
+After commit:
+  - all writes become visible
+  - subsequent matches see updated graph
+  - event subscribers receive events
+  - hooks may run asynchronously
+
+---------------------------------------------------------------------
+17. DETERMINISTIC REPLAY
+---------------------------------------------------------------------
+Replay requires:
+
+  - canonical IR
+  - runtime profile
+  - event log
+  - trust log
+  - resolution trace
+
+Replay MUST produce identical graph state.
+
+---------------------------------------------------------------------
+18. WHAT IS NOT IN TRANSACTION MODEL v0.15
+---------------------------------------------------------------------
+Not included:
+  - AI substrate semantics
+  - Boundary contract structure
+  - Trust propagation rules
+  - Tool execution semantics
+  - Hook implementation details
+
+These are defined in other specs.
+
+---------------------------------------------------------------------
+19. SUMMARY
+---------------------------------------------------------------------
+The Transaction Model v0.15 defines:
+
+  - rule matching
+  - scoring
+  - selection
+  - atomic transactions
+  - read validation
+  - write staging
+  - commit semantics
+  - event emission
+  - hook scheduling
+  - deterministic replay
+
+It is the core of GRISP’s deterministic execution engine.
+
+=====================================================================
+=========  END OF GRISP v0.15 - Spec 007 - TRANSACTION MODEL  =======
+=====================================================================

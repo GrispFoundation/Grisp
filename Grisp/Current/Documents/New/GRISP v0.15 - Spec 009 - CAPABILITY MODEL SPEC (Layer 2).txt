@@ -1,0 +1,304 @@
+=====================================================================
+======  GRISP v0.15 - Spec 009 - CAPABILITY MODEL SPEC (Layer 2)  ===
+=====================================================================
+
+STATUS: Stable Draft
+LAYER: Capability & Privilege Model (Layer 2)
+VERSION: grisp-capability-model-v0.15
+DEPENDENCIES:
+  - Canonical IR v0.15
+  - Trust Model v0.15
+  - Boundary Contract v0.15
+  - AI Substrate IR v0.15
+
+---------------------------------------------------------------------
+1. PURPOSE
+---------------------------------------------------------------------
+The Capability Model v0.15 defines **what tools are allowed to do**,  
+**under which trust conditions**, and **how GRISP enforces privilege
+boundaries**.
+
+It ensures:
+  - LLMs cannot silently call privileged tools
+  - Tools cannot escalate trust
+  - Human approval is required for sensitive operations
+  - Capabilities are explicit, granular, and auditable
+  - Every tool call is validated before execution
+
+This model is the “permission system” of GRISP.
+
+---------------------------------------------------------------------
+2. DESIGN PRINCIPLES
+---------------------------------------------------------------------
+- **Least privilege**: Tools get only the capabilities they need.
+- **Explicitness**: No implicit capability grants.
+- **Trust-aware**: Capabilities require minimum trust levels.
+- **Deterministic**: Capability checks must not depend on LLM behavior.
+- **Composable**: Works with Trust Model, Boundary Contract, and AI IR.
+- **Auditable**: All capability checks are logged.
+
+---------------------------------------------------------------------
+3. CAPABILITY CLASSES
+---------------------------------------------------------------------
+Tools declare one or more capability classes:
+
+  - read_only
+  - write_limited
+  - write_privileged
+  - external_side_effect
+  - llm_facing
+  - human_required
+
+3.1 read_only  
+Tool may read external data but not modify anything.
+
+3.2 write_limited  
+Tool may modify non-critical external state.
+
+3.3 write_privileged  
+Tool may modify critical or sensitive state.  
+Requires **human_confirmed** trust.
+
+3.4 external_side_effect  
+Tool interacts with external systems (email, APIs, etc).
+
+3.5 llm_facing  
+Tool accepts LLM-generated inputs.  
+All outputs are **llm_asserted**.
+
+3.6 human_required  
+Tool cannot be called unless a human explicitly approves the call.
+
+---------------------------------------------------------------------
+4. CAPABILITY DECLARATION
+---------------------------------------------------------------------
+Tools declare capabilities in their manifest:
+
+{
+  "tool_name": "task-service",
+  "capabilities": [
+    {
+      "id": "cap:task.read",
+      "class": "read_only",
+      "min_trust": "llm_asserted"
+    },
+    {
+      "id": "cap:task.update",
+      "class": "write_limited",
+      "min_trust": "tool_returned"
+    },
+    {
+      "id": "cap:task.delete",
+      "class": "write_privileged",
+      "min_trust": "human_confirmed"
+    }
+  ]
+}
+
+Fields:
+  - id: unique capability identifier
+  - class: capability class
+  - min_trust: minimum trust required for inputs
+
+---------------------------------------------------------------------
+5. CAPABILITY TOKENS
+---------------------------------------------------------------------
+Capability tokens represent **granted permissions**.
+
+{
+  "token_id": "string",
+  "capability_id": "cap:task.update",
+  "granted_by": "operator:alice",
+  "granted_at": 1680000000,
+  "session_turn": 12
+}
+
+Tokens may be:
+  - pre-granted (static)
+  - session-granted (dynamic)
+  - human-granted (explicit approval)
+
+Tokens MUST be included in Boundary Contract session:
+
+"capability_grants": ["cap:task.update"]
+
+---------------------------------------------------------------------
+6. CAPABILITY CHECKS
+---------------------------------------------------------------------
+Before executing a tool call, the engine MUST check:
+
+  1. Tool exists
+  2. Capability exists
+  3. Capability is granted
+  4. Input trust >= min_trust
+  5. Tool class constraints are satisfied
+
+If any check fails:
+  - tool call is blocked
+  - trust violation is recorded
+  - transaction aborts
+
+---------------------------------------------------------------------
+7. TRUST + CAPABILITY INTERACTION
+---------------------------------------------------------------------
+Trust Model v0.15 defines trust levels.  
+Capability Model v0.15 defines required trust.
+
+Combined rule:
+
+  A tool call is allowed only if:
+    trust(input) >= capability.min_trust
+
+Examples:
+
+- llm_asserted input → write_privileged tool  
+    → BLOCKED
+
+- tool_returned input → write_limited tool  
+    → ALLOWED
+
+- human_confirmed input → write_privileged tool  
+    → ALLOWED
+
+---------------------------------------------------------------------
+8. LLM-FACING TOOLS
+---------------------------------------------------------------------
+Tools marked llm_facing:
+
+  - MUST treat all inputs as llm_asserted
+  - MUST return llm_asserted outputs
+  - MUST NOT escalate trust
+  - MUST NOT perform privileged operations
+
+These tools are safe for free-form LLM interaction.
+
+---------------------------------------------------------------------
+9. HUMAN-REQUIRED TOOLS
+---------------------------------------------------------------------
+Tools marked human_required:
+
+  - MUST trigger a confirm action
+  - MUST NOT execute until human approval
+  - MUST record approval in resolution trace
+
+Example:
+
+{
+  "kind": "call",
+  "payload": {
+    "tool_name": "delete-database",
+    "args": { ... },
+    "requires_confirmation": true
+  }
+}
+
+---------------------------------------------------------------------
+10. CAPABILITY GROUPS
+---------------------------------------------------------------------
+Capabilities may be grouped:
+
+{
+  "group_id": "cap:task.admin",
+  "members": [
+    "cap:task.read",
+    "cap:task.update",
+    "cap:task.delete"
+  ]
+}
+
+Granting a group grants all members.
+
+---------------------------------------------------------------------
+11. CAPABILITY INHERITANCE
+---------------------------------------------------------------------
+Capabilities may inherit:
+
+{
+  "id": "cap:task.superdelete",
+  "extends": "cap:task.delete",
+  "min_trust": "human_confirmed"
+}
+
+Inheritance rules:
+  - class is inherited unless overridden
+  - min_trust may only increase
+  - extending multiple capabilities is forbidden
+
+---------------------------------------------------------------------
+12. CAPABILITY VIOLATIONS
+---------------------------------------------------------------------
+Violations MUST be recorded:
+
+{
+  "violation_type": "CAPABILITY_DENIED",
+  "capability_id": "cap:task.update",
+  "required_trust": "tool_returned",
+  "actual_trust": "llm_asserted",
+  "tool_name": "task-service",
+  "value_path": "Task.query_override"
+}
+
+Violations abort the transaction.
+
+---------------------------------------------------------------------
+13. CAPABILITY AUDIT LOG
+---------------------------------------------------------------------
+Every tool call MUST append:
+
+  - capability_id
+  - trust level
+  - granted_by
+  - granted_at
+  - session_turn
+  - call_id
+  - result (allowed/blocked)
+
+Audit logs MUST be immutable.
+
+---------------------------------------------------------------------
+14. CAPABILITY RESOLUTION IN AI IR
+---------------------------------------------------------------------
+AI IR MUST annotate proposed tool calls with:
+
+{
+  "required_capabilities": ["cap:task.update"],
+  "input_trust": "llm_asserted",
+  "allowed": false
+}
+
+Lowering MUST enforce capability rules.
+
+---------------------------------------------------------------------
+15. WHAT IS NOT IN CAPABILITY MODEL v0.15
+---------------------------------------------------------------------
+Not included:
+
+  - tool execution semantics
+  - trust propagation rules
+  - transaction semantics
+  - hook behavior
+  - AI substrate intent structure
+
+These are defined in other specs.
+
+---------------------------------------------------------------------
+16. SUMMARY
+---------------------------------------------------------------------
+The Capability Model v0.15 defines:
+
+  - capability classes
+  - capability tokens
+  - trust-aware tool gating
+  - human-required tools
+  - llm-facing tools
+  - capability inheritance
+  - capability groups
+  - deterministic capability checks
+  - audit logging
+
+It is the permission system that keeps GRISP safe, predictable, and
+secure in AI-driven environments.
+
+=====================================================================
+========  END OF GRISP v0.15 - Spec 009 - CAPABILITY MODEL  =========
+=====================================================================

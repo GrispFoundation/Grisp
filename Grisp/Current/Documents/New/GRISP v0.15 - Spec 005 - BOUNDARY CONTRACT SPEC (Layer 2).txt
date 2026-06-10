@@ -1,0 +1,362 @@
+=====================================================================
+=====  GRISP v0.15 - Spec 005 - BOUNDARY CONTRACT SPEC (Layer 2)  ===
+=====================================================================
+
+STATUS: Stable Draft
+LAYER: Engine ↔ AI Substrate Interface (Layer 2)
+VERSION: grisp-boundary-contract-v0.15
+DEPENDENCIES:
+  - Canonical IR v0.15
+  - Expression AST v0.15
+  - Trust Model v0.15
+  - Runtime Profile v0.15
+
+---------------------------------------------------------------------
+1. PURPOSE
+---------------------------------------------------------------------
+The Boundary Contract v0.15 defines the **only legal interface** between:
+
+  - The GRISP deterministic engine (Layer 0–1)
+  - The AI substrate (Layer 1.5–2)
+
+It specifies:
+  - Request and response envelopes
+  - Session threading
+  - Trust-aware value transport
+  - Clarification flows
+  - Rejection vs failure semantics
+  - Partial result semantics
+  - Resolution trace integration
+
+This contract is the “membrane” between deterministic execution and
+AI-driven reasoning.
+
+---------------------------------------------------------------------
+2. DESIGN PRINCIPLES
+---------------------------------------------------------------------
+- **Strict separation**: No AI logic inside the engine; no engine logic inside AI.
+- **Deterministic**: Engine behavior must not depend on LLM randomness.
+- **Trust-aware**: All values carry trust metadata.
+- **Session-based**: Multi-turn interactions are stateful.
+- **Extensible**: Unknown fields ignored by engine/substrate.
+- **Auditable**: All trust events recorded in resolution trace.
+
+---------------------------------------------------------------------
+3. TOP-LEVEL REQUEST STRUCTURE
+---------------------------------------------------------------------
+A GrispExecutionRequest is:
+
+{
+  "contract_version": "grisp-boundary-v0.15",
+  "request_id": "string",
+  "manifest_id": "string",
+  "manifest_version": "string",
+  "runtime_profile_id": "string | null",
+  "session": { ... },
+  "context": { ... },
+  "facts": [ ... ],
+  "resolution_trace_id": "string | null",
+  "options": { ... }
+}
+
+REQUIRED:
+  - contract_version
+  - request_id
+  - manifest_id
+  - manifest_version
+  - session
+  - context
+  - facts
+
+---------------------------------------------------------------------
+4. SESSION OBJECT
+---------------------------------------------------------------------
+{
+  "session_id": "string",
+  "turn_index": 12,
+  "established_facts": ["fact-1", "fact-2"],
+  "pending_clarifications": ["clarify-1"],
+  "confirmed_actions": ["action-1"],
+  "capability_grants": ["cap:tool.db.query"]
+}
+
+Meaning:
+  - session_id: Stable across turns.
+  - turn_index: Monotonic counter.
+  - established_facts: Facts already known to engine.
+  - pending_clarifications: Clarifications awaiting resolution.
+  - confirmed_actions: Actions already executed.
+  - capability_grants: Human-approved capability tokens.
+
+---------------------------------------------------------------------
+5. CONTEXT AND TRUST OVERRIDES
+---------------------------------------------------------------------
+{
+  "origin": "llm | tool | human | system",
+  "default_trust_level": "llm_asserted | tool_returned | system_derived | human_confirmed",
+  "trust_overrides": [
+    {
+      "fact_id": "string",
+      "field": "string | null",
+      "level": "tool_returned",
+      "source": "task-service",
+      "session_turn": 3
+    }
+  ]
+}
+
+Rules:
+  - default_trust_level applies to all inbound facts unless overridden.
+  - trust_overrides apply before rule evaluation.
+
+---------------------------------------------------------------------
+6. FACTS
+---------------------------------------------------------------------
+Facts are Canonical IR node instances with trust metadata:
+
+{
+  "id": "string",
+  "type": "string",
+  "data": { ... },
+  "_trust": { ... },
+  "_field_trust": { ... }
+}
+
+- data MUST conform to Canonical IR v0.15.
+- _trust and _field_trust follow Trust Model v0.15.
+
+---------------------------------------------------------------------
+7. OPTIONS
+---------------------------------------------------------------------
+{
+  "max_actions": 100,
+  "timeout_ms": 500,
+  "allow_partial": true
+}
+
+---------------------------------------------------------------------
+8. TOP-LEVEL RESULT STRUCTURE
+---------------------------------------------------------------------
+A GrispExecutionResult is:
+
+{
+  "contract_version": "grisp-boundary-v0.15",
+  "request_id": "string",
+  "manifest_id": "string",
+  "manifest_version": "string",
+  "runtime_profile_id": "string | null",
+  "session": { ... },
+  "status": "success | partial | failed",
+  "partial_reason": "timeout | max_actions_reached | engine_backpressure | null",
+  "actions": [ ... ],
+  "clarifications": [ ... ],
+  "trust_violations": [ ... ],
+  "errors": [ ... ],
+  "rejection": null,
+  "resolution_trace_id": "string | null"
+}
+
+---------------------------------------------------------------------
+9. ACTIONS
+---------------------------------------------------------------------
+Each action:
+
+{
+  "action_id": "string",
+  "rule_id": "string",
+  "rule_name": "string",
+  "index": 0,
+  "kind": "update | create | delete | call | emit | clarify",
+  "payload": { ... },
+  "trust_level": "llm_asserted | tool_returned | system_derived | human_confirmed",
+  "trust_blocked": false,
+  "scoring": {
+    "match_confidence": 0.94,
+    "rule_priority": 80,
+    "selection_score": 0.87
+  }
+}
+
+trust_blocked=true means:
+  - Action NOT executed
+  - Corresponding trust_violation MUST be present
+
+---------------------------------------------------------------------
+10. ACTION PAYLOADS
+---------------------------------------------------------------------
+
+10.1 update
+{
+  "kind": "update",
+  "payload": {
+    "fact_id": "string",
+    "type": "string",
+    "assigns": {
+      "fieldName": <expression>
+    }
+  }
+}
+
+10.2 create
+{
+  "kind": "create",
+  "payload": {
+    "temp_id": "string",
+    "type": "string",
+    "fields": {
+      "fieldName": <expression>
+    }
+  }
+}
+
+10.3 delete
+{
+  "kind": "delete",
+  "payload": {
+    "fact_id": "string",
+    "type": "string"
+  }
+}
+
+10.4 call
+{
+  "kind": "call",
+  "payload": {
+    "tool_name": "string",
+    "args": { "name": <expression> },
+    "call_id": "string"
+  }
+}
+
+10.5 emit
+{
+  "kind": "emit",
+  "payload": {
+    "event_type": "string",
+    "class": "audit | operational | debug",
+    "payload": { "fieldName": <expression> }
+  }
+}
+
+10.6 clarify
+{
+  "kind": "clarify",
+  "payload": {
+    "clarify_id": "string",
+    "reason": "string",
+    "ambiguities": [
+      {
+        "id": "string",
+        "value_path": "Task.query_override",
+        "required_level": "tool_returned | human_confirmed",
+        "actual_level": "llm_asserted",
+        "question": "string",
+        "depends_on": "string | null",
+        "sequence_id": 1
+      }
+    ]
+  }
+}
+
+---------------------------------------------------------------------
+11. REJECTION VS FAILURE
+---------------------------------------------------------------------
+
+11.1 Rejection
+Used when request cannot be processed at all.
+
+{
+  "rejection": {
+    "code": "MALFORMED_REQUEST | SCHEMA_VIOLATION | UNKNOWN_PROFILE | UNKNOWN_MANIFEST | UNSUPPORTED_CONTRACT_VERSION",
+    "message": "string",
+    "field_path": "string | null"
+  }
+}
+
+If rejection != null:
+  - status MUST be "failed"
+  - actions MUST be empty
+  - clarifications MUST be empty
+  - trust_violations MUST be empty
+
+11.2 Failure
+Used when execution started but encountered runtime errors.
+
+{
+  "errors": [
+    {
+      "code": "ENGINE_TIMEOUT | INTERNAL_ERROR | RULE_EVALUATION_ERROR | TOOL_CALL_ERROR",
+      "message": "string",
+      "rule_id": "string | null",
+      "action_index": 0
+    }
+  ]
+}
+
+---------------------------------------------------------------------
+12. TRUST VIOLATIONS
+---------------------------------------------------------------------
+{
+  "trust_violations": [
+    {
+      "rule_id": "AssignPendingTask",
+      "action_index": 2,
+      "violation_type": "INSUFFICIENT_TRUST | TAINT_BOUNDARY_VIOLATION | TRUST_PROMOTION_REJECTED",
+      "required_level": "tool_returned",
+      "actual_level": "llm_asserted",
+      "value_path": "Task.query_override"
+    }
+  ]
+}
+
+---------------------------------------------------------------------
+13. PARTIAL RESULTS
+---------------------------------------------------------------------
+status="partial" MUST include partial_reason:
+
+  - timeout
+  - max_actions_reached
+  - engine_backpressure
+
+Actions up to the stopping point MUST be included.
+
+---------------------------------------------------------------------
+14. RESOLUTION TRACE THREADING
+---------------------------------------------------------------------
+If resolution_trace_id is provided:
+  - Engine MUST append trust events
+  - Engine MUST return same ID
+
+If null:
+  - Engine MAY create a new trace or skip tracing
+
+---------------------------------------------------------------------
+15. WHAT IS NOT IN BOUNDARY CONTRACT v0.15
+---------------------------------------------------------------------
+Not included:
+  - Canonical IR semantics
+  - Expression AST definitions
+  - Runtime policy
+  - AI substrate intent model
+  - Tool capability definitions
+
+These are defined in other specs.
+
+---------------------------------------------------------------------
+16. SUMMARY
+---------------------------------------------------------------------
+The Boundary Contract v0.15 provides:
+
+  - Trust-aware request/response envelopes
+  - Clarification flows
+  - Trust violations
+  - Partial result semantics
+  - Deterministic action representation
+  - Session threading
+  - Resolution trace integration
+
+It is the membrane between deterministic execution and AI reasoning.
+
+=====================================================================
+=========  END OF GRISP v0.15 - Spec 005 - BOUNDARY CONTRACT  =======
+=====================================================================
