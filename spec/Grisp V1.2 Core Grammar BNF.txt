@@ -1,0 +1,156 @@
+GRISP V1.2 Core Grammar BNF (complete, implementation-ready)
+Notes
+
+This BNF focuses on the Core Language only (language semantics). Runtime Profiles remain separate.
+
+Deterministic time symbol is TickStartTime. WallClockTime and other nondeterministic functions are disallowed in when patterns.
+
+lease is a first-class primitive. Capability and Checkpoint are included.
+
+Event class is an enum: audit, operational, debug.
+
+The grammar is intentionally explicit about where pure, effect, and nondeterministic functions may appear.
+
+
+
+
+<program> ::= { <declaration> }
+
+<declaration> ::= <node_decl>
+                | <edge_decl>
+                | <policy_decl>        ; policies live in runtime profiles, allowed here only as forward refs
+                | <function_decl>
+                | <rule_decl>
+                | <checkpoint_decl>
+
+<node_decl> ::= "node" <identifier> "{" { <field_decl> } "}"
+<lease_decl> ::= "lease" <identifier> "{" { <field_decl> } "}"  ; lease primitive variant
+
+<field_decl> ::= <identifier> ":" <type> [ "?" ]  ; optional field with ?
+
+<edge_decl> ::= "edge" <identifier> "(" <type> "->" <type> ")"
+
+<checkpoint_decl> ::= "node" "Checkpoint" "{" 
+                        "id" ":" "identifier"
+                        "tick" ":" "integer"
+                        "graph_hash" ":" "string"
+                        "created_at" ":" "number"
+                        "manifest_version" ":" "string"
+                      "}"
+
+<type> ::= "identifier" | "string" | "number" | "integer" | "boolean" | "array" "<" <type> ">" | <identifier>
+
+<function_decl> ::= <pure_fn_decl> | <effect_fn_decl> | <nondet_fn_decl>
+
+<pure_fn_decl> ::= "pure" "fn" <identifier> "(" [ <param_list> ] ")" ":" <type>
+<effect_fn_decl> ::= "effect" "(" <effect_meta> ")" "fn" <identifier> "(" [ <param_list> ] ")" ":" <type>
+<nondet_fn_decl> ::= "nondeterministic" "fn" <identifier> "(" [ <param_list> ] ")" ":" <type>
+
+<effect_meta> ::= "idempotent" "=" ("true" | "false") "," "timeout_ms" "=" <integer> "," "on_timeout" "=" <on_timeout_val>
+<on_timeout_val> ::= "retry" | "fail" | "return_default" | "propagate" | "escalate"
+
+<param_list> ::= <param> { "," <param> }
+<param> ::= <identifier> ":" <type>
+
+<rule_decl> ::= "rule" <identifier> "priority" "=" <integer> "{" <rule_body> "}"
+<rule_body> ::= <metadata_block> <when_block> <then_block> [ <hooks_block> ]
+
+<metadata_block> ::= "metadata" "{" { <meta_field> } "}"
+<meta_field> ::= "idempotent" "=" ("true" | "false")
+               | "depends_on" "=" "[" <id_list> "]"
+               | "emits" "=" "[" <string_list> "]"
+
+<when_block> ::= "when" "{" { <pattern_line> } "}"
+<pattern_line> ::= <binding> | <let_binding> | <collection_binding> | <existence_expr> | <condition_expr>
+
+<binding> ::= <identifier> "where" <predicate>
+<let_binding> ::= "let" <identifier> "=" <pure_expr>
+<collection_binding> ::= <identifier> "many" <type> "where" <predicate>
+<existence_expr> ::= "exists" <pattern> | "not" "exists" <pattern>
+<condition_expr> ::= "condition" <pure_expr>
+
+<pattern> ::= <identifier> "where" <predicate> | "edge" <identifier> "(" <pattern_ref> "->" <pattern_ref> ")"
+<pattern_ref> ::= <identifier> | <identifier> "." <field_name>
+
+<predicate> ::= <expr>  ; boolean expression using pure functions and TickStartTime
+
+<then_block> ::= "then" "{" { <action> } "}"
+<action> ::= <let_action> | <update_action> | <create_action> | <delete_action> | <emit_action> | <for_action> | <call_action>
+
+<let_action> ::= "let" <identifier> "=" <expr>
+<update_action> ::= "update" <identifier> "{" { <assign> } "}"
+<create_action> ::= "create" <create_target>
+<delete_action> ::= "delete" <create_target> [ "when" <expr> ]
+<emit_action> ::= "emit" "Event" "(" <emit_args> ")"
+<for_action> ::= "for" <identifier> "in" <collection> "{" { <action> } "}"
+<call_action> ::= "call" <identifier> "(" [ <arg_list> ] ")"
+
+<create_target> ::= <identifier> ":" <type> "{" { <assign> } "}" | <edge_create>
+<edge_create> ::= <identifier> "(" <identifier> "->" <identifier> ")"
+
+<assign> ::= <field_name> ":" <expr>
+
+<emit_args> ::= "type" "=" <string> "," "class" "=" <event_class> [ "," "payload" "=" <expr> ] [ "," "emit_hint" "=" <emit_hint> ]
+<event_class> ::= "audit" | "operational" | "debug"
+<emit_hint> ::= "{" "sample_rate" ":" <number> [ "," "aggregate_key" ":" <string> ] "}"
+
+<hooks_block> ::= "hooks" "{" { <hook_entry> } "}"
+<hook_entry> ::= "after_commit" ":" "[" <string_list> "]" | "on_failure" ":" "[" <string_list> "]"
+
+<collection> ::= <identifier> | <identifier> "." <field_name>
+<arg_list> ::= <expr> { "," <expr> }
+
+<expr> ::= <pure_expr> | <effect_call> | <nondet_call>
+<pure_expr> ::= <literal> | <identifier> | <identifier> "." <field_name> | <pure_fn_call> | <binary_op>
+<pure_fn_call> ::= <identifier> "(" [ <arg_list> ] ")"
+<effect_call> ::= <identifier> "(" [ <arg_list> ] ")"  ; allowed in then but must respect effect annotations
+<nondet_call> ::= <identifier> "(" [ <arg_list> ] ")"  ; only allowed in hooks/effects
+
+<binary_op> ::= <expr> ("+" | "-" | "*" | "/" | "==" | "!=" | "<" | ">" | "<=" | ">=" | "and" | "or") <expr>
+
+<literal> ::= <number> | <string> | "true" | "false"
+<number> ::= <integer> | <float>
+<integer> ::= [0-9]+
+<float> ::= [0-9]+ "." [0-9]+
+
+<id_list> ::= <identifier> { "," <identifier> }
+<string_list> ::= <string> { "," <string> }
+
+<identifier> ::= [A-Za-z_][A-Za-z0-9_]*
+
+; Semantic constraints (normative, enforced by manifest-compile)
+; - TickStartTime is a reserved identifier available in when and then; Now() is forbidden in when.
+; - Lease is a first-class primitive with engine-enforced invariants: SingleActiveLeasePerTask, EpochMonotonicity, ExpiryInvariant.
+; - pure functions may be used in when and then; effect functions only in then; nondeterministic functions only in hooks/effects.
+; - Event class must be one of audit, operational, debug.
+; - Reads/writes inference performed by manifest-compile; production mode requires explicit reads/writes for selection-affecting rules.
+
+
+
+
+
+Minimal normative semantics summary for implementers
+TickStartTime: captured once per tick; used for all time comparisons in when and then.
+
+Lease primitive: engines must enforce single active lease per task, owner_epoch monotonicity, and expiry invariants atomically.
+
+Function categories: pure allowed anywhere; effect allowed only in then with declared timeouts; nondeterministic allowed only in hooks/effects and excluded from deterministic trace.
+
+Event ordering: events carry tick_number, transaction_commit_sequence, and event_index. These fields are part of the canonical trace.
+
+Emit hints: optional sampling/aggregation hints are advisory; runtime profiles map them to concrete retention/sampling policies.
+
+Manifest-compile: must perform static checks, enforce forbidden constructs (e.g., Now() in when), compute inferred reads/writes, and emit warnings or fail in production mode.
+
+Next steps I can produce immediately
+I’ll generate any of the following next, ready to copy/paste:
+
+Runtime Profile JSON Schema with selection_affecting annotations and scheduler profile fields.
+
+Example manifest pair .grisp + runtime.delphi.yaml demonstrating Acquire/Renew/Steal/Expire flows and NextLeaseEpoch usage.
+
+Reference scheduler profile and canonical test cases for manifest-verify.
+
+Conformance checklist and CI snippets for manifest-compile, manifest-verify, lease-simulator, and checkpoint tests.
+
+I’ll proceed to produce the Runtime Profile JSON Schema next unless you prefer a different artifact.

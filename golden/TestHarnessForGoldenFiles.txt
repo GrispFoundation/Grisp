@@ -1,0 +1,201 @@
+### Test harness: manifest-compile golden-file verifier
+
+Below is a compact, copy‑paste‑ready test harness you can drop into a repo to validate `manifest-compile` outputs against the canonical golden IRs. It includes:
+
+- **`canonicalize_json.py`** — deterministic canonical JSON serializer (key ordering, compact formatting, canonical number formatting).
+- **`verify-golden.sh`** — shell script that runs `manifest-compile`, canonicalizes output, and compares bytes to golden files.
+- **`ci-golden-check.yml`** — example GitHub Actions job to run the check in CI.
+
+Place your golden pairs under `golden/` as `golden-01-acquire.grisp` and `golden-01-acquire.ir.json` etc. Adjust `MANIFEST_COMPILE_CMD` to your tool invocation.
+
+---
+
+#### `canonicalize_json.py`
+```python
+#!/usr/bin/env python3
+# canonicalize_json.py
+# Read JSON from stdin, write canonical JSON to stdout.
+# Canonical rules:
+# - lexicographic object key ordering
+# - compact separators (no spaces)
+# - deterministic number formatting: integers as digits, floats with minimal decimals
+# - UTF-8 output
+
+import sys
+import json
+from decimal import Decimal
+
+def canonical_number(x):
+    # Use Decimal to avoid float representation differences
+    if isinstance(x, int):
+        return x
+    try:
+        d = Decimal(str(x))
+    except Exception:
+        return x
+    # If integer-valued, return int
+    if d == d.to_integral():
+        return int(d)
+    # Normalize to remove trailing zeros
+    return float(d.normalize())
+
+def canonicalize(obj):
+    if isinstance(obj, dict):
+        # sort keys
+        return {k: canonicalize(obj[k]) for k in sorted(obj.keys())}
+    if isinstance(obj, list):
+        return [canonicalize(v) for v in obj]
+    if isinstance(obj, float) or isinstance(obj, int):
+        return canonical_number(obj)
+    return obj
+
+def main():
+    data = json.load(sys.stdin)
+    can = canonicalize(data)
+    # Use separators to remove spaces, ensure ASCII safe via ensure_ascii=False for UTF-8
+    out = json.dumps(can, separators=(",", ":"), ensure_ascii=False, sort_keys=False)
+    sys.stdout.write(out)
+
+if __name__ == "__main__":
+    main()
+```
+
+Make executable:
+```bash
+chmod +x canonicalize_json.py
+```
+
+---
+
+#### `verify-golden.sh`
+```bash
+#!/usr/bin/env bash
+# verify-golden.sh
+# Usage: ./verify-golden.sh <golden-dir> <out-dir>
+# Expects manifest-compile to be available as $MANIFEST_COMPILE_CMD
+set -euo pipefail
+
+GOLDEN_DIR="${1:-golden}"
+OUT_DIR="${2:-out}"
+MANIFEST_COMPILE_CMD="${MANIFEST_COMPILE_CMD:-manifest-compile}"  # override in env if needed
+CANONICALIZER="./canonicalize_json.py"
+
+mkdir -p "$OUT_DIR"
+failures=0
+
+for src in "$GOLDEN_DIR"/*.grisp; do
+  base="$(basename "$src" .grisp)"
+  golden_json="$GOLDEN_DIR/$base.ir.json"
+  out_json="$OUT_DIR/$base.ir.json"
+
+  if [ ! -f "$golden_json" ]; then
+    echo "Skipping $src — missing golden IR $golden_json"
+    continue
+  fi
+
+  echo "Compiling $src -> $out_json"
+  # Run manifest-compile; it must write canonical IR to stdout or to a file.
+  # Adjust command if your compiler writes to a file.
+  # Example: manifest-compile --input "$src" --output "$out_json"
+  $MANIFEST_COMPILE_CMD --input "$src" --output "$out_json"
+
+  # Canonicalize both files
+  tmp_golden="$(mktemp)"
+  tmp_out="$(mktemp)"
+  python3 "$CANONICALIZER" < "$golden_json" > "$tmp_golden"
+  python3 "$CANONICALIZER" < "$out_json" > "$tmp_out"
+
+  if cmp -s "$tmp_golden" "$tmp_out"; then
+    echo "OK: $base"
+  else
+    echo "FAIL: $base — output differs from golden"
+    echo "  diff (golden vs out):"
+    diff -u "$tmp_golden" "$tmp_out" | sed 's/^/    /'
+    failures=$((failures+1))
+  fi
+
+  rm -f "$tmp_golden" "$tmp_out"
+done
+
+if [ "$failures" -ne 0 ]; then
+  echo "Verification failed: $failures mismatch(es)"
+  exit 2
+else
+  echo "All golden files matched."
+  exit 0
+fi
+```
+
+Make executable:
+```bash
+chmod +x verify-golden.sh
+```
+
+**Notes**
+- `MANIFEST_COMPILE_CMD` should be set to your compiler binary or wrapper. Example:
+  ```bash
+  export MANIFEST_COMPILE_CMD="./bin/manifest-compile"
+  ./verify-golden.sh golden out
+  ```
+- If your compiler writes to stdout, change the invocation to redirect stdout to `$out_json`.
+
+---
+
+#### `ci-golden-check.yml` (GitHub Actions)
+```yaml
+name: GRISP Golden IR Check
+
+on:
+  push:
+    paths:
+      - 'golden/**'
+      - 'src/**'
+  pull_request:
+    paths:
+      - 'golden/**'
+      - 'src/**'
+
+jobs:
+  golden-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install manifest-compile (example)
+        run: |
+          # Replace with your build/install steps
+          # e.g., make build && cp bin/manifest-compile /usr/local/bin/
+          echo "Install manifest-compile here"
+          # For CI, ensure MANIFEST_COMPILE_CMD points to the installed binary
+
+      - name: Run golden verification
+        env:
+          MANIFEST_COMPILE_CMD: "./bin/manifest-compile" # adjust as needed
+        run: |
+          chmod +x ./canonicalize_json.py
+          chmod +x ./verify-golden.sh
+          ./verify-golden.sh golden out
+```
+
+---
+
+### Optional: byte-for-byte golden files
+If you want **pre-serialized canonical JSON bytes** for each golden IR (so CI can compare files directly without canonicalizer), I can produce the canonicalized `.ir.json` files (compact, sorted) for all golden examples and include them in a `golden-canonical/` directory. Say “produce canonicalized golden files” and I’ll emit them as ready-to-copy JSON blocks.
+
+---
+
+### Next steps I can generate immediately
+Choose one and I’ll produce it next (ready to copy/paste):
+
+1. **Canonicalized golden IR files** (compact canonical JSON for all 16 examples).  
+2. **Additional golden examples** (10+ more edge cases).  
+3. **A small Node/Python multi-run harness** that runs multiple compiler implementations and asserts byte-for-byte equality.  
+4. **CI job variants** (GitLab CI, Azure Pipelines) and a `Makefile` to run local checks.
+
+Which one should I generate now?

@@ -1,0 +1,239 @@
+Manifest-Compile Mapping Guide (GRISP v1.2 ? Canonical IR)
+This document describes the deterministic, repeatable transformation from GRISP source (parser AST) to the Canonical IR v1.2. It is intended for implementers of manifest-compile so different toolchains produce identical IR for identical source input and deterministic inputs (runtime_profile_ref, manifest_version, id_generation settings). Follow these steps exactly; each step is normative for conformance.
+
+1. High-level pipeline (ordered)
+Parse source into a concrete AST using the grammar.
+
+Normalize AST: remove syntactic sugar, expand shorthand, and produce a simplified AST.
+
+Resolve symbols: bind names to declarations (nodes, edges, functions, rules). Produce symbol table.
+
+Type check: validate field types, enums, function signatures, and basic expression typing.
+
+Normalize expressions: convert all expression occurrences into the Expression AST nodes (literal, var, field, call, binary, unary, conditional, collection, object, array). Every value must be an expression node.
+
+Normalize patterns: convert when patterns into normalized pattern objects (binding, edge, existence, collection, let, condition).
+
+Normalize actions: convert then actions into canonical action objects (create, update, delete, emit, let, for, call).
+
+Infer reads/writes: compute inferred_reads and inferred_writes for each rule.
+
+Normalize IDs: compute deterministic IDs for nodes, edges, functions, and rules according to id_generation.
+
+Emit Canonical IR: assemble top-level IR object, sort keys lexicographically, and serialize using canonical JSON rules.
+
+2. Detailed normalization rules
+2.1 Expression normalization (mandatory)
+All literal values become { "kind":"literal", "literal_type":..., "value":... }.
+
+Variable references become { "kind":"var", "name": "<identifier>" }.
+
+Field access becomes { "kind":"field", "var":"<var>", "field":"<field>", "safe":<bool> }.
+
+Function calls become { "kind":"call", "fn":"<name>", "args":[...], "kwargs":{...} }.
+
+Binary/unary ops become { "kind":"binary", "op":"<op>", "left":..., "right":... } or unary form.
+
+Object/array literals become object/array expression nodes with nested expression values.
+
+Collection queries in when or for become collection expression nodes with source and normalized query object.
+
+Type hints: if the parser provides type hints, include type_hint on expression nodes; do not rely on them for semantics.
+
+2.2 Pattern normalization
+Binding: A: Agent where role == "x" ? { "kind":"binding", "var":"A", "type":"Agent", "constraints":[{...}] }.
+
+Edge: edge has_capability(A -> C) ? { "kind":"edge", "edge":"has_capability", "from":"A", "to":"C" }.
+
+Existence: not exists Lease where ... ? { "kind":"existence", "exists":false, "pattern":{...} }.
+
+Collection: X many Task where ... order by ... ? collection pattern with explicit order_by array and optional limit. order_by must be explicit in IR; if omitted in source, manifest-compile must apply deterministic default ordering (see section 4).
+
+Let: let n = Normalize(text) in when becomes { "kind":"let", "name":"n", "expr": <expr> }.
+
+2.3 Action normalization
+Create: both create Lease { ... } and create L: Lease { ... } produce { "kind":"create", "type":"Lease", "result_var": "<optional>", "fields": { ... } } where each field value is an expression node.
+
+Update: update Task { lifecycle: "assigned" } ? { "kind":"update", "target":"TaskVar", "assigns":[{ "field":"lifecycle", "value": <expr> }] }.
+
+Delete: include optional when expression normalized.
+
+Emit: normalize payload into an object expression node; include emit_hint if present. Mark non_deterministic only when emitted from hooks.
+
+For/Call/Let: canonical shapes with expression nodes for collection and call args.
+
+3. Reads/writes inference algorithm (normative)
+Purpose: produce inferred_reads and inferred_writes arrays for each rule.
+
+Algorithm (per rule):
+
+Initialize empty sets R (reads) and W (writes).
+
+Walk the normalized when patterns:
+
+For each binding pattern var:type add type.* to R only if the pattern references fields (e.g., role) add type.field to R.
+
+For edge patterns, add the referenced node fields to R (e.g., Agent.id if used).
+
+For collection patterns, add type.<ordered fields> to R for fields used in constraints and order_by.
+
+Walk the normalized then actions:
+
+For create actions: add the created node type (e.g., Lease) to W and add any referenced fields in expressions to R. For created fields, include Lease.field in W.
+
+For update actions: for each assigned field add TargetType.field to W; for assigned expressions, add referenced fields to R.
+
+For delete actions: add TargetType to W and any fields used in the when condition to R.
+
+For emit actions: treat payload expressions as reads; do not add to W.
+
+For function calls in when or then, consult function metadata:
+
+If function is pure, treat its argument fields as reads.
+
+If function is effect, do not include side-effect writes in inferred_writes (effects are outside deterministic trace) but include any explicit graph writes performed by the effect if declared.
+
+Normalize R and W into sorted arrays of canonical field paths (e.g., Task.lifecycle, Lease.expires_at). Include node-level writes as Lease if entire node is created/deleted.
+
+Emit inferred_reads = sorted R, inferred_writes = sorted W.
+
+Notes:
+
+manifest-compile must be conservative: if uncertain whether an expression reads a field, include it in inferred_reads.
+
+For nested object fields, use dot notation Node.field.subfield. Wildcards are not allowed in inferred_* arrays.
+
+4. Deterministic ordering rules
+To ensure identical IR bytes across toolchains, apply these ordering rules before serialization:
+
+Top-level keys: sort lexicographically.
+
+Arrays:
+
+nodes, edges, functions, rules — sort by name ascending; if name equal, sort by id.
+
+Within nodes.fields object, sort field names lexicographically.
+
+Within rules.when and rules.then arrays preserve normalized source order; do not reorder patterns or actions. (Compiler may reorder for optimization internally but must not change IR order.)
+
+inferred_reads and inferred_writes — sort lexicographically.
+
+Object keys: within any object, keys must be sorted lexicographically for canonical JSON.
+
+Expression nodes: canonicalize by:
+
+Representing commutative binary ops in a canonical operand order (e.g., for == and and sort operands by serialized canonical form).
+
+Always include kind as the first key in expression objects.
+
+5. ID generation and stability (normative)
+Goal: deterministic, stable IDs across compilers.
+
+Default algorithm (must be supported):
+
+id = sha256_hex( canonical_json( object_to_hash ) ) where:
+
+object_to_hash is the canonical JSON of the entity (node/edge/function/rule) with keys sorted and using the canonical expression serialization.
+
+For rules, include name, priority, normalized when and then, and metadata in the hashed object.
+
+Use lowercase hex encoding.
+
+Include id_generation metadata at top-level documenting the method.
+
+Alternative:
+
+If source provides an explicit id field, manifest-compile may use it verbatim but must still include id_generation = explicit_field and ensure the explicit id is stable.
+
+Requirement:
+
+Given identical source, manifest_version, runtime_profile_ref, and deterministic compiler environment, manifest-compile must produce identical IDs.
+
+6. Hooks and non-determinism handling
+Normalization:
+
+Hooks in rules are normalized into hooks.after_commit and hooks.on_failure arrays of hook objects with id, idempotent, timeout_ms, retry_policy, and non_deterministic:true.
+
+IR semantics:
+
+Hooks are outside the deterministic trace. Hook-emitted events must be marked non_deterministic in the IR.
+
+manifest-compile must set non_deterministic:true for hooks and any events they emit.
+
+Engines must exclude hook-emitted events from canonical conformance trace comparisons unless explicitly configured for hook-replay testing.
+
+Validation:
+
+manifest-compile must reject hooks that reference nondeterministic functions in when patterns. Hooks may call nondeterministic functions.
+
+7. Production mode checks
+When production_mode or declared_sets_required is enabled in the runtime profile:
+
+manifest-compile must require declared_reads and declared_writes for any rule that the compiler determines is selection-affecting (i.e., its inferred reads/writes include selection-relevant fields such as node lifecycle, status, or fields used in matching).
+
+Validate declared_* are supersets of inferred_*. If not, fail compilation with a clear error listing missing fields.
+
+Emit warnings for rules that create or update leases without using NextLeaseEpoch or without explicit owner_epoch handling.
+
+8. Canonical JSON emission
+After normalization and ordering:
+
+Serialize the IR to compact JSON with no insignificant whitespace.
+
+Ensure object keys are lexicographically sorted.
+
+Use UTF-8 encoding.
+
+Use deterministic number formatting: integers as digits; floats with minimal necessary decimal digits but consistent formatting (e.g., 1.5 not 1.500000).
+
+Produce the final file named grisp-ir.v1.2.json (recommended) or as required by CI.
+
+9. Example transformation (brief)
+Source snippet:
+
+Code
+rule AcquireLease priority=80 {
+  when {
+    Task where lifecycle == "pending"
+    Agent where role == "Specialist"
+    not exists Lease where Lease.task == Task and Lease.status == "active"
+  }
+  then {
+    create Lease { task: Task, agent: Agent, expires_at: TickStartTime + 30000, owner_epoch: NextLeaseEpoch(Task) }
+    update Task { lifecycle: "assigned" }
+    emit Event(type="LEASE_ACQUIRED", class="operational", payload={task: Task.id, agent: Agent.id})
+  }
+}
+Key normalized outputs:
+
+when patterns ? binding/edge/existence pattern objects.
+
+then.create fields ? expression nodes for expires_at and owner_epoch.
+
+inferred_reads ? ["Task.lifecycle","Agent.role","Task.id","Agent.id"] (conservative).
+
+inferred_writes ? ["Lease","Task.lifecycle","Lease.expires_at","Lease.owner_epoch"].
+
+Deterministic id computed via id_generation method.
+
+10. Conformance and testing
+Unit tests: for each grammar construct, assert the emitted IR matches a golden file (canonical JSON).
+
+Round-trip tests: parse ? compile ? serialize ? parse IR and assert structural equivalence.
+
+Determinism tests: run manifest-compile in different environments (languages, OSes) with identical inputs and assert byte-for-byte identical IR.
+
+Production checks: run manifest-compile --mode=production and assert declared sets are present and valid.
+
+11. Implementation notes and best practices
+Be conservative in inferred reads/writes; false positives are acceptable, false negatives are not.
+
+Cache capability closures and expression canonicalizations to speed repeated compilations.
+
+Log normalization steps and warnings to help authors fix ambiguous rules.
+
+Provide a --dump-ast and --dump-ir option for debugging and CI.
+
+Document the id_generation algorithm in the manifest and in CI to ensure reproducibility.
+
+This mapping guide is normative for any manifest-compile implementation targeting the Canonical IR v1.2. If you want, I will now generate: (A) a concrete set of golden-file examples (5–10 canonical manifests and their expected IR), or (B) a small reference manifest-compile test harness (shell + node/python scripts) that validates determinism across environments. I will produce the golden-file examples next unless you prefer the test harness.
