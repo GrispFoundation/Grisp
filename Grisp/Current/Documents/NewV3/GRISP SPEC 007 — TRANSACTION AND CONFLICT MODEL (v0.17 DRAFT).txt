@@ -1,0 +1,143 @@
+GRISP SPEC 007 — TRANSACTION AND CONFLICT MODEL (v0.17 DRAFT)
+
+Status: Draft
+Layer: 0 (Deterministic Core)
+Depends on: Spec 001 Canonical IR, Spec 002 Expression AST, Spec 003 Node and Edge Model, Spec 004 Type System, Spec 005 Pattern Model, Spec 006 Match Discovery Model, Spec 014 Dependency Set Model
+
+Purpose:
+This specification defines the deterministic transaction model for GRISP. It describes how matches are validated, how actions are staged, how conflicts are detected, and how state transitions are committed. The Transaction and Conflict Model ensures that all engines produce identical state transitions for the same Canonical IR and initial state.
+
+1. Overview
+A transaction is the execution of a selected match. A transaction consists of:
+- dependency validation
+- action staging
+- conflict detection
+- commit or abort
+Transactions must be deterministic. Transactions must not interleave. Only one transaction may commit per tick.
+
+2. Transaction Lifecycle
+The lifecycle of a transaction is:
+1. A match is selected by the Selection Model.
+2. The engine validates the match dependencies.
+3. If validation succeeds, the engine evaluates the then clause.
+4. The engine stages all resulting state changes.
+5. The engine performs conflict detection.
+6. If no conflicts are found, the engine commits the staged changes.
+7. If conflicts are found, the match is invalidated and the engine returns to match discovery.
+
+3. Dependency Validation
+Before executing a match, the engine must validate its dependency set. For each dependency in the match’s dependency snapshot:
+- retrieve the current version counter
+- compare it to the recorded version
+If any version differs, the match is invalid and must be discarded. Dependency validation ensures that the match was discovered on a consistent snapshot of the state.
+
+4. Action Evaluation
+If dependency validation succeeds, the engine evaluates the then clause. Action evaluation must be deterministic. Action evaluation may produce:
+- node creations
+- node updates
+- node deletions
+- edge creations
+- edge deletions
+- event emissions
+Action evaluation must not modify the state directly. All changes must be staged.
+
+5. Staged Changes
+Staged changes are stored in a transaction buffer. The buffer contains:
+- created nodes
+- updated nodes and their new field values
+- deleted nodes
+- created edges
+- deleted edges
+Staged changes must not be visible to match discovery or other transactions until commit.
+
+6. Conflict Detection
+After staging changes, the engine must detect conflicts. A conflict occurs if:
+- a staged update modifies a field whose version has changed since dependency validation
+- a staged delete removes a node or edge whose version has changed since dependency validation
+- a staged create violates structural constraints
+- a staged update violates type constraints
+Conflict detection must use the same version counters used in dependency validation.
+
+7. Conflict Rules
+Conflicts are detected using the following rules:
+- If a node version differs from the version recorded in the dependency snapshot, and the match depends on that node or its fields, conflict.
+- If a predicate version differs for any field used in a collection filter, conflict.
+- If an ordering version differs for any field used in a collection order_by, conflict.
+- If an extent version differs for any type used in a collection source, conflict.
+- If an edge version differs for any edge type used in the match, conflict.
+- If a staged update modifies a field not included in the dependency set, no conflict.
+- If a staged update modifies a field included in the dependency set and the version changed, conflict.
+
+8. Conflict Resolution
+If a conflict is detected:
+- the transaction is aborted
+- the match is invalidated
+- the engine returns to match discovery
+- the match must not be selected again unless rediscovered
+
+9. Commit
+If no conflicts are detected, the engine commits the staged changes. Commit must:
+- apply all node creations
+- apply all node updates
+- apply all node deletions
+- apply all edge creations
+- apply all edge deletions
+- increment version counters deterministically
+Commit must be atomic. Partial commits are forbidden.
+
+10. Version Counter Updates
+Commit must update version counters as follows:
+- node version increments on update or delete
+- predicate version increments when a field used in a filter changes
+- ordering version increments when a field used in order_by changes
+- extent version increments on node create or delete
+- edge version increments on edge create or delete
+
+11. Deterministic Ordering of Updates
+When multiple updates occur in a transaction:
+- node creations are applied in ascending node id order
+- node updates are applied in ascending node id order
+- node deletions are applied in ascending node id order
+- edge creations are applied in ascending edge id order
+- edge deletions are applied in ascending edge id order
+This ensures deterministic commit behavior.
+
+12. Transaction Failure Modes
+A transaction fails if:
+- dependency validation fails
+- conflict detection fails
+- action evaluation produces invalid operations
+- type checking fails
+- structural constraints are violated
+Failed transactions must not modify the state.
+
+13. Interaction with Match Discovery
+Match discovery must not see staged changes. Only committed changes are visible. After a transaction commits or aborts, match discovery must be re-run.
+
+14. Interaction with Selection Model
+The Selection Model chooses exactly one match per tick. The Transaction Model executes that match. If the match fails validation or conflict detection, the Selection Model must choose a new match.
+
+15. Interaction with Dependency Set Model
+The Transaction Model relies on dependency sets for:
+- dependency validation
+- conflict detection
+Dependency sets must be computed during match discovery and must not change during the transaction.
+
+16. Interaction with Golden Files
+Golden files must capture:
+- selected match
+- dependency validation result
+- conflict detection result
+- staged changes
+- committed changes
+- version counter updates
+Any deviation indicates nonconformance.
+
+17. Extensibility
+Future versions may extend the Transaction Model with:
+- multi-action transactions
+- deterministic batching
+- deterministic rollbacks
+All extensions must preserve determinism.
+
+End of GRISP SPEC 007 — TRANSACTION AND CONFLICT MODEL (v0.17 DRAFT)

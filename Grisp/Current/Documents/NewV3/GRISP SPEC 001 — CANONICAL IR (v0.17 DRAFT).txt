@@ -1,0 +1,140 @@
+GRISP SPEC 001 — CANONICAL IR (v0.17 DRAFT)
+
+Status: Draft
+Layer: 0 (Deterministic Core)
+Depends on: Spec 002 Expression AST, Spec 011 State Model, Spec 014 Dependency Set Model
+
+Purpose:
+This specification defines the Canonical Intermediate Representation for GRISP manifests. The Canonical IR is the fully normalized, deterministic representation of all rule definitions, node types, edge types, and functions. All engines must execute rules exclusively through this representation. The Canonical IR contains no nondeterministic constructs and no implicit defaults. All semantics are explicit.
+
+1. Overview
+The Canonical IR is a pure data structure describing the static components of a GRISP manifest. It includes node type definitions, edge type definitions, function definitions, and rule definitions. The Canonical IR is the only normative input to the deterministic execution engine. All engines must produce identical behavior when given the same Canonical IR and initial state.
+
+2. Node Types
+A node type defines a schema for nodes in the state graph. A node type consists of:
+- type_name: a string identifier, globally unique within the manifest.
+- fields: a mapping from field_name to field_type.
+- metadata: optional static metadata fields, not used for execution semantics.
+
+Node types are purely structural. They do not contain behavior. All node instances in the state graph must conform to their node type definition.
+
+3. Edge Types
+An edge type defines a schema for directed edges between nodes. An edge type consists of:
+- type_name: a string identifier, globally unique within the manifest.
+- source_type: the node type name for the edge source.
+- target_type: the node type name for the edge target.
+- multiplicity: optional constraints (e.g., one-to-one, one-to-many).
+- metadata: optional static metadata.
+
+Edge types are structural. They define allowed connections between node types. Edge instances in the state graph must conform to their edge type definition.
+
+4. Function Definitions
+Functions are reusable computations referenced from Expression ASTs. A function definition consists of:
+- function_name: a string identifier, unique within the manifest.
+- version: a semantic version string (e.g., "1.0.0").
+- kind: one of:
+  - pure: no side effects, deterministic, depends only on its inputs.
+  - effect_deterministic: has side effects but produces deterministic results given the same state and inputs.
+  - effect_nondeterministic: may produce different results for the same inputs and state.
+- parameters: a list of parameter definitions (name, type).
+- return_type: the type of the function result.
+- implementation_ref: an opaque identifier for the implementation (e.g., "builtin:compute_score", "plugin:uuid_v4").
+
+The Canonical IR does not embed function bodies. It only declares signatures and implementation references. Engines must provide implementations for all referenced functions. Pure functions must be deterministic. Effect_deterministic functions must be deterministic with respect to the state model. Effect_nondeterministic functions are allowed but must be isolated from the deterministic core (e.g., used only in boundary or AI layers).
+
+5. Rule Definitions
+A rule defines a pattern over the state graph and an action to perform when the pattern matches. A rule definition consists of:
+- rule_id: a string identifier, globally unique within the manifest.
+- rule_version: a semantic version string (e.g., "1.0.0").
+- priority: an integer base priority used by the Selection Model.
+- pattern: a declarative description of node and edge bindings.
+- when: an optional Expression AST that must evaluate to true for the match to be valid.
+- let: optional bindings computed from Expression ASTs.
+- then: an action block describing state changes (create, update, delete, emit).
+
+Rule IDs and versions are immutable identifiers. Changing rule semantics requires a new rule_version. Engines must treat (rule_id, rule_version) as the canonical identity of a rule.
+
+6. Pattern Structure
+The pattern section binds nodes and edges from the state graph. It consists of:
+- node bindings: each binding has a local name and a node type.
+- edge bindings: each binding has a local name and an edge type, plus source and target node bindings.
+Patterns may include constraints expressed via Expression ASTs (e.g., field comparisons). Patterns are purely declarative. They do not perform actions.
+
+7. When Clause
+The when clause is an optional Expression AST evaluated over the bound nodes and edges. It must evaluate to a boolean. If when evaluates to false, the match is discarded. The when clause may reference:
+- bound node fields.
+- bound edge metadata.
+- pure functions.
+The when clause must not invoke effect_nondeterministic functions. It may invoke effect_deterministic functions only if their behavior is fully captured by the state model.
+
+8. Let Clause
+The let clause defines computed bindings. Each let binding consists of:
+- name: a local identifier.
+- expr: an Expression AST.
+Let bindings may reference:
+- pattern bindings.
+- other let bindings (acyclic).
+- pure functions.
+Let bindings must not invoke effect_nondeterministic functions. Effect_deterministic functions are allowed only if their dependencies are captured in the Dependency Set Model.
+
+9. Then Clause
+The then clause defines the action to perform when a match is selected and validated. It consists of a sequence of operations:
+- create_node: create a new node of a given type with initial field values.
+- update_node: update fields on an existing node.
+- delete_node: delete an existing node.
+- create_edge: create a new edge of a given type between nodes.
+- delete_edge: delete an existing edge.
+- emit_event: emit a runtime event (outside the deterministic state).
+
+Each operation is described in Canonical IR as a structured action:
+- target: a binding or type.
+- fields: a mapping from field_name to Expression AST for new values.
+Actions may reference pattern bindings and let bindings. Actions must not invoke effect_nondeterministic functions directly. Any nondeterministic behavior must be isolated via boundary or AI layers.
+
+10. Deterministic Semantics and Dependency Hooks
+The Canonical IR does not itself compute dependency sets, but it must be structured so that Spec 014 Dependency Set Model can derive them deterministically. Therefore:
+- All field accesses in pattern, when, let, and then must be explicit in the Expression AST.
+- All collection expressions must specify source types, filter expressions, and order_by expressions explicitly.
+- All function calls must declare function_name and parameters explicitly.
+
+The Canonical IR must not contain implicit field accesses or hidden defaults. Engines must be able to walk the Canonical IR and Expression AST to construct dependency sets as defined in Spec 014.
+
+11. Manifest Structure
+A manifest is the top-level Canonical IR document. It consists of:
+- node_types: a list of node type definitions.
+- edge_types: a list of edge type definitions.
+- functions: a list of function definitions.
+- rules: a list of rule definitions.
+- metadata: optional manifest-level metadata.
+
+Manifests are immutable inputs to the deterministic core. Any change to a manifest requires a new manifest version and may require new golden files.
+
+12. Validation Requirements
+Engines must validate Canonical IR before execution:
+- All referenced node types and edge types must be defined.
+- All function references must resolve to known implementations.
+- All rule_ids must be unique.
+- All rule_versions must be valid semantic versions.
+- All Expression ASTs must be well-typed according to the type system.
+- No effect_nondeterministic functions may appear in pattern, when, or let clauses.
+
+Invalid manifests must be rejected before any execution.
+
+13. Golden Files and Canonical IR
+Golden files (Spec 010) use Canonical IR as the normative description of rule behavior. For a given Canonical IR and initial state, golden files capture:
+- match discovery sequences.
+- selection decisions.
+- dependency sets.
+- state transitions.
+
+Any engine that consumes the same Canonical IR and passes the golden file suite is considered conformant.
+
+14. Extensibility
+The Canonical IR may be extended in future versions to support:
+- additional function kinds.
+- richer type systems.
+- advanced pattern constructs.
+
+All extensions must preserve determinism and must be expressible in a way that Spec 014 can derive dependency sets.
+
+End of GRISP SPEC 001 — CANONICAL IR (v0.17 DRAFT)
