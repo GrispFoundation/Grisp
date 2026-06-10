@@ -1,0 +1,165 @@
+============  GRISP v0.16 — Spec 008 - HOOK SEMANTICS  ============
+
+Status: Draft
+Layer: 1 (Post-Commit Side-Effect Layer)
+Depends on:
+- Spec 001 Canonical IR
+- Spec 003 Runtime Profile
+- Spec 007 Transaction Model
+- Spec 012 Event Model
+
+1. Purpose
+Hook Semantics define how GRISP executes post-commit side effects. Hooks allow external integrations, logging, notifications, and asynchronous work without affecting deterministic state transitions. Hooks run after commit and must never modify graph state.
+
+2. Design Principles
+- Hooks must not affect determinism.
+- Hooks must not modify graph state.
+- Hooks must run in commit order.
+- Hooks may run asynchronously, but logical ordering must be preserved.
+- Hooks must be idempotent if retried.
+- Hooks must not influence match scoring or selection.
+
+3. Hook Types
+There are two hook types:
+
+3.1 Rule Hooks
+Attached to specific rules.
+
+{
+  "rule_id": "AssignTask",
+  "hook": {
+    "kind": "post_commit",
+    "action": "notify",
+    "params": { ... }
+  }
+}
+
+3.2 Global Hooks
+Attached to the manifest.
+
+{
+  "hook": {
+    "kind": "post_commit",
+    "action": "audit_log",
+    "params": { ... }
+  }
+}
+
+4. Hook Invocation Order
+Hooks must execute in the following deterministic order:
+
+Step 1: All rule-specific hooks for the committed rule, in manifest order.
+Step 2: All global hooks, in manifest order.
+
+If multiple hooks exist for a rule, they must run in the order they appear in the manifest.
+
+5. Hook Execution Model
+Hooks run after commit. They receive:
+
+{
+  "hook_id": "string",
+  "rule_id": "string",
+  "commit_id": "string",
+  "bindings": { ... },
+  "writes": { ... },
+  "events": [ ... ],
+  "timestamp": "logical_tick"
+}
+
+Rules:
+- timestamp is logical, not wall-clock.
+- bindings reflect the match that triggered the commit.
+- writes reflect the staged writes applied during commit.
+
+6. Allowed Hook Actions
+Hooks may perform:
+- logging
+- notifications
+- external service calls
+- event forwarding
+- metrics collection
+
+Hooks may not:
+- modify graph state
+- modify events
+- modify facts
+- modify edges
+- modify trust
+- modify capabilities
+- trigger new transactions
+
+7. Asynchronous Execution
+Hooks may run asynchronously, but must preserve logical ordering:
+
+- Hook A must complete before Hook B if A appears earlier in the manifest.
+- Engines may run hooks in parallel internally, but must serialize completion order.
+
+If a hook fails:
+- it may be retried
+- retries must be idempotent
+- failure must not affect engine state
+
+8. Idempotency Requirements
+Hook actions must be idempotent. Examples:
+
+Allowed:
+- sending a notification with a unique commit_id
+- writing an audit log entry with a unique commit_id
+- calling an external service with a unique request_id
+
+Forbidden:
+- incrementing counters without unique identifiers
+- performing non-idempotent writes to external systems
+
+9. Error Handling
+If a hook fails:
+- the engine must not roll back the commit
+- the engine must log the failure
+- the engine may retry the hook
+- the engine must not block future ticks indefinitely
+
+Hook errors must not propagate into the deterministic core.
+
+10. Interaction With Events
+Hooks may read emitted events but may not modify them.
+
+Hooks may forward events to external systems.
+
+11. Interaction With Runtime Profile
+Runtime Profile may define:
+- max_hook_retries
+- hook_timeout_ticks
+- hook_parallelism
+
+These must not affect determinism of the core engine.
+
+12. Determinism Requirements
+Hooks must not:
+- influence match scoring
+- influence match selection
+- influence commit order
+- influence graph state
+- introduce nondeterministic behavior
+
+Hook execution order must be deterministic even if execution is asynchronous.
+
+13. Validation Rules
+A hook is valid if:
+- kind is post_commit
+- action is recognized
+- params are structured
+- no graph state modifications occur
+- idempotency is guaranteed
+
+14. Summary
+Hook Semantics v0.16 define:
+- deterministic post-commit hook ordering
+- strict separation from graph state
+- idempotent external side effects
+- deterministic invocation model
+- safe asynchronous execution
+
+Hooks extend GRISP without compromising determinism.
+
+============  END OF SPEC 008  ============
+
