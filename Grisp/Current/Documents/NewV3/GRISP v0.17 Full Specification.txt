@@ -1,0 +1,2102 @@
+GRISP SPEC 001 — CANONICAL IR (v0.17 DRAFT)
+
+Status: Draft
+Layer: 0 (Deterministic Core)
+Depends on: Spec 002 Expression AST, Spec 011 State Model, Spec 014 Dependency Set Model
+
+Purpose:
+This specification defines the Canonical Intermediate Representation for GRISP manifests. The Canonical IR is the fully normalized, deterministic representation of all rule definitions, node types, edge types, and functions. All engines must execute rules exclusively through this representation. The Canonical IR contains no nondeterministic constructs and no implicit defaults. All semantics are explicit.
+
+1. Overview
+The Canonical IR is a pure data structure describing the static components of a GRISP manifest. It includes node type definitions, edge type definitions, function definitions, and rule definitions. The Canonical IR is the only normative input to the deterministic execution engine. All engines must produce identical behavior when given the same Canonical IR and initial state.
+
+2. Node Types
+A node type defines a schema for nodes in the state graph. A node type consists of:
+- type_name: a string identifier, globally unique within the manifest.
+- fields: a mapping from field_name to field_type.
+- metadata: optional static metadata fields, not used for execution semantics.
+
+Node types are purely structural. They do not contain behavior. All node instances in the state graph must conform to their node type definition.
+
+3. Edge Types
+An edge type defines a schema for directed edges between nodes. An edge type consists of:
+- type_name: a string identifier, globally unique within the manifest.
+- source_type: the node type name for the edge source.
+- target_type: the node type name for the edge target.
+- multiplicity: optional constraints (e.g., one-to-one, one-to-many).
+- metadata: optional static metadata.
+
+Edge types are structural. They define allowed connections between node types. Edge instances in the state graph must conform to their edge type definition.
+
+4. Function Definitions
+Functions are reusable computations referenced from Expression ASTs. A function definition consists of:
+- function_name: a string identifier, unique within the manifest.
+- version: a semantic version string (e.g., "1.0.0").
+- kind: one of:
+  - pure: no side effects, deterministic, depends only on its inputs.
+  - effect_deterministic: has side effects but produces deterministic results given the same state and inputs.
+  - effect_nondeterministic: may produce different results for the same inputs and state.
+- parameters: a list of parameter definitions (name, type).
+- return_type: the type of the function result.
+- implementation_ref: an opaque identifier for the implementation (e.g., "builtin:compute_score", "plugin:uuid_v4").
+
+The Canonical IR does not embed function bodies. It only declares signatures and implementation references. Engines must provide implementations for all referenced functions. Pure functions must be deterministic. Effect_deterministic functions must be deterministic with respect to the state model. Effect_nondeterministic functions are allowed but must be isolated from the deterministic core (e.g., used only in boundary or AI layers).
+
+5. Rule Definitions
+A rule defines a pattern over the state graph and an action to perform when the pattern matches. A rule definition consists of:
+- rule_id: a string identifier, globally unique within the manifest.
+- rule_version: a semantic version string (e.g., "1.0.0").
+- priority: an integer base priority used by the Selection Model.
+- pattern: a declarative description of node and edge bindings.
+- when: an optional Expression AST that must evaluate to true for the match to be valid.
+- let: optional bindings computed from Expression ASTs.
+- then: an action block describing state changes (create, update, delete, emit).
+
+Rule IDs and versions are immutable identifiers. Changing rule semantics requires a new rule_version. Engines must treat (rule_id, rule_version) as the canonical identity of a rule.
+
+6. Pattern Structure
+The pattern section binds nodes and edges from the state graph. It consists of:
+- node bindings: each binding has a local name and a node type.
+- edge bindings: each binding has a local name and an edge type, plus source and target node bindings.
+Patterns may include constraints expressed via Expression ASTs (e.g., field comparisons). Patterns are purely declarative. They do not perform actions.
+
+7. When Clause
+The when clause is an optional Expression AST evaluated over the bound nodes and edges. It must evaluate to a boolean. If when evaluates to false, the match is discarded. The when clause may reference:
+- bound node fields.
+- bound edge metadata.
+- pure functions.
+The when clause must not invoke effect_nondeterministic functions. It may invoke effect_deterministic functions only if their behavior is fully captured by the state model.
+
+8. Let Clause
+The let clause defines computed bindings. Each let binding consists of:
+- name: a local identifier.
+- expr: an Expression AST.
+Let bindings may reference:
+- pattern bindings.
+- other let bindings (acyclic).
+- pure functions.
+Let bindings must not invoke effect_nondeterministic functions. Effect_deterministic functions are allowed only if their dependencies are captured in the Dependency Set Model.
+
+9. Then Clause
+The then clause defines the action to perform when a match is selected and validated. It consists of a sequence of operations:
+- create_node: create a new node of a given type with initial field values.
+- update_node: update fields on an existing node.
+- delete_node: delete an existing node.
+- create_edge: create a new edge of a given type between nodes.
+- delete_edge: delete an existing edge.
+- emit_event: emit a runtime event (outside the deterministic state).
+
+Each operation is described in Canonical IR as a structured action:
+- target: a binding or type.
+- fields: a mapping from field_name to Expression AST for new values.
+Actions may reference pattern bindings and let bindings. Actions must not invoke effect_nondeterministic functions directly. Any nondeterministic behavior must be isolated via boundary or AI layers.
+
+10. Deterministic Semantics and Dependency Hooks
+The Canonical IR does not itself compute dependency sets, but it must be structured so that Spec 014 Dependency Set Model can derive them deterministically. Therefore:
+- All field accesses in pattern, when, let, and then must be explicit in the Expression AST.
+- All collection expressions must specify source types, filter expressions, and order_by expressions explicitly.
+- All function calls must declare function_name and parameters explicitly.
+
+The Canonical IR must not contain implicit field accesses or hidden defaults. Engines must be able to walk the Canonical IR and Expression AST to construct dependency sets as defined in Spec 014.
+
+11. Manifest Structure
+A manifest is the top-level Canonical IR document. It consists of:
+- node_types: a list of node type definitions.
+- edge_types: a list of edge type definitions.
+- functions: a list of function definitions.
+- rules: a list of rule definitions.
+- metadata: optional manifest-level metadata.
+
+Manifests are immutable inputs to the deterministic core. Any change to a manifest requires a new manifest version and may require new golden files.
+
+12. Validation Requirements
+Engines must validate Canonical IR before execution:
+- All referenced node types and edge types must be defined.
+- All function references must resolve to known implementations.
+- All rule_ids must be unique.
+- All rule_versions must be valid semantic versions.
+- All Expression ASTs must be well-typed according to the type system.
+- No effect_nondeterministic functions may appear in pattern, when, or let clauses.
+
+Invalid manifests must be rejected before any execution.
+
+13. Golden Files and Canonical IR
+Golden files (Spec 010) use Canonical IR as the normative description of rule behavior. For a given Canonical IR and initial state, golden files capture:
+- match discovery sequences.
+- selection decisions.
+- dependency sets.
+- state transitions.
+
+Any engine that consumes the same Canonical IR and passes the golden file suite is considered conformant.
+
+14. Extensibility
+The Canonical IR may be extended in future versions to support:
+- additional function kinds.
+- richer type systems.
+- advanced pattern constructs.
+
+All extensions must preserve determinism and must be expressible in a way that Spec 014 can derive dependency sets.
+
+End of GRISP SPEC 001 — CANONICAL IR (v0.17 DRAFT)
+GRISP SPEC 002 — EXPRESSION AST (v0.17 DRAFT)
+
+Status: Draft
+Layer: 0 (Deterministic Core)
+Depends on: Spec 001 Canonical IR, Spec 014 Dependency Set Model
+
+Purpose:
+This specification defines the canonical Expression Abstract Syntax Tree (Expression AST) used throughout GRISP. All expressions in patterns, when clauses, let bindings, and actions must be represented using this AST. The Expression AST is deterministic, fully explicit, and contains no implicit behavior. All engines must evaluate Expression ASTs identically.
+
+1. Overview
+The Expression AST is a pure functional expression language. It contains no side effects, no nondeterministic constructs, and no implicit conversions. All evaluation is deterministic and depends only on the current state, the match bindings, and pure function calls. The AST is used for:
+- field access
+- literal values
+- arithmetic
+- boolean logic
+- comparisons
+- conditional expressions
+- function calls
+- collection expressions
+- structural expressions used in actions
+
+2. Expression Kinds
+Every expression has a kind field that determines its structure. The allowed kinds are:
+literal
+identifier
+field
+binary
+unary
+if
+call
+collection
+list
+map
+
+No other expression kinds are permitted.
+
+3. Literal Expressions
+A literal expression represents a constant value. It consists of:
+kind: literal
+value: one of string, integer, boolean, float, null
+Literal expressions have no dependencies.
+
+4. Identifier Expressions
+An identifier expression refers to a bound name in the rule environment. It consists of:
+kind: identifier
+name: the identifier string
+Identifiers refer to:
+- pattern bindings
+- let bindings
+Identifiers do not refer to fields directly. Field access must use field expressions.
+
+5. Field Expressions
+A field expression accesses a field on a bound node. It consists of:
+kind: field
+target: an identifier expression
+field_name: the name of the field
+Field expressions contribute Field dependencies in Spec 014.
+
+6. Binary Expressions
+A binary expression applies an operator to two subexpressions. It consists of:
+kind: binary
+op: one of + - * / % == != < <= > >= and or
+left: Expression AST
+right: Expression AST
+Binary expressions must be evaluated left-to-right with no reordering. Division by zero is a validation error.
+
+7. Unary Expressions
+A unary expression applies a unary operator to a subexpression. It consists of:
+kind: unary
+op: one of not - (negation)
+expr: Expression AST
+
+8. Conditional Expressions
+A conditional expression selects between two branches. It consists of:
+kind: if
+cond: Expression AST
+then: Expression AST
+else: Expression AST
+The cond expression must evaluate to a boolean. Both branches must be well-typed.
+
+9. Function Call Expressions
+A function call expression invokes a function defined in the Canonical IR. It consists of:
+kind: call
+function_name: string
+args: list of Expression AST
+Function calls must reference pure or effect_deterministic functions only. Effect_nondeterministic functions are forbidden in Expression AST. Function calls contribute dependencies according to Spec 014 if the function is effect_deterministic.
+
+10. Collection Expressions
+A collection expression enumerates nodes or edges of a given type. It consists of:
+kind: collection
+source:
+  type: node or edge
+  name: type name
+filter: optional Expression AST
+order_by: optional list of:
+  expr: Expression AST
+  direction: asc or desc
+limit: optional integer literal
+
+Collection expressions have deterministic semantics:
+1. Enumerate all instances of the source type.
+2. Apply filter if present.
+3. Sort results lexicographically by order_by expressions.
+4. If no order_by is present, sort by canonical identifier ascending.
+5. Apply limit if present.
+6. Return the resulting list of node or edge identifiers.
+
+Collection expressions contribute the following dependencies:
+Extent(type)
+Predicate(type, field) for each field referenced in filter
+Ordering(type, field) for each field referenced in order_by
+Field(id, id) for identity ordering
+
+11. List Expressions
+A list expression constructs a list of values. It consists of:
+kind: list
+items: list of Expression AST
+List expressions evaluate each item left-to-right.
+
+12. Map Expressions
+A map expression constructs a mapping from string keys to values. It consists of:
+kind: map
+entries: list of:
+  key: string
+  value: Expression AST
+Map expressions evaluate values left-to-right.
+
+13. Deterministic Evaluation Rules
+Expression evaluation must follow these rules:
+- No short-circuit reordering beyond the semantics of and/or.
+- No constant folding beyond literal-literal operations.
+- No algebraic simplification.
+- No implicit type conversions.
+- All arithmetic uses deterministic integer or fixed-point semantics.
+- All comparisons use deterministic ordering rules.
+
+14. Type System Integration
+Every expression must be type-checked before execution. The type system includes:
+string
+integer
+boolean
+float (deprecated in v0.17)
+list
+map
+identifier
+node reference
+edge reference
+
+Float is deprecated and must not be used in new manifests. Fixed-point integer arithmetic is recommended.
+
+15. Dependency Extraction
+Spec 014 defines how dependencies are extracted from Expression AST. The Expression AST must expose all field accesses, function calls, and collection structures explicitly so that dependency extraction is deterministic.
+
+16. Validation Requirements
+Engines must validate Expression ASTs before execution:
+- All identifiers must resolve to known bindings.
+- All field accesses must reference valid fields.
+- All function calls must reference known functions.
+- No effect_nondeterministic functions may appear.
+- All collection expressions must specify source types explicitly.
+- All order_by expressions must be valid and well-typed.
+
+Invalid expressions must cause manifest rejection.
+
+17. Extensibility
+Future versions may extend the Expression AST with:
+- additional operators
+- pattern comprehensions
+- deterministic aggregations
+All extensions must preserve determinism and must be expressible in a way compatible with Spec 014.
+
+End of GRISP SPEC 002 — EXPRESSION AST (v0.17 DRAFT)
+GRISP SPEC 003 — NODE AND EDGE MODEL (v0.17 DRAFT)
+
+Status: Draft
+Layer: 0 (Deterministic Core)
+Depends on: Spec 001 Canonical IR, Spec 011 State Model, Spec 014 Dependency Set Model
+
+Purpose:
+This specification defines the static and runtime structure of nodes and edges in GRISP. It describes how node types and edge types declared in the Canonical IR map to concrete instances in the state graph. It also defines the deterministic rules for identity, field storage, edge storage, and structural constraints. The Node and Edge Model is the foundation for all deterministic state transitions.
+
+1. Overview
+The state graph consists of node instances and edge instances. Node instances represent typed entities with fields. Edge instances represent typed directed relationships between nodes. All state transitions operate on these instances. The Node and Edge Model defines how instances are created, updated, deleted, and validated.
+
+2. Node Instance Structure
+A node instance has the following fields:
+id: a globally unique identifier string
+type: the node type name as declared in the Canonical IR
+fields: a mapping from field_name to field_value
+version: a monotonically increasing integer used for conflict detection
+metadata: optional engine-defined metadata not used for deterministic semantics
+
+Node ids must be unique across the entire state graph. Node ids must be stable for the lifetime of the node. Node ids must not be reused after deletion.
+
+3. Node Field Semantics
+Each node type defines a fixed set of fields. A node instance must contain exactly those fields. Field values must conform to the field type declared in the Canonical IR. Field updates must increment the node version counter. Field updates must be atomic and deterministic.
+
+4. Node Creation
+A create_node action produces a new node instance. The engine must:
+- allocate a unique node id
+- set the node type
+- initialize all fields to the values provided in the action
+- set version to 1
+- insert the node into the state graph
+- increment the extent version for the node type
+
+Node creation must be deterministic with respect to field initialization. Node id generation may be nondeterministic but must not affect deterministic semantics because node ids are not compared numerically.
+
+5. Node Update
+An update_node action modifies one or more fields of an existing node. The engine must:
+- evaluate all field expressions deterministically
+- apply all field updates atomically
+- increment the node version counter
+- increment predicate and ordering versions for any updated fields
+
+Node updates must not change the node id or node type.
+
+6. Node Deletion
+A delete_node action removes a node instance. The engine must:
+- increment the node version counter before deletion
+- remove all edges incident to the node
+- remove the node from the state graph
+- increment the extent version for the node type
+
+Node deletion invalidates any match that depends on the node or its fields.
+
+7. Edge Instance Structure
+An edge instance has the following fields:
+id: a globally unique identifier string
+type: the edge type name as declared in the Canonical IR
+source: the id of the source node
+target: the id of the target node
+version: a monotonically increasing integer used for conflict detection
+metadata: optional engine-defined metadata not used for deterministic semantics
+
+Edge ids must be unique across the entire state graph. Edge ids must not be reused after deletion.
+
+8. Edge Semantics
+Edge types define allowed source and target node types. All edge instances must conform to these constraints. Edge instances do not contain fields beyond source, target, and metadata. Edge instances participate in dependency tracking via Edge dependencies.
+
+9. Edge Creation
+A create_edge action produces a new edge instance. The engine must:
+- allocate a unique edge id
+- set the edge type
+- set the source and target node ids
+- set version to 1
+- insert the edge into the state graph
+- increment the edge version counter for the edge type
+
+Edge creation must be deterministic with respect to source and target resolution.
+
+10. Edge Deletion
+A delete_edge action removes an edge instance. The engine must:
+- increment the edge version counter for the edge type
+- remove the edge from the state graph
+
+Edge deletion invalidates any match that depends on the edge type.
+
+11. Structural Constraints
+Node and edge types may declare multiplicity constraints. Engines must enforce:
+- one-to-one
+- one-to-many
+- many-to-one
+- many-to-many
+
+Violations must cause transaction failure before commit.
+
+12. Identity and Determinism
+Node and edge ids must be treated as opaque identifiers. Engines must not derive ordering or semantics from the lexical form of ids. All deterministic ordering must be explicitly defined in the Canonical IR or Expression AST.
+
+13. Interaction with Dependency Set Model
+Node and edge instances contribute version counters used in dependency validation. The following version counters must be maintained:
+- node version
+- field-level predicate versions
+- field-level ordering versions
+- type-level extent versions
+- edge-type version counters
+
+Dependency validation uses these counters to determine whether a match remains valid.
+
+14. Interaction with Transaction Model
+All node and edge operations occur within transactions. Transactions must:
+- stage node and edge operations
+- validate dependencies before commit
+- apply operations atomically
+- update version counters deterministically
+
+15. Interaction with Golden Files
+Golden files must capture:
+- node creation and deletion events
+- edge creation and deletion events
+- version counter changes
+- structural state transitions
+
+Golden files must not depend on nondeterministic node or edge ids.
+
+16. Extensibility
+Future versions may extend node and edge metadata, field types, or structural constraints. All extensions must preserve determinism and must integrate with the Dependency Set Model.
+
+End of GRISP SPEC 003 — NODE AND EDGE MODEL (v0.17 DRAFT)
+GRISP SPEC 004 — TYPE SYSTEM (v0.17 DRAFT)
+
+Status: Draft
+Layer: 0 (Deterministic Core)
+Depends on: Spec 001 Canonical IR, Spec 002 Expression AST, Spec 014 Dependency Set Model
+
+Purpose:
+This specification defines the GRISP type system used for validating Canonical IR, Expression ASTs, rule definitions, and state transitions. The type system ensures that all expressions, field accesses, function calls, and actions are well-typed and deterministic. The type system is static and must be validated before execution.
+
+1. Overview
+The GRISP type system is a simple, deterministic, structural type system. It defines the allowed primitive types, composite types, reference types, and function types. All expressions must be type-checked before execution. Engines must reject manifests that contain type errors. The type system contains no implicit conversions and no dynamic typing.
+
+2. Primitive Types
+The following primitive types are supported:
+string
+integer
+boolean
+float (deprecated in v0.17)
+null
+
+Float is deprecated and must not be used in new manifests. Engines must support float only for backward compatibility. All arithmetic in v0.17 should use integer or fixed-point semantics.
+
+3. Composite Types
+The following composite types are supported:
+list<T>
+map<string, T>
+
+Lists contain ordered sequences of values of type T. Maps contain string keys and values of type T. Composite types must be homogeneous.
+
+4. Node Reference Types
+A node reference type refers to a node of a specific node type. It is written as:
+node<T>
+where T is a node type name declared in the Canonical IR.
+
+Node reference types are used for:
+pattern bindings
+field expressions
+collection results
+
+Node references are opaque identifiers. They cannot be used as integers or strings.
+
+5. Edge Reference Types
+An edge reference type refers to an edge of a specific edge type. It is written as:
+edge<T>
+where T is an edge type name declared in the Canonical IR.
+
+Edge references are opaque identifiers. They cannot be used as integers or strings.
+
+6. Function Types
+A function type is defined by:
+parameter types
+return type
+
+Function types must match the function definitions in the Canonical IR. Pure functions must be deterministic. Effect_deterministic functions must have dependencies captured by Spec 014. Effect_nondeterministic functions must not appear in Expression AST.
+
+7. Type Rules for Expression AST
+Literal expressions:
+- literal string → string
+- literal integer → integer
+- literal boolean → boolean
+- literal null → null
+- literal float → float (deprecated)
+
+Identifier expressions:
+- type is the type of the referenced binding
+
+Field expressions:
+- target must be node<T>
+- field_name must exist in node type T
+- result type is the field type declared in the Canonical IR
+
+Binary expressions:
+- arithmetic operators require integer operands
+- comparison operators require operands of the same type
+- boolean operators require boolean operands
+- result type is determined by operator
+
+Unary expressions:
+- not requires boolean operand
+- negation requires integer operand
+
+Conditional expressions:
+- cond must be boolean
+- then and else must have the same type
+- result type is that type
+
+Function call expressions:
+- function_name must reference a known function
+- argument types must match parameter types
+- result type is the function return type
+
+Collection expressions:
+- source.type = node → result type is list<node<T>>
+- source.type = edge → result type is list<edge<T>>
+- filter must be boolean
+- order_by expressions must be comparable
+- limit must be integer
+
+List expressions:
+- all items must have the same type
+- result type is list<T>
+
+Map expressions:
+- all keys must be strings
+- all values must have the same type
+- result type is map<string, T>
+
+8. Type Rules for Pattern Bindings
+Pattern node bindings:
+- binding_name: node<T>
+Pattern edge bindings:
+- binding_name: edge<T>
+
+Pattern constraints must be boolean expressions.
+
+9. Type Rules for Let Bindings
+Let expressions must be well-typed. Let bindings introduce new identifiers with the type of their expression. Let bindings must not form cycles.
+
+10. Type Rules for Actions
+create_node:
+- type must be a known node type
+- fields must match declared field types
+
+update_node:
+- target must be node<T>
+- updated fields must match declared field types
+
+delete_node:
+- target must be node<T>
+
+create_edge:
+- type must be a known edge type
+- source and target must match declared node types
+
+delete_edge:
+- target must be edge<T>
+
+emit_event:
+- payload may be any type
+
+11. Type Rules for Rule Definitions
+pattern must bind valid node and edge references
+when must be boolean
+let bindings must be well-typed
+then actions must be well-typed
+
+12. Type Checking Algorithm
+The engine must:
+- build a type environment from pattern and let bindings
+- recursively type-check all Expression ASTs
+- validate all field accesses
+- validate all function calls
+- validate all action expressions
+- reject manifests with type errors
+
+13. Determinism Requirements
+The type system must not allow:
+- implicit conversions
+- overloaded operators
+- dynamic typing
+- runtime type errors
+
+All type errors must be detected at manifest load time.
+
+14. Interaction with Dependency Set Model
+The type system ensures that:
+- all field accesses are explicit
+- all collection expressions are explicit
+- all function calls are explicit
+
+This allows Spec 014 to extract dependencies deterministically.
+
+15. Extensibility
+Future versions may add:
+- additional primitive types
+- deterministic aggregate types
+- deterministic pattern comprehensions
+
+All extensions must preserve determinism.
+
+End of GRISP SPEC 004 — TYPE SYSTEM (v0.17 DRAFT)
+GRISP SPEC 005 — PATTERN MODEL (v0.17 DRAFT)
+
+Status: Draft
+Layer: 0 (Deterministic Core)
+Depends on: Spec 001 Canonical IR, Spec 002 Expression AST, Spec 003 Node and Edge Model, Spec 014 Dependency Set Model
+
+Purpose:
+This specification defines the structure and semantics of rule patterns in GRISP. Patterns describe the structural bindings of nodes and edges that form the basis of match discovery. The Pattern Model ensures that all engines discover identical matches for the same state and Canonical IR.
+
+1. Overview
+A pattern is a declarative description of nodes and edges that must exist in the state graph for a rule to match. Patterns bind node identifiers and edge identifiers to local names. Patterns may include constraints expressed as Expression ASTs. Patterns contain no actions and no side effects.
+
+2. Pattern Structure
+A pattern consists of:
+- node bindings
+- edge bindings
+- optional constraints
+
+Node bindings introduce names for nodes of specific types. Edge bindings introduce names for edges of specific types and specify their source and target node bindings. Constraints are boolean expressions evaluated over the bound nodes and edges.
+
+3. Node Bindings
+A node binding has the form:
+name: node_type
+where name is a local identifier and node_type is a node type declared in the Canonical IR. A node binding matches any node instance of the given type. Node bindings do not impose uniqueness constraints unless explicitly expressed in constraints.
+
+4. Edge Bindings
+An edge binding has the form:
+name: edge_type(source_name, target_name)
+where name is a local identifier, edge_type is an edge type declared in the Canonical IR, and source_name and target_name are node bindings. An edge binding matches any edge instance of the given type whose source and target match the referenced node bindings.
+
+5. Binding Environment
+The pattern defines a binding environment mapping local names to:
+node<T> for node bindings
+edge<T> for edge bindings
+This environment is used for type checking and expression evaluation.
+
+6. Pattern Constraints
+Constraints are boolean expressions evaluated using the Expression AST. Constraints may reference:
+- node fields
+- edge metadata
+- pure functions
+- effect_deterministic functions whose dependencies are captured by Spec 014
+Constraints must not reference effect_nondeterministic functions. Constraints must evaluate to true for the match to be valid.
+
+7. Deterministic Binding Semantics
+Pattern matching must be deterministic. Engines must:
+- enumerate node bindings in a deterministic order
+- enumerate edge bindings in a deterministic order
+- evaluate constraints deterministically
+- produce matches in a deterministic sequence
+
+Node enumeration order is defined by ascending node id. Edge enumeration order is defined by ascending edge id.
+
+8. Binding Cardinality
+Patterns do not enforce uniqueness unless explicitly stated. If a pattern binds two nodes of the same type, they may refer to the same node unless a constraint forbids it. To enforce distinctness, the manifest must include a constraint such as:
+nodeA.id != nodeB.id
+
+9. Pattern Matching Algorithm
+The engine must:
+1. Enumerate all nodes for the first node binding.
+2. For each node, enumerate all nodes for the second node binding.
+3. Continue until all node bindings are assigned.
+4. For each complete node assignment, enumerate edges for each edge binding.
+5. For each complete binding environment, evaluate constraints.
+6. If constraints evaluate to true, produce a match.
+
+This algorithm must be implemented in a way that preserves deterministic ordering. Engines may optimize but must produce identical results.
+
+10. Interaction with Dependency Set Model
+Pattern bindings contribute Field dependencies for:
+- node id
+- any fields referenced in constraints
+Pattern bindings contribute Edge dependencies for:
+- any edge bindings
+Pattern bindings do not contribute Predicate or Ordering dependencies unless used in collection expressions.
+
+11. Interaction with When Clause
+The when clause is evaluated after pattern matching. The when clause may reference pattern bindings. The when clause must not modify the binding environment. The when clause must evaluate deterministically.
+
+12. Interaction with Let Clause
+Let bindings may reference pattern bindings. Let bindings must not modify the binding environment. Let bindings must be evaluated deterministically.
+
+13. Interaction with Then Clause
+The then clause may reference pattern bindings. The then clause must not modify the binding environment. The then clause must not affect match discovery.
+
+14. Invalid Patterns
+A pattern is invalid if:
+- it references unknown node or edge types
+- it contains cycles in binding definitions
+- it contains type errors in constraints
+- it references effect_nondeterministic functions
+- it contains ambiguous or implicit semantics
+
+Invalid patterns must cause manifest rejection.
+
+15. Extensibility
+Future versions may extend patterns with:
+- optional bindings
+- negative patterns
+- deterministic aggregations
+All extensions must preserve determinism and must integrate with Spec 014.
+
+End of GRISP SPEC 005 — PATTERN MODEL (v0.17 DRAFT)
+GRISP SPEC 006 — MATCH DISCOVERY MODEL (v0.17 DRAFT)
+
+Status: Draft
+Layer: 0 (Deterministic Core)
+Depends on: Spec 001 Canonical IR, Spec 002 Expression AST, Spec 003 Node and Edge Model, Spec 004 Type System, Spec 005 Pattern Model, Spec 014 Dependency Set Model
+
+Purpose:
+This specification defines the deterministic algorithm for discovering matches for rules. Match discovery is the process of enumerating all valid bindings of pattern variables that satisfy the pattern structure, constraints, when clause, and let bindings. All engines must produce identical match sets for the same state and Canonical IR.
+
+1. Overview
+Match discovery is a pure, deterministic enumeration process. It takes as input:
+- the current state graph
+- the Canonical IR rule definition
+and produces:
+- a list of match objects, each containing:
+  - rule_id
+  - binding environment
+  - evaluated let bindings
+  - dependency set (from Spec 014)
+Match discovery must not modify the state. Match discovery must not depend on nondeterministic operations.
+
+2. Binding Environment
+A binding environment is a mapping from local names to:
+- node references
+- edge references
+- let binding values
+The binding environment is constructed incrementally during match discovery.
+
+3. Deterministic Enumeration Order
+Match discovery must enumerate bindings in a deterministic order:
+- node bindings are enumerated in ascending node id order
+- edge bindings are enumerated in ascending edge id order
+- constraints are evaluated in the order they appear
+- let bindings are evaluated in the order they appear
+- matches are produced in lexicographic order of binding names
+This ensures identical match ordering across engines.
+
+4. Node Binding Enumeration
+For each node binding in the pattern:
+- enumerate all nodes of the required type
+- in ascending node id order
+- assign each node to the binding
+- proceed to the next binding
+Node enumeration must not skip nodes unless filtered by constraints.
+
+5. Edge Binding Enumeration
+For each edge binding:
+- enumerate all edges of the required type
+- in ascending edge id order
+- filter edges whose source and target do not match the bound nodes
+- assign each edge to the binding
+- proceed to the next binding
+
+6. Constraint Evaluation
+After all node and edge bindings are assigned:
+- evaluate each constraint expression
+- constraints must evaluate to boolean
+- if any constraint evaluates to false, discard the binding environment
+Constraint evaluation must be deterministic and must not modify the state.
+
+7. When Clause Evaluation
+If the rule has a when clause:
+- evaluate the when expression using the binding environment
+- if the result is false, discard the match
+The when clause must be deterministic and must not modify the state.
+
+8. Let Binding Evaluation
+Let bindings are evaluated after the when clause. For each let binding:
+- evaluate the expression deterministically
+- store the result in the binding environment
+- let bindings may reference earlier let bindings
+- let bindings must not form cycles
+Let bindings must not modify the state.
+
+9. Match Construction
+For each valid binding environment:
+- construct a match object containing:
+  - rule_id
+  - binding environment
+  - let binding values
+  - dependency set (computed via Spec 014)
+Matches must be immutable once constructed.
+
+10. Dependency Set Construction
+Match discovery must compute the dependency set for each match. The dependency set includes:
+- Field dependencies for all field accesses in pattern, when, let, and then
+- Extent dependencies for all collection sources
+- Predicate dependencies for all collection filter fields
+- Ordering dependencies for all collection order_by fields
+- Edge dependencies for all edge bindings
+Dependency sets must be computed deterministically.
+
+11. Match Identity
+Each match has a match_key defined as:
+rule_id + "|" + sorted(binding_pairs)
+Binding pairs are sorted lexicographically by binding name. The match_key is used for selection ordering and match aging.
+
+12. Match Deduplication
+If two binding environments produce identical match_keys:
+- they are considered the same match
+- only one match is produced
+This ensures deterministic behavior even if multiple enumeration paths lead to the same binding.
+
+13. Invalid Matches
+A match is invalid if:
+- any constraint fails
+- the when clause evaluates to false
+- any let binding fails type checking
+- any expression evaluation fails
+- the dependency set cannot be constructed
+Invalid matches must be discarded silently.
+
+14. Performance Considerations
+Engines may optimize match discovery using:
+- indexes
+- precomputed adjacency lists
+- cached pattern expansions
+However, optimizations must not change:
+- enumeration order
+- match ordering
+- dependency sets
+- match identity
+- match count
+
+15. Interaction with Transaction Model
+Match discovery occurs before selection and before any state changes. Matches discovered in a tick remain candidates until:
+- selected for execution
+- invalidated by dependency changes
+- discarded at the end of the tick
+
+16. Interaction with Selection Model
+Match discovery produces the input set for the Selection Model. The Selection Model must not modify matches. Match ordering must be preserved.
+
+17. Interaction with Golden Files
+Golden files must capture:
+- match discovery order
+- match_keys
+- binding environments
+- dependency sets
+Any deviation indicates nonconformance.
+
+18. Extensibility
+Future versions may extend match discovery with:
+- negative patterns
+- optional bindings
+- deterministic aggregations
+All extensions must preserve determinism.
+
+End of GRISP SPEC 006 — MATCH DISCOVERY MODEL (v0.17 DRAFT)
+GRISP SPEC 007 — TRANSACTION AND CONFLICT MODEL (v0.17 DRAFT)
+
+Status: Draft
+Layer: 0 (Deterministic Core)
+Depends on: Spec 001 Canonical IR, Spec 002 Expression AST, Spec 003 Node and Edge Model, Spec 004 Type System, Spec 005 Pattern Model, Spec 006 Match Discovery Model, Spec 014 Dependency Set Model
+
+Purpose:
+This specification defines the deterministic transaction model for GRISP. It describes how matches are validated, how actions are staged, how conflicts are detected, and how state transitions are committed. The Transaction and Conflict Model ensures that all engines produce identical state transitions for the same Canonical IR and initial state.
+
+1. Overview
+A transaction is the execution of a selected match. A transaction consists of:
+- dependency validation
+- action staging
+- conflict detection
+- commit or abort
+Transactions must be deterministic. Transactions must not interleave. Only one transaction may commit per tick.
+
+2. Transaction Lifecycle
+The lifecycle of a transaction is:
+1. A match is selected by the Selection Model.
+2. The engine validates the match dependencies.
+3. If validation succeeds, the engine evaluates the then clause.
+4. The engine stages all resulting state changes.
+5. The engine performs conflict detection.
+6. If no conflicts are found, the engine commits the staged changes.
+7. If conflicts are found, the match is invalidated and the engine returns to match discovery.
+
+3. Dependency Validation
+Before executing a match, the engine must validate its dependency set. For each dependency in the match’s dependency snapshot:
+- retrieve the current version counter
+- compare it to the recorded version
+If any version differs, the match is invalid and must be discarded. Dependency validation ensures that the match was discovered on a consistent snapshot of the state.
+
+4. Action Evaluation
+If dependency validation succeeds, the engine evaluates the then clause. Action evaluation must be deterministic. Action evaluation may produce:
+- node creations
+- node updates
+- node deletions
+- edge creations
+- edge deletions
+- event emissions
+Action evaluation must not modify the state directly. All changes must be staged.
+
+5. Staged Changes
+Staged changes are stored in a transaction buffer. The buffer contains:
+- created nodes
+- updated nodes and their new field values
+- deleted nodes
+- created edges
+- deleted edges
+Staged changes must not be visible to match discovery or other transactions until commit.
+
+6. Conflict Detection
+After staging changes, the engine must detect conflicts. A conflict occurs if:
+- a staged update modifies a field whose version has changed since dependency validation
+- a staged delete removes a node or edge whose version has changed since dependency validation
+- a staged create violates structural constraints
+- a staged update violates type constraints
+Conflict detection must use the same version counters used in dependency validation.
+
+7. Conflict Rules
+Conflicts are detected using the following rules:
+- If a node version differs from the version recorded in the dependency snapshot, and the match depends on that node or its fields, conflict.
+- If a predicate version differs for any field used in a collection filter, conflict.
+- If an ordering version differs for any field used in a collection order_by, conflict.
+- If an extent version differs for any type used in a collection source, conflict.
+- If an edge version differs for any edge type used in the match, conflict.
+- If a staged update modifies a field not included in the dependency set, no conflict.
+- If a staged update modifies a field included in the dependency set and the version changed, conflict.
+
+8. Conflict Resolution
+If a conflict is detected:
+- the transaction is aborted
+- the match is invalidated
+- the engine returns to match discovery
+- the match must not be selected again unless rediscovered
+
+9. Commit
+If no conflicts are detected, the engine commits the staged changes. Commit must:
+- apply all node creations
+- apply all node updates
+- apply all node deletions
+- apply all edge creations
+- apply all edge deletions
+- increment version counters deterministically
+Commit must be atomic. Partial commits are forbidden.
+
+10. Version Counter Updates
+Commit must update version counters as follows:
+- node version increments on update or delete
+- predicate version increments when a field used in a filter changes
+- ordering version increments when a field used in order_by changes
+- extent version increments on node create or delete
+- edge version increments on edge create or delete
+
+11. Deterministic Ordering of Updates
+When multiple updates occur in a transaction:
+- node creations are applied in ascending node id order
+- node updates are applied in ascending node id order
+- node deletions are applied in ascending node id order
+- edge creations are applied in ascending edge id order
+- edge deletions are applied in ascending edge id order
+This ensures deterministic commit behavior.
+
+12. Transaction Failure Modes
+A transaction fails if:
+- dependency validation fails
+- conflict detection fails
+- action evaluation produces invalid operations
+- type checking fails
+- structural constraints are violated
+Failed transactions must not modify the state.
+
+13. Interaction with Match Discovery
+Match discovery must not see staged changes. Only committed changes are visible. After a transaction commits or aborts, match discovery must be re-run.
+
+14. Interaction with Selection Model
+The Selection Model chooses exactly one match per tick. The Transaction Model executes that match. If the match fails validation or conflict detection, the Selection Model must choose a new match.
+
+15. Interaction with Dependency Set Model
+The Transaction Model relies on dependency sets for:
+- dependency validation
+- conflict detection
+Dependency sets must be computed during match discovery and must not change during the transaction.
+
+16. Interaction with Golden Files
+Golden files must capture:
+- selected match
+- dependency validation result
+- conflict detection result
+- staged changes
+- committed changes
+- version counter updates
+Any deviation indicates nonconformance.
+
+17. Extensibility
+Future versions may extend the Transaction Model with:
+- multi-action transactions
+- deterministic batching
+- deterministic rollbacks
+All extensions must preserve determinism.
+
+End of GRISP SPEC 007 — TRANSACTION AND CONFLICT MODEL (v0.17 DRAFT)
+GRISP SPEC 008 — ACTION MODEL (v0.17 DRAFT)
+
+Status: Draft
+Layer: 0 (Deterministic Core)
+Depends on: Spec 001 Canonical IR, Spec 002 Expression AST, Spec 003 Node and Edge Model, Spec 004 Type System, Spec 005 Pattern Model, Spec 006 Match Discovery Model, Spec 007 Transaction and Conflict Model, Spec 014 Dependency Set Model
+
+Purpose:
+This specification defines the deterministic semantics of actions in GRISP. Actions describe how the state graph changes when a rule fires. The Action Model ensures that all engines evaluate actions identically, stage changes identically, and commit changes identically.
+
+1. Overview
+Actions are executed after a match is selected and validated. Actions must be deterministic, side-effect free during evaluation, and must produce a staged set of changes. Actions do not modify the state directly. Only the Transaction Model applies staged changes.
+
+2. Action Types
+The Action Model supports the following action types:
+create_node
+update_node
+delete_node
+create_edge
+delete_edge
+emit_event
+Actions appear in the then clause of a rule. Actions must be evaluated in the order they appear.
+
+3. Deterministic Evaluation
+Action evaluation must be deterministic. All Expression ASTs used in actions must be evaluated using the deterministic rules defined in Spec 002. Actions must not depend on nondeterministic functions. Actions must not modify the state during evaluation.
+
+4. Create Node
+A create_node action has:
+type: node type name
+fields: mapping from field_name to Expression AST
+Evaluation steps:
+1. Evaluate all field expressions.
+2. Validate field types.
+3. Allocate a new node id.
+4. Produce a staged node creation entry.
+Node creation contributes an extent version increment for the node type at commit time.
+
+5. Update Node
+An update_node action has:
+target: identifier referencing a bound node
+fields: mapping from field_name to Expression AST
+Evaluation steps:
+1. Evaluate all field expressions.
+2. Validate field types.
+3. Produce a staged node update entry.
+Node updates increment the node version at commit time. Node updates also increment predicate and ordering versions for fields used in filters or order_by expressions.
+
+6. Delete Node
+A delete_node action has:
+target: identifier referencing a bound node
+Evaluation steps:
+1. Produce a staged node deletion entry.
+Node deletion increments the node version and the extent version at commit time. Node deletion also removes all incident edges.
+
+7. Create Edge
+A create_edge action has:
+type: edge type name
+source: identifier referencing a bound node
+target: identifier referencing a bound node
+Evaluation steps:
+1. Validate that source and target types match the edge type.
+2. Allocate a new edge id.
+3. Produce a staged edge creation entry.
+Edge creation increments the edge version at commit time.
+
+8. Delete Edge
+A delete_edge action has:
+target: identifier referencing a bound edge
+Evaluation steps:
+1. Produce a staged edge deletion entry.
+Edge deletion increments the edge version at commit time.
+
+9. Emit Event
+An emit_event action has:
+payload: Expression AST
+Evaluation steps:
+1. Evaluate the payload expression.
+2. Produce an event entry.
+Events do not affect deterministic state and do not participate in dependency tracking.
+
+10. Action Ordering
+Actions must be evaluated in the order they appear. Staged changes must preserve this order. Commit ordering is defined in Spec 007 and must not depend on action order.
+
+11. Deterministic Node ID Allocation
+Node ids must be unique but may be nondeterministic. Engines must not derive semantics from node id structure. Node id allocation must not affect deterministic behavior because node ids are treated as opaque identifiers.
+
+12. Deterministic Edge ID Allocation
+Edge ids must be unique but may be nondeterministic. Engines must not derive semantics from edge id structure. Edge id allocation must not affect deterministic behavior.
+
+13. Interaction with Dependency Set Model
+Actions do not add dependencies. Dependencies are computed during match discovery. However, actions may modify fields or structures that appear in dependency sets. Conflict detection ensures that such modifications do not violate determinism.
+
+14. Interaction with Transaction Model
+Actions produce staged changes. The Transaction Model:
+- validates dependencies
+- detects conflicts
+- commits staged changes
+Actions must not bypass the Transaction Model.
+
+15. Interaction with Golden Files
+Golden files must capture:
+- evaluated action expressions
+- staged node creations
+- staged node updates
+- staged node deletions
+- staged edge creations
+- staged edge deletions
+- emitted events
+Any deviation indicates nonconformance.
+
+16. Invalid Actions
+An action is invalid if:
+- it references unknown node or edge types
+- it references unknown bindings
+- it produces type errors
+- it violates structural constraints
+- it uses nondeterministic functions
+Invalid actions must cause transaction failure.
+
+17. Extensibility
+Future versions may extend actions with:
+- deterministic aggregations
+- deterministic batch operations
+- deterministic structural rewrites
+All extensions must preserve determinism.
+
+End of GRISP SPEC 008 — ACTION MODEL (v0.17 DRAFT)
+GRISP SPEC 009 — EVENT MODEL (v0.17 DRAFT)
+
+Status: Draft
+Layer: 0 (Deterministic Core)
+Depends on: Spec 001 Canonical IR, Spec 002 Expression AST, Spec 003 Node and Edge Model, Spec 004 Type System, Spec 005 Pattern Model, Spec 006 Match Discovery Model, Spec 007 Transaction and Conflict Model, Spec 008 Action Model
+
+Purpose:
+This specification defines the deterministic event model for GRISP. Events represent external notifications emitted by rules. Events do not affect deterministic state and do not participate in dependency tracking. The Event Model ensures that all engines emit identical events for the same Canonical IR and initial state.
+
+1. Overview
+Events are produced by emit_event actions. Events are immutable, deterministic outputs that may be consumed by external systems. Events do not modify the state graph. Events do not influence match discovery, selection, or conflict detection. Events are part of the observable behavior of a GRISP engine.
+
+2. Event Structure
+An event consists of:
+event_id: a unique identifier
+rule_id: the rule that emitted the event
+payload: a value produced by evaluating an Expression AST
+timestamp: optional engine-provided timestamp (non-deterministic, not part of golden files)
+metadata: optional engine-defined metadata
+
+Only event_id, rule_id, and payload are part of deterministic semantics.
+
+3. Deterministic Event Payloads
+The payload of an event must be produced by evaluating an Expression AST. Payload evaluation must be deterministic. Payloads may contain:
+- primitive values
+- lists
+- maps
+Payloads must not contain node or edge references. Payloads must not contain nondeterministic values.
+
+4. Event Emission Semantics
+Events are emitted during transaction commit. The sequence of emitted events must match the order of emit_event actions in the then clause. Events must not be emitted if the transaction aborts. Events must not be emitted during dependency validation or conflict detection.
+
+5. Event Ordering
+Events must be emitted in the order they appear in the then clause. If multiple events are emitted in a single transaction, their order must be preserved. If multiple transactions occur across ticks, events must be ordered by tick number and then by action order.
+
+6. Event Identity
+Each event must have a unique event_id. Event ids may be nondeterministic but must not affect deterministic semantics. Event ids must not be reused. Event ids must not encode semantic information.
+
+7. Event Visibility
+Events are visible to:
+- external systems
+- golden file capture
+Events are not visible to:
+- match discovery
+- selection model
+- dependency tracking
+- conflict detection
+Events must not influence deterministic execution.
+
+8. Event Evaluation Rules
+Event payload expressions must:
+- be well-typed
+- evaluate deterministically
+- not reference nondeterministic functions
+- not reference node or edge references directly
+- not modify the state
+
+9. Interaction with Transaction Model
+Events are produced only if:
+- dependency validation succeeds
+- conflict detection succeeds
+- commit succeeds
+Events must be included in the transaction commit record. Events must not be emitted for aborted transactions.
+
+10. Interaction with Dependency Set Model
+Events do not contribute dependencies. Events do not depend on version counters. Events do not affect dependency validation. Events must not reference fields or structures that would require dependency tracking.
+
+11. Interaction with Golden Files
+Golden files must capture:
+- event emission order
+- event payloads
+- rule_id associated with each event
+Golden files must not capture:
+- event_id
+- timestamps
+- engine metadata
+Any deviation indicates nonconformance.
+
+12. Invalid Events
+An event is invalid if:
+- its payload expression is ill-typed
+- its payload expression references nondeterministic functions
+- its payload expression references node or edge references
+- its payload expression fails evaluation
+Invalid events must cause transaction failure.
+
+13. Event Consumers
+Event consumers are external to the deterministic core. Engines may:
+- deliver events to subscribers
+- log events
+- forward events to external systems
+Event delivery must not affect deterministic execution.
+
+14. Extensibility
+Future versions may extend the Event Model with:
+- structured event schemas
+- deterministic event batching
+- event routing rules
+All extensions must preserve determinism.
+
+End of GRISP SPEC 009 — EVENT MODEL (v0.17 DRAFT)
+GRISP SPEC 010 — GOLDEN FILE MODEL (v0.17 DRAFT)
+
+Status: Draft
+Layer: 0 (Deterministic Core)
+Depends on: Spec 001 Canonical IR, Spec 002 Expression AST, Spec 003 Node and Edge Model, Spec 004 Type System, Spec 005 Pattern Model, Spec 006 Match Discovery Model, Spec 007 Transaction and Conflict Model, Spec 008 Action Model, Spec 009 Event Model, Spec 014 Dependency Set Model
+
+Purpose:
+This specification defines the Golden File Model for GRISP. Golden files are deterministic execution traces used to verify engine conformance. A golden file captures the exact sequence of matches, selections, dependency validations, conflicts, actions, commits, events, and final state transitions for a given manifest and initial state. Any engine that produces identical golden files is considered conformant.
+
+1. Overview
+A golden file is a deterministic record of:
+- match discovery order
+- match keys
+- dependency sets
+- selection decisions
+- transaction validation results
+- conflict detection results
+- staged changes
+- committed changes
+- version counter updates
+- emitted events
+Golden files must be byte-for-byte identical across engines.
+
+2. Golden File Structure
+A golden file consists of:
+header
+initial_state
+ticks[]
+final_state
+
+The header contains:
+manifest_version
+engine_version
+timestamp (optional, ignored for conformance)
+
+The initial_state contains:
+all nodes
+all edges
+all version counters
+
+Each tick contains:
+tick_number
+discovered_matches[]
+selected_match
+dependency_validation
+conflict_detection
+staged_changes
+committed_changes
+events[]
+
+The final_state contains:
+all nodes
+all edges
+all version counters
+
+3. Match Discovery Recording
+For each tick, the golden file must record:
+- the list of discovered matches in deterministic order
+- for each match:
+  - match_key
+  - binding environment (node ids and edge ids)
+  - let binding values
+  - dependency set (all dependencies with recorded versions)
+
+Match discovery must be recorded exactly as produced by the engine.
+
+4. Selection Recording
+The golden file must record:
+- the selected match_key
+- the computed score (fixed-point integer)
+- the match age
+- the fairness boost
+- the tie-break component
+
+Selection must be deterministic and must match Spec 013.
+
+5. Dependency Validation Recording
+The golden file must record:
+- whether validation succeeded
+- for each dependency:
+  - dependency type
+  - recorded version
+  - current version
+If validation fails, the match is invalidated and no transaction occurs.
+
+6. Conflict Detection Recording
+If dependency validation succeeds, the golden file must record:
+- whether conflict detection succeeded
+- for each staged change:
+  - whether it conflicts with any dependency
+If conflict detection fails, the match is invalidated and no commit occurs.
+
+7. Staged Changes Recording
+If conflict detection succeeds, the golden file must record:
+- all staged node creations
+- all staged node updates
+- all staged node deletions
+- all staged edge creations
+- all staged edge deletions
+Staged changes must be recorded in the order they were produced.
+
+8. Commit Recording
+If commit succeeds, the golden file must record:
+- applied node creations
+- applied node updates
+- applied node deletions
+- applied edge creations
+- applied edge deletions
+- updated version counters
+Commit ordering must follow Spec 007.
+
+9. Event Recording
+The golden file must record:
+- all emitted events
+- event payloads
+- rule_id associated with each event
+Event ids and timestamps must not be recorded.
+
+10. Final State Recording
+After all ticks, the golden file must record:
+- all nodes with final field values
+- all edges
+- all version counters
+The final state must be byte-for-byte identical across engines.
+
+11. Deterministic Serialization
+Golden files must use deterministic serialization rules:
+- keys sorted lexicographically
+- lists serialized in deterministic order
+- integers serialized without leading zeros
+- strings serialized without escaping unless required
+- no floating-point values allowed
+- fixed-point integers must be serialized as integers
+
+12. Conformance Requirements
+An engine is conformant if:
+- for a given manifest and initial state
+- it produces a golden file identical to the reference golden file
+Conformance must be strict. Any deviation indicates nonconformance.
+
+13. Non-Deterministic Fields
+Golden files must not include:
+- timestamps
+- event ids
+- node id generation seeds
+- engine metadata
+These fields are nondeterministic and must be excluded.
+
+14. Golden File Generation
+Golden files must be generated by:
+- executing the manifest deterministically
+- capturing all required fields
+- serializing deterministically
+Golden file generation must not modify the state.
+
+15. Golden File Validation
+To validate an engine:
+- run the manifest
+- capture the golden file
+- compare byte-for-byte with the reference
+If identical, the engine is conformant.
+
+16. Interaction with Dependency Set Model
+Golden files must record:
+- dependency sets
+- dependency snapshots
+- version counters
+This ensures that dependency validation is reproducible.
+
+17. Interaction with Selection Model
+Golden files must record:
+- selection scores
+- match ages
+- fairness boosts
+- tie-break components
+This ensures deterministic selection.
+
+18. Interaction with Transaction Model
+Golden files must record:
+- dependency validation
+- conflict detection
+- staged changes
+- committed changes
+This ensures deterministic state transitions.
+
+19. Extensibility
+Future versions may extend golden files with:
+- deterministic profiling data
+- deterministic performance metrics
+All extensions must preserve determinism.
+
+End of GRISP SPEC 010 — GOLDEN FILE MODEL (v0.17 DRAFT)
+GRISP SPEC 011 — STATE MODEL (v0.17 DRAFT)
+
+Status: Draft
+Layer: 0 (Deterministic Core)
+Depends on: Spec 001 Canonical IR, Spec 003 Node and Edge Model, Spec 007 Transaction and Conflict Model, Spec 014 Dependency Set Model
+
+Purpose:
+This specification defines the GRISP State Model. The State Model describes the complete deterministic representation of all nodes, edges, and version counters that constitute the runtime state of a GRISP engine. The State Model is the authoritative source of truth for match discovery, dependency validation, conflict detection, and state transitions.
+
+1. Overview
+The GRISP state consists of:
+- a set of node instances
+- a set of edge instances
+- version counters for nodes, fields, predicates, ordering, extents, and edges
+The state must be fully deterministic. All engines must represent and update state identically.
+
+2. State Graph Structure
+The state graph is a directed multigraph consisting of:
+nodes: typed entities with fields
+edges: typed directed relationships between nodes
+The state graph must always satisfy:
+- all nodes conform to their node type definitions
+- all edges conform to their edge type definitions
+- all structural constraints are satisfied
+
+3. Node Storage
+Nodes are stored in a mapping:
+nodes[node_id] = node_instance
+A node instance contains:
+id: unique identifier
+type: node type name
+fields: mapping from field_name to value
+version: integer
+metadata: optional engine metadata
+Node ids must be unique and must not be reused.
+
+4. Edge Storage
+Edges are stored in a mapping:
+edges[edge_id] = edge_instance
+An edge instance contains:
+id: unique identifier
+type: edge type name
+source: node_id
+target: node_id
+version: integer
+metadata: optional engine metadata
+Edge ids must be unique and must not be reused.
+
+5. Version Counters
+The State Model maintains the following version counters:
+node version: per node
+field predicate version: per (node_type, field_name)
+field ordering version: per (node_type, field_name)
+extent version: per node_type
+edge version: per edge_type
+These counters are used by the Dependency Set Model for validation and conflict detection.
+
+6. Node Version Counter Semantics
+The node version counter increments when:
+- any field on the node is updated
+- the node is deleted
+Node version counters must not increment for unrelated operations.
+
+7. Predicate Version Counter Semantics
+The predicate version counter increments when:
+- any field used in a collection filter changes on any node of that type
+Predicate version counters ensure deterministic invalidation of matches that depend on filtered collections.
+
+8. Ordering Version Counter Semantics
+The ordering version counter increments when:
+- any field used in a collection order_by changes on any node of that type
+Ordering version counters ensure deterministic invalidation of matches that depend on sorted collections.
+
+9. Extent Version Counter Semantics
+The extent version counter increments when:
+- a node of the type is created
+- a node of the type is deleted
+Extent version counters ensure deterministic invalidation of matches that depend on collection sources.
+
+10. Edge Version Counter Semantics
+The edge version counter increments when:
+- an edge of the type is created
+- an edge of the type is deleted
+Edge version counters ensure deterministic invalidation of matches that depend on edge structures.
+
+11. State Initialization
+The initial state must be:
+- fully validated against the Canonical IR
+- free of structural constraint violations
+- free of type errors
+- assigned initial version counters (all counters start at 1)
+Invalid initial states must be rejected.
+
+12. State Query Semantics
+State queries must be deterministic. The following operations must be supported:
+get_node(node_id)
+get_edge(edge_id)
+get_nodes_by_type(type)
+get_edges_by_type(type)
+get_edges_from(node_id)
+get_edges_to(node_id)
+All queries must return results in deterministic order:
+- nodes sorted by node id
+- edges sorted by edge id
+
+13. State Mutation Semantics
+State mutations occur only during transaction commit. Mutations include:
+- node creation
+- node update
+- node deletion
+- edge creation
+- edge deletion
+Mutations must be atomic and must update version counters deterministically.
+
+14. Node Creation Semantics
+When a node is created:
+- a unique id is assigned
+- fields are initialized
+- version is set to 1
+- extent version increments
+Node creation must not affect other nodes.
+
+15. Node Update Semantics
+When a node is updated:
+- updated fields are replaced
+- node version increments
+- predicate and ordering versions increment for affected fields
+Node updates must not modify unrelated fields.
+
+16. Node Deletion Semantics
+When a node is deleted:
+- node version increments
+- extent version increments
+- all incident edges are deleted
+Node deletion must not leave dangling edges.
+
+17. Edge Creation Semantics
+When an edge is created:
+- a unique id is assigned
+- version is set to 1
+- edge version increments
+Edge creation must not modify nodes.
+
+18. Edge Deletion Semantics
+When an edge is deleted:
+- edge version increments
+Edge deletion must not modify nodes.
+
+19. Deterministic Ordering of Mutations
+Mutations must be applied in deterministic order:
+- node creations sorted by node id
+- node updates sorted by node id
+- node deletions sorted by node id
+- edge creations sorted by edge id
+- edge deletions sorted by edge id
+
+20. State Consistency Requirements
+The state must always satisfy:
+- all node types are valid
+- all edge types are valid
+- all field values are well-typed
+- all structural constraints are satisfied
+- all version counters are consistent
+
+21. Interaction with Match Discovery
+Match discovery reads:
+- node fields
+- edge structures
+- version counters
+Match discovery must not modify the state.
+
+22. Interaction with Dependency Set Model
+The State Model provides:
+- version counters
+- field values
+- node and edge existence
+Dependency validation uses these values to determine match validity.
+
+23. Interaction with Transaction Model
+The Transaction Model:
+- stages changes
+- validates dependencies
+- detects conflicts
+- commits changes
+The State Model applies committed changes.
+
+24. Interaction with Golden Files
+Golden files must record:
+- initial state
+- final state
+- all version counter updates
+- all node and edge mutations
+Any deviation indicates nonconformance.
+
+25. Extensibility
+Future versions may extend the State Model with:
+- additional metadata
+- deterministic indexing structures
+- deterministic caching
+All extensions must preserve determinism.
+
+End of GRISP SPEC 011 — STATE MODEL (v0.17 DRAFT)
+GRISP SPEC 012 — TICK MODEL (v0.17 DRAFT)
+
+Status: Draft
+Layer: 0 (Deterministic Core)
+Depends on: Spec 001 Canonical IR, Spec 006 Match Discovery Model, Spec 007 Transaction and Conflict Model, Spec 013 Selection Model, Spec 014 Dependency Set Model
+
+Purpose:
+This specification defines the Tick Model for GRISP. A tick is the fundamental unit of deterministic execution. Each tick consists of match discovery, selection, transaction execution, and state transition. The Tick Model ensures that all engines execute rules in the same order and produce identical results.
+
+1. Overview
+A tick is a deterministic execution cycle consisting of:
+1. match discovery
+2. match selection
+3. transaction execution
+4. commit or abort
+5. event emission
+6. tick finalization
+Only one transaction may commit per tick. A tick must be fully deterministic.
+
+2. Tick Lifecycle
+The lifecycle of a tick is:
+1. Begin tick
+2. Discover matches
+3. Select one match
+4. Validate dependencies
+5. Execute actions
+6. Detect conflicts
+7. Commit or abort
+8. Emit events
+9. End tick
+If no matches are available, the tick performs no state changes.
+
+3. Tick Start
+At the start of a tick:
+- the state is stable
+- all version counters are current
+- no staged changes exist
+- match discovery begins from a clean snapshot
+
+4. Match Discovery Phase
+The engine must:
+- enumerate all rules
+- discover all matches for each rule
+- compute dependency sets
+- compute match keys
+- compute match ages
+Match discovery must be deterministic and must not modify the state.
+
+5. Selection Phase
+The engine must:
+- compute a score for each match
+- apply fairness adjustments
+- break ties deterministically
+- select exactly one match
+If no matches exist, the tick ends with no state changes.
+
+6. Transaction Phase
+The engine must:
+- validate dependencies
+- evaluate actions
+- stage changes
+- detect conflicts
+If validation or conflict detection fails, the match is discarded and the engine returns to match discovery.
+
+7. Commit Phase
+If no conflicts are detected:
+- apply staged node creations
+- apply staged node updates
+- apply staged node deletions
+- apply staged edge creations
+- apply staged edge deletions
+- update version counters
+Commit must be atomic and deterministic.
+
+8. Event Emission Phase
+If the transaction commits:
+- emit events in the order of emit_event actions
+Events must not be emitted if the transaction aborts.
+
+9. Tick End
+At the end of the tick:
+- the state is stable
+- all version counters reflect committed changes
+- match ages are updated
+- the tick counter increments
+
+10. Tick Counter
+The engine maintains a tick counter starting at 1. The tick counter increments after each tick. The tick counter is used for:
+- match age computation
+- golden file recording
+The tick counter must not affect deterministic semantics.
+
+11. Deterministic Ordering Requirements
+The following must be deterministic:
+- match discovery order
+- match selection order
+- transaction execution order
+- commit order
+- event emission order
+- tick ordering
+Any nondeterministic ordering is forbidden.
+
+12. No Parallel Execution
+Ticks must not run in parallel. Transactions must not run in parallel. Match discovery must not run in parallel with state mutation. All execution must be strictly sequential.
+
+13. Tick Termination Conditions
+A tick terminates when:
+- a transaction commits
+- or no matches exist
+- or all matches fail validation or conflict detection
+If all matches fail, the tick ends with no state changes.
+
+14. Interaction with Match Discovery Model
+Match discovery occurs at the start of each tick. Match discovery must not see staged changes. Match discovery must be repeated after any transaction abort.
+
+15. Interaction with Selection Model
+The Selection Model chooses exactly one match per tick. The Tick Model executes that match. If the match fails, the Selection Model must choose a new match.
+
+16. Interaction with Transaction Model
+The Transaction Model executes the selected match. The Tick Model ensures that only one transaction may commit per tick.
+
+17. Interaction with Dependency Set Model
+Dependency sets are computed during match discovery. Dependency validation occurs during the transaction phase. The Tick Model ensures that dependency sets remain valid until validation.
+
+18. Interaction with Golden File Model
+Golden files must record:
+- tick number
+- discovered matches
+- selected match
+- dependency validation result
+- conflict detection result
+- staged changes
+- committed changes
+- events
+Any deviation indicates nonconformance.
+
+19. Extensibility
+Future versions may extend the Tick Model with:
+- deterministic multi-match execution
+- deterministic batching
+- deterministic tick grouping
+All extensions must preserve determinism.
+
+End of GRISP SPEC 012 — TICK MODEL (v0.17 DRAFT)
+GRISP SPEC 013 — SELECTION MODEL (v0.17 DRAFT)
+
+Status: Draft
+Layer: 0 (Deterministic Core)
+Depends on: Spec 001 Canonical IR, Spec 006 Match Discovery Model, Spec 012 Tick Model, Spec 014 Dependency Set Model
+
+Purpose:
+This specification defines the deterministic Selection Model for GRISP. The Selection Model chooses exactly one match per tick from the set of discovered matches. Selection must be deterministic, fair, reproducible, and independent of engine implementation details. All engines must select the same match for the same state and Canonical IR.
+
+1. Overview
+The Selection Model assigns each match a deterministic score. The score is computed from:
+- base priority
+- match age
+- fairness boost
+- tie-break component
+The match with the highest score is selected. If multiple matches have the same score, deterministic tie-breaking rules apply.
+
+2. Base Priority
+Each rule has a base priority defined in the Canonical IR. Base priority is an integer. Higher values indicate higher priority. Base priority is the first component of the score.
+
+3. Match Age
+Match age is the number of ticks since the match was first discovered. Match age starts at 0 when the match is first discovered. Match age increments by 1 at the end of each tick in which the match remains valid. Match age resets to 0 when:
+- the match fires
+- the match becomes invalid
+- the match is rediscovered after invalidation
+Match age is used to ensure fairness.
+
+4. Fairness Boost
+The fairness boost is computed as:
+fairness_boost = match_age * fairness_factor
+The fairness_factor is a constant defined as 1 in v0.17. The fairness boost ensures that long-waiting matches eventually fire even if they have lower base priority.
+
+5. Tie-Break Component
+The tie-break component is computed from the match_key. The match_key is hashed using a deterministic hash function. The hash is converted to a fixed-point integer. The tie-break component ensures deterministic ordering among matches with identical priority and fairness.
+
+6. Score Computation
+The score for a match is computed as:
+score = base_priority * priority_scale + fairness_boost * fairness_scale + tie_break * tie_break_scale
+The scale constants are:
+priority_scale = 1,000,000
+fairness_scale = 1,000
+tie_break_scale = 1
+These constants ensure that:
+- base priority dominates fairness
+- fairness dominates tie-break
+- tie-break resolves final ties
+
+7. Deterministic Hash Function
+The hash function used for tie-break must be:
+- deterministic
+- stable across engines
+- stable across platforms
+- stable across versions
+The hash function must operate on the match_key string. The hash must produce a 32-bit integer. The hash must not depend on memory layout or pointer values.
+
+8. Selection Algorithm
+The selection algorithm is:
+1. For each match, compute score.
+2. Select the match with the highest score.
+3. If multiple matches have the same score, select the one with the smallest match_key lexicographically.
+4. Return the selected match.
+The algorithm must be deterministic.
+
+9. No Randomness
+The Selection Model must not use:
+- randomness
+- nondeterministic ordering
+- nondeterministic tie-breaking
+- nondeterministic hashing
+All selection behavior must be reproducible.
+
+10. Match Aging Rules
+Match age increments only if:
+- the match remains valid
+- the match is not selected
+Match age resets if:
+- the match fires
+- the match becomes invalid
+- the match is rediscovered after invalidation
+Match age must be stored in the match table.
+
+11. Match Table
+The engine maintains a match table containing:
+- match_key
+- match_age
+- last_seen_tick
+- dependency set
+- binding environment
+The match table is updated each tick.
+
+12. Match Table Update Rules
+At the start of each tick:
+- matches discovered in the previous tick are carried forward
+- matches not rediscovered are removed
+- matches rediscovered retain their age
+At the end of each tick:
+- match_age increments for all matches not selected
+
+13. Interaction with Dependency Set Model
+Matches whose dependencies become invalid:
+- are removed from the match table
+- have their age reset
+- must be rediscovered to re-enter the table
+
+14. Interaction with Tick Model
+The Selection Model runs once per tick. The Tick Model executes the selected match. If the selected match fails dependency validation or conflict detection, the Selection Model must choose a new match.
+
+15. Interaction with Golden File Model
+Golden files must record:
+- match scores
+- match ages
+- fairness boosts
+- tie-break components
+- selected match
+Any deviation indicates nonconformance.
+
+16. Invalid Matches
+A match is invalid if:
+- its dependency set cannot be validated
+- its binding environment is inconsistent
+- its rule definition is invalid
+Invalid matches must not be selected.
+
+17. Extensibility
+Future versions may extend the Selection Model with:
+- weighted fairness
+- priority decay
+- deterministic batching
+All extensions must preserve determinism.
+
+End of GRISP SPEC 013 — SELECTION MODEL (v0.17 DRAFT)
+GRISP SPEC 014 — DEPENDENCY SET MODEL (v0.17 DRAFT)
+
+Status: Draft
+Layer: 0 (Deterministic Core)
+Depends on: Spec 001 Canonical IR, Spec 002 Expression AST, Spec 003 Node and Edge Model, Spec 004 Type System, Spec 005 Pattern Model, Spec 006 Match Discovery Model, Spec 007 Transaction and Conflict Model, Spec 011 State Model
+
+Purpose:
+This specification defines the Dependency Set Model for GRISP. Dependency sets are the deterministic mechanism that ensures match validity, conflict detection, and reproducible execution. A dependency set records exactly which parts of the state a match depends on, and which version counters must remain unchanged for the match to remain valid. All engines must compute identical dependency sets for the same match.
+
+1. Overview
+A dependency set is a collection of dependency entries. Each entry records:
+- the dependency type
+- the identifier or type name
+- the version counter at match discovery time
+Dependency sets are computed during match discovery and validated during transaction execution. If any version counter changes, the match becomes invalid.
+
+2. Dependency Types
+The Dependency Set Model defines the following dependency types:
+Field(node_id, field_name)
+Predicate(node_type, field_name)
+Ordering(node_type, field_name)
+Extent(node_type)
+Edge(edge_type)
+These dependencies cover all deterministic state interactions.
+
+3. Field Dependencies
+A Field dependency is recorded when:
+- a field expression is evaluated
+- a constraint references a field
+- a when clause references a field
+- a let binding references a field
+A Field dependency consists of:
+type: Field
+node_id: the node whose field was accessed
+field_name: the field accessed
+version: the node version at match discovery time
+If the node version changes, the match is invalid.
+
+4. Predicate Dependencies
+A Predicate dependency is recorded when:
+- a collection expression uses a filter referencing a field
+A Predicate dependency consists of:
+type: Predicate
+node_type: the type of nodes being filtered
+field_name: the field used in the filter
+version: the predicate version counter at match discovery time
+If the predicate version changes, the match is invalid.
+
+5. Ordering Dependencies
+An Ordering dependency is recorded when:
+- a collection expression uses an order_by referencing a field
+An Ordering dependency consists of:
+type: Ordering
+node_type: the type of nodes being sorted
+field_name: the field used in ordering
+version: the ordering version counter at match discovery time
+If the ordering version changes, the match is invalid.
+
+6. Extent Dependencies
+An Extent dependency is recorded when:
+- a collection expression enumerates nodes of a type
+- a collection expression enumerates edges of a type
+An Extent dependency consists of:
+type: Extent
+node_type: the type being enumerated
+version: the extent version counter at match discovery time
+If the extent version changes, the match is invalid.
+
+7. Edge Dependencies
+An Edge dependency is recorded when:
+- a pattern binds an edge
+- a constraint references an edge
+An Edge dependency consists of:
+type: Edge
+edge_type: the edge type being referenced
+version: the edge version counter at match discovery time
+If the edge version changes, the match is invalid.
+
+8. Dependency Extraction Rules
+Dependency extraction must be deterministic. The engine must:
+- walk the pattern
+- walk the when clause
+- walk the let bindings
+- walk the then clause
+- extract dependencies from all Expression ASTs
+Dependencies must be recorded in deterministic order:
+1. Field dependencies sorted by (node_id, field_name)
+2. Predicate dependencies sorted by (node_type, field_name)
+3. Ordering dependencies sorted by (node_type, field_name)
+4. Extent dependencies sorted by node_type
+5. Edge dependencies sorted by edge_type
+
+9. Dependency Snapshot
+A dependency snapshot is the set of version counters recorded at match discovery time. The snapshot is stored in the match table. The snapshot must not change after match discovery.
+
+10. Dependency Validation
+During transaction execution, the engine must:
+- retrieve the current version counter for each dependency
+- compare it to the recorded version
+If any version differs, the match is invalid. Dependency validation must be deterministic.
+
+11. Dependency Invalidation
+A match becomes invalid if:
+- any field dependency version changes
+- any predicate dependency version changes
+- any ordering dependency version changes
+- any extent dependency version changes
+- any edge dependency version changes
+Invalid matches must be removed from the match table.
+
+12. Dependency and Conflict Detection
+Conflict detection uses dependency sets to determine whether staged changes conflict with the match. A conflict occurs if:
+- a staged update modifies a field referenced in a Field dependency
+- a staged update modifies a field referenced in a Predicate dependency
+- a staged update modifies a field referenced in an Ordering dependency
+- a staged create or delete affects an Extent dependency
+- a staged create or delete affects an Edge dependency
+Conflict detection must be deterministic.
+
+13. Dependency and Collections
+Collection expressions produce multiple dependencies:
+- Extent dependency for the source type
+- Predicate dependencies for filter fields
+- Ordering dependencies for order_by fields
+- Field dependencies for any fields referenced inside filter or order_by expressions
+Collection dependencies ensure that matches depending on collections remain valid only if the collection remains unchanged.
+
+14. Dependency and Function Calls
+Function calls may introduce dependencies if:
+- the function is effect_deterministic
+- the function reads fields or structures
+Pure functions do not introduce dependencies. Effect_nondeterministic functions are forbidden in Expression AST.
+
+15. Dependency and Pattern Bindings
+Pattern bindings introduce:
+- Field dependencies for any field accesses
+- Edge dependencies for any edge bindings
+Pattern bindings do not introduce Predicate or Ordering dependencies unless used in collections.
+
+16. Dependency and Let Bindings
+Let bindings introduce dependencies based on:
+- field accesses
+- collection expressions
+- function calls
+Let bindings must be evaluated deterministically.
+
+17. Dependency and Then Clause
+The then clause introduces dependencies only for:
+- field accesses inside expressions
+The then clause does not introduce structural dependencies because actions do not affect match discovery.
+
+18. Dependency Set Serialization
+Golden files must serialize dependency sets deterministically:
+- sorted by dependency type
+- sorted lexicographically within each type
+- version counters serialized as integers
+Any deviation indicates nonconformance.
+
+19. Dependency Set Completeness
+A dependency set must include all dependencies required to ensure deterministic execution. Missing dependencies may cause nondeterministic behavior. Engines must reject manifests that produce incomplete dependency sets.
+
+20. Dependency Set Minimality
+A dependency set must not include unnecessary dependencies. Unnecessary dependencies reduce concurrency and may cause unnecessary invalidations. Engines must compute minimal dependency sets.
+
+21. Interaction with Match Discovery Model
+Match discovery computes dependency sets. Dependency sets must be stored in the match table. Dependency sets must not change after match discovery.
+
+22. Interaction with Transaction Model
+The Transaction Model uses dependency sets for:
+- dependency validation
+- conflict detection
+Dependency sets must be validated before action evaluation.
+
+23. Interaction with Selection Model
+Dependency sets do not affect selection. However, invalid matches must not be selected.
+
+24. Interaction with Golden File Model
+Golden files must record:
+- dependency sets
+- dependency snapshots
+- dependency validation results
+Any deviation indicates nonconformance.
+
+25. Extensibility
+Future versions may extend the Dependency Set Model with:
+- deterministic aggregate dependencies
+- deterministic temporal dependencies
+All extensions must preserve determinism.
+
+End of GRISP SPEC 014 — DEPENDENCY SET MODEL (v0.17 DRAFT)
