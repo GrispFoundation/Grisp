@@ -1,0 +1,2547 @@
+============  GRISP v0.16 — Spec 001 - CANONICAL IR  ============
+
+Status: Draft
+Layer: 0 (Deterministic Execution Core)
+Depends on:
+- Spec 002 Expression AST
+- Spec 007 Transaction Model
+- Spec 011 State Model
+- Spec 013 Selection Model
+
+1. Purpose
+Canonical IR defines the deterministic execution contract for all GRISP engines. It specifies the schema for rule definitions, node type definitions, edge type definitions, function definitions, and manifests. Canonical IR contains no trust semantics, no AI constructs, and no runtime policy. It is a pure, stable, deterministic representation.
+
+2. Manifest Structure
+A manifest defines the static schema and rule set.
+
+{
+  "ir_version": "grisp-ir-v0.16",
+  "manifest_id": "string",
+  "manifest_version": "string",
+  "node_types": [...],
+  "edge_types": [...],
+  "functions": [...],
+  "rules": [...],
+  "metadata": {},
+  "custom": {}
+}
+
+3. Node Types
+Node types define the schema for fact instances stored in the graph state.
+
+{
+  "name": "Task",
+  "fields": {
+    "id": { "type": "identifier" },
+    "lifecycle": { "type": "string" },
+    "priority": { "type": "integer", "default": 0 }
+  },
+  "constraints": [
+    {
+      "kind": "expression",
+      "expr": { Expression AST }
+    }
+  ],
+  "custom": {}
+}
+
+Rules:
+- Node types define schema only.
+- Instances are defined in Spec 011 State Model.
+- Field types must be one of: string, integer, boolean, identifier, float, list, map.
+- Default values apply when omitted in create actions.
+
+4. Edge Types
+Edge types define typed relationships between node instances.
+
+{
+  "name": "AssignedTo",
+  "from": "Task",
+  "to": "Agent",
+  "multiplicity": "many_to_one",
+  "custom": {}
+}
+
+Rules:
+- Edge instances are defined in Spec 011 State Model.
+- Multiplicity is one of: one_to_one, one_to_many, many_to_one, many_to_many.
+- Engines must enforce multiplicity constraints during transaction validation.
+
+5. Function Definitions
+Functions are pure or effectful operations callable from expressions or actions.
+
+{
+  "name": "compute_score",
+  "kind": "pure",
+  "signature": {
+    "params": [
+      { "name": "task", "type": "Task" }
+    ],
+    "returns": { "type": "integer" }
+  },
+  "custom": {}
+}
+
+Rules:
+- Function signatures use normalized AST, not string syntax.
+- Function kinds are: pure, effect, nondeterministic.
+- Pure functions must be deterministic and side-effect free.
+- Nondeterministic functions may only appear in effect actions, never in expressions.
+
+6. Rule Structure
+
+{
+  "rule_id": "AssignTask",
+  "rule_version": "1.0.0",
+  "when": [...],
+  "let": [...],
+  "then": [...],
+  "metadata": {},
+  "custom": {}
+}
+
+7. Match Patterns
+Patterns bind facts from the graph state.
+
+{
+  "bind": "t",
+  "type": "Task",
+  "where": {
+    "kind": "binary",
+    "op": "==",
+    "left": { "kind": "field", "path": ["t", "lifecycle"] },
+    "right": { "kind": "literal", "literal_type": "string", "value": "pending" }
+  }
+}
+
+Rules:
+- All conditions use Expression AST.
+- Bindings must be unique within a rule.
+- Pattern evaluation is defined in Spec 007 Transaction Model.
+
+8. Let Bindings
+
+{
+  "name": "score",
+  "expr": { Expression AST }
+}
+
+Rules:
+- Let bindings are evaluated after pattern matching.
+- Let bindings may not modify graph state.
+- Let bindings may not call effect or nondeterministic functions.
+
+9. Actions
+Actions modify graph state or call external tools. Canonical IR defines only the schema. Execution semantics are in Spec 007.
+
+Example update action:
+
+{
+  "kind": "update",
+  "target": "t",
+  "assigns": {
+    "lifecycle": {
+      "kind": "literal",
+      "literal_type": "string",
+      "value": "assigned"
+    }
+  }
+}
+
+Allowed kinds:
+- create
+- update
+- delete
+- call
+- emit
+
+Clarify actions are defined in Spec 005 Boundary Contract.
+
+10. Read and Write Inference
+Canonical IR requires complete and correct inference of reads and writes for each rule.
+
+10.1 Inferred Reads
+A rule reads:
+- all fields referenced in pattern expressions
+- all fields referenced in let expressions
+- all fields referenced in action expressions
+- all fields of any fact bound in a pattern with no where clause
+- all fields accessed via field expressions
+
+10.2 Inferred Writes
+A rule writes:
+- all fields assigned in update actions
+- all fields of created facts
+- deletion of a fact counts as writing all its fields
+- creation or deletion of edges counts as writing the edge type
+
+10.3 Formal Algorithm
+The following algorithm is normative:
+
+Step 1: Initialize empty sets inferred_reads and inferred_writes.
+Step 2: Walk all expressions in when, let, then.
+Step 3: For each field access expression, add (binding, field) to inferred_reads.
+Step 4: For each update action, add (binding, field) to inferred_writes.
+Step 5: For each create action, add all fields of the node type to inferred_writes.
+Step 6: For each delete action, add all fields of the node type to inferred_writes.
+Step 7: For each edge create or delete, add the edge type to inferred_writes.
+Step 8: Output both sets.
+
+11. Canonical Serialization
+Canonical IR objects must serialize to canonical JSON:
+- sorted keys
+- UTF-8
+- no whitespace beyond single spaces
+- no trailing commas
+- deterministic number formatting
+
+Graph hashing is defined in Spec 011 State Model.
+
+12. Validation Rules
+A manifest is valid if:
+- all node types have unique names
+- all edge types reference valid node types
+- all functions have valid signatures
+- all rules reference valid types and bindings
+- inferred_reads and inferred_writes are computable
+- no nondeterministic functions appear in expressions
+- all actions reference valid bindings
+
+13. Summary
+Canonical IR v0.16 defines:
+- normalized schema for rule definitions
+- normalized schema for node and edge types
+- normalized function signatures
+- deterministic read and write inference
+- deterministic serialization
+- no trust, no AI, no runtime policy
+
+It is the stable execution contract for all GRISP engines.
+
+============  END OF SPEC 001  ============
+
+============  GRISP v0.16 — Spec 002 - EXPRESSION AST  ============
+
+Status: Draft
+Layer: 0 (Deterministic Execution Core)
+Depends on:
+- Spec 001 Canonical IR
+- Spec 011 State Model
+
+1. Purpose
+This specification defines the normalized Expression AST used by all GRISP engines. Expressions appear in rule patterns, let bindings, constraints, and action payloads. The Expression AST is fully structured, contains no embedded DSL, and is deterministic across all engines.
+
+2. General Structure
+Every expression is a JSON object with a mandatory field:
+"kind": "..."
+
+All expression kinds defined in this document are normative. Engines must reject any expression with an unknown kind.
+
+3. Literal Expressions
+Represents a constant value.
+
+{
+  "kind": "literal",
+  "literal_type": "string|integer|float|boolean|null",
+  "value": <value>
+}
+
+Rules:
+- literal_type must match the JSON type of value.
+- null is allowed only when literal_type is null.
+
+4. Identifier Expressions
+Represents a reference to a let binding or rule binding.
+
+{
+  "kind": "identifier",
+  "name": "binding_name"
+}
+
+Rules:
+- name must reference a valid binding or let variable.
+
+5. Field Access Expressions
+Represents access to a field of a bound fact.
+
+{
+  "kind": "field",
+  "path": ["binding", "field_name"]
+}
+
+Rules:
+- path[0] must be a valid binding.
+- path[1] must be a valid field of the node type.
+
+6. Binary Expressions
+Represents a binary operator.
+
+{
+  "kind": "binary",
+  "op": "==|!=|<|<=|>|>=|and|or|+|-|*|/|%",
+  "left": { Expression },
+  "right": { Expression }
+}
+
+Rules:
+- Operators must be deterministic.
+- Division by zero must be rejected at evaluation time.
+
+7. Unary Expressions
+
+{
+  "kind": "unary",
+  "op": "not|-",
+  "expr": { Expression }
+}
+
+Rules:
+- Unary minus applies only to numeric types.
+
+8. Conditional Expressions
+
+{
+  "kind": "if",
+  "cond": { Expression },
+  "then": { Expression },
+  "else": { Expression }
+}
+
+Rules:
+- cond must evaluate to boolean.
+- Both branches must be type compatible.
+
+9. Collection Expressions
+Represents a deterministic query over the graph state.
+
+{
+  "kind": "collection",
+  "source": {
+    "type": "node" or "edge",
+    "name": "Task" or "AssignedTo"
+  },
+  "filter": { Expression or null },
+  "order_by": [
+    {
+      "expr": { Expression },
+      "direction": "asc|desc"
+    }
+  ],
+  "limit": integer or null
+}
+
+Rules:
+- filter must evaluate to boolean when present.
+- order_by expressions must be deterministic.
+- limit must be positive when present.
+- Collection semantics are defined in Section 10.
+
+10. Collection Semantics
+v0.16 introduces a fully deterministic collection model.
+
+Step 1: Enumerate all instances of the specified node or edge type.
+Step 2: Apply filter expression if present.
+Step 3: Sort results lexicographically by evaluating each order_by expression.
+Step 4: Apply limit if present.
+Step 5: Return the resulting list.
+
+All steps are deterministic and must produce identical results across engines.
+
+11. Function Call Expressions
+
+{
+  "kind": "call",
+  "function": "function_name",
+  "args": [ Expression, ... ]
+}
+
+Rules:
+- Only pure functions may appear in expressions.
+- Effect and nondeterministic functions are forbidden here.
+- Function signatures are defined in Spec 001.
+
+12. List Expressions
+
+{
+  "kind": "list",
+  "items": [ Expression, ... ]
+}
+
+Rules:
+- Items must be type compatible.
+
+13. Map Expressions
+
+{
+  "kind": "map",
+  "entries": [
+    {
+      "key": "string",
+      "value": { Expression }
+    }
+  ]
+}
+
+Rules:
+- Keys must be unique.
+- Keys must be strings.
+
+14. Type Hints
+
+{
+  "kind": "type_hint",
+  "expr": { Expression },
+  "type": "string|integer|float|boolean|identifier|list|map"
+}
+
+Rules:
+- Engines must enforce type compatibility.
+- Type hints do not change semantics, only validation.
+
+15. Determinism Requirements
+All expressions must be:
+- side-effect free
+- pure
+- deterministic
+- serializable in canonical JSON
+
+Any expression that violates these rules must be rejected.
+
+16. Validation Rules
+An expression is valid if:
+- kind is recognized
+- all subexpressions are valid
+- no nondeterministic or effect functions appear
+- all field accesses reference valid bindings
+- all operators are type compatible
+- collection ordering is deterministic
+
+17. Summary
+Expression AST v0.16 defines:
+- a fully normalized, structured expression language
+- deterministic evaluation rules
+- deterministic collection semantics
+- strict purity requirements
+- no embedded DSL or string parsing
+
+It is the foundation for rule evaluation and static analysis.
+
+============  END OF SPEC 002  ============
+
+============  GRISP v0.16 — Spec 003 - RUNTIME PROFILE  ============
+
+Status: Draft
+Layer: 1 (Execution Policy Layer)
+Depends on:
+- Spec 001 Canonical IR
+- Spec 007 Transaction Model
+- Spec 013 Selection Model
+
+1. Purpose
+The Runtime Profile defines execution policy for a GRISP engine. It does not change rule semantics. It influences scheduling, fairness, rate limits, and engine behavior under load. Runtime Profile is optional. When omitted, engines must use default values defined in this specification.
+
+2. Structure
+
+{
+  "profile_id": "string",
+  "profile_version": "string",
+  "scheduler": {
+    "priority_mode": "absolute|relative",
+    "fairness_window": 10,
+    "max_match_age": 100,
+    "priority_boost_per_tick": 0.02,
+    "tie_breaker": "rule_id|match_key|hash",
+    "custom": {}
+  },
+  "rate_limits": {
+    "max_transactions_per_tick": 1,
+    "max_effect_calls_per_tick": 10,
+    "max_emit_events_per_tick": 100,
+    "custom": {}
+  },
+  "timeouts": {
+    "max_rule_eval_steps": 10000,
+    "max_expression_depth": 64,
+    "custom": {}
+  },
+  "custom": {}
+}
+
+3. Determinism Requirements
+Runtime Profile must not introduce nondeterminism. All parameters must be numeric, boolean, or enumerated. No time-based or random-based behavior is allowed.
+
+4. Scheduler Parameters
+
+4.1 priority_mode
+absolute:
+- rule priority is taken directly from rule metadata
+
+relative:
+- rule priority is normalized across all rules
+
+4.2 fairness_window
+Defines how many ticks a match may remain pending before receiving a fairness boost.
+
+4.3 max_match_age
+Defines the maximum number of ticks a match may remain valid before forced invalidation.
+
+4.4 priority_boost_per_tick
+Defines how much match score increases per tick of waiting.
+
+4.5 tie_breaker
+Determines deterministic ordering when scores are equal:
+- rule_id: lexicographic
+- match_key: deterministic match key defined in Spec 013
+- hash: canonical hash of match context
+
+5. Rate Limits
+
+5.1 max_transactions_per_tick
+Defines how many transactions may commit per engine tick. Default is 1 for deterministic operation.
+
+5.2 max_effect_calls_per_tick
+Limits external tool calls.
+
+5.3 max_emit_events_per_tick
+Limits event emission.
+
+6. Timeouts
+
+6.1 max_rule_eval_steps
+Defines maximum evaluation steps for pattern matching and let bindings.
+
+6.2 max_expression_depth
+Defines maximum allowed nesting depth for Expression AST.
+
+7. Interaction With Transaction Model
+Runtime Profile influences:
+- match scoring
+- match aging
+- match invalidation
+- tie breaking
+
+Runtime Profile does not influence:
+- rule semantics
+- read/write inference
+- conflict detection
+- commit semantics
+
+8. Interaction With Selection Model
+Selection Model (Spec 013) defines the scoring formula. Runtime Profile provides parameters used by that formula.
+
+9. Validation Rules
+A Runtime Profile is valid if:
+- all numeric values are non-negative
+- priority_boost_per_tick is finite
+- fairness_window and max_match_age are integers
+- tie_breaker is recognized
+- no field introduces nondeterminism
+
+10. Defaults
+If no Runtime Profile is provided, engines must use:
+
+priority_mode: absolute
+fairness_window: 10
+max_match_age: 100
+priority_boost_per_tick: 0.02
+tie_breaker: rule_id
+max_transactions_per_tick: 1
+max_effect_calls_per_tick: 10
+max_emit_events_per_tick: 100
+max_rule_eval_steps: 10000
+max_expression_depth: 64
+
+11. Summary
+Runtime Profile v0.16 defines:
+- deterministic scheduling parameters
+- deterministic fairness and aging
+- deterministic tie breaking
+- deterministic rate limits
+- no semantic influence on rules
+
+It is a pure policy layer above Canonical IR.
+
+============  END OF SPEC 003  ============
+
+============  GRISP v0.16 — Spec 004 - TRUST MODEL  ============
+
+Status: Draft
+Layer: 1.5 (Trust and Provenance Layer)
+Depends on:
+- Spec 001 Canonical IR
+- Spec 005 Boundary Contract
+- Spec 006 AI Substrate IR
+- Spec 011 State Model
+
+1. Purpose
+The Trust Model defines how trust levels are represented, propagated, validated, and enforced across GRISP. Trust is a mandatory component for safe AI-assisted automation. Trust levels apply to all values entering the system from external sources, including AI-generated values, tool outputs, and human confirmations.
+
+2. Trust Levels
+Trust is a total order:
+
+llm_asserted < tool_returned < system_derived < human_confirmed
+
+Definitions:
+llm_asserted: Value originated from an AI model or was influenced by AI reasoning.
+tool_returned: Value returned by a trusted external tool or service.
+system_derived: Value computed deterministically by the engine.
+human_confirmed: Value explicitly confirmed by a human.
+
+3. Trust-Carrying Values
+Every value entering the Boundary Contract must include:
+
+{
+  "value": <any>,
+  "trust": "llm_asserted|tool_returned|system_derived|human_confirmed"
+}
+
+Values inside Canonical IR do not carry trust. Trust is applied only at the boundary.
+
+4. Trust Propagation Rule
+Trust propagation uses the minimum rule:
+
+trust(result) = min(trust(input1), trust(input2), ...)
+
+This rule is normative and must be applied uniformly.
+
+Examples:
+system_derived + llm_asserted -> llm_asserted
+human_confirmed + tool_returned -> tool_returned
+system_derived + system_derived -> system_derived
+
+5. Field-Level Trust
+Trust may be attached to:
+- entire objects
+- individual fields
+
+Field-level trust overrides object-level trust.
+
+Example:
+{
+  "value": {
+    "name": { "value": "Alice", "trust": "human_confirmed" },
+    "age": { "value": 30, "trust": "llm_asserted" }
+  },
+  "trust": "tool_returned"
+}
+
+Effective trust of "age" is llm_asserted.
+
+6. Trust Promotion
+Trust may only increase through explicit human confirmation.
+
+Promotion rules:
+- llm_asserted -> tool_returned: forbidden
+- tool_returned -> system_derived: forbidden
+- system_derived -> human_confirmed: forbidden
+- llm_asserted -> human_confirmed: allowed only via explicit confirm action
+- tool_returned -> human_confirmed: allowed only via explicit confirm action
+
+7. Trust Demotion
+Trust may decrease automatically through propagation. Trust may never increase automatically.
+
+8. Trust Decay
+Trust decay is optional and disabled by default.
+
+If enabled:
+- human_confirmed may decay to tool_returned after a configured duration
+- decay must be deterministic and based on logical ticks, not wall-clock time
+- decay must be explicitly configured in the Runtime Profile
+
+9. Trust Violations
+A trust violation occurs when:
+- a value with insufficient trust is used in an action requiring higher trust
+- a rule attempts to modify or delete a fact using insufficient trust
+- a capability requires a trust level not met by the provided value
+
+When a trust violation occurs:
+- the engine must reject the action
+- the Boundary Contract must return a clarify request
+
+10. Trust Requirements for Actions
+Minimum trust levels:
+
+create:
+- all fields must be at least tool_returned
+
+update:
+- updated fields must be at least tool_returned
+
+delete:
+- the fact identifier must be human_confirmed
+
+call:
+- arguments must meet the capability trust requirements defined in Spec 009
+
+emit:
+- no trust requirement
+
+11. Trust in Boundary Contract
+Boundary Contract values must include trust. When lowering AI IR to Boundary Contract:
+- all AI-provided values default to llm_asserted
+- trust overrides from the AI IR must be validated
+- invalid trust levels must be rejected
+
+12. Trust in AI IR
+AI IR may include:
+- confidence values
+- uncertainty annotations
+- trust hints
+
+These are advisory only. Canonical trust levels are assigned during lowering.
+
+13. Trust in State Model
+Facts stored in the graph state do not carry trust. Trust applies only to incoming values and action arguments.
+
+14. Trust in Transaction Model
+During transaction validation:
+- trust levels of action arguments must be checked
+- trust violations must abort the transaction
+- trust propagation must be applied to computed values
+
+15. Trust in Capability Model
+Capabilities define minimum trust levels for:
+- reading
+- writing
+- calling tools
+- performing privileged actions
+
+Trust Model and Capability Model interact but remain separate.
+
+16. Determinism Requirements
+Trust evaluation must be deterministic:
+- no time-based trust changes unless using tick-based decay
+- no probabilistic trust adjustments
+- no model-dependent trust inference
+
+17. Validation Rules
+A trust-carrying value is valid if:
+- trust is one of the four allowed levels
+- field-level trust does not exceed object-level trust unless explicitly promoted
+- trust promotion occurs only via confirm actions
+
+18. Summary
+Trust Model v0.16 defines:
+- a strict trust lattice
+- deterministic trust propagation
+- explicit human-controlled promotion
+- field-level trust semantics
+- trust enforcement for all actions
+- trust-aware boundary interactions
+
+It is the foundation for safe AI-assisted automation.
+
+============  END OF SPEC 004  ============
+
+============  GRISP v0.16 — Spec 005 - BOUNDARY CONTRACT  ============
+
+Status: Draft
+Layer: 2 (Engine to External World Interface)
+Depends on:
+- Spec 001 Canonical IR
+- Spec 004 Trust Model
+- Spec 006 AI Substrate IR
+- Spec 007 Transaction Model
+- Spec 012 Event Model
+
+1. Purpose
+The Boundary Contract defines the structured request and response protocol between the GRISP engine and any external actor, including AI systems, humans, or external services. It is the only interface through which values, actions, clarifications, and trust-carrying data enter or leave the deterministic core.
+
+2. Design Principles
+- All inputs must be explicit.
+- All outputs must be explicit.
+- No ambiguity is allowed.
+- All values must carry trust.
+- All interactions must be deterministic.
+- No free-form text is interpreted by the engine.
+
+3. Boundary Request Structure
+
+{
+  "session_id": "string",
+  "request_id": "string",
+  "actions": [...],
+  "facts": [...],
+  "trust_overrides": [...],
+  "capability_grants": [...],
+  "metadata": {},
+  "custom": {}
+}
+
+3.1 session_id
+Identifies a long-lived interaction context. Sessions allow multi-turn clarification.
+
+3.2 request_id
+Unique identifier for idempotency.
+
+3.3 actions
+A list of proposed actions. Each action must be one of:
+- create
+- update
+- delete
+- call
+- confirm
+- clarify_response
+
+Actions must follow the schemas defined in Section 5.
+
+3.4 facts
+Optional. Allows external systems to provide new facts or override existing ones. Facts must include trust.
+
+3.5 trust_overrides
+Optional. Allows explicit human confirmation to promote trust.
+
+3.6 capability_grants
+Optional. Grants capabilities to the session. Defined in Spec 009.
+
+4. Boundary Response Structure
+
+{
+  "session_id": "string",
+  "request_id": "string",
+  "status": "ok|error|clarify|partial",
+  "results": [...],
+  "clarifications": [...],
+  "events": [...],
+  "errors": [...],
+  "metadata": {},
+  "custom": {}
+}
+
+4.1 status
+ok: all actions accepted and executed
+error: request rejected
+clarify: engine requires more information
+partial: some actions executed, others require clarification
+
+4.2 results
+Contains results of executed actions.
+
+4.3 clarifications
+Contains clarification requests when the engine cannot proceed.
+
+4.4 events
+Contains emitted events. Defined in Spec 012.
+
+4.5 errors
+Contains structured error messages.
+
+5. Action Schemas
+
+5.1 Create Action
+
+{
+  "kind": "create",
+  "node_type": "Task",
+  "fields": {
+    "name": { "value": "Example", "trust": "llm_asserted" }
+  }
+}
+
+Rules:
+- All fields must include trust.
+- Minimum trust: tool_returned.
+
+5.2 Update Action
+
+{
+  "kind": "update",
+  "target": "node_id",
+  "assigns": {
+    "lifecycle": { "value": "assigned", "trust": "tool_returned" }
+  }
+}
+
+Rules:
+- Updated fields must include trust.
+- Minimum trust: tool_returned.
+
+5.3 Delete Action
+
+{
+  "kind": "delete",
+  "target": "node_id",
+  "trust": "human_confirmed"
+}
+
+Rules:
+- Delete requires human_confirmed trust.
+
+5.4 Call Action
+
+{
+  "kind": "call",
+  "tool": "external_service",
+  "args": [
+    { "value": 42, "trust": "tool_returned" }
+  ]
+}
+
+Rules:
+- Capability Model defines required trust.
+
+5.5 Confirm Action
+
+{
+  "kind": "confirm",
+  "target": "field_path",
+  "value": <value>,
+  "trust": "human_confirmed"
+}
+
+Rules:
+- Only humans may issue confirm actions.
+- Used to promote trust.
+
+5.6 Clarify Response Action
+
+{
+  "kind": "clarify_response",
+  "clarification_id": "string",
+  "answer": { "value": <value>, "trust": "human_confirmed|tool_returned|llm_asserted" }
+}
+
+Rules:
+- Clarification responses must include trust.
+
+6. Clarification Requests
+When the engine cannot proceed due to ambiguity or insufficient trust, it must return a clarification request.
+
+Clarification request structure:
+
+{
+  "clarification_id": "string",
+  "reason": "insufficient_trust|ambiguous_value|missing_field|invalid_action",
+  "required_trust": "tool_returned|human_confirmed",
+  "field": "field_path",
+  "message": "string"
+}
+
+Clarification requests are deterministic and must not depend on external context.
+
+7. Partial Results
+If some actions can be executed but others require clarification, the engine must:
+- execute the valid subset
+- return status = partial
+- include results for executed actions
+- include clarifications for blocked actions
+
+Partial results must be deterministic and must not depend on timing.
+
+8. Error Handling
+Errors must be structured:
+
+{
+  "code": "invalid_action|trust_violation|schema_error|unknown_node|unknown_field",
+  "message": "string",
+  "details": {}
+}
+
+Errors must not contain stack traces or implementation details.
+
+9. Trust Enforcement
+Boundary Contract is the enforcement point for trust rules.
+
+Rules:
+- All incoming values must include trust.
+- Missing trust defaults to llm_asserted.
+- Trust promotion requires confirm action.
+- Trust violations must produce clarify or error.
+
+10. Interaction With AI IR
+AI IR is lowered into Boundary Contract using:
+- deterministic trust assignment
+- deterministic uncertainty resolution
+- deterministic field mapping
+
+Lowering rules are defined in Spec 006.
+
+11. Interaction With Transaction Model
+Boundary Contract actions become transaction actions. Transaction Model defines:
+- validation
+- commit
+- event emission
+
+Boundary Contract defines only the external schema.
+
+12. Determinism Requirements
+Boundary Contract must be:
+- fully structured
+- canonical JSON
+- no free-form text interpretation
+- no nondeterministic fields
+- no time-based behavior
+
+13. Validation Rules
+A Boundary Request is valid if:
+- all actions follow schemas
+- all values include trust
+- trust levels are valid
+- capability requirements are met
+- no unknown fields appear
+
+14. Summary
+Boundary Contract v0.16 defines:
+- the structured interface between GRISP and external actors
+- trust-aware value transport
+- deterministic clarification flows
+- deterministic error handling
+- deterministic partial results
+- strict schemas for all actions
+
+It is the membrane between the deterministic core and the outside world.
+
+============  END OF SPEC 005  ============
+
+============  GRISP v0.16 — Spec 006 - AI SUBSTRATE IR  ============
+
+Status: Draft
+Layer: 2.5 (AI Mediation Layer)
+Depends on:
+- Spec 001 Canonical IR
+- Spec 002 Expression AST
+- Spec 004 Trust Model
+- Spec 005 Boundary Contract
+- Spec 013 Selection Model
+
+1. Purpose
+AI Substrate IR defines the structured, deterministic representation of AI-generated intentions, uncertainties, and proposed actions before they are lowered into the Boundary Contract. It is the membrane between free-form AI reasoning and the strict deterministic world of GRISP.
+
+AI Substrate IR is not executed by the engine. It is transformed deterministically into Boundary Contract actions.
+
+2. Design Principles
+- No free-form text is interpreted.
+- All AI outputs must be structured.
+- All uncertainties must be explicit.
+- All values must be annotated with confidence.
+- Lowering must be deterministic.
+- No trust is assigned at this layer; trust is assigned during lowering.
+
+3. AI IR Document Structure
+
+{
+  "ai_ir_version": "grisp-ai-ir-v0.16",
+  "session_id": "string",
+  "turn_id": "string",
+  "intents": [...],
+  "proposed_actions": [...],
+  "uncertainties": [...],
+  "facts": [...],
+  "metadata": {},
+  "custom": {}
+}
+
+4. Intents
+Intents describe what the AI believes should happen, without committing to specific actions.
+
+Example:
+
+{
+  "intent_id": "assign_task",
+  "confidence": 0.82,
+  "description": "Assign a pending task to an available agent",
+  "targets": ["task", "agent"]
+}
+
+Rules:
+- confidence is between 0 and 1.
+- description is advisory only.
+- intents do not directly produce actions.
+
+5. Proposed Actions
+Proposed actions are structured suggestions that may map to Boundary Contract actions.
+
+Example:
+
+{
+  "kind": "update",
+  "target_ref": "task_1",
+  "assigns": {
+    "lifecycle": {
+      "value": "assigned",
+      "confidence": 0.91
+    }
+  }
+}
+
+Rules:
+- Proposed actions must be structured.
+- Proposed actions must not include trust.
+- Proposed actions may include confidence.
+- Proposed actions may include uncertainty markers.
+
+6. Uncertainty Annotations
+AI IR must explicitly represent uncertainty.
+
+Example:
+
+{
+  "field": "task.priority",
+  "alternatives": [
+    { "value": 1, "confidence": 0.4 },
+    { "value": 2, "confidence": 0.35 },
+    { "value": 3, "confidence": 0.25 }
+  ]
+}
+
+Rules:
+- Alternatives must sum to 1.0 within tolerance.
+- Alternatives must be deterministic in ordering (descending confidence, then lexicographic).
+
+7. Fact Proposals
+AI IR may propose new facts.
+
+Example:
+
+{
+  "node_type": "Task",
+  "fields": {
+    "name": { "value": "Example", "confidence": 0.77 },
+    "priority": { "value": 2, "confidence": 0.63 }
+  }
+}
+
+Rules:
+- Facts must be structured.
+- Facts must not include trust.
+- Facts may include confidence.
+
+8. Deterministic Lowering
+Lowering converts AI IR into Boundary Contract actions.
+
+Lowering steps:
+
+Step 1: Normalize all confidence values.
+Step 2: Resolve uncertainties deterministically:
+  - choose highest confidence value
+  - if tie, choose lexicographically smallest
+Step 3: Assign trust:
+  - all AI-provided values become llm_asserted
+Step 4: Convert proposed actions into Boundary Contract actions.
+Step 5: Convert fact proposals into create actions.
+Step 6: Generate clarification requests if:
+  - confidence is below threshold
+  - alternatives are too close
+  - required fields are missing
+Step 7: Produce deterministic output.
+
+This algorithm is normative.
+
+9. Confidence Thresholds
+Confidence thresholds determine when clarification is required.
+
+Default thresholds:
+- action_confidence_min: 0.5
+- field_confidence_min: 0.4
+- alternative_gap_min: 0.1
+
+If confidence is below threshold:
+- engine must request clarification.
+
+10. Interaction With Trust Model
+AI IR does not contain trust.
+Trust is assigned during lowering:
+- all AI values become llm_asserted
+- trust promotion requires confirm action
+
+11. Interaction With Boundary Contract
+Lowering produces:
+- create actions
+- update actions
+- delete actions
+- call actions
+- clarify requests
+
+Boundary Contract enforces trust and capability rules.
+
+12. Interaction With Selection Model
+Selection Model may use AI IR confidence values to:
+- prioritize clarification
+- prioritize proposed actions
+- influence match scoring indirectly
+
+Selection Model does not use AI IR directly.
+
+13. Determinism Requirements
+AI IR must be:
+- fully structured
+- canonical JSON
+- no free-form text interpretation
+- no nondeterministic ordering
+- no implicit inference
+
+14. Validation Rules
+AI IR is valid if:
+- all confidence values are between 0 and 1
+- all alternatives sum to 1.0
+- all proposed actions follow schema
+- no trust fields appear
+- no unknown fields appear
+
+15. Summary
+AI Substrate IR v0.16 defines:
+- structured AI intentions
+- structured proposed actions
+- explicit uncertainty representation
+- deterministic lowering rules
+- deterministic confidence handling
+- strict separation from trust
+
+It is the safe, deterministic interface between AI reasoning and GRISP execution.
+
+============  END OF SPEC 006  ============
+
+============  GRISP v0.16 — Spec 007 - TRANSACTION MODEL  ============
+
+Status: Draft
+Layer: 0 (Deterministic Execution Core)
+Depends on:
+- Spec 001 Canonical IR
+- Spec 002 Expression AST
+- Spec 003 Runtime Profile
+- Spec 004 Trust Model
+- Spec 005 Boundary Contract
+- Spec 011 State Model
+- Spec 013 Selection Model
+
+1. Purpose
+The Transaction Model defines how GRISP evaluates rule matches, validates them, applies actions, detects invalidation, and commits deterministic state transitions. It is the core execution algorithm of the GRISP engine.
+
+2. Design Principles
+- Deterministic evaluation
+- Deterministic match selection
+- Deterministic commit
+- No concurrency
+- No nondeterministic ordering
+- No time-based behavior
+- No side effects outside commit
+
+3. Transaction Lifecycle
+A transaction consists of the following deterministic phases:
+
+Step 1: Match discovery  
+Step 2: Match scoring  
+Step 3: Match selection  
+Step 4: Read validation  
+Step 5: Action evaluation  
+Step 6: Write staging  
+Step 7: Conflict and invalidation checks  
+Step 8: Commit  
+Step 9: Hook execution  
+Step 10: Event emission
+
+All steps must be executed in this order.
+
+4. Match Discovery
+For each rule:
+- Evaluate all pattern bindings.
+- Evaluate where clauses.
+- Produce zero or more matches.
+
+A match is:
+
+{
+  "rule_id": "string",
+  "bindings": { "name": "node_id", ... },
+  "let_values": { "name": <value>, ... },
+  "inferred_reads": [...],
+  "inferred_writes": [...],
+  "match_key": "string"
+}
+
+match_key is defined in Spec 013.
+
+5. Match Scoring
+Match scoring uses the Selection Model (Spec 013). Runtime Profile provides parameters.
+
+Score inputs:
+- rule priority
+- match age
+- fairness window
+- priority boost per tick
+
+Score output must be deterministic.
+
+6. Match Selection
+The match with the highest score is selected.
+
+Tie breaking uses:
+- tie_breaker from Runtime Profile
+- deterministic ordering rules from Spec 013
+
+7. Read Validation
+Before executing actions, the engine must validate that:
+- all inferred_reads still match the current graph state
+- no field read has changed since match discovery
+- no fact has been deleted
+- no edge has been modified if it was read
+
+If validation fails:
+- the match is invalidated
+- the engine restarts from match discovery
+
+8. Action Evaluation
+Actions are evaluated in order.
+
+Allowed actions:
+- create
+- update
+- delete
+- call
+- emit
+
+Action semantics are defined in Boundary Contract (Spec 005).
+
+Action evaluation must:
+- evaluate all expressions
+- apply trust rules
+- apply capability rules
+- produce a write set
+
+9. Write Staging
+All writes are staged in a temporary buffer.
+
+Staged writes include:
+- new facts
+- updated fields
+- deleted facts
+- created edges
+- deleted edges
+- emitted events
+
+No writes may be applied to the graph state until commit.
+
+10. Conflict and Invalidation Checks
+v0.16 introduces a formal definition of conflict:
+
+A conflict occurs if:
+- a staged write modifies a field that has changed since match discovery
+- a staged delete targets a fact that has changed since match discovery
+- a staged edge modification targets an edge that has changed since match discovery
+- trust requirements are not met
+- capability requirements are not met
+
+If a conflict occurs:
+- the match is invalidated
+- the engine restarts from match discovery
+
+11. Commit
+Commit applies staged writes atomically.
+
+Commit steps:
+- apply fact creations
+- apply fact updates
+- apply fact deletions
+- apply edge modifications
+- append events to event log
+
+Commit must be atomic and deterministic.
+
+12. Hook Execution
+After commit, hooks may run.
+
+Hooks:
+- must run in commit order
+- must not modify graph state
+- may call external systems
+- must be idempotent if retried
+- must not affect determinism
+
+Hook semantics are defined in Spec 008.
+
+13. Event Emission
+Events produced during commit are emitted after hooks.
+
+Event structure is defined in Spec 012.
+
+14. Match Aging
+Each match has an age counter incremented per tick.
+
+Age affects scoring:
+- older matches receive priority boosts
+- matches exceeding max_match_age are invalidated
+
+15. Deterministic Tick Model
+A tick is defined as:
+- one full execution of the transaction lifecycle
+- exactly one commit per tick (default)
+- no wall-clock dependency
+
+16. Error Handling
+If an action fails:
+- the transaction aborts
+- no writes are committed
+- an error is returned via Boundary Contract
+
+17. Determinism Requirements
+Transaction Model must be:
+- fully deterministic
+- independent of timing
+- independent of external ordering
+- independent of concurrency
+
+18. Validation Rules
+A transaction is valid if:
+- all reads are validated
+- no conflicts occur
+- all trust rules pass
+- all capability rules pass
+- all actions are valid
+
+19. Summary
+Transaction Model v0.16 defines:
+- deterministic match discovery
+- deterministic scoring and selection
+- deterministic read validation
+- deterministic conflict detection
+- deterministic commit
+- deterministic hooks
+- deterministic event emission
+
+It is the core execution algorithm of GRISP.
+
+============  END OF SPEC 007  ============
+
+============  GRISP v0.16 — Spec 008 - HOOK SEMANTICS  ============
+
+Status: Draft
+Layer: 1 (Post-Commit Side-Effect Layer)
+Depends on:
+- Spec 001 Canonical IR
+- Spec 003 Runtime Profile
+- Spec 007 Transaction Model
+- Spec 012 Event Model
+
+1. Purpose
+Hook Semantics define how GRISP executes post-commit side effects. Hooks allow external integrations, logging, notifications, and asynchronous work without affecting deterministic state transitions. Hooks run after commit and must never modify graph state.
+
+2. Design Principles
+- Hooks must not affect determinism.
+- Hooks must not modify graph state.
+- Hooks must run in commit order.
+- Hooks may run asynchronously, but logical ordering must be preserved.
+- Hooks must be idempotent if retried.
+- Hooks must not influence match scoring or selection.
+
+3. Hook Types
+There are two hook types:
+
+3.1 Rule Hooks
+Attached to specific rules.
+
+{
+  "rule_id": "AssignTask",
+  "hook": {
+    "kind": "post_commit",
+    "action": "notify",
+    "params": { ... }
+  }
+}
+
+3.2 Global Hooks
+Attached to the manifest.
+
+{
+  "hook": {
+    "kind": "post_commit",
+    "action": "audit_log",
+    "params": { ... }
+  }
+}
+
+4. Hook Invocation Order
+Hooks must execute in the following deterministic order:
+
+Step 1: All rule-specific hooks for the committed rule, in manifest order.
+Step 2: All global hooks, in manifest order.
+
+If multiple hooks exist for a rule, they must run in the order they appear in the manifest.
+
+5. Hook Execution Model
+Hooks run after commit. They receive:
+
+{
+  "hook_id": "string",
+  "rule_id": "string",
+  "commit_id": "string",
+  "bindings": { ... },
+  "writes": { ... },
+  "events": [ ... ],
+  "timestamp": "logical_tick"
+}
+
+Rules:
+- timestamp is logical, not wall-clock.
+- bindings reflect the match that triggered the commit.
+- writes reflect the staged writes applied during commit.
+
+6. Allowed Hook Actions
+Hooks may perform:
+- logging
+- notifications
+- external service calls
+- event forwarding
+- metrics collection
+
+Hooks may not:
+- modify graph state
+- modify events
+- modify facts
+- modify edges
+- modify trust
+- modify capabilities
+- trigger new transactions
+
+7. Asynchronous Execution
+Hooks may run asynchronously, but must preserve logical ordering:
+
+- Hook A must complete before Hook B if A appears earlier in the manifest.
+- Engines may run hooks in parallel internally, but must serialize completion order.
+
+If a hook fails:
+- it may be retried
+- retries must be idempotent
+- failure must not affect engine state
+
+8. Idempotency Requirements
+Hook actions must be idempotent. Examples:
+
+Allowed:
+- sending a notification with a unique commit_id
+- writing an audit log entry with a unique commit_id
+- calling an external service with a unique request_id
+
+Forbidden:
+- incrementing counters without unique identifiers
+- performing non-idempotent writes to external systems
+
+9. Error Handling
+If a hook fails:
+- the engine must not roll back the commit
+- the engine must log the failure
+- the engine may retry the hook
+- the engine must not block future ticks indefinitely
+
+Hook errors must not propagate into the deterministic core.
+
+10. Interaction With Events
+Hooks may read emitted events but may not modify them.
+
+Hooks may forward events to external systems.
+
+11. Interaction With Runtime Profile
+Runtime Profile may define:
+- max_hook_retries
+- hook_timeout_ticks
+- hook_parallelism
+
+These must not affect determinism of the core engine.
+
+12. Determinism Requirements
+Hooks must not:
+- influence match scoring
+- influence match selection
+- influence commit order
+- influence graph state
+- introduce nondeterministic behavior
+
+Hook execution order must be deterministic even if execution is asynchronous.
+
+13. Validation Rules
+A hook is valid if:
+- kind is post_commit
+- action is recognized
+- params are structured
+- no graph state modifications occur
+- idempotency is guaranteed
+
+14. Summary
+Hook Semantics v0.16 define:
+- deterministic post-commit hook ordering
+- strict separation from graph state
+- idempotent external side effects
+- deterministic invocation model
+- safe asynchronous execution
+
+Hooks extend GRISP without compromising determinism.
+
+============  END OF SPEC 008  ============
+
+============  GRISP v0.16 — Spec 009 - CAPABILITY MODEL  ============
+
+Status: Draft
+Layer: 2 (Permission and Safety Layer)
+Depends on:
+- Spec 001 Canonical IR
+- Spec 004 Trust Model
+- Spec 005 Boundary Contract
+- Spec 007 Transaction Model
+
+1. Purpose
+The Capability Model defines what external actions an actor is allowed to perform through the Boundary Contract. Capabilities restrict access to sensitive operations, enforce trust requirements, and ensure that AI systems cannot perform unsafe actions without explicit human authorization.
+
+2. Design Principles
+- Capabilities are explicit.
+- Capabilities are least-privilege.
+- Capabilities are session-scoped.
+- Capabilities are deterministic.
+- Capabilities must be validated before every action.
+- Capabilities must not be inferred from context or text.
+
+3. Capability Grant Structure
+
+{
+  "capability_id": "string",
+  "kind": "read|write|delete|call|admin",
+  "target": "Task|Agent|*",
+  "trust_required": "llm_asserted|tool_returned|system_derived|human_confirmed",
+  "constraints": { ... },
+  "metadata": {},
+  "custom": {}
+}
+
+Fields:
+capability_id: unique identifier
+kind: type of permission
+target: node type, edge type, or wildcard
+trust_required: minimum trust level required to use the capability
+constraints: optional structured restrictions
+
+4. Capability Kinds
+
+4.1 read
+Allows reading facts of the specified type.
+
+4.2 write
+Allows updating fields of the specified type.
+
+4.3 delete
+Allows deleting facts of the specified type.
+
+4.4 call
+Allows calling external tools or services.
+
+4.5 admin
+Allows privileged operations such as:
+- granting capabilities
+- revoking capabilities
+- modifying trust decay settings
+
+Admin capabilities must require human_confirmed trust.
+
+5. Capability Constraints
+Constraints restrict how a capability may be used.
+
+Examples:
+
+5.1 Field Restriction
+
+{
+  "allowed_fields": ["priority", "lifecycle"]
+}
+
+5.2 Value Restriction
+
+{
+  "allowed_values": {
+    "lifecycle": ["pending", "assigned"]
+  }
+}
+
+5.3 Expression Restriction
+
+{
+  "expr": { Expression AST }
+}
+
+Constraints must be deterministic and must not depend on external context.
+
+6. Session-Scoped Capabilities
+Capabilities apply to a session, not globally.
+
+Session structure:
+
+{
+  "session_id": "string",
+  "capabilities": [ ... ]
+}
+
+Capabilities may be granted:
+- at session creation
+- via admin actions
+- via explicit human confirmation
+
+Capabilities may be revoked:
+- via admin actions
+- via session expiration
+
+7. Capability Enforcement
+Before executing any Boundary Contract action, the engine must check:
+
+Step 1: Does the session have a capability matching the action kind?  
+Step 2: Does the capability target match the action target?  
+Step 3: Does the provided trust meet or exceed trust_required?  
+Step 4: Do all constraints pass?  
+
+If any check fails:
+- the action is rejected
+- a clarification or error is returned
+
+8. Trust Interaction
+Capabilities define minimum trust requirements.
+
+Examples:
+- write capability for Task.priority may require tool_returned trust
+- delete capability for Task may require human_confirmed trust
+- call capability for external tools may require system_derived trust
+
+Trust Model (Spec 004) defines trust propagation and promotion.
+
+9. Capability Examples
+
+9.1 Safe Write Capability
+
+{
+  "capability_id": "task_write_safe",
+  "kind": "write",
+  "target": "Task",
+  "trust_required": "tool_returned",
+  "constraints": {
+    "allowed_fields": ["lifecycle"]
+  }
+}
+
+9.2 Dangerous Delete Capability
+
+{
+  "capability_id": "task_delete",
+  "kind": "delete",
+  "target": "Task",
+  "trust_required": "human_confirmed"
+}
+
+9.3 External Tool Call Capability
+
+{
+  "capability_id": "call_weather_api",
+  "kind": "call",
+  "target": "weather_service",
+  "trust_required": "system_derived"
+}
+
+10. Capability Resolution
+When multiple capabilities match an action:
+- the most restrictive trust_required applies
+- all constraints must pass
+- if any capability denies the action, the action is denied
+
+11. Default Capabilities
+By default, a session has no capabilities.
+
+Capabilities must be explicitly granted.
+
+12. Capability Granting
+Capabilities may be granted by:
+- human_confirmed admin actions
+- system initialization
+- explicit configuration
+
+AI systems may not grant capabilities.
+
+13. Capability Revocation
+Capabilities may be revoked by:
+- admin actions
+- session expiration
+- explicit revocation commands
+
+Revocation must be deterministic.
+
+14. Determinism Requirements
+Capabilities must not:
+- depend on free-form text
+- depend on timing
+- depend on external state
+- be inferred implicitly
+
+All capability checks must be deterministic.
+
+15. Validation Rules
+A capability is valid if:
+- kind is recognized
+- target is valid
+- trust_required is valid
+- constraints are structured
+- no unknown fields appear
+
+16. Summary
+Capability Model v0.16 defines:
+- explicit permission structures
+- trust-aware access control
+- deterministic capability enforcement
+- session-scoped permissions
+- strict least-privilege rules
+
+It ensures that AI and external systems cannot perform unsafe actions without explicit authorization.
+
+============  END OF SPEC 009  ============
+
+============  GRISP v0.16 — Spec 010 - GOLDEN FILES  ============
+
+Status: Draft
+Layer: 0 (Deterministic Verification Layer)
+Depends on:
+- Spec 001 Canonical IR
+- Spec 002 Expression AST
+- Spec 003 Runtime Profile
+- Spec 007 Transaction Model
+- Spec 011 State Model
+- Spec 013 Selection Model
+
+1. Purpose
+Golden Files define the canonical, engine-independent reference outputs for GRISP. They ensure that any compliant engine produces identical results for the same inputs. Golden Files are used for conformance testing, regression testing, and deterministic verification.
+
+2. Design Principles
+- Golden Files must be deterministic.
+- Golden Files must be canonical JSON.
+- Golden Files must not depend on timing.
+- Golden Files must not depend on external systems.
+- Golden Files must not depend on nondeterministic ordering.
+- Golden Files must fully specify expected engine behavior.
+
+3. Golden File Categories
+Golden Files are divided into the following categories:
+
+3.1 Manifest Golden Files
+Contain canonical IR manifests.
+
+3.2 State Golden Files
+Contain initial and final graph states.
+
+3.3 Match Golden Files
+Contain expected matches for each rule.
+
+3.4 Transaction Golden Files
+Contain expected transaction sequences.
+
+3.5 Event Golden Files
+Contain expected emitted events.
+
+3.6 Error Golden Files
+Contain expected structured errors.
+
+4. Golden File Structure
+
+{
+  "golden_file_version": "grisp-golden-v0.16",
+  "description": "string",
+  "input": { ... },
+  "expected_output": { ... },
+  "metadata": {},
+  "custom": {}
+}
+
+Fields:
+golden_file_version: version identifier
+description: human-readable description
+input: structured input to the engine
+expected_output: deterministic expected result
+
+5. Manifest Golden Files
+Manifest Golden Files contain:
+
+{
+  "manifest": { Canonical IR Manifest },
+  "expected_validation": "ok|error",
+  "expected_errors": [ ... ]
+}
+
+Rules:
+- expected_validation must be deterministic.
+- expected_errors must be structured.
+
+6. State Golden Files
+State Golden Files contain:
+
+{
+  "initial_state": { Graph State },
+  "final_state": { Graph State }
+}
+
+Rules:
+- Graph State is defined in Spec 011.
+- All node and edge instances must be canonical.
+
+7. Match Golden Files
+Match Golden Files contain:
+
+{
+  "manifest": { Canonical IR Manifest },
+  "state": { Graph State },
+  "expected_matches": [
+    {
+      "rule_id": "string",
+      "bindings": { ... },
+      "let_values": { ... },
+      "match_key": "string",
+      "score": number
+    }
+  ]
+}
+
+Rules:
+- match_key must follow Spec 013.
+- score must follow Selection Model.
+
+8. Transaction Golden Files
+Transaction Golden Files contain:
+
+{
+  "manifest": { Canonical IR Manifest },
+  "state": { Graph State },
+  "runtime_profile": { Runtime Profile },
+  "expected_transactions": [
+    {
+      "transaction_id": "string",
+      "selected_match": { ... },
+      "writes": { ... },
+      "events": [ ... ]
+    }
+  ]
+}
+
+Rules:
+- selected_match must match Match Golden Files.
+- writes must match Transaction Model semantics.
+- events must match Event Model.
+
+9. Event Golden Files
+Event Golden Files contain:
+
+{
+  "events": [
+    {
+      "event_type": "string",
+      "payload": { ... },
+      "timestamp": "logical_tick"
+    }
+  ]
+}
+
+Rules:
+- timestamp must be logical, not wall-clock.
+
+10. Error Golden Files
+Error Golden Files contain:
+
+{
+  "input": { ... },
+  "expected_error": {
+    "code": "string",
+    "message": "string",
+    "details": { ... }
+  }
+}
+
+Rules:
+- errors must be deterministic.
+- errors must not contain stack traces.
+
+11. Canonical Serialization Rules
+Golden Files must follow canonical JSON rules:
+- sorted keys
+- UTF-8 encoding
+- no trailing commas
+- deterministic number formatting
+- no whitespace beyond single spaces
+
+12. Deterministic Comparison
+Golden Files must be compared using:
+- byte-for-byte comparison
+- no tolerance for formatting differences
+- no tolerance for ordering differences
+
+13. Test Execution Model
+Golden Files are executed as follows:
+
+Step 1: Load manifest.
+Step 2: Load initial state.
+Step 3: Apply deterministic engine steps.
+Step 4: Capture output.
+Step 5: Compare output to expected_output.
+Step 6: Pass or fail.
+
+14. Versioning
+Golden Files must include:
+- golden_file_version
+- manifest_version
+- runtime_profile_version
+
+Golden Files must be regenerated when:
+- IR changes
+- Transaction Model changes
+- Selection Model changes
+
+15. Validation Rules
+A Golden File is valid if:
+- it follows canonical JSON
+- expected_output is deterministic
+- no unknown fields appear
+- all dependencies are valid
+
+16. Summary
+Golden Files v0.16 define:
+- deterministic reference outputs
+- canonical test structures
+- strict comparison rules
+- complete coverage of engine behavior
+
+Golden Files ensure that all GRISP engines behave identically.
+
+============  END OF SPEC 010  ============
+
+============  GRISP v0.16 — Spec 011 - STATE MODEL  ============
+
+Status: Draft
+Layer: 0 (Deterministic Execution Core)
+Depends on:
+- Spec 001 Canonical IR
+- Spec 002 Expression AST
+- Spec 007 Transaction Model
+
+1. Purpose
+The State Model defines the in-memory representation of all facts, edges, and metadata that make up the GRISP graph state. It is the authoritative source of truth for rule evaluation, match discovery, and transaction commit.
+
+2. Design Principles
+- State must be deterministic.
+- State must be canonical.
+- State must be fully serializable.
+- State must not contain trust.
+- State must not contain AI metadata.
+- State must not contain runtime policy.
+
+3. Graph State Structure
+
+{
+  "nodes": {
+    "<node_id>": {
+      "type": "Task",
+      "fields": {
+        "name": "Example",
+        "priority": 2,
+        "lifecycle": "pending"
+      }
+    },
+    ...
+  },
+  "edges": {
+    "AssignedTo": [
+      { "from": "task_1", "to": "agent_3" },
+      ...
+    ]
+  },
+  "metadata": {
+    "next_node_id": 1234,
+    "tick": 42
+  }
+}
+
+4. Node Instances
+A node instance is:
+
+{
+  "type": "NodeTypeName",
+  "fields": {
+    "<field_name>": <value>,
+    ...
+  }
+}
+
+Rules:
+- All fields must conform to the node type schema.
+- Missing fields must be filled with default values.
+- Extra fields must be rejected.
+- Node instances do not carry trust.
+
+5. Node Identifiers
+Node identifiers must be:
+- unique
+- stable
+- canonical strings
+
+Default format:
+node_<integer>
+
+Engines may use alternative formats if deterministic.
+
+6. Edge Instances
+Edges represent typed relationships.
+
+Edge instance:
+
+{
+  "from": "node_id",
+  "to": "node_id"
+}
+
+Rules:
+- Edge type defines allowed from/to node types.
+- Multiplicity constraints must be enforced.
+- Duplicate edges must be rejected.
+- Edge instances do not carry trust.
+
+7. State Metadata
+State metadata contains:
+- next_node_id: deterministic node ID generator
+- tick: logical tick counter
+
+tick increments once per committed transaction.
+
+8. Canonical Serialization
+State must serialize to canonical JSON:
+- sorted keys
+- deterministic ordering of nodes
+- deterministic ordering of edges
+- deterministic number formatting
+
+Node ordering:
+- lexicographic by node_id
+
+Edge ordering:
+- lexicographic by from, then to
+
+9. State Hashing
+State hashing is used for:
+- deterministic debugging
+- golden file verification
+- distributed consistency checks
+
+Hash input:
+- canonical JSON serialization of state
+
+Hash algorithm:
+- SHA-256 over UTF-8 bytes
+
+10. State Transitions
+State transitions occur only through commit.
+
+Commit applies:
+- node creations
+- node updates
+- node deletions
+- edge creations
+- edge deletions
+
+No other mechanism may modify state.
+
+11. Read Semantics
+Reads occur during:
+- pattern matching
+- let evaluation
+- action evaluation
+
+Reads must:
+- access only existing nodes
+- access only existing edges
+- access only valid fields
+- be deterministic
+
+12. Write Semantics
+Writes occur only during commit.
+
+Writes must:
+- apply staged updates
+- enforce schema
+- enforce multiplicity
+- enforce node type constraints
+- enforce edge type constraints
+
+13. Deletion Semantics
+Deleting a node:
+- removes the node
+- removes all edges referencing the node
+- invalidates any matches referencing the node
+
+14. State Validation
+State is valid if:
+- all nodes conform to schema
+- all edges conform to schema
+- no dangling edges exist
+- metadata fields are valid
+- canonical serialization is possible
+
+15. Determinism Requirements
+State Model must not depend on:
+- timing
+- concurrency
+- external systems
+- nondeterministic ordering
+
+16. Summary
+State Model v0.16 defines:
+- deterministic graph representation
+- canonical node and edge structures
+- deterministic serialization and hashing
+- strict schema enforcement
+- deterministic state transitions
+
+It is the foundation for all GRISP execution.
+
+============  END OF SPEC 011  ============
+
+============  GRISP v0.16 — Spec 012 - EVENT MODEL  ============
+
+Status: Draft
+Layer: 1 (Post-Commit Notification Layer)
+Depends on:
+- Spec 001 Canonical IR
+- Spec 007 Transaction Model
+- Spec 008 Hook Semantics
+
+1. Purpose
+The Event Model defines how GRISP represents, stores, and emits events. Events are immutable records produced during transaction commit. They provide a deterministic audit trail and a mechanism for external systems to react to state changes.
+
+2. Design Principles
+- Events must be immutable.
+- Events must be deterministic.
+- Events must be canonical.
+- Events must not modify graph state.
+- Events must not depend on timing.
+- Events must not depend on external systems.
+
+3. Event Structure
+
+{
+  "event_id": "string",
+  "event_type": "string",
+  "payload": { ... },
+  "tick": <integer>,
+  "commit_id": "string"
+}
+
+Fields:
+event_id: unique identifier
+event_type: string describing the event
+payload: structured data
+tick: logical tick number
+commit_id: identifier of the commit that produced the event
+
+4. Event Types
+Event types are defined by the manifest or by rule actions.
+
+Examples:
+- task_created
+- task_updated
+- task_deleted
+- edge_created
+- edge_deleted
+- custom_event
+
+Event types must be deterministic strings.
+
+5. Event Emission
+Events are emitted during commit.
+
+Emission steps:
+Step 1: Transaction Model stages events.
+Step 2: Commit applies writes.
+Step 3: Events are appended to event log.
+Step 4: Hooks may read events.
+Step 5: Boundary Contract returns events to external systems.
+
+Events must not be emitted before commit.
+
+6. Event Ordering
+Events must be ordered deterministically:
+
+Primary key: tick  
+Secondary key: commit_id  
+Tertiary key: event_id  
+
+Within a single commit:
+- events must appear in the order they were produced by actions
+
+7. Event Log
+The event log is an append-only structure:
+
+{
+  "events": [
+    { event },
+    { event },
+    ...
+  ]
+}
+
+Rules:
+- events must never be modified
+- events must never be deleted
+- events must be stored in canonical order
+
+8. Event ID Generation
+event_id must be deterministic.
+
+Default format:
+event_<tick>_<sequence_number>
+
+sequence_number increments per event within a commit.
+
+9. Event Payload
+Payload must be:
+- structured
+- canonical JSON
+- deterministic
+- free of trust
+- free of AI metadata
+
+Payload may contain:
+- node identifiers
+- field values
+- edge identifiers
+- rule identifiers
+- commit metadata
+
+10. Event Creation by Actions
+Actions may explicitly create events using:
+
+{
+  "kind": "emit",
+  "event_type": "string",
+  "payload": { Expression AST }
+}
+
+Rules:
+- payload expressions must be deterministic
+- event_type must be a string literal
+- emit must not modify graph state
+
+11. System Events
+The engine may emit system events:
+
+commit_applied  
+node_created  
+node_updated  
+node_deleted  
+edge_created  
+edge_deleted  
+
+System events must follow the same structure as user-defined events.
+
+12. Event Consumption
+Events may be consumed by:
+- hooks
+- external systems
+- logging systems
+- monitoring systems
+
+Events must not be consumed by:
+- rule evaluation
+- match scoring
+- transaction logic
+
+13. Event Retention
+Retention policy is implementation-defined but must be deterministic.
+
+Allowed policies:
+- retain all events
+- retain last N events
+- retain events for last M ticks
+
+Retention must not affect determinism of rule execution.
+
+14. Event Serialization
+Events must serialize to canonical JSON:
+- sorted keys
+- deterministic formatting
+- UTF-8 encoding
+- no trailing commas
+
+15. Determinism Requirements
+Events must not depend on:
+- wall-clock time
+- randomness
+- external ordering
+- concurrency
+
+tick must be logical, not real time.
+
+16. Validation Rules
+An event is valid if:
+- event_id is unique
+- event_type is a string
+- payload is structured
+- tick is non-negative
+- commit_id is valid
+- canonical serialization is possible
+
+17. Summary
+Event Model v0.16 defines:
+- deterministic event structure
+- deterministic event ordering
+- immutable event log
+- structured event emission
+- safe post-commit notifications
+
+Events provide a deterministic audit trail and integration point for external systems.
+
+============  END OF SPEC 012  ============
+
+============  GRISP v0.16 — Spec 013 - SELECTION MODEL  ============
+
+Status: Draft
+Layer: 0 (Deterministic Execution Core)
+Depends on:
+- Spec 001 Canonical IR
+- Spec 003 Runtime Profile
+- Spec 007 Transaction Model
+
+1. Purpose
+The Selection Model defines how GRISP scores, ranks, and selects rule matches for execution. It ensures deterministic behavior across all engines, independent of timing, concurrency, or implementation details.
+
+2. Design Principles
+- Selection must be deterministic.
+- Selection must be reproducible.
+- Selection must not depend on timing.
+- Selection must not depend on external systems.
+- Selection must not depend on nondeterministic ordering.
+- Selection must be fully defined by manifest, runtime profile, and state.
+
+3. Match Score Formula
+Each match receives a score computed as:
+
+score = base_priority
+      + age_boost
+      + fairness_boost
+      + tie_break_component
+
+All components must be deterministic.
+
+4. Base Priority
+Base priority is defined by rule metadata:
+
+{
+  "priority": <integer>
+}
+
+If omitted, default priority is 0.
+
+5. Age Boost
+Age boost increases score for older matches.
+
+age_boost = match_age * priority_boost_per_tick
+
+match_age:
+- increments by 1 per tick
+- resets to 0 when match is created
+
+priority_boost_per_tick:
+- defined in Runtime Profile
+- default: 0.02
+
+6. Fairness Boost
+Fairness boost prevents starvation.
+
+If match_age >= fairness_window:
+  fairness_boost = 1.0
+Else:
+  fairness_boost = 0.0
+
+fairness_window:
+- defined in Runtime Profile
+- default: 10
+
+7. Tie Break Component
+If two matches have identical scores, a deterministic tie breaker is applied.
+
+tie_break_component is computed as:
+
+tie_break_component = hash(match_key) * epsilon
+
+epsilon:
+- small constant
+- default: 1e-9
+
+hash:
+- SHA-256 over UTF-8 bytes
+- interpreted as unsigned integer
+- normalized to [0, 1)
+
+8. Match Key
+match_key is a deterministic string representing the match.
+
+match_key = rule_id + "|" + sorted(binding_pairs)
+
+binding_pairs:
+- each pair is "name=node_id"
+- sorted lexicographically
+
+Example:
+"AssignTask|agent=agent_3|task=task_1"
+
+9. Deterministic Ordering
+Matches must be sorted by:
+1. score (descending)
+2. tie_break_component (descending)
+3. match_key (lexicographic)
+
+10. Selection Algorithm
+Step 1: Compute score for each match.
+Step 2: Sort matches deterministically.
+Step 3: Select the first match.
+Step 4: Execute transaction lifecycle.
+
+11. Match Invalidation
+A match is invalidated if:
+- any read field changes
+- any read node is deleted
+- any read edge is modified
+- match_age exceeds max_match_age
+
+max_match_age:
+- defined in Runtime Profile
+- default: 100
+
+12. Match Aging
+match_age increments by 1 per tick.
+
+Tick definition:
+- one full transaction lifecycle
+- independent of wall-clock time
+
+13. Deterministic Hashing
+Hashing rules:
+- SHA-256
+- UTF-8 encoding
+- canonical JSON for structured values
+- normalized to float in [0, 1)
+
+14. Deterministic Floating Point Rules
+Floating point operations must:
+- use IEEE 754 double precision
+- avoid rounding differences
+- avoid platform-dependent behavior
+
+15. Deterministic Sorting Rules
+Sorting must:
+- be stable
+- be lexicographic for strings
+- be numeric for scores
+- be deterministic across all engines
+
+16. Validation Rules
+Selection Model is valid if:
+- all matches have valid match_keys
+- all scores are finite
+- no NaN values appear
+- sorting is deterministic
+
+17. Summary
+Selection Model v0.16 defines:
+- deterministic scoring
+- deterministic aging
+- deterministic fairness
+- deterministic tie breaking
+- deterministic match selection
+
+It ensures that all GRISP engines select the same match under the same conditions.
+
+============  END OF SPEC 013  ============
+
