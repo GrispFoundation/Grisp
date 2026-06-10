@@ -1,0 +1,3068 @@
+=====================================================================
+===========  GRISP v0.15 - Spec 001 - CANONICAL IR SPEC  ============
+=====================================================================
+
+STATUS: Stable Draft
+LAYER: Deterministic Engine Contract (Layer 0)
+VERSION: grisp-ir-v0.15
+DEPENDENCIES:
+  - Expression AST v0.15
+  - Transaction Model v0.15
+
+---------------------------------------------------------------------
+1. PURPOSE
+---------------------------------------------------------------------
+The GRISP Canonical IR v0.15 defines the stable, deterministic,
+language-agnostic representation of GRISP manifests. It is the only
+format executed by GRISP engines.
+
+This IR:
+  - Contains no syntactic sugar
+  - Contains no trust logic
+  - Contains no runtime policy
+  - Contains no AI substrate constructs
+  - Is fully normalized
+  - Is deterministic and stable across versions
+
+All compilers, parsers, and tools MUST target this IR.
+
+---------------------------------------------------------------------
+2. DESIGN PRINCIPLES
+---------------------------------------------------------------------
+- Minimality: Only what the engine needs to execute deterministically.
+- Normalization: All expressions are AST nodes; no strings or DSL.
+- Determinism: Canonical JSON, sorted keys, stable hashing.
+- Extensibility: Unknown fields in "custom" are ignored by engines.
+- Separation of Concerns: Trust, runtime policy, and AI substrate live
+  outside the canonical IR.
+
+---------------------------------------------------------------------
+3. TOP-LEVEL STRUCTURE
+---------------------------------------------------------------------
+The canonical IR is a JSON object with the following structure:
+
+{
+  "ir_version": "grisp-ir-v0.15",
+  "manifest_id": "string",
+  "manifest_version": "string",
+  "nodes": [ ... ],
+  "edges": [ ... ],
+  "functions": [ ... ],
+  "rules": [ ... ],
+  "runtime_profile_ref": "string | null",
+  "metadata": { ... },
+  "custom": { ... }
+}
+
+REQUIRED:
+  - ir_version
+  - manifest_id
+  - manifest_version
+  - nodes
+  - edges
+  - functions
+  - rules
+
+OPTIONAL:
+  - runtime_profile_ref
+  - metadata
+  - custom
+
+---------------------------------------------------------------------
+4. NODE DEFINITIONS
+---------------------------------------------------------------------
+Nodes define typed entities in the GRISP graph.
+
+Node object:
+
+{
+  "name": "Task",
+  "fields": {
+    "id": { "type": "identifier" },
+    "lifecycle": { "type": "string" },
+    "cost": { "type": "integer" }
+  },
+  "constraints": [],
+  "custom": {}
+}
+
+Field types include:
+  - identifier
+  - string
+  - number
+  - integer
+  - boolean
+  - enum([...])
+  - array<T>
+  - references to other node types
+
+Node constraints are reserved for future static validation.
+
+---------------------------------------------------------------------
+5. EDGE DEFINITIONS
+---------------------------------------------------------------------
+Edges define typed relationships between nodes.
+
+{
+  "name": "requires_capability",
+  "from": "Task",
+  "to": "Capability",
+  "acyclic": true,
+  "custom": {}
+}
+
+NOTES:
+  - acyclic=true allows engines to enforce DAG constraints.
+  - Edges are first-class graph elements.
+
+---------------------------------------------------------------------
+6. FUNCTION DEFINITIONS
+---------------------------------------------------------------------
+Functions represent pure or effectful operations referenced in
+expressions.
+
+{
+  "name": "NextLeaseEpoch",
+  "kind": "pure",
+  "signature": "(Task) -> integer",
+  "external": true,
+  "effect_meta": null,
+  "custom": {}
+}
+
+Kinds:
+  - pure
+  - effect
+  - nondeterministic
+
+Effect metadata:
+
+{
+  "idempotent": true,
+  "timeout_ms": 5000,
+  "on_timeout": "retry"
+}
+
+---------------------------------------------------------------------
+7. RULE DEFINITIONS
+---------------------------------------------------------------------
+Rules define pattern matching and actions.
+
+{
+  "id": "rule-uuid",
+  "name": "AssignTask",
+  "priority": 80,
+  "metadata": { ... },
+  "when": [ ... ],
+  "then": [ ... ],
+  "hooks": { ... },
+  "inferred_reads": [ ... ],
+  "inferred_writes": [ ... ],
+  "declared_reads": null,
+  "declared_writes": null,
+  "custom": {}
+}
+
+7.1 Rule Metadata
+
+{
+  "idempotent": false,
+  "depends_on": ["PlanTask"],
+  "emits": ["TASK_ASSIGNED"]
+}
+
+7.2 When-block Patterns
+Kinds:
+  - binding
+  - edge
+  - existence
+  - collection
+  - condition
+  - let
+
+Example:
+
+{
+  "kind": "binding",
+  "var": "Task",
+  "type": "Task",
+  "constraints": [
+    {
+      "field": "lifecycle",
+      "op": "eq",
+      "value": { "kind": "literal", "literal_type": "string", "value": "pending" }
+    }
+  ]
+}
+
+7.3 Then-block Actions
+Kinds:
+  - let
+  - update
+  - create
+  - delete
+  - emit
+  - call
+  - for
+  - if
+
+Example update:
+
+{
+  "kind": "update",
+  "target": "Task",
+  "assigns": [
+    {
+      "field": "lifecycle",
+      "value": { "kind": "literal", "literal_type": "string", "value": "assigned" }
+    }
+  ]
+}
+
+7.4 Hooks
+
+{
+  "after_commit": [ { "id": "emit_assignment_webhook" } ],
+  "on_failure": []
+}
+
+---------------------------------------------------------------------
+8. EXPRESSION AST
+---------------------------------------------------------------------
+All expressions MUST conform to the external document:
+
+GRISP v0.15 — Expression AST Specification
+
+This removes duplication from earlier versions.
+
+---------------------------------------------------------------------
+9. READ/WRITE INFERENCE
+---------------------------------------------------------------------
+The compiler MUST compute:
+  - inferred_reads
+  - inferred_writes
+
+These MUST be correct and complete.
+
+Used for:
+  - conflict detection
+  - transaction planning
+  - deterministic scheduling
+
+---------------------------------------------------------------------
+10. CANONICAL SERIALIZATION
+---------------------------------------------------------------------
+Canonical JSON rules:
+  - Sorted object keys
+  - No insignificant whitespace
+  - UTF-8 encoding
+  - Deterministic number formatting
+  - Arrays preserved in emitted order
+
+This ensures byte-for-byte reproducibility.
+
+---------------------------------------------------------------------
+11. GRAPH HASHING
+---------------------------------------------------------------------
+Procedure:
+  1. Extract nodes and edges
+  2. Sort nodes by (type, id)
+  3. Sort edges by (type, from, to)
+  4. Serialize using canonical JSON rules
+  5. Compute SHA-256
+  6. Encode as lowercase hex
+
+Used for:
+  - checkpoints
+  - conformance testing
+  - distributed validation
+
+---------------------------------------------------------------------
+12. CHECKPOINTS
+---------------------------------------------------------------------
+Example:
+
+{
+  "checkpoint": {
+    "tick": 12345,
+    "graph_hash": "a3f4...e9b2",
+    "created_at": 1680000000,
+    "manifest_version": "grisp-ir-v0.15"
+  }
+}
+
+---------------------------------------------------------------------
+13. VALIDATION RULES
+---------------------------------------------------------------------
+Compiler MUST validate:
+  - Node/edge types
+  - Function signatures
+  - Pattern normalization
+  - Expression AST correctness
+  - Read/write inference
+  - Rule metadata consistency
+
+Engine MUST validate:
+  - Lease invariants
+  - Transaction atomicity
+  - Conflict detection
+  - Event ordering
+
+---------------------------------------------------------------------
+14. NON-NORMATIVE EXTENSIONS
+---------------------------------------------------------------------
+The IR allows:
+
+"custom": { ... }
+
+Engines MUST ignore unknown fields.
+
+Used for:
+  - vendor extensions
+  - debugging metadata
+  - AI substrate annotations (outside canonical IR)
+
+---------------------------------------------------------------------
+15. WHAT IS NOT IN CANONICAL IR v0.15
+---------------------------------------------------------------------
+These belong to other documents:
+
+  - Trust Model v0.15
+  - Boundary Contract v0.15
+  - AI Substrate IR v0.15
+  - Runtime Profile v0.15
+  - Transaction Model v0.15
+
+Canonical IR v0.15 remains pure, deterministic, and minimal.
+
+=====================================================================
+=========  END OF GRISP v0.15 - Spec 001 - CANONICAL IR SPEC ========
+=====================================================================
+=====================================================================
+======  GRISP v0.15 - Spec 002 - EXPRESSION AST SPEC (Layer 0)  =====
+=====================================================================
+
+STATUS: Stable Draft
+LAYER: Deterministic Engine Contract (Layer 0)
+VERSION: grisp-expression-ast-v0.15
+DEPENDENCIES:
+  - Canonical IR v0.15
+  - Transaction Model v0.15
+
+---------------------------------------------------------------------
+1. PURPOSE
+---------------------------------------------------------------------
+The GRISP Expression AST v0.15 defines the **only legal representation**
+of all expressions inside the Canonical IR.
+
+This AST:
+  - Eliminates all string-based expressions
+  - Ensures deterministic evaluation
+  - Enables static analysis, read/write inference, and optimization
+  - Is stable across GRISP versions
+  - Is language-agnostic (Delphi, Rust, Python, etc.)
+
+Every expression in:
+  - rule patterns
+  - rule actions
+  - function calls
+  - constraints
+  - event payloads
+  - object/array literals
+
+MUST be represented using this AST.
+
+---------------------------------------------------------------------
+2. DESIGN PRINCIPLES
+---------------------------------------------------------------------
+- **No strings**: No embedded DSLs, no inline code, no ad-hoc syntax.
+- **Fully normalized**: Every expression is a JSON object with a `kind`.
+- **Deterministic**: No ambiguity, no implicit coercions.
+- **Extensible**: `meta` fields allow tooling extensions.
+- **Pure structure**: No trust, no runtime policy, no AI substrate logic.
+
+---------------------------------------------------------------------
+3. BASE EXPRESSION STRUCTURE
+---------------------------------------------------------------------
+Every expression node has:
+
+{
+  "kind": "string",
+  "type_hint": "string | null",
+  "meta": { ... }
+}
+
+- `kind` determines the node type.
+- `type_hint` is optional static typing information.
+- `meta` is ignored by engines but used by tools.
+
+---------------------------------------------------------------------
+4. EXPRESSION KINDS
+---------------------------------------------------------------------
+The allowed expression kinds are:
+
+  - literal
+  - var
+  - field
+  - call
+  - binary
+  - unary
+  - conditional
+  - collection
+  - object
+  - array
+
+These are described below.
+
+---------------------------------------------------------------------
+5. LITERAL EXPRESSIONS
+---------------------------------------------------------------------
+{
+  "kind": "literal",
+  "literal_type": "integer | number | string | boolean | null",
+  "value": <value>,
+  "format_hint": "string | null",
+  "meta": { ... }
+}
+
+Examples:
+  - integer literal
+  - string literal
+  - boolean literal
+
+Literal nodes MUST NOT contain trust metadata (trust lives outside IR).
+
+---------------------------------------------------------------------
+6. VARIABLE REFERENCES
+---------------------------------------------------------------------
+{
+  "kind": "var",
+  "name": "string",
+  "namespace": "string | null",
+  "meta": { ... }
+}
+
+- `name` refers to a pattern variable or let-binding.
+- `namespace` is optional for nested scopes.
+
+---------------------------------------------------------------------
+7. FIELD ACCESS
+---------------------------------------------------------------------
+{
+  "kind": "field",
+  "var": "string | field-access | var-ref",
+  "field": "string",
+  "safe": false,
+  "meta": { ... }
+}
+
+- `safe=true` means missing fields return null instead of error.
+
+---------------------------------------------------------------------
+8. FUNCTION CALLS
+---------------------------------------------------------------------
+{
+  "kind": "call",
+  "fn": "string",
+  "args": [ <expression> ],
+  "kwargs": { "name": <expression> },
+  "meta": { ... }
+}
+
+- `fn` MUST reference a function defined in the Canonical IR.
+- `args` and `kwargs` MUST be expression nodes.
+
+---------------------------------------------------------------------
+9. BINARY OPERATIONS
+---------------------------------------------------------------------
+{
+  "kind": "binary",
+  "op": "+ | - | * | / | % | == | != | < | > | <= | >= | and | or | in | not_in | contains",
+  "left": <expression>,
+  "right": <expression>,
+  "meta": { ... }
+}
+
+Binary operations MUST be deterministic.
+
+---------------------------------------------------------------------
+10. UNARY OPERATIONS
+---------------------------------------------------------------------
+{
+  "kind": "unary",
+  "op": "- | not",
+  "operand": <expression>,
+  "meta": { ... }
+}
+
+---------------------------------------------------------------------
+11. CONDITIONAL EXPRESSIONS
+---------------------------------------------------------------------
+{
+  "kind": "conditional",
+  "cond": <expression>,
+  "then": <expression>,
+  "else": <expression>,
+  "meta": { ... }
+}
+
+All branches MUST be valid expressions.
+
+---------------------------------------------------------------------
+12. COLLECTION EXPRESSIONS
+---------------------------------------------------------------------
+{
+  "kind": "collection",
+  "source": {
+    "type": "string",
+    "query": { ... }
+  },
+  "order_by": [
+    { "field": "string", "direction": "asc | desc" }
+  ],
+  "limit": 1,
+  "meta": { ... }
+}
+
+Used for:
+  - iterating over node sets
+  - filtered collections
+  - ordered selections
+
+---------------------------------------------------------------------
+13. OBJECT EXPRESSIONS
+---------------------------------------------------------------------
+{
+  "kind": "object",
+  "fields": {
+    "fieldName": <expression>
+  },
+  "meta": { ... }
+}
+
+Used for:
+  - event payloads
+  - structured values
+  - function arguments
+
+---------------------------------------------------------------------
+14. ARRAY EXPRESSIONS
+---------------------------------------------------------------------
+{
+  "kind": "array",
+  "items": [ <expression>, ... ],
+  "meta": { ... }
+}
+
+Used for:
+  - lists
+  - multi-value payloads
+  - composite structures
+
+---------------------------------------------------------------------
+15. META FIELD
+---------------------------------------------------------------------
+The `meta` field is an open extension point.
+
+Engines MUST ignore unknown fields.
+
+Tools MAY use:
+  - source mapping
+  - debugging info
+  - static analysis hints
+  - trust annotations (outside canonical IR)
+
+---------------------------------------------------------------------
+16. VALIDATION RULES
+---------------------------------------------------------------------
+The compiler MUST validate:
+  - All expressions have a valid `kind`
+  - All required fields are present
+  - No unknown fields except inside `meta`
+  - All nested expressions are valid AST nodes
+  - No circular references
+  - All function names exist in the Canonical IR
+
+---------------------------------------------------------------------
+17. WHAT IS NOT IN EXPRESSION AST v0.15
+---------------------------------------------------------------------
+The AST does NOT include:
+  - trust metadata
+  - clarify actions
+  - runtime policy
+  - AI substrate constructs
+  - tool capability declarations
+
+These belong to other specs.
+
+---------------------------------------------------------------------
+18. SUMMARY
+---------------------------------------------------------------------
+The Expression AST v0.15 is:
+  - deterministic
+  - normalized
+  - minimal
+  - stable
+  - language-agnostic
+
+It is the foundation for:
+  - rule evaluation
+  - static analysis
+  - conflict detection
+  - deterministic replay
+
+=====================================================================
+==========  END OF GRISP v0.15 - Spec 002 - EXPRESSION AST  =========
+=====================================================================
+=====================================================================
+=====  GRISP v0.15 - Spec 003 - RUNTIME PROFILE SPEC (Layer 1)  =====
+=====================================================================
+
+STATUS: Stable Draft
+LAYER: Runtime Policy (Layer 1)
+VERSION: grisp-runtime-profile-v0.15
+DEPENDENCIES:
+  - Canonical IR v0.15
+  - Expression AST v0.15
+  - Transaction Model v0.15
+
+---------------------------------------------------------------------
+1. PURPOSE
+---------------------------------------------------------------------
+The GRISP Runtime Profile v0.15 defines **operational policy** applied
+at execution time. It is intentionally separated from:
+
+  - Canonical IR (business logic)
+  - Trust Model (value provenance)
+  - Boundary Contract (engine/substrate interface)
+  - AI Substrate IR (LLM-facing layer)
+
+Runtime Profiles allow deployments to adjust behavior without modifying
+the Canonical IR.
+
+Examples of runtime policy:
+  - scheduler fairness
+  - rate limits
+  - rule-level overrides
+  - selection-affecting hints
+  - engine compatibility modes
+
+Runtime Profiles MUST NOT change:
+  - rule semantics
+  - expression evaluation
+  - trust propagation
+  - deterministic replay
+
+---------------------------------------------------------------------
+2. DESIGN PRINCIPLES
+---------------------------------------------------------------------
+- **Separation of concerns**: Logic lives in IR; policy lives here.
+- **Determinism**: Profiles must not introduce nondeterminism.
+- **Override model**: Profiles may override defaults but not IR semantics.
+- **Compatibility**: Profiles declare compatibility targets.
+- **Safety**: Profiles may tighten trust gates but never loosen them.
+
+---------------------------------------------------------------------
+3. TOP-LEVEL STRUCTURE
+---------------------------------------------------------------------
+{
+  "profile_id": "string",
+  "profile_version": "string",
+  "engine": "string",
+  "compatibility": "reference | best-effort | engine-specific",
+  "selection_affecting_defaults": { ... },
+  "rules": { ... }
+}
+
+REQUIRED:
+  - profile_id
+  - profile_version
+  - engine
+
+OPTIONAL:
+  - compatibility
+  - selection_affecting_defaults
+  - rules
+
+---------------------------------------------------------------------
+4. COMPATIBILITY MODES
+---------------------------------------------------------------------
+compatibility = one of:
+
+  - reference
+      Must pass strict validation.
+      No nondeterministic tie-breakers.
+      No engine-specific extensions.
+
+  - best-effort
+      Default mode.
+      Allows minor engine differences.
+
+  - engine-specific
+      Allows:
+        - nondeterministic tie-breakers (seeded)
+        - vendor extensions
+        - custom scheduling strategies
+
+---------------------------------------------------------------------
+5. SELECTION-AFFECTING DEFAULTS
+---------------------------------------------------------------------
+These defaults apply when rules do not override them.
+
+{
+  "scheduler": {
+    "fairness_window": 20,
+    "matchAge_boost_alpha": 0.02,
+    "baseline_priority": 50,
+    "tie_breaker": "rule_name | match_key | random"
+  },
+  "rate_limit": {
+    "max_per_tick": 100,
+    "max_concurrent": 10
+  }
+}
+
+5.1 Scheduler Fields
+
+- fairness_window  
+    Sliding window for fairness scoring.
+
+- matchAge_boost_alpha  
+    Weight applied to older matches.
+
+- baseline_priority  
+    Default rule priority if not specified.
+
+- tie_breaker  
+    Determines deterministic tie resolution.
+
+    Allowed:
+      - rule_name
+      - match_key
+      - random (only in engine-specific mode)
+
+5.2 Rate Limit Fields
+
+- max_per_tick  
+    Maximum rule firings per tick.
+
+- max_concurrent  
+    Maximum concurrent effectful operations.
+
+---------------------------------------------------------------------
+6. RULE-LEVEL OVERRIDES
+---------------------------------------------------------------------
+Rules may override defaults.
+
+Structure:
+
+"rules": {
+  "AssignTask": {
+    "selection_affecting": true,
+    "declared_reads": [ "Task.lifecycle" ],
+    "declared_writes": [ "Task.lifecycle" ],
+    "scheduler": {
+      "baseline_priority": 90
+    },
+    "rate_limit": {
+      "max_per_tick": 5
+    }
+  }
+}
+
+6.1 selection_affecting
+Advisory hint for tooling.
+
+6.2 declared_reads / declared_writes
+Overrides IR-declared sets.
+
+Rules:
+  - declared_reads MUST be a superset of inferred_reads.
+  - declared_writes MUST be a superset of inferred_writes.
+
+6.3 scheduler overrides
+Rule-specific scheduling policy.
+
+6.4 rate_limit overrides
+Rule-specific rate limits.
+
+---------------------------------------------------------------------
+7. ENGINE FIELD
+---------------------------------------------------------------------
+"engine": "reference | delphi | rust | custom"
+
+This field identifies the intended execution engine.
+
+Engines MAY reject profiles not matching their declared compatibility.
+
+---------------------------------------------------------------------
+8. VALIDATION RULES
+---------------------------------------------------------------------
+The runtime profile MUST satisfy:
+
+- profile_id is non-empty
+- profile_version is semantic version
+- engine is recognized
+- compatibility is valid
+- declared_reads/writes are supersets of inferred sets
+- tie_breaker=random is only allowed in engine-specific mode
+- no unknown fields outside custom sections
+
+---------------------------------------------------------------------
+9. WHAT RUNTIME PROFILES CANNOT DO
+---------------------------------------------------------------------
+Runtime Profiles MUST NOT:
+
+- change rule semantics
+- modify expressions
+- alter trust levels
+- introduce nondeterminism (except engine-specific mode)
+- override Canonical IR structure
+- add or remove rules
+- add or remove nodes or edges
+
+---------------------------------------------------------------------
+10. SUMMARY
+---------------------------------------------------------------------
+The Runtime Profile v0.15 provides:
+
+  - scheduling policy
+  - rate limits
+  - rule-level overrides
+  - compatibility modes
+  - deterministic selection behavior
+
+It is the operational layer that adapts GRISP to different environments
+without modifying the Canonical IR.
+
+=====================================================================
+=========  END OF GRISP v0.15 - Spec 003 - RUNTIME PROFILE  =========
+=====================================================================
+=====================================================================
+======  GRISP v0.15 - Spec 004 - TRUST MODEL SPEC (Layer 1.5)  ======
+=====================================================================
+
+STATUS: Stable Draft
+LAYER: Trust & Provenance (Layer 1.5)
+VERSION: grisp-trust-model-v0.15
+DEPENDENCIES:
+  - Canonical IR v0.15
+  - Expression AST v0.15
+  - Boundary Contract v0.15
+
+---------------------------------------------------------------------
+1. PURPOSE
+---------------------------------------------------------------------
+The GRISP Trust Model v0.15 defines how **every value** flowing through
+the GRISP substrate acquires, propagates, and loses trust.
+
+It ensures:
+  - LLM-generated values cannot silently escalate privilege
+  - Tool outputs cannot launder untrusted inputs
+  - Human confirmations are explicit and auditable
+  - Deterministic trust propagation across all operations
+  - Full traceability of provenance
+
+This model is the foundation for safe AI-driven automation.
+
+---------------------------------------------------------------------
+2. TRUST LEVELS
+---------------------------------------------------------------------
+Trust levels form a strict partial order:
+
+  llm_asserted < tool_returned < system_derived < human_confirmed
+
+Definitions:
+
+- llm_asserted  
+    Value originated from an LLM or unknown source.
+
+- tool_returned  
+    Value returned by a tool execution.
+
+- system_derived  
+    Value computed deterministically from trusted inputs.
+
+- human_confirmed  
+    Value explicitly approved by a human operator.
+
+Special:
+- unknown  
+    Treated as llm_asserted.
+
+---------------------------------------------------------------------
+3. TRUST ANNOTATIONS
+---------------------------------------------------------------------
+Every value may carry:
+
+_top-level trust_:
+{
+  "_trust": {
+    "level": "tool_returned",
+    "source": "task-service",
+    "acquired_at": "...",
+    "session_turn": 3
+  }
+}
+
+_field-level trust_:
+{
+  "_field_trust": {
+    "query_override": {
+      "level": "llm_asserted",
+      "source": "llm:session-42"
+    }
+  }
+}
+
+Field-level trust overrides top-level trust.
+
+---------------------------------------------------------------------
+4. TRUST IN EXPRESSION AST
+---------------------------------------------------------------------
+Expressions may include:
+
+"meta": {
+  "trust": {
+    "level": "...",
+    "source": "...",
+    "session_turn": 3
+  }
+}
+
+Engines MUST read trust from meta.trust when present.
+
+---------------------------------------------------------------------
+5. TRUST PROPAGATION RULES
+---------------------------------------------------------------------
+Fundamental rule:
+
+  trust(result) = min(trust(inputs))
+
+Examples:
+
+- Arithmetic:
+    tool_returned + llm_asserted → llm_asserted
+
+- Field access:
+    trust(field) = field-level trust OR top-level trust
+
+- Conditionals:
+    trust(if cond then a else b) = min(cond, a, b)
+
+- Collections:
+    trust(element) = min(collection, element)
+
+---------------------------------------------------------------------
+6. TRUST PROMOTION
+---------------------------------------------------------------------
+Trust can ONLY be promoted via a confirm action.
+
+Implicit promotion is forbidden.
+
+Promotion metadata:
+
+{
+  "promoted_by": "operator:alice",
+  "promotion_reason": "Reviewed query"
+}
+
+---------------------------------------------------------------------
+7. TOOL TRUST CLASSES
+---------------------------------------------------------------------
+Tools declare:
+
+- verified
+- external
+- llm_facing
+- privileged
+
+llm_facing tools ALWAYS return llm_asserted.
+
+privileged tools require human_confirmed inputs.
+
+---------------------------------------------------------------------
+8. TRUST GATES
+---------------------------------------------------------------------
+Default minimum trust required:
+
+  update → tool_returned  
+  create → tool_returned  
+  delete → human_confirmed  
+  call   → tool-defined  
+  emit   → llm_asserted  
+  clarify→ llm_asserted  
+
+Runtime profiles may tighten gates.
+
+---------------------------------------------------------------------
+9. CONFIRM ACTION
+---------------------------------------------------------------------
+A confirm action suspends execution until a human approves.
+
+{
+  "confirm": "Task.query_override",
+  "required_level": "human_confirmed",
+  "reason": "Query targets privileged tool",
+  "timeout_ms": 300000,
+  "on_timeout": "fail"
+}
+
+---------------------------------------------------------------------
+10. TAINT TRACKING
+---------------------------------------------------------------------
+Every value carries a taint tag (trust annotation).
+
+Rules:
+  - llm_asserted taints all downstream values
+  - system_derived only applies if all inputs are trusted
+  - taint persists across rule firings
+
+---------------------------------------------------------------------
+11. TAINT BOUNDARY RULES
+---------------------------------------------------------------------
+Rules may declare:
+
+"metadata": {
+  "taint_boundary": true
+}
+
+Such rules:
+  - may accept llm_asserted inputs
+  - MUST output system_derived or higher
+  - are audited more strictly
+
+---------------------------------------------------------------------
+12. TRUST VIOLATIONS
+---------------------------------------------------------------------
+Types:
+
+- INSUFFICIENT_TRUST
+- TAINT_BOUNDARY_VIOLATION
+- TRUST_PROMOTION_REJECTED
+
+Example:
+
+{
+  "violation_type": "INSUFFICIENT_TRUST",
+  "required_level": "tool_returned",
+  "actual_level": "llm_asserted",
+  "value_path": "Task.query_override"
+}
+
+---------------------------------------------------------------------
+13. RESOLUTION TRACE INTEGRATION
+---------------------------------------------------------------------
+Every trust event is recorded:
+
+- trust_assignment
+- trust_propagation
+- trust_gate_check
+- trust_promotion
+
+Trace entries MUST be immutable.
+
+---------------------------------------------------------------------
+14. TRUST DECAY (OPTIONAL)
+---------------------------------------------------------------------
+Deployments MAY define:
+
+- human_confirmed → tool_returned after N days
+- system_derived → tool_returned after M days
+
+Decay is optional and implementation-specific.
+
+---------------------------------------------------------------------
+15. WHAT IS NOT IN TRUST MODEL v0.15
+---------------------------------------------------------------------
+Not included:
+  - AI substrate semantics
+  - Boundary contract structure
+  - Canonical IR semantics
+  - Runtime policy
+  - Tool capability definitions
+
+These are defined in other specs.
+
+---------------------------------------------------------------------
+16. SUMMARY
+---------------------------------------------------------------------
+The Trust Model v0.15 provides:
+
+  - strict trust ordering
+  - deterministic propagation
+  - explicit promotion
+  - taint tracking
+  - trust gates
+  - auditability
+  - safe integration with LLMs
+
+It is the backbone of secure AI-driven automation.
+
+=====================================================================
+========  END OF GRISP v0.15 - Spec 004 - TRUST MODEL SPEC  =========
+=====================================================================
+=====================================================================
+=====  GRISP v0.15 - Spec 005 - BOUNDARY CONTRACT SPEC (Layer 2)  ===
+=====================================================================
+
+STATUS: Stable Draft
+LAYER: Engine ↔ AI Substrate Interface (Layer 2)
+VERSION: grisp-boundary-contract-v0.15
+DEPENDENCIES:
+  - Canonical IR v0.15
+  - Expression AST v0.15
+  - Trust Model v0.15
+  - Runtime Profile v0.15
+
+---------------------------------------------------------------------
+1. PURPOSE
+---------------------------------------------------------------------
+The Boundary Contract v0.15 defines the **only legal interface** between:
+
+  - The GRISP deterministic engine (Layer 0–1)
+  - The AI substrate (Layer 1.5–2)
+
+It specifies:
+  - Request and response envelopes
+  - Session threading
+  - Trust-aware value transport
+  - Clarification flows
+  - Rejection vs failure semantics
+  - Partial result semantics
+  - Resolution trace integration
+
+This contract is the “membrane” between deterministic execution and
+AI-driven reasoning.
+
+---------------------------------------------------------------------
+2. DESIGN PRINCIPLES
+---------------------------------------------------------------------
+- **Strict separation**: No AI logic inside the engine; no engine logic inside AI.
+- **Deterministic**: Engine behavior must not depend on LLM randomness.
+- **Trust-aware**: All values carry trust metadata.
+- **Session-based**: Multi-turn interactions are stateful.
+- **Extensible**: Unknown fields ignored by engine/substrate.
+- **Auditable**: All trust events recorded in resolution trace.
+
+---------------------------------------------------------------------
+3. TOP-LEVEL REQUEST STRUCTURE
+---------------------------------------------------------------------
+A GrispExecutionRequest is:
+
+{
+  "contract_version": "grisp-boundary-v0.15",
+  "request_id": "string",
+  "manifest_id": "string",
+  "manifest_version": "string",
+  "runtime_profile_id": "string | null",
+  "session": { ... },
+  "context": { ... },
+  "facts": [ ... ],
+  "resolution_trace_id": "string | null",
+  "options": { ... }
+}
+
+REQUIRED:
+  - contract_version
+  - request_id
+  - manifest_id
+  - manifest_version
+  - session
+  - context
+  - facts
+
+---------------------------------------------------------------------
+4. SESSION OBJECT
+---------------------------------------------------------------------
+{
+  "session_id": "string",
+  "turn_index": 12,
+  "established_facts": ["fact-1", "fact-2"],
+  "pending_clarifications": ["clarify-1"],
+  "confirmed_actions": ["action-1"],
+  "capability_grants": ["cap:tool.db.query"]
+}
+
+Meaning:
+  - session_id: Stable across turns.
+  - turn_index: Monotonic counter.
+  - established_facts: Facts already known to engine.
+  - pending_clarifications: Clarifications awaiting resolution.
+  - confirmed_actions: Actions already executed.
+  - capability_grants: Human-approved capability tokens.
+
+---------------------------------------------------------------------
+5. CONTEXT AND TRUST OVERRIDES
+---------------------------------------------------------------------
+{
+  "origin": "llm | tool | human | system",
+  "default_trust_level": "llm_asserted | tool_returned | system_derived | human_confirmed",
+  "trust_overrides": [
+    {
+      "fact_id": "string",
+      "field": "string | null",
+      "level": "tool_returned",
+      "source": "task-service",
+      "session_turn": 3
+    }
+  ]
+}
+
+Rules:
+  - default_trust_level applies to all inbound facts unless overridden.
+  - trust_overrides apply before rule evaluation.
+
+---------------------------------------------------------------------
+6. FACTS
+---------------------------------------------------------------------
+Facts are Canonical IR node instances with trust metadata:
+
+{
+  "id": "string",
+  "type": "string",
+  "data": { ... },
+  "_trust": { ... },
+  "_field_trust": { ... }
+}
+
+- data MUST conform to Canonical IR v0.15.
+- _trust and _field_trust follow Trust Model v0.15.
+
+---------------------------------------------------------------------
+7. OPTIONS
+---------------------------------------------------------------------
+{
+  "max_actions": 100,
+  "timeout_ms": 500,
+  "allow_partial": true
+}
+
+---------------------------------------------------------------------
+8. TOP-LEVEL RESULT STRUCTURE
+---------------------------------------------------------------------
+A GrispExecutionResult is:
+
+{
+  "contract_version": "grisp-boundary-v0.15",
+  "request_id": "string",
+  "manifest_id": "string",
+  "manifest_version": "string",
+  "runtime_profile_id": "string | null",
+  "session": { ... },
+  "status": "success | partial | failed",
+  "partial_reason": "timeout | max_actions_reached | engine_backpressure | null",
+  "actions": [ ... ],
+  "clarifications": [ ... ],
+  "trust_violations": [ ... ],
+  "errors": [ ... ],
+  "rejection": null,
+  "resolution_trace_id": "string | null"
+}
+
+---------------------------------------------------------------------
+9. ACTIONS
+---------------------------------------------------------------------
+Each action:
+
+{
+  "action_id": "string",
+  "rule_id": "string",
+  "rule_name": "string",
+  "index": 0,
+  "kind": "update | create | delete | call | emit | clarify",
+  "payload": { ... },
+  "trust_level": "llm_asserted | tool_returned | system_derived | human_confirmed",
+  "trust_blocked": false,
+  "scoring": {
+    "match_confidence": 0.94,
+    "rule_priority": 80,
+    "selection_score": 0.87
+  }
+}
+
+trust_blocked=true means:
+  - Action NOT executed
+  - Corresponding trust_violation MUST be present
+
+---------------------------------------------------------------------
+10. ACTION PAYLOADS
+---------------------------------------------------------------------
+
+10.1 update
+{
+  "kind": "update",
+  "payload": {
+    "fact_id": "string",
+    "type": "string",
+    "assigns": {
+      "fieldName": <expression>
+    }
+  }
+}
+
+10.2 create
+{
+  "kind": "create",
+  "payload": {
+    "temp_id": "string",
+    "type": "string",
+    "fields": {
+      "fieldName": <expression>
+    }
+  }
+}
+
+10.3 delete
+{
+  "kind": "delete",
+  "payload": {
+    "fact_id": "string",
+    "type": "string"
+  }
+}
+
+10.4 call
+{
+  "kind": "call",
+  "payload": {
+    "tool_name": "string",
+    "args": { "name": <expression> },
+    "call_id": "string"
+  }
+}
+
+10.5 emit
+{
+  "kind": "emit",
+  "payload": {
+    "event_type": "string",
+    "class": "audit | operational | debug",
+    "payload": { "fieldName": <expression> }
+  }
+}
+
+10.6 clarify
+{
+  "kind": "clarify",
+  "payload": {
+    "clarify_id": "string",
+    "reason": "string",
+    "ambiguities": [
+      {
+        "id": "string",
+        "value_path": "Task.query_override",
+        "required_level": "tool_returned | human_confirmed",
+        "actual_level": "llm_asserted",
+        "question": "string",
+        "depends_on": "string | null",
+        "sequence_id": 1
+      }
+    ]
+  }
+}
+
+---------------------------------------------------------------------
+11. REJECTION VS FAILURE
+---------------------------------------------------------------------
+
+11.1 Rejection
+Used when request cannot be processed at all.
+
+{
+  "rejection": {
+    "code": "MALFORMED_REQUEST | SCHEMA_VIOLATION | UNKNOWN_PROFILE | UNKNOWN_MANIFEST | UNSUPPORTED_CONTRACT_VERSION",
+    "message": "string",
+    "field_path": "string | null"
+  }
+}
+
+If rejection != null:
+  - status MUST be "failed"
+  - actions MUST be empty
+  - clarifications MUST be empty
+  - trust_violations MUST be empty
+
+11.2 Failure
+Used when execution started but encountered runtime errors.
+
+{
+  "errors": [
+    {
+      "code": "ENGINE_TIMEOUT | INTERNAL_ERROR | RULE_EVALUATION_ERROR | TOOL_CALL_ERROR",
+      "message": "string",
+      "rule_id": "string | null",
+      "action_index": 0
+    }
+  ]
+}
+
+---------------------------------------------------------------------
+12. TRUST VIOLATIONS
+---------------------------------------------------------------------
+{
+  "trust_violations": [
+    {
+      "rule_id": "AssignPendingTask",
+      "action_index": 2,
+      "violation_type": "INSUFFICIENT_TRUST | TAINT_BOUNDARY_VIOLATION | TRUST_PROMOTION_REJECTED",
+      "required_level": "tool_returned",
+      "actual_level": "llm_asserted",
+      "value_path": "Task.query_override"
+    }
+  ]
+}
+
+---------------------------------------------------------------------
+13. PARTIAL RESULTS
+---------------------------------------------------------------------
+status="partial" MUST include partial_reason:
+
+  - timeout
+  - max_actions_reached
+  - engine_backpressure
+
+Actions up to the stopping point MUST be included.
+
+---------------------------------------------------------------------
+14. RESOLUTION TRACE THREADING
+---------------------------------------------------------------------
+If resolution_trace_id is provided:
+  - Engine MUST append trust events
+  - Engine MUST return same ID
+
+If null:
+  - Engine MAY create a new trace or skip tracing
+
+---------------------------------------------------------------------
+15. WHAT IS NOT IN BOUNDARY CONTRACT v0.15
+---------------------------------------------------------------------
+Not included:
+  - Canonical IR semantics
+  - Expression AST definitions
+  - Runtime policy
+  - AI substrate intent model
+  - Tool capability definitions
+
+These are defined in other specs.
+
+---------------------------------------------------------------------
+16. SUMMARY
+---------------------------------------------------------------------
+The Boundary Contract v0.15 provides:
+
+  - Trust-aware request/response envelopes
+  - Clarification flows
+  - Trust violations
+  - Partial result semantics
+  - Deterministic action representation
+  - Session threading
+  - Resolution trace integration
+
+It is the membrane between deterministic execution and AI reasoning.
+
+=====================================================================
+=========  END OF GRISP v0.15 - Spec 005 - BOUNDARY CONTRACT  =======
+=====================================================================
+=====================================================================
+=====  GRISP v0.15 - Spec 006 - AI SUBSTRATE IR SPEC (Layer 2.5)  ===
+=====================================================================
+
+STATUS: Stable Draft
+LAYER: AI Substrate (Layer 2.5)
+VERSION: grisp-ai-ir-v0.15
+DEPENDENCIES:
+  - Canonical IR v0.15
+  - Expression AST v0.15
+  - Trust Model v0.15
+  - Boundary Contract v0.15
+
+---------------------------------------------------------------------
+1. PURPOSE
+---------------------------------------------------------------------
+The AI Substrate IR v0.15 defines the **intermediate representation**
+used between:
+
+  - LLM-generated reasoning (Layer 3)
+  - Boundary Contract requests (Layer 2)
+  - Canonical IR execution (Layer 0)
+
+It is the “AI-facing IR” that allows:
+  - Uncertain values
+  - Partial structures
+  - Intent nodes
+  - Clarification requests
+  - Trust annotations
+  - Session state
+  - Human-in-the-loop flows
+
+This IR is NOT executed by the engine.
+It is transformed into Boundary Contract requests.
+
+---------------------------------------------------------------------
+2. DESIGN PRINCIPLES
+---------------------------------------------------------------------
+- **LLM-friendly**: Structured but tolerant of uncertainty.
+- **Lossless**: All intent preserved until clarified.
+- **Trust-aware**: Every value carries trust metadata.
+- **Composable**: AI IR → Boundary Contract → Canonical IR.
+- **Deterministic lowering**: AI IR must lower deterministically.
+- **Explainable**: Every transformation is traceable.
+
+---------------------------------------------------------------------
+3. TOP-LEVEL STRUCTURE
+---------------------------------------------------------------------
+{
+  "ai_ir_version": "grisp-ai-ir-v0.15",
+  "session": { ... },
+  "intents": [ ... ],
+  "facts": [ ... ],
+  "uncertainties": [ ... ],
+  "clarifications": [ ... ],
+  "proposed_actions": [ ... ],
+  "meta": { ... }
+}
+
+Fields:
+
+- session  
+    Mirrors Boundary Contract session, but AI-extended.
+
+- intents  
+    High-level LLM intentions.
+
+- facts  
+    Proposed or updated facts (pre-canonical).
+
+- uncertainties  
+    Values requiring clarification.
+
+- clarifications  
+    AI-generated clarification prompts.
+
+- proposed_actions  
+    High-level actions before lowering.
+
+- meta  
+    Tooling metadata.
+
+---------------------------------------------------------------------
+4. SESSION OBJECT
+---------------------------------------------------------------------
+{
+  "session_id": "string",
+  "turn_index": 12,
+  "history": [ ... ],
+  "active_clarifications": [ ... ],
+  "confirmed_values": { ... },
+  "meta": { ... }
+}
+
+Differences from Boundary Contract:
+  - history: LLM reasoning trace
+  - confirmed_values: human-confirmed values cached for reuse
+
+---------------------------------------------------------------------
+5. INTENT NODES
+---------------------------------------------------------------------
+Intents represent high-level LLM reasoning.
+
+Example:
+
+{
+  "kind": "assign_task",
+  "target": "Task",
+  "reason": "Task is pending and agent is available",
+  "confidence": 0.82,
+  "meta": { ... }
+}
+
+Common intent kinds:
+  - update_fact
+  - create_fact
+  - delete_fact
+  - call_tool
+  - emit_event
+  - request_clarification
+  - propose_rule_match
+  - propose_rule_execution
+
+Intents are NOT executable.
+They are lowered into Boundary Contract actions.
+
+---------------------------------------------------------------------
+6. FACT NODES
+---------------------------------------------------------------------
+AI IR facts are “soft facts”:
+
+{
+  "id": "temp-123",
+  "type": "Task",
+  "fields": {
+    "lifecycle": {
+      "value": "assigned",
+      "confidence": 0.77,
+      "trust": "llm_asserted"
+    }
+  },
+  "meta": { ... }
+}
+
+Differences from Canonical IR:
+  - fields may include confidence
+  - trust is explicit
+  - fields may be missing
+  - structure may be partial
+
+---------------------------------------------------------------------
+7. UNCERTAINTY NODES
+---------------------------------------------------------------------
+Uncertainties represent ambiguous or incomplete values.
+
+{
+  "id": "unc-42",
+  "value_path": "Task.query_override",
+  "candidates": [
+    { "value": "SELECT * FROM tasks", "confidence": 0.31 },
+    { "value": "task.id = 5", "confidence": 0.22 }
+  ],
+  "required_trust": "tool_returned",
+  "reason": "Value affects privileged tool",
+  "meta": { ... }
+}
+
+Uncertainties MUST be resolved before lowering.
+
+---------------------------------------------------------------------
+8. CLARIFICATION NODES
+---------------------------------------------------------------------
+Clarifications are AI-generated questions for the user.
+
+{
+  "clarify_id": "clarify-77",
+  "question": "Which task should be assigned?",
+  "options": [
+    { "label": "Task 12", "value": "12" },
+    { "label": "Task 19", "value": "19" }
+  ],
+  "depends_on": null,
+  "meta": { ... }
+}
+
+Clarifications map directly to Boundary Contract clarify actions.
+
+---------------------------------------------------------------------
+9. PROPOSED ACTIONS
+---------------------------------------------------------------------
+High-level actions before lowering:
+
+{
+  "kind": "update",
+  "target": "Task",
+  "assigns": {
+    "lifecycle": {
+      "value": "assigned",
+      "confidence": 0.88,
+      "trust": "llm_asserted"
+    }
+  },
+  "reason": "Agent is available",
+  "meta": { ... }
+}
+
+These are NOT canonical actions.
+They are transformed into Boundary Contract actions.
+
+---------------------------------------------------------------------
+10. TRUST IN AI IR
+---------------------------------------------------------------------
+Every value may include:
+
+{
+  "trust": "llm_asserted | tool_returned | system_derived | human_confirmed",
+  "source": "string",
+  "session_turn": 12
+}
+
+Trust propagation follows Trust Model v0.15.
+
+---------------------------------------------------------------------
+11. LOWERING PROCESS
+---------------------------------------------------------------------
+AI IR → Boundary Contract → Canonical IR
+
+Steps:
+
+1. Validate AI IR structure.
+2. Resolve uncertainties.
+3. Resolve clarifications.
+4. Apply trust propagation.
+5. Enforce trust gates.
+6. Convert proposed actions → Boundary Contract actions.
+7. Convert facts → Canonical IR facts.
+8. Produce GrispExecutionRequest.
+
+Lowering MUST be deterministic.
+
+---------------------------------------------------------------------
+12. ERROR CONDITIONS
+---------------------------------------------------------------------
+AI IR lowering fails if:
+
+- unresolved uncertainties remain
+- required trust levels unmet
+- invalid intent kinds
+- malformed expressions
+- missing required fields
+- circular clarifications
+
+---------------------------------------------------------------------
+13. WHAT IS NOT IN AI IR v0.15
+---------------------------------------------------------------------
+Not included:
+  - Canonical IR semantics
+  - Runtime policy
+  - Engine scheduling
+  - Tool execution semantics
+  - Hook semantics
+
+These belong to other specs.
+
+---------------------------------------------------------------------
+14. SUMMARY
+---------------------------------------------------------------------
+The AI Substrate IR v0.15 provides:
+
+  - structured LLM intentions
+  - uncertainty modeling
+  - clarification flows
+  - trust-aware value representation
+  - deterministic lowering to Boundary Contract
+
+It is the bridge between free-form AI reasoning and deterministic GRISP execution.
+
+=====================================================================
+=========  END OF GRISP v0.15 - Spec 006 - AI SUBSTRATE IR  =========
+=====================================================================
+=====================================================================
+=====  GRISP v0.15 - Spec 007 - TRANSACTION MODEL SPEC (Layer 0)  ===
+=====================================================================
+
+STATUS: Stable Draft
+LAYER: Deterministic Execution (Layer 0)
+VERSION: grisp-transaction-model-v0.15
+DEPENDENCIES:
+  - Canonical IR v0.15
+  - Expression AST v0.15
+  - Runtime Profile v0.15
+  - Trust Model v0.15
+
+---------------------------------------------------------------------
+1. PURPOSE
+---------------------------------------------------------------------
+The Transaction Model v0.15 defines the **precise, deterministic,
+engine-level execution semantics** for GRISP.
+
+It answers the critical questions:
+
+  - When does a rule “fire”?
+  - What is a match?
+  - How are conflicts resolved?
+  - What is a transaction boundary?
+  - What is committed atomically?
+  - What is visible to subsequent rules?
+  - How are events and hooks ordered?
+
+This model ensures that **all GRISP engines behave identically**.
+
+---------------------------------------------------------------------
+2. DESIGN PRINCIPLES
+---------------------------------------------------------------------
+- **Determinism**: Same input → same output → same graph.
+- **Atomicity**: A rule firing is a single atomic transaction.
+- **Isolation**: No rule sees partial effects of another.
+- **Consistency**: Graph invariants must hold after each commit.
+- **Replayability**: Execution must be reproducible from logs.
+- **Minimality**: No hidden side effects.
+
+---------------------------------------------------------------------
+3. EXECUTION OVERVIEW
+---------------------------------------------------------------------
+Execution proceeds in discrete ticks.
+
+Each tick:
+
+  1. Evaluate rule matches
+  2. Score matches
+  3. Select a rule firing
+  4. Begin transaction
+  5. Validate reads
+  6. Apply writes
+  7. Commit transaction
+  8. Emit events
+  9. Schedule hooks
+
+This cycle repeats until:
+  - no rules match, or
+  - runtime profile halts execution.
+
+---------------------------------------------------------------------
+4. RULE MATCHING
+---------------------------------------------------------------------
+A rule match is a binding of pattern variables to graph facts.
+
+Match structure:
+
+{
+  "rule_id": "string",
+  "bindings": { "Task": "fact-123", "Agent": "fact-55" },
+  "reads": [ ... ],
+  "writes": [ ... ],
+  "score": 0.0
+}
+
+4.1 Pattern Evaluation
+Patterns are evaluated in order:
+
+  - binding patterns
+  - edge patterns
+  - existence patterns
+  - collection patterns
+  - condition patterns
+  - let patterns
+
+All expressions MUST be evaluated using Expression AST v0.15.
+
+4.2 Match Validity
+A match is valid if:
+  - all patterns succeed
+  - all referenced facts exist
+  - trust gates do not block required reads
+  - no inferred read/write conflicts exist within the match
+
+---------------------------------------------------------------------
+5. MATCH SCORING
+---------------------------------------------------------------------
+Matches are scored using:
+
+  - rule priority
+  - match age
+  - fairness window
+  - runtime profile overrides
+
+score = f(priority, age, fairness, profile)
+
+Scoring MUST be deterministic.
+
+---------------------------------------------------------------------
+6. RULE SELECTION
+---------------------------------------------------------------------
+The highest-scoring match is selected.
+
+Tie-breaking order:
+
+  1. runtime profile tie_breaker
+  2. rule name (lexicographic)
+  3. match key (sorted binding IDs)
+  4. deterministic hash
+
+Random tie-breakers are allowed ONLY in engine-specific mode.
+
+---------------------------------------------------------------------
+7. TRANSACTION BOUNDARY
+---------------------------------------------------------------------
+A rule firing is a single atomic transaction.
+
+Transaction phases:
+
+  1. Begin
+  2. Read validation
+  3. Action application
+  4. Write staging
+  5. Commit
+  6. Event emission
+  7. Hook scheduling
+
+No other rule may interleave effects.
+
+---------------------------------------------------------------------
+8. READ VALIDATION
+---------------------------------------------------------------------
+Before applying writes, the engine MUST validate:
+
+  - All facts referenced in inferred_reads still exist
+  - All fields read have not changed since match time
+  - Trust levels still satisfy trust gates
+
+If validation fails:
+  - transaction aborts
+  - match is discarded
+  - next match is selected
+
+---------------------------------------------------------------------
+9. ACTION APPLICATION
+---------------------------------------------------------------------
+Actions are applied in order:
+
+  1. let
+  2. update
+  3. create
+  4. delete
+  5. emit
+  6. call
+  7. for
+  8. if
+
+Actions produce staged writes.
+
+9.1 Update
+  - Modify fields of existing facts.
+
+9.2 Create
+  - Create new facts with temporary IDs.
+
+9.3 Delete
+  - Mark facts for removal.
+
+9.4 Emit
+  - Produce events (not committed yet).
+
+9.5 Call
+  - Schedule tool calls (not executed yet).
+
+---------------------------------------------------------------------
+10. WRITE STAGING
+---------------------------------------------------------------------
+Writes are staged in a transaction buffer.
+
+Staged writes MUST NOT be visible to:
+  - other rules
+  - other matches
+  - other transactions
+
+---------------------------------------------------------------------
+11. COMMIT PHASE
+---------------------------------------------------------------------
+Commit applies staged writes atomically:
+
+  - updates applied
+  - new facts inserted
+  - deleted facts removed
+  - graph hash updated
+
+Commit MUST be atomic and isolated.
+
+---------------------------------------------------------------------
+12. EVENT EMISSION
+---------------------------------------------------------------------
+After commit:
+
+  - events are emitted in action order
+  - events are appended to the event log
+  - events are visible to subscribers
+
+Event emission is NOT part of the transaction.
+
+---------------------------------------------------------------------
+13. HOOK SCHEDULING
+---------------------------------------------------------------------
+Hooks are scheduled AFTER commit.
+
+Hook types:
+  - after_commit
+  - on_failure
+
+Hooks MUST NOT affect transaction semantics.
+
+---------------------------------------------------------------------
+14. FAILURE SEMANTICS
+---------------------------------------------------------------------
+Failures may occur in:
+
+  - read validation
+  - action evaluation
+  - commit phase
+  - hook execution
+
+14.1 Transaction Failure
+If a transaction fails before commit:
+  - no writes are applied
+  - no events are emitted
+  - on_failure hooks are scheduled
+
+14.2 Hook Failure
+Hook failures MUST NOT affect graph state.
+
+---------------------------------------------------------------------
+15. CONFLICT DETECTION
+---------------------------------------------------------------------
+Conflicts occur when:
+
+  - two matches write the same field
+  - one match deletes a fact another reads
+  - trust gates block a write
+
+Conflicts MUST be detected BEFORE commit.
+
+---------------------------------------------------------------------
+16. VISIBILITY RULES
+---------------------------------------------------------------------
+After commit:
+  - all writes become visible
+  - subsequent matches see updated graph
+  - event subscribers receive events
+  - hooks may run asynchronously
+
+---------------------------------------------------------------------
+17. DETERMINISTIC REPLAY
+---------------------------------------------------------------------
+Replay requires:
+
+  - canonical IR
+  - runtime profile
+  - event log
+  - trust log
+  - resolution trace
+
+Replay MUST produce identical graph state.
+
+---------------------------------------------------------------------
+18. WHAT IS NOT IN TRANSACTION MODEL v0.15
+---------------------------------------------------------------------
+Not included:
+  - AI substrate semantics
+  - Boundary contract structure
+  - Trust propagation rules
+  - Tool execution semantics
+  - Hook implementation details
+
+These are defined in other specs.
+
+---------------------------------------------------------------------
+19. SUMMARY
+---------------------------------------------------------------------
+The Transaction Model v0.15 defines:
+
+  - rule matching
+  - scoring
+  - selection
+  - atomic transactions
+  - read validation
+  - write staging
+  - commit semantics
+  - event emission
+  - hook scheduling
+  - deterministic replay
+
+It is the core of GRISP’s deterministic execution engine.
+
+=====================================================================
+=========  END OF GRISP v0.15 - Spec 007 - TRANSACTION MODEL  =======
+=====================================================================
+=====================================================================
+======  GRISP v0.15 - Spec 008 - HOOK SEMANTICS SPEC (Layer 1)  =====
+=====================================================================
+
+STATUS: Stable Draft
+LAYER: Post‑Transaction Effects (Layer 1)
+VERSION: grisp-hook-semantics-v0.15
+DEPENDENCIES:
+  - Canonical IR v0.15
+  - Transaction Model v0.15
+  - Runtime Profile v0.15
+  - Trust Model v0.15
+
+---------------------------------------------------------------------
+1. PURPOSE
+---------------------------------------------------------------------
+The Hook Semantics v0.15 specification defines the **precise behavior**
+of GRISP hooks:
+
+  - when they run
+  - what they can see
+  - what they are allowed to do
+  - how failures are handled
+  - how they interact with events and transactions
+
+Hooks are **not** part of the transaction itself.  
+They run *after* the transaction commits or fails.
+
+This spec ensures that all GRISP engines implement hooks in a
+deterministic, consistent, and safe manner.
+
+---------------------------------------------------------------------
+2. TYPES OF HOOKS
+---------------------------------------------------------------------
+GRISP defines two hook types:
+
+  - after_commit
+  - on_failure
+
+2.1 after_commit  
+Runs **after a successful transaction commit**.
+
+2.2 on_failure  
+Runs **after a transaction aborts**, but only if the rule defines them.
+
+Hooks NEVER run inside the transaction.
+
+---------------------------------------------------------------------
+3. HOOK DECLARATION
+---------------------------------------------------------------------
+Hooks are declared inside a rule:
+
+{
+  "hooks": {
+    "after_commit": [
+      { "id": "emit_assignment_webhook" }
+    ],
+    "on_failure": [
+      { "id": "log_failure" }
+    ]
+  }
+}
+
+Each hook entry contains:
+
+  - id: unique identifier
+  - args (optional): structured arguments
+  - meta (optional): debugging metadata
+
+---------------------------------------------------------------------
+4. HOOK EXECUTION ORDER
+---------------------------------------------------------------------
+Hook execution order is strictly defined:
+
+4.1 After Commit  
+Executed in the order they appear in the rule.
+
+4.2 On Failure  
+Executed in the order they appear in the rule.
+
+4.3 Across Rules  
+Hooks from different rule firings execute in **commit order**.
+
+4.4 No Interleaving  
+Hooks from one transaction MUST NOT interleave with hooks from another.
+
+---------------------------------------------------------------------
+5. HOOK EXECUTION CONTEXT
+---------------------------------------------------------------------
+Hooks run with the following context:
+
+{
+  "transaction_id": "string",
+  "rule_id": "string",
+  "rule_name": "string",
+  "bindings": { ... },
+  "committed_writes": { ... },
+  "events": [ ... ],
+  "graph_snapshot": { ... },
+  "trust_context": { ... }
+}
+
+5.1 graph_snapshot  
+A **read-only** snapshot of the graph *after* commit.
+
+5.2 committed_writes  
+The exact writes applied by the transaction.
+
+5.3 events  
+Events emitted by the transaction.
+
+5.4 trust_context  
+Trust metadata relevant to the transaction.
+
+---------------------------------------------------------------------
+6. HOOK CAPABILITIES
+---------------------------------------------------------------------
+Hooks MAY:
+
+  - emit external events
+  - log information
+  - call external systems
+  - enqueue asynchronous tasks
+  - update monitoring systems
+
+Hooks MUST NOT:
+
+  - modify the GRISP graph
+  - modify session state
+  - modify trust state
+  - modify runtime profile
+  - trigger new rule evaluations
+  - create new transactions
+
+Hooks are **side-effect only**.
+
+---------------------------------------------------------------------
+7. FAILURE SEMANTICS
+---------------------------------------------------------------------
+Hook failures MUST NOT affect:
+
+  - the committed transaction
+  - the graph state
+  - event emission
+  - other hooks
+
+Hook failures MUST be recorded:
+
+{
+  "hook_failure": {
+    "hook_id": "string",
+    "error": "string",
+    "timestamp": 1680000000
+  }
+}
+
+Engines MAY retry hooks, but retries MUST NOT affect determinism.
+
+---------------------------------------------------------------------
+8. HOOK TIMEOUTS
+---------------------------------------------------------------------
+Hooks MAY define timeouts:
+
+{
+  "id": "emit_webhook",
+  "timeout_ms": 5000
+}
+
+If a hook times out:
+
+  - it is marked as failed
+  - execution continues to next hook
+  - transaction remains committed
+
+Timeouts MUST NOT block the engine indefinitely.
+
+---------------------------------------------------------------------
+9. HOOK ISOLATION
+---------------------------------------------------------------------
+Hooks MUST run in isolation:
+
+  - no shared mutable state
+  - no access to in-flight transactions
+  - no access to uncommitted writes
+  - no ability to influence rule selection
+
+Isolation ensures deterministic engine behavior.
+
+---------------------------------------------------------------------
+10. HOOK SCHEDULING MODEL
+---------------------------------------------------------------------
+Hooks are scheduled by the engine in a FIFO queue:
+
+  - enqueue after commit or failure
+  - dequeue in order
+  - execute sequentially
+  - record results
+
+Engines MAY execute hooks asynchronously, but MUST preserve order.
+
+---------------------------------------------------------------------
+11. HOOKS AND TRUST MODEL
+---------------------------------------------------------------------
+Hooks MUST NOT:
+
+  - promote trust
+  - demote trust
+  - override trust gates
+  - modify trust metadata
+
+Hooks MAY:
+
+  - emit events containing trust metadata
+  - log trust violations
+  - notify external systems of trust issues
+
+---------------------------------------------------------------------
+12. HOOKS AND RESOLUTION TRACE
+---------------------------------------------------------------------
+Hooks MUST append entries to the resolution trace:
+
+  - hook_started
+  - hook_succeeded
+  - hook_failed
+  - hook_timeout
+
+Trace entries MUST include:
+
+  - hook_id
+  - rule_id
+  - transaction_id
+  - timestamp
+
+---------------------------------------------------------------------
+13. HOOKS AND PARTIAL RESULTS
+---------------------------------------------------------------------
+If a transaction ends with:
+
+  - status = partial  
+  - partial_reason = timeout | max_actions_reached | backpressure
+
+Then:
+
+  - after_commit hooks MUST run
+  - on_failure hooks MUST NOT run
+
+Partial results count as successful commits.
+
+---------------------------------------------------------------------
+14. HOOKS AND ENGINE FAILURE
+---------------------------------------------------------------------
+If the engine crashes:
+
+  - committed transactions MUST remain committed
+  - unexecuted hooks MAY be retried on restart
+  - hook retries MUST NOT affect graph state
+
+---------------------------------------------------------------------
+15. WHAT IS NOT IN HOOK SEMANTICS v0.15
+---------------------------------------------------------------------
+Not included:
+
+  - tool execution semantics
+  - AI substrate logic
+  - trust propagation rules
+  - rule matching
+  - transaction selection
+  - event schema definitions
+
+These are defined in other specs.
+
+---------------------------------------------------------------------
+16. SUMMARY
+---------------------------------------------------------------------
+Hook Semantics v0.15 defines:
+
+  - deterministic hook ordering
+  - strict isolation
+  - post-commit and post-failure behavior
+  - failure handling
+  - timeout behavior
+  - resolution trace integration
+  - trust-safe side effects
+
+Hooks provide a safe, deterministic way to integrate GRISP with the
+outside world without affecting core execution.
+
+=====================================================================
+=========  END OF GRISP v0.15 - Spec 008 - HOOK SEMANTICS  ==========
+=====================================================================
+=====================================================================
+======  GRISP v0.15 - Spec 009 - CAPABILITY MODEL SPEC (Layer 2)  ===
+=====================================================================
+
+STATUS: Stable Draft
+LAYER: Capability & Privilege Model (Layer 2)
+VERSION: grisp-capability-model-v0.15
+DEPENDENCIES:
+  - Canonical IR v0.15
+  - Trust Model v0.15
+  - Boundary Contract v0.15
+  - AI Substrate IR v0.15
+
+---------------------------------------------------------------------
+1. PURPOSE
+---------------------------------------------------------------------
+The Capability Model v0.15 defines **what tools are allowed to do**,  
+**under which trust conditions**, and **how GRISP enforces privilege
+boundaries**.
+
+It ensures:
+  - LLMs cannot silently call privileged tools
+  - Tools cannot escalate trust
+  - Human approval is required for sensitive operations
+  - Capabilities are explicit, granular, and auditable
+  - Every tool call is validated before execution
+
+This model is the “permission system” of GRISP.
+
+---------------------------------------------------------------------
+2. DESIGN PRINCIPLES
+---------------------------------------------------------------------
+- **Least privilege**: Tools get only the capabilities they need.
+- **Explicitness**: No implicit capability grants.
+- **Trust-aware**: Capabilities require minimum trust levels.
+- **Deterministic**: Capability checks must not depend on LLM behavior.
+- **Composable**: Works with Trust Model, Boundary Contract, and AI IR.
+- **Auditable**: All capability checks are logged.
+
+---------------------------------------------------------------------
+3. CAPABILITY CLASSES
+---------------------------------------------------------------------
+Tools declare one or more capability classes:
+
+  - read_only
+  - write_limited
+  - write_privileged
+  - external_side_effect
+  - llm_facing
+  - human_required
+
+3.1 read_only  
+Tool may read external data but not modify anything.
+
+3.2 write_limited  
+Tool may modify non-critical external state.
+
+3.3 write_privileged  
+Tool may modify critical or sensitive state.  
+Requires **human_confirmed** trust.
+
+3.4 external_side_effect  
+Tool interacts with external systems (email, APIs, etc).
+
+3.5 llm_facing  
+Tool accepts LLM-generated inputs.  
+All outputs are **llm_asserted**.
+
+3.6 human_required  
+Tool cannot be called unless a human explicitly approves the call.
+
+---------------------------------------------------------------------
+4. CAPABILITY DECLARATION
+---------------------------------------------------------------------
+Tools declare capabilities in their manifest:
+
+{
+  "tool_name": "task-service",
+  "capabilities": [
+    {
+      "id": "cap:task.read",
+      "class": "read_only",
+      "min_trust": "llm_asserted"
+    },
+    {
+      "id": "cap:task.update",
+      "class": "write_limited",
+      "min_trust": "tool_returned"
+    },
+    {
+      "id": "cap:task.delete",
+      "class": "write_privileged",
+      "min_trust": "human_confirmed"
+    }
+  ]
+}
+
+Fields:
+  - id: unique capability identifier
+  - class: capability class
+  - min_trust: minimum trust required for inputs
+
+---------------------------------------------------------------------
+5. CAPABILITY TOKENS
+---------------------------------------------------------------------
+Capability tokens represent **granted permissions**.
+
+{
+  "token_id": "string",
+  "capability_id": "cap:task.update",
+  "granted_by": "operator:alice",
+  "granted_at": 1680000000,
+  "session_turn": 12
+}
+
+Tokens may be:
+  - pre-granted (static)
+  - session-granted (dynamic)
+  - human-granted (explicit approval)
+
+Tokens MUST be included in Boundary Contract session:
+
+"capability_grants": ["cap:task.update"]
+
+---------------------------------------------------------------------
+6. CAPABILITY CHECKS
+---------------------------------------------------------------------
+Before executing a tool call, the engine MUST check:
+
+  1. Tool exists
+  2. Capability exists
+  3. Capability is granted
+  4. Input trust >= min_trust
+  5. Tool class constraints are satisfied
+
+If any check fails:
+  - tool call is blocked
+  - trust violation is recorded
+  - transaction aborts
+
+---------------------------------------------------------------------
+7. TRUST + CAPABILITY INTERACTION
+---------------------------------------------------------------------
+Trust Model v0.15 defines trust levels.  
+Capability Model v0.15 defines required trust.
+
+Combined rule:
+
+  A tool call is allowed only if:
+    trust(input) >= capability.min_trust
+
+Examples:
+
+- llm_asserted input → write_privileged tool  
+    → BLOCKED
+
+- tool_returned input → write_limited tool  
+    → ALLOWED
+
+- human_confirmed input → write_privileged tool  
+    → ALLOWED
+
+---------------------------------------------------------------------
+8. LLM-FACING TOOLS
+---------------------------------------------------------------------
+Tools marked llm_facing:
+
+  - MUST treat all inputs as llm_asserted
+  - MUST return llm_asserted outputs
+  - MUST NOT escalate trust
+  - MUST NOT perform privileged operations
+
+These tools are safe for free-form LLM interaction.
+
+---------------------------------------------------------------------
+9. HUMAN-REQUIRED TOOLS
+---------------------------------------------------------------------
+Tools marked human_required:
+
+  - MUST trigger a confirm action
+  - MUST NOT execute until human approval
+  - MUST record approval in resolution trace
+
+Example:
+
+{
+  "kind": "call",
+  "payload": {
+    "tool_name": "delete-database",
+    "args": { ... },
+    "requires_confirmation": true
+  }
+}
+
+---------------------------------------------------------------------
+10. CAPABILITY GROUPS
+---------------------------------------------------------------------
+Capabilities may be grouped:
+
+{
+  "group_id": "cap:task.admin",
+  "members": [
+    "cap:task.read",
+    "cap:task.update",
+    "cap:task.delete"
+  ]
+}
+
+Granting a group grants all members.
+
+---------------------------------------------------------------------
+11. CAPABILITY INHERITANCE
+---------------------------------------------------------------------
+Capabilities may inherit:
+
+{
+  "id": "cap:task.superdelete",
+  "extends": "cap:task.delete",
+  "min_trust": "human_confirmed"
+}
+
+Inheritance rules:
+  - class is inherited unless overridden
+  - min_trust may only increase
+  - extending multiple capabilities is forbidden
+
+---------------------------------------------------------------------
+12. CAPABILITY VIOLATIONS
+---------------------------------------------------------------------
+Violations MUST be recorded:
+
+{
+  "violation_type": "CAPABILITY_DENIED",
+  "capability_id": "cap:task.update",
+  "required_trust": "tool_returned",
+  "actual_trust": "llm_asserted",
+  "tool_name": "task-service",
+  "value_path": "Task.query_override"
+}
+
+Violations abort the transaction.
+
+---------------------------------------------------------------------
+13. CAPABILITY AUDIT LOG
+---------------------------------------------------------------------
+Every tool call MUST append:
+
+  - capability_id
+  - trust level
+  - granted_by
+  - granted_at
+  - session_turn
+  - call_id
+  - result (allowed/blocked)
+
+Audit logs MUST be immutable.
+
+---------------------------------------------------------------------
+14. CAPABILITY RESOLUTION IN AI IR
+---------------------------------------------------------------------
+AI IR MUST annotate proposed tool calls with:
+
+{
+  "required_capabilities": ["cap:task.update"],
+  "input_trust": "llm_asserted",
+  "allowed": false
+}
+
+Lowering MUST enforce capability rules.
+
+---------------------------------------------------------------------
+15. WHAT IS NOT IN CAPABILITY MODEL v0.15
+---------------------------------------------------------------------
+Not included:
+
+  - tool execution semantics
+  - trust propagation rules
+  - transaction semantics
+  - hook behavior
+  - AI substrate intent structure
+
+These are defined in other specs.
+
+---------------------------------------------------------------------
+16. SUMMARY
+---------------------------------------------------------------------
+The Capability Model v0.15 defines:
+
+  - capability classes
+  - capability tokens
+  - trust-aware tool gating
+  - human-required tools
+  - llm-facing tools
+  - capability inheritance
+  - capability groups
+  - deterministic capability checks
+  - audit logging
+
+It is the permission system that keeps GRISP safe, predictable, and
+secure in AI-driven environments.
+
+=====================================================================
+========  END OF GRISP v0.15 - Spec 009 - CAPABILITY MODEL  =========
+=====================================================================
+=====================================================================
+======  GRISP v0.15 - Spec 010 - GOLDEN FILES SPEC (Reference)  =====
+=====================================================================
+
+STATUS: Stable Draft
+LAYER: Reference Examples (Non‑Normative)
+VERSION: grisp-golden-files-v0.15
+DEPENDENCIES:
+  - Canonical IR v0.15
+  - Expression AST v0.15
+  - Runtime Profile v0.15
+  - Transaction Model v0.15
+  - Trust Model v0.15
+  - Boundary Contract v0.15
+  - AI Substrate IR v0.15
+  - Capability Model v0.15
+
+---------------------------------------------------------------------
+1. PURPOSE
+---------------------------------------------------------------------
+Golden Files v0.15 provide **canonical reference examples** for:
+
+  - Canonical IR manifests
+  - Expression AST structures
+  - Rule evaluation
+  - Transaction execution
+  - Trust propagation
+  - Boundary Contract requests/responses
+  - AI IR lowering
+  - Capability checks
+  - Event emission
+  - Hook execution
+
+Golden Files are **not normative**, but they are the **ground truth**
+for:
+
+  - engine conformance tests
+  - compiler validation
+  - regression testing
+  - cross‑implementation consistency
+  - documentation examples
+
+They ensure all GRISP implementations behave identically.
+
+---------------------------------------------------------------------
+2. STRUCTURE OF GOLDEN FILES
+---------------------------------------------------------------------
+Golden Files are organized into sections:
+
+  - manifest/
+  - rules/
+  - expressions/
+  - transactions/
+  - trust/
+  - boundary/
+  - ai_ir/
+  - capabilities/
+  - events/
+  - hooks/
+
+Each section contains one or more `.golden.json` files.
+
+---------------------------------------------------------------------
+3. GOLDEN FILE FORMAT
+---------------------------------------------------------------------
+Golden Files MUST use:
+
+  - canonical JSON
+  - sorted keys
+  - deterministic formatting
+  - UTF‑8 encoding
+  - no comments
+  - no trailing commas
+
+Example header:
+
+{
+  "_golden": {
+    "version": "v0.15",
+    "description": "Basic task assignment example"
+  },
+  ...
+}
+
+---------------------------------------------------------------------
+4. GOLDEN FILE: MINIMAL MANIFEST
+---------------------------------------------------------------------
+File: manifest/minimal_manifest.golden.json
+
+{
+  "_golden": {
+    "version": "v0.15",
+    "description": "Minimal manifest with Task and Agent nodes"
+  },
+  "ir_version": "grisp-ir-v0.15",
+  "manifest_id": "example.minimal",
+  "manifest_version": "1.0.0",
+  "nodes": [
+    {
+      "name": "Task",
+      "fields": {
+        "id": { "type": "identifier" },
+        "lifecycle": { "type": "string" }
+      },
+      "constraints": [],
+      "custom": {}
+    },
+    {
+      "name": "Agent",
+      "fields": {
+        "id": { "type": "identifier" },
+        "available": { "type": "boolean" }
+      },
+      "constraints": [],
+      "custom": {}
+    }
+  ],
+  "edges": [],
+  "functions": [],
+  "rules": [],
+  "runtime_profile_ref": null,
+  "metadata": {},
+  "custom": {}
+}
+
+---------------------------------------------------------------------
+5. GOLDEN FILE: EXPRESSION AST
+---------------------------------------------------------------------
+File: expressions/literal_and_binary.golden.json
+
+{
+  "_golden": {
+    "version": "v0.15",
+    "description": "Literal and binary expression example"
+  },
+  "expr": {
+    "kind": "binary",
+    "op": "+",
+    "left": {
+      "kind": "literal",
+      "literal_type": "integer",
+      "value": 5
+    },
+    "right": {
+      "kind": "literal",
+      "literal_type": "integer",
+      "value": 7
+    }
+  }
+}
+
+---------------------------------------------------------------------
+6. GOLDEN FILE: RULE MATCH
+---------------------------------------------------------------------
+File: rules/simple_match.golden.json
+
+{
+  "_golden": {
+    "version": "v0.15",
+    "description": "Simple rule match for pending task"
+  },
+  "match": {
+    "rule_id": "AssignTask",
+    "bindings": {
+      "Task": "task-123"
+    },
+    "reads": ["Task.lifecycle"],
+    "writes": ["Task.lifecycle"],
+    "score": 0.87
+  }
+}
+
+---------------------------------------------------------------------
+7. GOLDEN FILE: TRANSACTION EXECUTION
+---------------------------------------------------------------------
+File: transactions/update_task.golden.json
+
+{
+  "_golden": {
+    "version": "v0.15",
+    "description": "Transaction updating Task.lifecycle"
+  },
+  "transaction": {
+    "transaction_id": "tx-001",
+    "rule_id": "AssignTask",
+    "actions": [
+      {
+        "kind": "update",
+        "payload": {
+          "fact_id": "task-123",
+          "type": "Task",
+          "assigns": {
+            "lifecycle": {
+              "kind": "literal",
+              "literal_type": "string",
+              "value": "assigned"
+            }
+          }
+        }
+      }
+    ],
+    "committed": true,
+    "writes": {
+      "task-123": {
+        "lifecycle": "assigned"
+      }
+    }
+  }
+}
+
+---------------------------------------------------------------------
+8. GOLDEN FILE: TRUST PROPAGATION
+---------------------------------------------------------------------
+File: trust/propagation_example.golden.json
+
+{
+  "_golden": {
+    "version": "v0.15",
+    "description": "Trust propagation from llm_asserted input"
+  },
+  "input": {
+    "value": {
+      "kind": "literal",
+      "literal_type": "string",
+      "value": "dangerous query"
+    },
+    "trust": "llm_asserted"
+  },
+  "operation": "binary +",
+  "result": {
+    "trust": "llm_asserted"
+  }
+}
+
+---------------------------------------------------------------------
+9. GOLDEN FILE: BOUNDARY CONTRACT REQUEST
+---------------------------------------------------------------------
+File: boundary/request_example.golden.json
+
+{
+  "_golden": {
+    "version": "v0.15",
+    "description": "Boundary Contract request with one fact"
+  },
+  "contract_version": "grisp-boundary-v0.15",
+  "request_id": "req-001",
+  "manifest_id": "example.minimal",
+  "manifest_version": "1.0.0",
+  "session": {
+    "session_id": "sess-1",
+    "turn_index": 1,
+    "established_facts": [],
+    "pending_clarifications": [],
+    "confirmed_actions": [],
+    "capability_grants": []
+  },
+  "context": {
+    "origin": "llm",
+    "default_trust_level": "llm_asserted"
+  },
+  "facts": [
+    {
+      "id": "task-123",
+      "type": "Task",
+      "data": {
+        "id": "task-123",
+        "lifecycle": "pending"
+      },
+      "_trust": {
+        "level": "llm_asserted"
+      }
+    }
+  ]
+}
+
+---------------------------------------------------------------------
+10. GOLDEN FILE: BOUNDARY CONTRACT RESPONSE
+---------------------------------------------------------------------
+File: boundary/response_example.golden.json
+
+{
+  "_golden": {
+    "version": "v0.15",
+    "description": "Boundary Contract response with update action"
+  },
+  "status": "success",
+  "actions": [
+    {
+      "kind": "update",
+      "payload": {
+        "fact_id": "task-123",
+        "type": "Task",
+        "assigns": {
+          "lifecycle": {
+            "kind": "literal",
+            "literal_type": "string",
+            "value": "assigned"
+          }
+        }
+      }
+    }
+  ]
+}
+
+---------------------------------------------------------------------
+11. GOLDEN FILE: AI IR LOWERING
+---------------------------------------------------------------------
+File: ai_ir/lowering_example.golden.json
+
+{
+  "_golden": {
+    "version": "v0.15",
+    "description": "AI IR lowering to Boundary Contract"
+  },
+  "ai_ir": {
+    "intents": [
+      {
+        "kind": "update_fact",
+        "target": "Task",
+        "assigns": {
+          "lifecycle": {
+            "value": "assigned",
+            "confidence": 0.92,
+            "trust": "llm_asserted"
+          }
+        }
+      }
+    ]
+  },
+  "lowered_request": {
+    "actions": [
+      {
+        "kind": "update",
+        "payload": {
+          "fact_id": "task-123",
+          "type": "Task",
+          "assigns": {
+            "lifecycle": {
+              "kind": "literal",
+              "literal_type": "string",
+              "value": "assigned"
+            }
+          }
+        }
+      }
+    ]
+  }
+}
+
+---------------------------------------------------------------------
+12. GOLDEN FILE: CAPABILITY CHECK FAILURE
+---------------------------------------------------------------------
+File: capabilities/denied_call.golden.json
+
+{
+  "_golden": {
+    "version": "v0.15",
+    "description": "Capability denial example"
+  },
+  "call": {
+    "tool_name": "task-service",
+    "capability_required": "cap:task.delete",
+    "input_trust": "llm_asserted"
+  },
+  "result": {
+    "allowed": false,
+    "violation": {
+      "violation_type": "CAPABILITY_DENIED",
+      "required_trust": "human_confirmed",
+      "actual_trust": "llm_asserted"
+    }
+  }
+}
+
+---------------------------------------------------------------------
+13. GOLDEN FILE: HOOK EXECUTION
+---------------------------------------------------------------------
+File: hooks/after_commit_example.golden.json
+
+{
+  "_golden": {
+    "version": "v0.15",
+    "description": "After-commit hook example"
+  },
+  "transaction": {
+    "transaction_id": "tx-001",
+    "committed": true
+  },
+  "hooks_executed": [
+    {
+      "hook_id": "emit_assignment_webhook",
+      "status": "success"
+    }
+  ]
+}
+
+---------------------------------------------------------------------
+14. SUMMARY
+---------------------------------------------------------------------
+Golden Files v0.15 provide:
+
+  - canonical examples
+  - deterministic reference outputs
+  - cross-engine validation
+  - regression testing baselines
+  - documentation samples
+
+They ensure that all GRISP implementations behave identically and
+conform to the v0.15 specification suite.
+
+=====================================================================
+=========  END OF GRISP v0.15 - Spec 010 - GOLDEN FILES  ============
+=====================================================================
