@@ -1,0 +1,696 @@
+# GRISP Canonical IR Specification v0.29v7
+
+## Normative Specification
+
+This document defines the Canonical Intermediate Representation (IR) for GRISP systems. It is the **sole executable representation** consumed by conformant GRISP engines and maps directly onto the GRISP Deterministic Kernel Specification v0.29.
+
+All source languages, DSLs, compilers, and code generators SHALL produce Canonical IR before execution. The IR is independent of source syntax and forms a stable contract between parsers, compilers, validators, optimizers, execution engines, and test harnesses.
+
+---
+
+## IR-001 Goals
+
+The Canonical IR SHALL be: Deterministic, Canonicalizable, Serialization Stable, Language Independent, Fully Explicit, Self Contained.
+
+It SHALL NOT depend upon source‑language syntax, runtime reflection, host‑language behavior, or external schema systems.
+
+---
+
+## IR-002 Design Principles
+
+All executable behavior SHALL be represented explicitly.
+
+The IR SHALL contain: Type Definitions, Function Definitions, Rule Definitions, Expressions, Actions.
+
+The IR SHALL NOT contain: Comments, formatting directives, editor metadata, runtime implementation details, or control‑flow constructs (`If`, `ForEach`) or local bindings (`Let`) as actions.
+
+---
+
+## IR-003 Top-Level Structure
+
+```json
+{
+  "ir_version": "grisp-ir-v0.29v7",
+  "manifest_id": "...",
+  "manifest_version": "...",
+  "types": [],
+  "functions": [],
+  "rules": [],
+  "constants": {},
+  "metadata": {}
+}
+```
+
+Required fields: `ir_version`, `manifest_id`, `manifest_version`, `types`, `functions`, `rules`. Unknown top‑level fields rejected.
+
+`manifest_id`, `manifest_version`, `metadata` are descriptive only. Engines SHALL ignore unrecognized metadata fields.
+
+---
+
+## IR-004 Type System
+
+Primitive types: `Boolean`, `Integer`, `String`, `Identifier`.
+
+Compound types: `List<T>`, `Map<String,T>`, `FixedPoint(scale)`.
+
+Floating point, `Null`, `Undefined` forbidden.
+
+---
+
+## IR-005 Node Type Definitions
+
+```json
+{
+  "kind": "node_type",
+  "name": "Person",
+  "fields": {
+    "name": "String",
+    "age": "Integer"
+  }
+}
+```
+
+All fields mandatory. Duplicate field names rejected.
+
+---
+
+## IR-006 Edge Type Definitions
+
+Edges have fields exactly like nodes. The edge type definition includes a `fields` object (may be empty).
+
+```json
+{
+  "kind": "edge_type",
+  "name": "Friendship",
+  "from": "Person",
+  "to": "Person",
+  "fields": {
+    "strength": "Integer",
+    "since": "FixedPoint(0)"
+  }
+}
+```
+
+Edge endpoints SHALL reference valid node types.
+
+---
+
+## IR-007 Constants
+
+Immutable, type‑annotated. SHALL NOT depend on runtime state.
+
+```json
+{
+  "MAX_LEVEL": { "type": "Integer", "value": 100 }
+}
+```
+
+---
+
+## IR-008 Functions
+
+`pure` or `effect_deterministic`. Example:
+
+```json
+{
+  "function_id": "CalculateTax",
+  "kind": "pure",
+  "parameters": [{"name": "income", "type": "Integer"}],
+  "return_type": "Integer"
+}
+```
+
+---
+
+## IR-009 Effect Functions
+
+Declare `declared_reads`. Under‑declaration rejected. Over‑declaration permitted.
+
+```json
+{
+  "function_id": "NearbyEnemies",
+  "kind": "effect_deterministic",
+  "declared_reads": [{"dependency": "Extent", "type": "Enemy"}]
+}
+```
+
+---
+
+## IR-010 Expressions
+
+Immutable trees. Supported kinds: `Literal`, `Variable`, `FieldAccess`, `FunctionCall`, arithmetic (`Add`,`Subtract`,`Multiply`,`Divide`,`Modulo`), comparisons (`Equal`,`NotEqual`,`Less`,`LessEqual`,`Greater`,`GreaterEqual`), boolean (`And`,`Or`,`Not`), `Conditional`, `MapLiteral`, `Array`.
+
+Unknown kinds rejected. Evaluation deterministic.
+
+---
+
+## IR-011 Literals
+
+Allowed literal types: `Boolean`, `Integer`, `String`, `Identifier`.
+
+Identifier literal format: `TypeName:nonNegativeInteger` where `TypeName` follows the grammar `[A-Za-z_][A-Za-z0-9_-]*` (allows hyphens). Example: `"Task-12:5"`.
+
+**Lexical distinction:** `TypeName` is used only inside identifier literals. Variable, function, and rule identifiers (IR‑021) follow a different grammar (no hyphens). Malformed identifier literals rejected.
+
+Floating‑point and `null` literals rejected.
+
+---
+
+## IR-012 Pattern Matching
+
+Supported pattern kinds (Kernel SPEC 008): `Binding`, `Edge`, `Existence`, `Let`, `Collection`, `Condition`.
+
+- `Binding`: matches a node of given type, binds variable.
+- `Edge`: matches an edge between two bound nodes.
+- `Existence`: tests existence without binding.
+- `Let`: local pure computation, evaluated during discovery, immutable, excluded from match identity.
+- `Collection`: iterates over a collection (e.g., adjacency) – see **Collection iteration semantics** below.
+- `Condition`: boolean constraint (see IR-013 for evaluation order).
+
+**`Let` binding rules:**
+- Let expressions are pure (no `effect_deterministic` calls).
+- They are evaluated in the order they appear.
+- A later Let may reference earlier Let bindings or pattern bindings.
+- Let bindings do not create new matches; they only add computed values to the match record.
+
+**Pattern array semantics:** The `pattern` array is **conjunctive** – all patterns must match. The rule fires for each distinct combination of binding variables that satisfies all patterns. Let bindings are not part of match identity.
+
+**Collection iteration semantics:** A `Collection` pattern iterates over a **deterministic snapshot** taken at discovery time. Iteration order SHALL be the canonical order defined by the Kernel:
+- For nodes: ascending `node_id`.
+- For edges: ascending `edge_id`.
+- For adjacency (e.g., `node.outgoing(EdgeType)`): the Kernel’s defined order (source.out or target.in).
+
+Each element of the collection may introduce new bindings. The pattern’s conjunction semantics apply per iterated element – the rule fires once per element that satisfies all constraints.
+
+Example:
+```json
+"pattern": [
+  {"kind": "Binding", "variable": "a", "type": "Person"},
+  {"kind": "Collection", "variable": "e", "collection": {"kind": "Adjacency", "node": "a", "edge_type": "Friendship", "direction": "outgoing"}},
+  {"kind": "Binding", "variable": "b", "type": "Person", "from_edge": "e", "role": "target"},
+  {"kind": "Let", "variable": "total", "expression": {"kind": "Add", ...}}
+]
+```
+
+---
+
+## IR-013 Constraints
+
+A `Constraint` is evaluated **after** all bindings in its scope are resolved. It acts as an additional predicate that must be satisfied for the match to be valid. Constraints may appear anywhere within a pattern sequence; they are evaluated in order and may refer to any bindings introduced earlier (including those from previous patterns or `Let` bindings). Constraints do not introduce new bindings and do not affect match identity.
+
+> Constraints evaluate only over bindings defined prior to their position in the pattern sequence. A constraint SHALL NOT reference bindings introduced later in the same pattern array.
+
+Example:
+```json
+{"kind": "Constraint", "expression": {"kind": "Less", ...}}
+```
+
+---
+
+## IR-014 Rule Definitions
+
+```json
+{
+  "rule_id": "AgePerson",
+  "priority": 100,
+  "pattern": [],
+  "actions": []
+}
+```
+
+- `rule_id` globally unique.
+- `priority` = `base_priority` (Kernel SPEC 012). Global scaling factors (`priority_scale`, `fairness_scale`) are kernel configuration, not part of IR.
+
+**Rule firing granularity:** Each distinct match (each unique combination of binding values satisfying the pattern) is considered a separate candidate. The Kernel’s selection model (SPEC 012) chooses at most one match per tick. The chosen match’s actions are staged and committed as a single transaction. There is no aggregation of actions from multiple matches in one tick. If a rule’s pattern produces multiple matches, each is evaluated independently over successive ticks.
+
+**Rule arbitration:** When multiple rules have eligible matches, Kernel SPEC 012 priority ordering applies. Ties in score are resolved by ascending `rule_id` lexicographically.
+
+---
+
+## IR-015 Actions
+
+Only the six Kernel actions allowed:
+
+`CreateNode`, `CreateEdge`, `UpdateField`, `DeleteNode`, `DeleteEdge`, `EmitEvent`.
+
+`Let`, `If`, `ForEach` are **forbidden** as actions. Any IR containing them is invalid.
+
+---
+
+## IR-016 Dependency Model
+
+Supported categories: `NodeExistence` (instance), `EdgeExistence` (instance), `Field`, `Predicate`, `Extent` (type‑wide), `Ordering`, `EdgePredicate`, `EdgeOrdering`, `EdgeType`, `Adjacency` (instance with direction).
+
+---
+
+## IR-017 Events
+
+Deterministic. Example:
+
+```json
+{
+  "action": "EmitEvent",
+  "event_type": "PersonAged",
+  "payload": {"person": {"kind": "Variable", "name": "p"}}
+}
+```
+
+**Purity requirement:** Payload expressions SHALL contain only pure sub‑expressions. Calls to `effect_deterministic` functions are forbidden unless the call can be constant‑folded at compile time (i.e., all arguments are compile‑time constants and the function is referentially transparent). Engines SHALL reject IR that violates this.
+
+**Dependency extraction:** Payload expressions participate in dependency extraction during discovery, even if the transaction is later rejected.
+
+---
+
+## IR-017.5 Runtime Visibility Model
+
+This section defines the global visibility and ordering rules for version counters, dependency snapshots, and commit semantics.
+
+### T.1 Tick as Atomic Visibility Unit
+- A **tick** is the atomic unit of execution (Kernel SPEC 017).
+- All changes resulting from a committed transaction become **simultaneously visible** at the end of the tick.
+- No intermediate state within a tick is observable to dependency validation, match discovery, or event emission outside that tick.
+
+### T.2 Dependency Snapshot Lifetime
+- A dependency snapshot is taken **once per tick**, immediately after tick counter increment and before any match discovery.
+- The snapshot reflects the **post‑commit state of the previous tick** (or initial state for tick 1).
+- During match discovery and validation, all dependency version comparisons use this immutable snapshot. No changes that occur later in the same tick affect validation.
+
+### T.3 Counter Visibility and Cumulative Effect
+- **Post‑commit counter values** are the only values observable to subsequent ticks.
+- If an operation creates and then deletes an element within the same transaction, the counter increments for both operations are applied cumulatively in commit order, and the final counter values **must reflect both operations** even though the element does not persist.
+
+### T.4 Snapshot Materialization Rule
+- Any on‑demand or lazy materialization of counters MUST compute values based on the **same snapshot state** used at dependency extraction time, not on live state that may have changed during the tick.
+- Implementations may cache counters, but when materialized for validation or golden file output, they must return the value that existed at the snapshot boundary.
+
+### T.5 Ordering of Increments Across Categories
+- When the commit order increments multiple counters, the relative order of increments across different dependency categories is **not observable** to match validation within the same tick, because validation occurs before commit.
+- The **final post‑commit values** must be identical to a naive sequential execution. Implementations may reorder increments across categories as long as the final counter vector matches.
+
+### T.6 Relationship to Kernel Specification
+- This section refines Kernel SPEC 010, SPEC 015, and SPEC 017. In case of conflict, the Kernel Specification takes precedence.
+
+---
+
+## IR-017.6 Execution Model
+
+This section defines the deterministic execution framework for all ticks.
+
+### E.1 Tick Atomicity and State Progression
+- A **tick** is the atomic unit of execution. Each tick consists of: increment tick counter, capture frozen snapshot, discover all matches, select at most one match, validate dependencies, evaluate and commit a transaction (or discard), publish events.
+- The state at the beginning of tick *N* is exactly the post‑commit state of tick *N‑1* (or the initial state for tick 1).
+- No cross‑tick persistence: No information about matches or intermediate states persists across ticks except as stored in the graph state. `match_age` is recomputed each tick by comparing the current match set to the previous tick’s match set; there is no long‑term memory beyond one tick.
+
+### E.2 Snapshot Semantics
+- Immediately after the tick counter increments, the engine captures a **read‑only snapshot** of the entire state (nodes, edges, version counters, sequence counters). This snapshot is used for all match discovery, pattern evaluation, constraint checking, and dependency validation within the tick.
+- Changes caused by the committed transaction in the same tick **do not** affect match discovery or dependency validation for that tick. Validation uses the pre‑commit snapshot only.
+- The snapshot includes all version counters and existence markers as defined in Kernel SPEC 004 and SPEC 010. On‑demand materialization must produce values consistent with this snapshot.
+
+### E.3 Match Generation Determinism
+- All matches for all rules are generated deterministically from the snapshot. The order of generation is defined by:
+  - Primary: `rule_id` (lexicographically by UTF‑8 bytes).
+  - Secondary: match_key (canonical IR-018 JSON string as defined below).
+- This ordering is used only for deterministic enumeration; it **does not** affect scoring or `match_age` computation. It is used only as a tie‑breaker when all higher‑order selection criteria are equal.
+- All matches are recomputed from scratch each tick using the current snapshot.
+
+### E.4 Match Selection
+- Each match’s score is computed as `(base_priority * priority_scale) + (match_age * fairness_scale)` using signed 64‑bit arithmetic with full overflow detection on intermediate products and final sum. Any overflow is a fatal conformance error.
+- Matches are ordered by: descending score, then ascending match_key (lexicographic by UTF‑8 bytes). The first match in this order is the selected candidate.
+- If scores and match keys are equal (extremely rare), the engine MUST select a deterministic match using the lexicographic order of the match’s full binding serialization (match_key), which is already unique by construction.
+
+### E.5 Cross‑Tick Match Age
+- For each match key present in the current tick’s **candidate match set** (all matches discovered from the snapshot, before validation and selection):
+  - If the same match key was not present in the previous tick’s candidate match set → `match_age = 0`.
+  - If it was present → `match_age = previous_age + 1`.
+- `match_age` progression is defined over match keys of all discovered candidates, regardless of whether those candidates later fail validation or are not selected.
+- `match_age` is a signed 64‑bit integer. Overflow is a fatal conformance error.
+
+---
+
+## IR-018 Canonical Serialization
+
+Canonical IR, match keys, golden files, and all other normative textual artifacts in the GRISP system use **GRISP Canonical JSON**, a strict subset of RFC 8259 JSON defined below. This is the **sole serialization semantics** in the entire system. No other serialization format or canonicalization rule is permitted for any observable artifact.
+
+**GRISP Canonical JSON rules:**
+- Encoding: UTF‑8, no BOM.
+- Line endings: LF only.
+- No whitespace outside string literals (no spaces, tabs, newlines between tokens).
+- Object keys: lexicographically sorted by UTF‑8 byte sequence.
+- No duplicate object keys.
+- Arrays: preserve declared order; no trailing commas.
+- Integers: base‑10, no leading zeros (except single digit `0`), no `+` sign, minus only for negative.
+- Booleans: `true`, `false`.
+- Strings: escaped per Kernel SPEC 018 (backslash, double quote, control characters as `\uXXXX`).
+- Floating point, `null`, `Infinity`, `NaN` forbidden.
+
+**Round‑trip stability:** Parsing a valid Canonical IR document and immediately reserializing it SHALL produce an identical byte sequence.
+
+**Authority boundary:** For Canonical IR documents, match keys, golden files, dependency snapshots (when serialized), and all IR‑defined artifacts, this specification (IR-018) is the sole serialization authority. Where Kernel SPEC 018 differs, IR-018 takes precedence for IR‑defined outputs. Kernel SPEC 018 remains authoritative for kernel‑internal artifacts not governed by this specification.
+
+---
+
+## IR-019 Validation Rules
+
+A Canonical IR document SHALL be rejected if any of the following occur:
+- Duplicate type names, rule IDs, function IDs
+- Unknown type, field, expression kind, action kind, dependency kind references
+- Invalid function signatures
+- Invalid identifier syntax (including malformed identifier literals)
+- Cyclic type definitions
+- Floating point or null values
+- Non‑deterministic function declarations
+- Under‑declared effect function dependencies
+- Ordering operations on non‑orderable types
+- Temporary handles used in `UpdateField` or `EmitEvent` payloads
+- Recursive function definitions (direct or mutual)
+- `FixedPoint` addition/subtraction with mismatched scales
+- `Let`, `If`, `ForEach` appearing as actions
+- EmitEvent payload containing non‑pure expressions
+- Pattern Let bindings that are not pure or that reference future bindings
+- Violation of collection iteration snapshot/ordering rules
+
+Validation before execution.
+
+---
+
+## IR-020 Conformance
+
+A conformant compiler SHALL produce valid Canonical IR, deterministic output, and canonical serialization.
+
+A conformant engine SHALL accept valid IR, reject invalid IR, and execute per Kernel Specification v0.29.
+
+Observable behavior identical across conformant engines.
+
+---
+
+## IR-021 Identifier Rules
+
+**For variable names, function IDs, rule IDs, and parameter names:**
+```text
+Identifier ::= [A-Za-z_][A-Za-z0-9_]*
+```
+(No hyphens, no colons, no digits at start.)
+
+These identifiers SHALL be case‑sensitive, UTF‑8, non‑empty, globally unique per manifest.
+
+Reserved prefix: `__grisp_`.
+
+**For the `TypeName` part of an identifier literal (e.g., `Task-12:5`):**
+```text
+TypeName ::= [A-Za-z_][A-Za-z0-9_-]*
+```
+(Hyphens allowed. This grammar is used **only** inside identifier literal values, never for variable/function/rule names.)
+
+---
+
+## IR-022 Type Grammar
+
+```text
+Type ::= Boolean | Integer | String | Identifier
+       | FixedPoint(Integer)
+       | List<Type>
+       | Map<String,Type>
+```
+
+No `Set`, no floating point, no null.
+
+`FixedPoint` scale ≥ 0.
+
+**Arithmetic rules (Kernel SPEC 001):**
+- Addition/Subtraction: scales must match; result scale same.
+- Multiplication: result scale = left scale + right scale.
+- Division: result scale = dividend scale; division truncates toward zero.
+- Overflow: fatal conformance error.
+- Negative scale: forbidden.
+
+Examples: `FixedPoint(2) + FixedPoint(2)` valid; `FixedPoint(2) + FixedPoint(3)` invalid.
+
+---
+
+## IR-023 Function Signature Rules
+
+Every function defines `function_id`, `kind`, `parameters`, `return_type`. Parameter names unique.
+
+Recursive functions (direct or mutual) rejected.
+
+Functions SHALL NOT access time, random, or implementation‑specific state.
+
+Effect‑deterministic functions SHALL declare reads.
+
+---
+
+## IR-024 Expression Catalog
+
+(Already covered in IR-010. `MapLiteral` order not semantically meaningful; canonical serialization sorts keys.)
+
+---
+
+## IR-025 Pattern Semantics
+
+(Already covered in IR‑012 and IR‑013.)
+
+---
+
+## IR-026 Action Semantics
+
+Actions map directly to Kernel SPEC 013‑015.
+
+**Commit order:** `CreateNode`, `CreateEdge`, `UpdateField`, `DeleteEdge`, `DeleteNode`.
+
+**Identifier allocation order:** Within each commit phase, identifiers allocated in action order. Global identifier ordering is defined per Kernel SPEC 003: lexicographic by type name, then numeric sequence.
+
+**Temporary handles:** Not allowed in `UpdateField` or `EmitEvent`.
+
+---
+
+## IR-027 Complete Dependency Catalog
+
+| Dependency | Fields | Maps to (Kernel) |
+|------------|--------|------------------|
+| `NodeExistence` | `node` (variable) | `node.existence_version` |
+| `EdgeExistence` | `edge` (variable) | `edge.existence_version` |
+| `Field` | `element` (variable), `field` | `field_versions[field]` |
+| `Predicate` | `type`, `field` | `predicate_version[type][field]` |
+| `Extent` | `type` | `extent_version[type]` |
+| `Ordering` | `type`, `field` | `ordering_dependency_version[type][field]` |
+| `EdgePredicate` | `edge_type`, `field` | `edge_predicate_version[edge_type][field]` |
+| `EdgeOrdering` | `edge_type`, `field` | `edge_ordering_dependency_version[edge_type][field]` |
+| `EdgeType` | `edge_type` | `edge_type_version[edge_type]` |
+| `Adjacency` | `node` (variable), `edge_type`, `direction` | `adjacency_version[node][edge_type][direction]` |
+
+Allowed directions: `"incoming"`, `"outgoing"`.
+
+---
+
+## IR-028 IR Invariants
+
+- **Determinism** – Identical IR and identical input state produce identical observable behavior.
+- **Explicitness** – All executable behavior is represented explicitly.
+- **Canonicality** – Equivalent IR documents serialize identically.
+- **Type Safety** – All field references resolve to declared fields.
+- **Dependency Completeness** – All observable reads are represented through the dependency model.
+- **Stable Identity** – Type, function, and rule identifiers remain stable across serialization.
+- **Serialization Unification** – Every normative textual artifact (IR document, match key, golden file, serialized dependency snapshot, error record) uses GRISP Canonical JSON (IR-018) without exception.
+
+---
+
+# Appendix A: Dependency Extraction (Normative)
+
+This appendix defines a deterministic algorithm for extracting dependencies from any Canonical IR construct. All conformant engines SHALL implement dependency extraction that is observably equivalent to the rules defined herein.
+
+## A.1 Core Principles
+- Dependency extraction is **static** with respect to the IR, but accounts for declared reads of effect‑deterministic functions.
+- Extraction does **not** depend on runtime values.
+- Short‑circuit evaluation does **not** affect extraction: all branches are always traversed.
+- The output is a **multiset** of dependencies (ordered by traversal). Engines may canonicalize to a set, but observable validation behavior must be identical.
+
+## A.2 Traversal Algorithm (Pseudocode)
+
+```
+function extractDependencies(node):
+  dependencies = empty multiset
+  match node.kind:
+    case "Literal", "Variable", "Constant": return dependencies
+    case "FieldAccess":
+      dependencies.add(Field(node.variable, node.field))
+      return dependencies
+    case "FunctionCall":
+      if function is effect_deterministic:
+        for each dep in function.declared_reads: dependencies.add(dep)
+      for each arg in node.arguments: dependencies.addAll(extractDependencies(arg))
+      return dependencies
+    case "Add","Subtract","Multiply","Divide","Modulo",
+         "Equal","NotEqual","Less","LessEqual","Greater","GreaterEqual":
+      dependencies.addAll(extractDependencies(node.left))
+      dependencies.addAll(extractDependencies(node.right))
+      return dependencies
+    case "And","Or":
+      dependencies.addAll(extractDependencies(node.left))
+      dependencies.addAll(extractDependencies(node.right))
+      return dependencies
+    case "Not": return extractDependencies(node.operand)
+    case "Conditional":
+      dependencies.addAll(extractDependencies(node.condition))
+      dependencies.addAll(extractDependencies(node.then))
+      dependencies.addAll(extractDependencies(node.else))
+      return dependencies
+    case "MapLiteral":
+      for each (key, valueExpr) in node.entries: dependencies.addAll(extractDependencies(valueExpr))
+      return dependencies
+    case "Array":
+      for each elem in node.elements: dependencies.addAll(extractDependencies(elem))
+      return dependencies
+    case "Binding": return dependencies
+    case "Edge":
+      dependencies.add(EdgeExistence(edge_variable))
+      dependencies.add(EdgeType(node.edge_type))
+      return dependencies
+    case "Existence":
+      if node.element is node: dependencies.add(NodeExistence(node.element))
+      if node.element is edge: dependencies.add(EdgeExistence(node.element))
+      return dependencies
+    case "Let": return extractDependencies(node.expression)
+    case "Collection":
+      dependencies.addAll(extractDependencies(node.collection))
+      if collection implies ordering: dependencies.add(Ordering(...))
+      return dependencies
+    case "Condition": return extractDependencies(node.expression)
+    case "CreateNode","CreateEdge","DeleteNode","DeleteEdge": return dependencies
+    case "UpdateField":
+      dependencies.addAll(extractDependencies(node.value))
+      return dependencies
+    case "EmitEvent": return extractDependencies(node.payload)
+    default: reject("Unknown IR node kind")
+```
+
+## A.3 Normative Dependency Mappings
+
+| When extracting … | Also include … |
+|------------------|----------------|
+| `Field(node, field)` | `NodeExistence(node)`, `Predicate(node.type, field)` |
+| `Field(edge, field)` | `EdgeExistence(edge)`, `EdgePredicate(edge.type, field)` |
+| `Ordering(type, field)` | `Extent(type)` |
+| `EdgeOrdering(edge_type, field)` | `EdgeType(edge_type)` |
+| `Adjacency(node, edge_type, dir)` | `NodeExistence(node)`, `EdgeType(edge_type)` |
+| Iteration over `node.outgoing(edge_type)` | `Adjacency(node, edge_type, outgoing)`, `EdgeType(edge_type)` |
+| `min(type.field)` or `max(type.field)` | `Extent(type)`, `Ordering(type, field)` |
+| `sort(type by field)` | `Extent(type)`, `Ordering(type, field)` |
+| `count(type)` | `Extent(type)` |
+
+## A.4 Worked Examples
+
+**Example 1 – Field access in constraint:**
+```json
+"pattern": [
+  {"kind": "Binding", "variable": "p", "type": "Person"},
+  {"kind": "Constraint", "expression": {"kind": "Less", "left": {"kind": "FieldAccess", "variable": "p", "field": "age"}, "right": {"kind": "Literal", "type": "Integer", "value": 18}}}
+]
+```
+Extracted: `Field(p, age)`, `NodeExistence(p)`, `Predicate(Person, age)`
+
+**Example 2 – EmitEvent with function call:**
+```json
+{"action": "EmitEvent", "event_type": "TaxComputed", "payload": {"kind": "FunctionCall", "function": "CalculateTax", "arguments": [{"kind": "FieldAccess", "variable": "p", "field": "income"}]}}
+```
+If `CalculateTax` is effect_deterministic with `declared_reads = [{"dependency": "Extent", "type": "TaxBracket"}]`, extracted includes `Field(p, income)`, `NodeExistence(p)`, `Predicate(Person, income)`, `Extent(TaxBracket)`.
+
+**Example 3 – Conditional (no short‑circuit):**
+```json
+{"kind": "Conditional", "condition": ..., "then": {"kind": "FieldAccess", "variable": "p", "field": "age"}, "else": {"kind": "FieldAccess", "variable": "p", "field": "height"}}
+```
+Extracted includes **both** `Field(p, age)` and `Field(p, height)` regardless of condition.
+
+---
+
+# Appendix B: Arithmetic Semantics (Normative)
+
+This appendix defines deterministic arithmetic for all operations in Canonical IR, supplementing Kernel SPEC 001.
+
+## B.1 Scope and Evaluation Model
+- All arithmetic is pure and deterministic.
+- Evaluation is tree‑based with no hidden sequencing. No implicit type coercions: mixing `Integer` and `FixedPoint` is invalid IR. Fixed‑point addition/subtraction requires identical scales.
+
+## B.2 Integer Division (`Divide`)
+- Truncation toward zero. Examples: `7/2=3`, `-7/2=-3`, `7/-2=-3`, `-7/-2=3`.
+- Division by zero is fatal.
+
+## B.3 Integer Modulo (`Modulo`)
+- Identity: `a = (a // b) * b + (a % b)` with `//` as above.
+- Sign follows the dividend. Examples: `7%2=1`, `-7%2=-1`, `7%-2=1`, `-7%-2=-1`.
+- Modulo by zero is fatal.
+
+## B.4 Fixed‑Point Arithmetic
+Fixed‑point: real value = `value * 10^(-scale)`. All operations use integer arithmetic with scale handling.
+
+- **Addition/Subtraction:** Scales must match; result scale same; value = v₁ ± v₂.
+- **Multiplication:** Result scale = scale₁+scale₂; value = v₁*v₂.
+- **Division:** Result scale = dividend scale; value = (v₁ * 10^(scale₂)) // v₂ (trunc toward zero).
+- **Comparison:** Exact rational comparison without overflow. Use arbitrary‑precision scaling or cross‑multiplication with overflow detection.
+- **Overflow:** Any overflow (intermediate or final) is fatal. Engines may use wider intermediates.
+
+## B.5 Comparison Semantics
+- Value comparisons only; no epsilon or tolerance.
+- Lists compare lexicographically.
+- Maps not orderable.
+
+## B.6 Mixed‑Type Safety
+- `Integer` and `FixedPoint` cannot be mixed in binary operations. IR validator rejects.
+
+## B.7 No‑Op Detection for Fixed‑Point
+- UpdateField is No‑Op iff stored integer value unchanged.
+
+---
+
+# Appendix C: Counter Optimization Guidance (Normative)
+
+This appendix defines allowed optimizations for version counters without changing observable behavior. Engines MAY implement these optimizations provided they preserve the observable invariants.
+
+## C.1 Observable Invariants
+1. **Per‑operation increments** – Final counter values after commit match Kernel SPEC 015/010.
+2. **Existence and field versions** – Values as required by spec.
+3. **Adjacency and edge_type versions** – Increments as specified.
+4. **Deterministic ordering** – Unchanged.
+5. **Counter monotonicity** – Strictly increasing, no wrap (overflow fatal).
+
+All invariants apply to the post‑commit state of a tick.
+
+## C.2 Allowed Internal Strategies
+- **Sparse counters** – Store only changed counters; materialize on demand from snapshot.
+- **Batched increments** – Aggregate increments within a single commit; apply atomically.
+- **Epoching with checkpointing** – Maintain epoch + deltas; advance epoch deterministically.
+- **Hierarchical counters** – Coarse + fine deltas; resolve deterministically.
+- **On‑demand materialization** – Materialize only when needed, using snapshot state.
+
+## C.3 Prohibited Optimizations
+- Delayed increment, counter reuse/reset, optimistic validation, rounding, reordering that changes final counter vector, partial visibility, nondeterministic lazy computation, identifier reuse, changing which counters are in a match snapshot.
+
+## C.4 Test Vectors (for engine validation)
+
+| Vector | Initial | Action | Expected Counter Changes |
+|--------|---------|--------|--------------------------|
+| 1 | empty | CreateNode(Person) | `extent_version[Person]+1`, existence_version=1, field_versions=1 |
+| 2 | Node A exists | CreateNode(B), CreateEdge(Friendship A→B), DeleteNode(B) | `edge_type_version` increments twice (create+auto‑delete); adjacency_version increments per incident edge |
+| 3 | p.age=30, field_version=5 | UpdateField(p,age,30) | No change (No‑Op) |
+| 4 | Tick N: CreateNode(X); Tick N+1: UpdateField(X,f) | – | existence_version=1 at creation; field_version=1 at creation then 2 after update |
+| 5 | Node N with 3 incident edges type E | DeleteNode(N) | adjacency_version increments 3 times per direction/type |
+| 6 | Person with ordering by score | UpdateField(Person:1,score) | `ordering_dependency_version[Person][score]`+1; extent_version unchanged |
+| 7 | Function F declares Extent(T) only | EmitEvent with F that reads Predicate(T,field) | Invalid IR (under‑declared) – reject |
+| 8 | Large fixed‑point near 64‑bit limit | Multiply causing overflow | Fatal conformance error |
+
+---
+
+# Conformance Pack (Summary)
+
+The conformance pack provides five canonical manifests in GRISP Canonical JSON with expected golden file fragments. Full details are in the companion *GRISP Conformance Test Suite* document. The manifests exercise:
+
+1. **Basic node creation and field update** – tests `CreateNode`, `UpdateField`, No‑Op detection.
+2. **Edge creation and traversal** – tests `CreateEdge`, adjacency iteration, `Collection` pattern.
+3. **Match lifecycle and aging** – tests `match_age`, rule selection, tie‑breaking.
+4. **DeleteNode with automatic incident edge removal** – tests deletion cascade, cumulative counters.
+5. **Fatal conformance error (division by zero)** – tests error recording and halt.
+
+Engine implementers MUST run these manifests and compare golden files byte‑exactly using the runner checklist provided in the conformance pack.
+
+---
+
+*End of GRISP Canonical IR Specification v0.29v7*

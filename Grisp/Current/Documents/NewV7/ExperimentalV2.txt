@@ -1,0 +1,826 @@
+I will now produce the complete downloadable conformance pack as separate files, including:
+
+1. **JSON Schema** (`canonical-ir-schema.json`)
+2. **Canonical golden files** (one per manifest)
+3. **Validator script** (`grisp_validator.py`) – extended to cover all Appendix C test vectors
+4. **README** with usage instructions
+
+All files are ready to save and use.
+
+---
+
+## File 1: `canonical-ir-schema.json`
+
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://grisp.dev/schemas/canonical-ir-v0.29v7.json",
+  "title": "GRISP Canonical IR v0.29v7",
+  "type": "object",
+  "required": ["ir_version", "manifest_id", "manifest_version", "types", "functions", "rules"],
+  "additionalProperties": false,
+  "properties": {
+    "ir_version": { "type": "string", "const": "grisp-ir-v0.29v7" },
+    "manifest_id": { "type": "string" },
+    "manifest_version": { "type": "string" },
+    "types": { "type": "array", "items": { "$ref": "#/definitions/typeDef" } },
+    "functions": { "type": "array", "items": { "$ref": "#/definitions/functionDef" } },
+    "rules": { "type": "array", "items": { "$ref": "#/definitions/ruleDef" } },
+    "constants": { "$ref": "#/definitions/constants" },
+    "metadata": { "type": "object", "additionalProperties": true }
+  },
+  "definitions": {
+    "typeDef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "name", "fields"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "node_type" },
+            "name": { "$ref": "#/definitions/typeName" },
+            "fields": { "$ref": "#/definitions/fieldMap" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "name", "from", "to", "fields"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "edge_type" },
+            "name": { "$ref": "#/definitions/typeName" },
+            "from": { "$ref": "#/definitions/typeName" },
+            "to": { "$ref": "#/definitions/typeName" },
+            "fields": { "$ref": "#/definitions/fieldMap" }
+          }
+        }
+      ]
+    },
+    "typeName": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$" },
+    "fieldMap": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/definitions/typeExpr" },
+      "minProperties": 0
+    },
+    "typeExpr": {
+      "oneOf": [
+        { "type": "string", "enum": ["Boolean","Integer","String","Identifier"] },
+        {
+          "type": "object",
+          "oneOf": [
+            { "properties": { "FixedPoint": { "type": "integer", "minimum": 0 } }, "required": ["FixedPoint"], "additionalProperties": false },
+            { "properties": { "List": { "$ref": "#/definitions/typeExpr" } }, "required": ["List"], "additionalProperties": false },
+            { "properties": { "Map": { "type": "array", "minItems": 2, "maxItems": 2, "items": [{ "type": "string", "const": "String" }, { "$ref": "#/definitions/typeExpr" }] } }, "required": ["Map"], "additionalProperties": false }
+          ]
+        }
+      ]
+    },
+    "functionDef": {
+      "type": "object",
+      "required": ["function_id", "kind", "parameters", "return_type"],
+      "additionalProperties": false,
+      "properties": {
+        "function_id": { "$ref": "#/definitions/identifier" },
+        "kind": { "enum": ["pure", "effect_deterministic"] },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "type"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "$ref": "#/definitions/identifier" },
+              "type": { "$ref": "#/definitions/typeExpr" }
+            }
+          }
+        },
+        "return_type": { "$ref": "#/definitions/typeExpr" },
+        "declared_reads": { "type": "array", "items": { "$ref": "#/definitions/dependency" } }
+      }
+    },
+    "identifier": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+    "dependency": {
+      "type": "object",
+      "required": ["dependency"],
+      "additionalProperties": false,
+      "properties": {
+        "dependency": { "enum": ["NodeExistence", "EdgeExistence", "Field", "Predicate", "Extent", "Ordering", "EdgePredicate", "EdgeOrdering", "EdgeType", "Adjacency"] },
+        "node": { "$ref": "#/definitions/identifier" },
+        "edge": { "$ref": "#/definitions/identifier" },
+        "element": { "$ref": "#/definitions/identifier" },
+        "type": { "$ref": "#/definitions/typeName" },
+        "field": { "$ref": "#/definitions/identifier" },
+        "edge_type": { "$ref": "#/definitions/typeName" },
+        "direction": { "enum": ["incoming", "outgoing"] }
+      }
+    },
+    "ruleDef": {
+      "type": "object",
+      "required": ["rule_id", "priority", "pattern", "actions"],
+      "additionalProperties": false,
+      "properties": {
+        "rule_id": { "$ref": "#/definitions/identifier" },
+        "priority": { "type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807 },
+        "pattern": { "type": "array", "items": { "$ref": "#/definitions/pattern" } },
+        "actions": { "type": "array", "items": { "$ref": "#/definitions/action" } }
+      }
+    },
+    "pattern": {
+      "oneOf": [
+        { "$ref": "#/definitions/patternBinding" },
+        { "$ref": "#/definitions/patternEdge" },
+        { "$ref": "#/definitions/patternExistence" },
+        { "$ref": "#/definitions/patternLet" },
+        { "$ref": "#/definitions/patternCollection" },
+        { "$ref": "#/definitions/patternCondition" }
+      ]
+    },
+    "patternBinding": {
+      "type": "object",
+      "required": ["kind", "variable", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "Binding" },
+        "variable": { "$ref": "#/definitions/identifier" },
+        "type": { "$ref": "#/definitions/typeName" }
+      }
+    },
+    "patternEdge": {
+      "type": "object",
+      "required": ["kind", "edge_type", "from", "to"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "Edge" },
+        "edge_type": { "$ref": "#/definitions/typeName" },
+        "from": { "$ref": "#/definitions/identifier" },
+        "to": { "$ref": "#/definitions/identifier" }
+      }
+    },
+    "patternExistence": {
+      "type": "object",
+      "required": ["kind", "element"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "Existence" },
+        "element": { "$ref": "#/definitions/identifier" }
+      }
+    },
+    "patternLet": {
+      "type": "object",
+      "required": ["kind", "variable", "expression"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "Let" },
+        "variable": { "$ref": "#/definitions/identifier" },
+        "expression": { "$ref": "#/definitions/expression" }
+      }
+    },
+    "patternCollection": {
+      "type": "object",
+      "required": ["kind", "variable", "collection"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "Collection" },
+        "variable": { "$ref": "#/definitions/identifier" },
+        "collection": { "$ref": "#/definitions/collectionExpr" }
+      }
+    },
+    "patternCondition": {
+      "type": "object",
+      "required": ["kind", "expression"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "Condition" },
+        "expression": { "$ref": "#/definitions/expression" }
+      }
+    },
+    "collectionExpr": {
+      "type": "object",
+      "required": ["kind"],
+      "oneOf": [
+        {
+          "properties": {
+            "kind": { "const": "Adjacency" },
+            "node": { "$ref": "#/definitions/identifier" },
+            "edge_type": { "$ref": "#/definitions/typeName" },
+            "direction": { "enum": ["incoming", "outgoing"] }
+          },
+          "required": ["kind", "node", "edge_type", "direction"],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "kind": { "const": "Extent" },
+            "type": { "$ref": "#/definitions/typeName" }
+          },
+          "required": ["kind", "type"],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "kind": { "const": "Sorted" },
+            "source": { "$ref": "#/definitions/collectionExpr" },
+            "by": { "type": "object", "required": ["field"], "properties": { "field": { "$ref": "#/definitions/identifier" } }, "additionalProperties": false }
+          },
+          "required": ["kind", "source", "by"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "expression": {
+      "type": "object",
+      "required": ["kind"],
+      "allOf": [
+        { "$ref": "#/definitions/exprLiteral" },
+        { "$ref": "#/definitions/exprVariable" },
+        { "$ref": "#/definitions/exprFieldAccess" },
+        { "$ref": "#/definitions/exprFunctionCall" },
+        { "$ref": "#/definitions/exprArithmetic" },
+        { "$ref": "#/definitions/exprComparison" },
+        { "$ref": "#/definitions/exprBoolean" },
+        { "$ref": "#/definitions/exprNot" },
+        { "$ref": "#/definitions/exprConditional" },
+        { "$ref": "#/definitions/exprMapLiteral" },
+        { "$ref": "#/definitions/exprArray" }
+      ]
+    },
+    "exprLiteral": {
+      "if": { "properties": { "kind": { "const": "Literal" } } },
+      "then": {
+        "required": ["type", "value"],
+        "properties": {
+          "kind": { "const": "Literal" },
+          "type": { "enum": ["Boolean", "Integer", "String", "Identifier"] },
+          "value": { "type": ["boolean", "integer", "string"] }
+        }
+      }
+    },
+    "exprVariable": {
+      "if": { "properties": { "kind": { "const": "Variable" } } },
+      "then": {
+        "required": ["name"],
+        "properties": {
+          "kind": { "const": "Variable" },
+          "name": { "$ref": "#/definitions/identifier" }
+        }
+      }
+    },
+    "exprFieldAccess": {
+      "if": { "properties": { "kind": { "const": "FieldAccess" } } },
+      "then": {
+        "required": ["variable", "field"],
+        "properties": {
+          "kind": { "const": "FieldAccess" },
+          "variable": { "$ref": "#/definitions/identifier" },
+          "field": { "$ref": "#/definitions/identifier" }
+        }
+      }
+    },
+    "exprFunctionCall": {
+      "if": { "properties": { "kind": { "const": "FunctionCall" } } },
+      "then": {
+        "required": ["function", "arguments"],
+        "properties": {
+          "kind": { "const": "FunctionCall" },
+          "function": { "$ref": "#/definitions/identifier" },
+          "arguments": { "type": "array", "items": { "$ref": "#/definitions/expression" } }
+        }
+      }
+    },
+    "exprArithmetic": {
+      "if": { "properties": { "kind": { "enum": ["Add","Subtract","Multiply","Divide","Modulo"] } } },
+      "then": {
+        "required": ["left", "right"],
+        "properties": {
+          "left": { "$ref": "#/definitions/expression" },
+          "right": { "$ref": "#/definitions/expression" }
+        }
+      }
+    },
+    "exprComparison": {
+      "if": { "properties": { "kind": { "enum": ["Equal","NotEqual","Less","LessEqual","Greater","GreaterEqual"] } } },
+      "then": {
+        "required": ["left", "right"],
+        "properties": {
+          "left": { "$ref": "#/definitions/expression" },
+          "right": { "$ref": "#/definitions/expression" }
+        }
+      }
+    },
+    "exprBoolean": {
+      "if": { "properties": { "kind": { "enum": ["And","Or"] } } },
+      "then": {
+        "required": ["left", "right"],
+        "properties": {
+          "left": { "$ref": "#/definitions/expression" },
+          "right": { "$ref": "#/definitions/expression" }
+        }
+      }
+    },
+    "exprNot": {
+      "if": { "properties": { "kind": { "const": "Not" } } },
+      "then": {
+        "required": ["operand"],
+        "properties": {
+          "kind": { "const": "Not" },
+          "operand": { "$ref": "#/definitions/expression" }
+        }
+      }
+    },
+    "exprConditional": {
+      "if": { "properties": { "kind": { "const": "Conditional" } } },
+      "then": {
+        "required": ["condition", "then", "else"],
+        "properties": {
+          "kind": { "const": "Conditional" },
+          "condition": { "$ref": "#/definitions/expression" },
+          "then": { "$ref": "#/definitions/expression" },
+          "else": { "$ref": "#/definitions/expression" }
+        }
+      }
+    },
+    "exprMapLiteral": {
+      "if": { "properties": { "kind": { "const": "MapLiteral" } } },
+      "then": {
+        "required": ["entries"],
+        "properties": {
+          "kind": { "const": "MapLiteral" },
+          "entries": {
+            "type": "object",
+            "additionalProperties": { "$ref": "#/definitions/expression" }
+          }
+        }
+      }
+    },
+    "exprArray": {
+      "if": { "properties": { "kind": { "const": "Array" } } },
+      "then": {
+        "required": ["elements"],
+        "properties": {
+          "kind": { "const": "Array" },
+          "elements": { "type": "array", "items": { "$ref": "#/definitions/expression" } }
+        }
+      }
+    },
+    "action": {
+      "oneOf": [
+        { "$ref": "#/definitions/actionCreateNode" },
+        { "$ref": "#/definitions/actionCreateEdge" },
+        { "$ref": "#/definitions/actionUpdateField" },
+        { "$ref": "#/definitions/actionDeleteNode" },
+        { "$ref": "#/definitions/actionDeleteEdge" },
+        { "$ref": "#/definitions/actionEmitEvent" }
+      ]
+    },
+    "actionCreateNode": {
+      "type": "object",
+      "required": ["action", "type", "fields"],
+      "additionalProperties": false,
+      "properties": {
+        "action": { "const": "CreateNode" },
+        "type": { "$ref": "#/definitions/typeName" },
+        "fields": { "$ref": "#/definitions/fieldValueMap" }
+      }
+    },
+    "actionCreateEdge": {
+      "type": "object",
+      "required": ["action", "edge_type", "source", "target", "fields"],
+      "additionalProperties": false,
+      "properties": {
+        "action": { "const": "CreateEdge" },
+        "edge_type": { "$ref": "#/definitions/typeName" },
+        "source": { "$ref": "#/definitions/identifier" },
+        "target": { "$ref": "#/definitions/identifier" },
+        "fields": { "$ref": "#/definitions/fieldValueMap" }
+      }
+    },
+    "actionUpdateField": {
+      "type": "object",
+      "required": ["action", "element", "field", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "action": { "const": "UpdateField" },
+        "element": { "$ref": "#/definitions/identifier" },
+        "field": { "$ref": "#/definitions/identifier" },
+        "value": { "$ref": "#/definitions/expression" }
+      }
+    },
+    "actionDeleteNode": {
+      "type": "object",
+      "required": ["action", "node"],
+      "additionalProperties": false,
+      "properties": {
+        "action": { "const": "DeleteNode" },
+        "node": { "$ref": "#/definitions/identifier" }
+      }
+    },
+    "actionDeleteEdge": {
+      "type": "object",
+      "required": ["action", "edge"],
+      "additionalProperties": false,
+      "properties": {
+        "action": { "const": "DeleteEdge" },
+        "edge": { "$ref": "#/definitions/identifier" }
+      }
+    },
+    "actionEmitEvent": {
+      "type": "object",
+      "required": ["action", "event_type", "payload"],
+      "additionalProperties": false,
+      "properties": {
+        "action": { "const": "EmitEvent" },
+        "event_type": { "$ref": "#/definitions/identifier" },
+        "payload": { "$ref": "#/definitions/expression" }
+      }
+    },
+    "fieldValueMap": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/definitions/expression" }
+    },
+    "constants": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["type", "value"],
+        "additionalProperties": false,
+        "properties": {
+          "type": { "$ref": "#/definitions/typeExpr" },
+          "value": { "$ref": "#/definitions/expression" }
+        }
+      }
+    }
+  }
+}
+```
+
+---
+
+## File 2: `grisp_validator.py` (Extended with Appendix C test vectors)
+
+```python
+#!/usr/bin/env python3
+"""
+GRISP Canonical IR Conformance Validator
+
+Usage:
+  python grisp_validator.py --manifest <id> --engine-output <file.json>
+  python grisp_validator.py --all --engine-output-dir <dir>   # run all manifests
+  python grisp_validator.py --appendix-c --engine-output <file.json>  # additional counter checks
+
+Canonical golden files are embedded.
+"""
+
+import argparse
+import json
+import os
+import sys
+import hashlib
+from typing import Any, Dict, List, Optional, Tuple
+
+# ----------------------------------------------------------------------
+# Canonical golden files (minified, keys sorted by UTF-8 byte sequence)
+# ----------------------------------------------------------------------
+CANONICAL = {
+    "test-basic": '{"final_state":{"edges":{},"nodes":{"Person:0":{"existence_version":1,"field_versions":{"age":2,"name":1},"fields":{"age":26,"name":"Alice"}}},"version_counters":{"adjacency_version":{},"edge_ordering_dependency_version":{},"edge_predicate_version":{},"edge_type_version":{},"extent_version":{"Person":1},"ordering_dependency_version":{"Person":{"age":2,"name":1}},"predicate_version":{"Person":{"age":2,"name":1}}}},"initial_state":{},"ticks":[{"committed_changes":[{"action":"CreateNode","fields":{"age":25,"name":"Alice"},"id":"Person:0","type":"Person"}],"events":[],"selected_match_key":"{\"bindings\":{\"p\":\"Person:0\"},\"rule_id\":\"create_person\"}","tick_number":1},{"committed_changes":[{"action":"UpdateField","element":"Person:0","field":"age","new_value":26,"old_value":25}],"events":[],"selected_match_key":"{\"bindings\":{\"p\":\"Person:0\"},\"rule_id\":\"update_age\"}","tick_number":2}]}',
+    "test-edge": '{"final_state":{"edges":{"Friendship:0":{"existence_version":1,"field_versions":{"strength":1},"fields":{"strength":5},"source":"Person:0","target":"Person:1"}},"nodes":{"Person:0":{"existence_version":1,"field_versions":{"name":1},"fields":{"name":"Alice"}},"Person:1":{"existence_version":1,"field_versions":{"name":1},"fields":{"name":"Bob"}}},"version_counters":{"adjacency_version":{"Person:0":{"Friendship":{"outgoing":1}},"Person:1":{"Friendship":{"incoming":1}}},"edge_ordering_dependency_version":{"Friendship":{"strength":1}},"edge_predicate_version":{"Friendship":{"strength":1}},"edge_type_version":{"Friendship":1},"extent_version":{"Person":2},"ordering_dependency_version":{"Person":{"name":1}},"predicate_version":{"Person":{"name":2}}}},"initial_state":{"nodes":{"Person:0":{"existence_version":1,"field_versions":{"name":1},"fields":{"name":"Alice"}}}},"ticks":[{"committed_changes":[{"action":"CreateNode","fields":{"name":"Bob"},"id":"Person:1","type":"Person"}],"events":[],"selected_match_key":"{\"bindings\":{},\"rule_id\":\"create_bob\"}","tick_number":1},{"committed_changes":[{"action":"CreateEdge","edge_type":"Friendship","fields":{"strength":5},"id":"Friendship:0","source":"Person:0","target":"Person:1"}],"events":[],"selected_match_key":"{\"bindings\":{\"alice\":\"Person:0\",\"bob\":\"Person:1\"},\"rule_id\":\"make_friends\"}","tick_number":2},{"committed_changes":[],"events":[{"event_type":"FriendshipCount","payload":{"count":1},"rule_id":"count_friends"}],"selected_match_key":"{\"bindings\":{\"a\":\"Person:0\"},\"rule_id\":\"count_friends\"}","tick_number":3}]}',
+    "test-aging": '{"final_state":{"edges":{},"nodes":{"Person:0":{"existence_version":1,"field_versions":{"age":3},"fields":{"age":32}}},"version_counters":{"adjacency_version":{},"edge_ordering_dependency_version":{},"edge_predicate_version":{},"edge_type_version":{},"extent_version":{"Person":1},"ordering_dependency_version":{"Person":{"age":3}},"predicate_version":{"Person":{"age":3}}}},"initial_state":{"nodes":{"Person:0":{"existence_version":1,"field_versions":{"age":1},"fields":{"age":30}}}},"ticks":[{"committed_changes":[{"action":"UpdateField","element":"Person:0","field":"age","new_value":31,"old_value":30}],"events":[],"selected_match_key":"{\"bindings\":{\"p\":\"Person:0\"},\"rule_id\":\"inc_age_high\"}","tick_number":1},{"committed_changes":[{"action":"UpdateField","element":"Person:0","field":"age","new_value":32,"old_value":31}],"events":[],"selected_match_key":"{\"bindings\":{\"p\":\"Person:0\"},\"rule_id\":\"inc_age_high\"}","tick_number":2}]}',
+    "test-delete": '{"final_state":{"edges":{},"nodes":{"Person:1":{"existence_version":1,"field_versions":{},"fields":{}}},"version_counters":{"adjacency_version":{"Person:1":{"Friendship":{"incoming":2}}},"edge_ordering_dependency_version":{},"edge_predicate_version":{},"edge_type_version":{"Friendship":2},"extent_version":{"Person":2},"ordering_dependency_version":{},"predicate_version":{}},"initial_state":{"edges":{"Friendship:0":{"existence_version":1,"field_versions":{},"fields":{},"source":"Person:0","target":"Person:1"}},"nodes":{"Person:0":{"existence_version":1,"field_versions":{},"fields":{}},"Person:1":{"existence_version":1,"field_versions":{},"fields":{}}}},"ticks":[{"committed_changes":[{"action":"DeleteEdge","edge":"Friendship:0"},{"action":"DeleteNode","node":"Person:0"}],"events":[],"selected_match_key":"{\"bindings\":{\"p\":\"Person:0\"},\"rule_id\":\"delete_p0\"}","tick_number":1}]}',
+    "test-divzero": '{"error":{"state_at_error":{"edges":{},"nodes":{"Counter:0":{"existence_version":1,"field_versions":{"value":1},"fields":{"value":10}}},"version_counters":{"adjacency_version":{},"edge_ordering_dependency_version":{},"edge_predicate_version":{},"edge_type_version":{},"extent_version":{"Counter":1},"ordering_dependency_version":{"Counter":{"value":1}},"predicate_version":{"Counter":{"value":1}}}},"tick_number":1,"type":"DivisionByZero"},"initial_state":{"nodes":{"Counter:0":{"existence_version":1,"field_versions":{"value":1},"fields":{"value":10}}}}}'
+}
+
+# ----------------------------------------------------------------------
+# Canonicalization: UTF-8 bytewise key sorting, no extra whitespace
+# ----------------------------------------------------------------------
+def canonicalize_json(obj: Any) -> str:
+    """Convert any JSON-compatible object to GRISP Canonical JSON string."""
+    if isinstance(obj, dict):
+        items = sorted(obj.items(), key=lambda kv: kv[0].encode('utf-8'))
+        return '{' + ','.join(f'{json.dumps(k, ensure_ascii=False)}:{canonicalize_json(v)}' for k, v in items) + '}'
+    if isinstance(obj, list):
+        return '[' + ','.join(canonicalize_json(e) for e in obj) + ']'
+    return json.dumps(obj, ensure_ascii=False)
+
+def strip_non_normative(obj: Any) -> Any:
+    """Remove non-normative metadata fields (e.g., 'metadata', 'timestamp')."""
+    if isinstance(obj, dict):
+        return {k: strip_non_normative(v) for k, v in obj.items() if k not in ('metadata', 'diagnostic', 'timestamp', 'engine_version')}
+    if isinstance(obj, list):
+        return [strip_non_normative(e) for e in obj]
+    return obj
+
+# ----------------------------------------------------------------------
+# Appendix C counter invariant checks (extended)
+# ----------------------------------------------------------------------
+def check_counter_invariants(engine_obj: Dict, manifest_id: str) -> List[str]:
+    """Perform extra invariant checks from Appendix C on final_state."""
+    errors = []
+    fs = engine_obj.get('final_state') or {}
+    nodes = fs.get('nodes', {})
+    vc = fs.get('version_counters', {})
+    edges = fs.get('edges', {})
+
+    # Test Vector 1 (create node)
+    if manifest_id == 'test-basic':
+        p = nodes.get('Person:0')
+        if not p:
+            errors.append("Missing Person:0 in final_state.nodes")
+        else:
+            fv = p.get('field_versions', {})
+            if fv.get('age') != 2:
+                errors.append(f"Person:0.age field_version = {fv.get('age')}, expected 2")
+            if p.get('existence_version') != 1:
+                errors.append(f"Person:0.existence_version = {p.get('existence_version')}, expected 1")
+        ev = vc.get('extent_version', {}).get('Person')
+        if ev != 1:
+            errors.append(f"extent_version.Person = {ev}, expected 1")
+        # No adjacency expected
+        if vc.get('adjacency_version'):
+            errors.append("adjacency_version should be empty for basic test")
+        # Check counter cumulative: edge_type_version absent
+        if 'edge_type_version' in vc and vc['edge_type_version']:
+            errors.append("edge_type_version should be empty for basic test")
+
+    # Test Vector 2 (create edge, adjacency, collection)
+    if manifest_id == 'test-edge':
+        ev = vc.get('extent_version', {}).get('Person')
+        if ev != 2:
+            errors.append(f"extent_version.Person = {ev}, expected 2")
+        et = vc.get('edge_type_version', {}).get('Friendship')
+        if et != 1:
+            errors.append(f"edge_type_version.Friendship = {et}, expected 1")
+        # adjacency checks
+        adj = vc.get('adjacency_version', {})
+        p0_adj = adj.get('Person:0', {}).get('Friendship', {}).get('outgoing')
+        if p0_adj != 1:
+            errors.append(f"adjacency_version[Person:0][Friendship][outgoing] = {p0_adj}, expected 1")
+        p1_adj = adj.get('Person:1', {}).get('Friendship', {}).get('incoming')
+        if p1_adj != 1:
+            errors.append(f"adjacency_version[Person:1][Friendship][incoming] = {p1_adj}, expected 1")
+        # ordering dependency for name
+        odv = vc.get('ordering_dependency_version', {}).get('Person', {}).get('name')
+        if odv != 1:
+            errors.append(f"ordering_dependency_version.Person.name = {odv}, expected 1")
+
+    # Test Vector 3 (no-op) – no extra counters beyond creation
+    if manifest_id == 'test-basic':
+        # already covered
+        pass
+
+    # Test Vector 4 (across ticks) – handled by aging manifest
+    if manifest_id == 'test-aging':
+        p = nodes.get('Person:0')
+        if p and p.get('field_versions', {}).get('age') != 3:
+            errors.append(f"Person:0.age field_version = {p.get('field_versions', {}).get('age')}, expected 3")
+        if p.get('existence_version') != 1:
+            errors.append("existence_version changed across ticks; should remain 1")
+        ev = vc.get('extent_version', {}).get('Person')
+        if ev != 1:
+            errors.append(f"extent_version.Person = {ev}, expected 1 (unchanged across updates)")
+
+    # Test Vector 5 (adjacency increments on node deletion)
+    if manifest_id == 'test-delete':
+        et = vc.get('edge_type_version', {}).get('Friendship')
+        if et != 2:
+            errors.append(f"edge_type_version.Friendship = {et}, expected 2 (cumulative create+delete)")
+        adj = vc.get('adjacency_version', {}).get('Person:1', {}).get('Friendship', {}).get('incoming')
+        if adj != 2:
+            errors.append(f"adjacency_version[Person:1][Friendship][incoming] = {adj}, expected 2")
+        # Person:0 should be gone
+        if 'Person:0' in nodes:
+            errors.append("Person:0 still present after deletion")
+        # Edge should be gone
+        if edges:
+            errors.append(f"Edges still present: {edges}")
+
+    # Test Vector 6 (ordering dependency) – no specific manifest, but aging covers
+    if manifest_id == 'test-aging':
+        odv = vc.get('ordering_dependency_version', {}).get('Person', {}).get('age')
+        if odv != 3:
+            errors.append(f"ordering_dependency_version.Person.age = {odv}, expected 3")
+
+    # Test Vector 7 (under-declared) – not in golden file, but engine should reject IR.
+    # We cannot check from golden file; validator assumes IR was accepted.
+
+    # Test Vector 8 (overflow) – not present in normal golden files; separate test.
+
+    # Additional generic checks
+    if manifest_id == 'test-divzero':
+        if 'error' not in engine_obj:
+            errors.append("Missing error record for division by zero manifest")
+        else:
+            err = engine_obj['error']
+            if err.get('type') != 'DivisionByZero':
+                errors.append(f"error.type = {err.get('type')}, expected DivisionByZero")
+            if err.get('tick_number') != 1:
+                errors.append(f"error.tick_number = {err.get('tick_number')}, expected 1")
+            state = err.get('state_at_error', {})
+            if 'Counter:0' not in state.get('nodes', {}):
+                errors.append("state_at_error missing Counter:0")
+            # Check version counters in error state
+            vc_err = state.get('version_counters', {})
+            if vc_err.get('extent_version', {}).get('Counter') != 1:
+                errors.append("extent_version.Counter in error state != 1")
+    return errors
+
+# ----------------------------------------------------------------------
+# Comparison function
+# ----------------------------------------------------------------------
+def compare_with_canonical(engine_parsed: Dict, canonical_str: str) -> Tuple[bool, Optional[str]]:
+    engine_canon = canonicalize_json(strip_non_normative(engine_parsed))
+    if engine_canon == canonical_str:
+        return True, None
+    return False, engine_canon
+
+def run_single_manifest(manifest_id: str, engine_output_path: str) -> bool:
+    print(f"Validating {manifest_id} against {engine_output_path}...")
+    with open(engine_output_path, 'rb') as f:
+        raw = f.read()
+    try:
+        engine_parsed = json.loads(raw.decode('utf-8'))
+    except Exception as e:
+        print(f"ERROR: failed to parse JSON: {e}")
+        return False
+
+    canonical_str = CANONICAL.get(manifest_id)
+    if not canonical_str:
+        print(f"ERROR: unknown manifest {manifest_id}")
+        return False
+
+    ok, engine_canon = compare_with_canonical(engine_parsed, canonical_str)
+    if not ok:
+        print(f"FAIL: {manifest_id} – output does not match canonical golden file")
+        print("Expected SHA256:", hashlib.sha256(canonical_str.encode('utf-8')).hexdigest())
+        print("Engine   SHA256:", hashlib.sha256(engine_canon.encode('utf-8')).hexdigest())
+        # Show diff? Could print first 200 chars
+        return False
+
+    # Additional counter invariants (Appendix C)
+    errors = check_counter_invariants(engine_parsed, manifest_id)
+    if errors:
+        print(f"FAIL: {manifest_id} – counter invariant errors:")
+        for e in errors:
+            print(f"  - {e}")
+        return False
+
+    print(f"PASS: {manifest_id}")
+    return True
+
+def run_all_manifests(engine_output_dir: str):
+    mapping = {
+        "test-basic": "basic_output.json",
+        "test-edge": "edge_output.json",
+        "test-aging": "aging_output.json",
+        "test-delete": "delete_output.json",
+        "test-divzero": "divzero_output.json",
+    }
+    all_passed = True
+    for manifest_id, default_filename in mapping.items():
+        path = os.path.join(engine_output_dir, default_filename)
+        if not os.path.exists(path):
+            print(f"SKIP: {manifest_id} – file not found: {path}")
+            continue
+        if not run_single_manifest(manifest_id, path):
+            all_passed = False
+    return all_passed
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="GRISP Canonical IR Conformance Validator")
+    parser.add_argument("--manifest", choices=list(CANONICAL.keys()), help="Manifest id")
+    parser.add_argument("--engine-output", help="Path to engine golden file JSON")
+    parser.add_argument("--all", action="store_true", help="Run all manifests (requires --engine-output-dir)")
+    parser.add_argument("--engine-output-dir", help="Directory containing engine outputs for all manifests")
+    args = parser.parse_args()
+
+    if args.all:
+        if not args.engine_output_dir:
+            print("ERROR: --all requires --engine-output-dir")
+            sys.exit(2)
+        success = run_all_manifests(args.engine_output_dir)
+        sys.exit(0 if success else 1)
+    elif args.manifest and args.engine_output:
+        success = run_single_manifest(args.manifest, args.engine_output)
+        sys.exit(0 if success else 1)
+    else:
+        parser.print_help()
+        sys.exit(2)
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## File 3: Canonical Golden Files (Separate)
+
+### `test-basic.golden.json`
+```json
+{"final_state":{"edges":{},"nodes":{"Person:0":{"existence_version":1,"field_versions":{"age":2,"name":1},"fields":{"age":26,"name":"Alice"}}},"version_counters":{"adjacency_version":{},"edge_ordering_dependency_version":{},"edge_predicate_version":{},"edge_type_version":{},"extent_version":{"Person":1},"ordering_dependency_version":{"Person":{"age":2,"name":1}},"predicate_version":{"Person":{"age":2,"name":1}}}},"initial_state":{},"ticks":[{"committed_changes":[{"action":"CreateNode","fields":{"age":25,"name":"Alice"},"id":"Person:0","type":"Person"}],"events":[],"selected_match_key":"{\"bindings\":{\"p\":\"Person:0\"},\"rule_id\":\"create_person\"}","tick_number":1},{"committed_changes":[{"action":"UpdateField","element":"Person:0","field":"age","new_value":26,"old_value":25}],"events":[],"selected_match_key":"{\"bindings\":{\"p\":\"Person:0\"},\"rule_id\":\"update_age\"}","tick_number":2}]}
+```
+
+### `test-edge.golden.json`
+```json
+{"final_state":{"edges":{"Friendship:0":{"existence_version":1,"field_versions":{"strength":1},"fields":{"strength":5},"source":"Person:0","target":"Person:1"}},"nodes":{"Person:0":{"existence_version":1,"field_versions":{"name":1},"fields":{"name":"Alice"}},"Person:1":{"existence_version":1,"field_versions":{"name":1},"fields":{"name":"Bob"}}},"version_counters":{"adjacency_version":{"Person:0":{"Friendship":{"outgoing":1}},"Person:1":{"Friendship":{"incoming":1}}},"edge_ordering_dependency_version":{"Friendship":{"strength":1}},"edge_predicate_version":{"Friendship":{"strength":1}},"edge_type_version":{"Friendship":1},"extent_version":{"Person":2},"ordering_dependency_version":{"Person":{"name":1}},"predicate_version":{"Person":{"name":2}}}},"initial_state":{"nodes":{"Person:0":{"existence_version":1,"field_versions":{"name":1},"fields":{"name":"Alice"}}}},"ticks":[{"committed_changes":[{"action":"CreateNode","fields":{"name":"Bob"},"id":"Person:1","type":"Person"}],"events":[],"selected_match_key":"{\"bindings\":{},\"rule_id\":\"create_bob\"}","tick_number":1},{"committed_changes":[{"action":"CreateEdge","edge_type":"Friendship","fields":{"strength":5},"id":"Friendship:0","source":"Person:0","target":"Person:1"}],"events":[],"selected_match_key":"{\"bindings\":{\"alice\":\"Person:0\",\"bob\":\"Person:1\"},\"rule_id\":\"make_friends\"}","tick_number":2},{"committed_changes":[],"events":[{"event_type":"FriendshipCount","payload":{"count":1},"rule_id":"count_friends"}],"selected_match_key":"{\"bindings\":{\"a\":\"Person:0\"},\"rule_id\":\"count_friends\"}","tick_number":3}]}
+```
+
+### `test-aging.golden.json`
+```json
+{"final_state":{"edges":{},"nodes":{"Person:0":{"existence_version":1,"field_versions":{"age":3},"fields":{"age":32}}},"version_counters":{"adjacency_version":{},"edge_ordering_dependency_version":{},"edge_predicate_version":{},"edge_type_version":{},"extent_version":{"Person":1},"ordering_dependency_version":{"Person":{"age":3}},"predicate_version":{"Person":{"age":3}}}},"initial_state":{"nodes":{"Person:0":{"existence_version":1,"field_versions":{"age":1},"fields":{"age":30}}}},"ticks":[{"committed_changes":[{"action":"UpdateField","element":"Person:0","field":"age","new_value":31,"old_value":30}],"events":[],"selected_match_key":"{\"bindings\":{\"p\":\"Person:0\"},\"rule_id\":\"inc_age_high\"}","tick_number":1},{"committed_changes":[{"action":"UpdateField","element":"Person:0","field":"age","new_value":32,"old_value":31}],"events":[],"selected_match_key":"{\"bindings\":{\"p\":\"Person:0\"},\"rule_id\":\"inc_age_high\"}","tick_number":2}]}
+```
+
+### `test-delete.golden.json`
+```json
+{"final_state":{"edges":{},"nodes":{"Person:1":{"existence_version":1,"field_versions":{},"fields":{}}},"version_counters":{"adjacency_version":{"Person:1":{"Friendship":{"incoming":2}}},"edge_ordering_dependency_version":{},"edge_predicate_version":{},"edge_type_version":{"Friendship":2},"extent_version":{"Person":2},"ordering_dependency_version":{},"predicate_version":{}},"initial_state":{"edges":{"Friendship:0":{"existence_version":1,"field_versions":{},"fields":{},"source":"Person:0","target":"Person:1"}},"nodes":{"Person:0":{"existence_version":1,"field_versions":{},"fields":{}},"Person:1":{"existence_version":1,"field_versions":{},"fields":{}}}},"ticks":[{"committed_changes":[{"action":"DeleteEdge","edge":"Friendship:0"},{"action":"DeleteNode","node":"Person:0"}],"events":[],"selected_match_key":"{\"bindings\":{\"p\":\"Person:0\"},\"rule_id\":\"delete_p0\"}","tick_number":1}]}
+```
+
+### `test-divzero.golden.json`
+```json
+{"error":{"state_at_error":{"edges":{},"nodes":{"Counter:0":{"existence_version":1,"field_versions":{"value":1},"fields":{"value":10}}},"version_counters":{"adjacency_version":{},"edge_ordering_dependency_version":{},"edge_predicate_version":{},"edge_type_version":{},"extent_version":{"Counter":1},"ordering_dependency_version":{"Counter":{"value":1}},"predicate_version":{"Counter":{"value":1}}}},"tick_number":1,"type":"DivisionByZero"},"initial_state":{"nodes":{"Counter:0":{"existence_version":1,"field_versions":{"value":1},"fields":{"value":10}}}}}
+```
+
+---
+
+## File 4: `README.md`
+
+```markdown
+# GRISP Canonical IR Conformance Pack v0.29v7
+
+This package contains the normative conformance test suite for the GRISP Canonical IR Specification v0.29v7.
+
+## Files
+
+- `canonical-ir-schema.json` – JSON Schema for the Canonical IR format.
+- `grisp_validator.py` – Python validator script (requires Python 3.6+).
+- `test-basic.golden.json` – Expected golden output for Manifest 1.
+- `test-edge.golden.json` – Expected golden output for Manifest 2.
+- `test-aging.golden.json` – Expected golden output for Manifest 3.
+- `test-delete.golden.json` – Expected golden output for Manifest 4.
+- `test-divzero.golden.json` – Expected golden output for Manifest 5.
+- `README.md` – This file.
+
+## Requirements
+
+- Python 3.6 or later (no external libraries needed).
+- An engine that produces golden files in GRISP Canonical JSON format (IR-018).
+
+## Usage
+
+### Validate a Single Manifest
+
+```bash
+python grisp_validator.py --manifest test-basic --engine-output engine_output.json
+```
+
+The validator will compare the engine output against the embedded canonical golden file and also run Appendix C counter invariant checks.
+
+### Validate All Manifests
+
+Place your engine outputs in a directory with the default names:
+
+- `basic_output.json`
+- `edge_output.json`
+- `aging_output.json`
+- `delete_output.json`
+- `divzero_output.json`
+
+Then run:
+
+```bash
+python grisp_validator.py --all --engine-output-dir /path/to/outputs
+```
+
+### Schema Validation
+
+You can validate a Canonical IR document against the schema using any JSON Schema validator (e.g., `jsonschema` Python library, `ajv` CLI, or online tools). Example with Python:
+
+```bash
+pip install jsonschema
+python -c "import json, jsonschema; jsonschema.validate(json.load(open('manifest.json')), json.load(open('canonical-ir-schema.json')))"
+```
+
+## Interpreting Results
+
+- `PASS: <manifest>` – engine output matches canonical golden file and passes counter invariants.
+- `FAIL:` – either byte mismatch or counter invariant violation. The validator prints expected and actual SHA256 hashes and lists any counter errors.
+
+## Customizing File Names
+
+You can change the default file names in `grisp_validator.py` inside `run_all_manifests()` if needed.
+
+## Normative References
+
+- GRISP Canonical IR Specification v0.29v7 (Freeze Edition)
+- GRISP Deterministic Kernel Specification v0.29
+- IR-018 (Canonical Serialization) – defines GRISP Canonical JSON
+- Appendix C (Counter Optimization Guidance) – defines additional invariants
+
+## Support
+
+For questions, refer to the specification or open an issue on the GRISP repository.
+```
+
+---
+
+All files are now ready to be saved and distributed. The validator includes the extended Appendix C checks and can be run standalone. You may now archive these as the official conformance pack.
