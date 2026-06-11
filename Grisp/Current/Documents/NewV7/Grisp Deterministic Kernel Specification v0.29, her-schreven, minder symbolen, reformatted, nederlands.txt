@@ -1,0 +1,556 @@
+Hier is de herschreven specificatie in de stijl van versie 0.20, met dezelfde functionele inhoud als versie 0.29. Moeilijke symbolen zijn vervangen door woorden, en de opmaak is rustiger en beter leesbaar gemaakt.
+
+---
+
+# GRISP DETERMINISTIC KERNEL SPECIFICATION v0.29 (herschreven)
+
+## Preambule
+
+Deze specificatie vervangt alle voorgaande versies. Het is een complete, op zichzelf staande definitie van de GRISP Deterministische Kernel. Alle normatieve regels hierin zijn verplicht voor conformiteit. Deze versie wordt beschouwd als de **bevroren kandidaat** voor v1.0.
+
+---
+
+## SPEC 000 KERNPRINCIPES
+
+De GRISP Deterministische Kernel definieert een volledig deterministisch uitvoeringsmodel voor regelgestuurde toestandsovergangen op een getypeerde graaf.
+
+Bij identieke Canonische IR en identieke begintoestand moeten alle conforme engines identiek waarneembaar gedrag produceren.
+
+Waarneembaar gedrag bestaat uitsluitend uit:
+
+* Gepleegde toestandsovergangen
+* Uitgezonden gebeurtenissen
+* Golden file uitvoer
+
+Alle andere implementatiedetails zijn niet-normatief.
+
+De kernel wordt beheerst door de volgende principes:
+
+1. **Determinisme** – Al het waarneembare gedrag moet deterministisch zijn. Verboden zijn: rekenen met drijvende komma, random nummergeneratie, systeemtijd, geheugenadressen, pointeridentiteit, threadplanning, hash-gebaseerde ordening, runtime-metadata, engine-specifiek gedrag.
+
+2. **Explicietheid** – Alle leesbewerkingen, schrijfbewerkingen, afhankelijkheden, identificaties, ordeningsregels en versietellers moeten expliciet worden weergegeven. Impliciete leesbewerkingen zijn niet toegestaan.
+
+3. **Bevroren Ontdekking** – Matchontdekking vindt precies één keer per tik plaats. De resulterende ontdekkingsmomentopname is onveranderlijk voor de rest van de tik.
+
+4. **Afhankelijkheidsvalidatie** – Afhankelijkheidsvalidatie is het enige correctheidsmechanisme. Conflictdetectie bestaat niet.
+
+5. **Enkele Commit** – Hoogstens één transactie mag per tik worden gecommit.
+
+6. **Canonieke Ordening** – Elke geordende bewerking moet een expliciet gedefinieerde deterministische ordening hebben.
+
+7. **Canonieke Serialisatie** – Alle deterministische artefacten moeten canoniek worden geserialiseerd.
+
+8. **Referentiële Transparantie** – Expressies zijn puur. Acties hebben alleen effect tijdens de commit.
+
+9. **Geen Hergebruik van Identificaties** – Identificaties zijn uniek voor de levensduur van de graaf. Verwijderde identificaties mogen nooit worden hergebruikt.
+
+10. **Reproduceerbaarheid tussen Engines** – Alle conforme engines moeten identieke golden files produceren.
+
+**Fatale Conformiteitsfout** – Een fatale conformiteitsfout is een onherstelbare fout die optreedt tijdens uitvoering (bijvoorbeeld rekenkundige overloop, deling door nul, telleroverloop). Bij een dergelijke fout moet de engine de uitvoering onmiddellijk stoppen. Er worden geen verdere tikken verwerkt. De golden file moet de fout en de toestand op het punt van de fout op een deterministische manier vastleggen (bijvoorbeeld het huidige tiknummer en het fouttype). Alle conforme engines moeten voor dezelfde foutconditie identieke golden file uitvoer produceren.
+
+---
+
+## SPEC 001 NUMERIEK MODEL
+
+Alle numerieke waarden zijn ondertekende 64‑bits gehele getallen. Getallen met drijvende komma zijn verboden.
+
+**Vaste‑komma weergave** – Vaste‑komma waarden worden weergegeven als geschaalde gehele getallen. De schaalfactor wordt per veld gedeclareerd (SPEC 002) als een niet-negatief geheel getal dat het aantal fractionele decimale cijfers aangeeft. Voorbeeld: schaal `2` betekent dat het gehele getal `123` staat voor `1.23`.
+
+**Vaste‑komma rekenkunde** – Bewerkingen volgen de regels voor gehele getallen met schaalafhandeling:
+
+- Optellen, aftrekken: de schaalfactoren moeten gelijk zijn; het resultaat heeft dezelfde schaal.
+- Vermenigvuldigen: de schaal van het resultaat is schaal₁ plus schaal₂.
+- **Delen**: Stel dat het deeltal schaal `s_d` heeft en waarde `v_d`, en de deler schaal `s_r` heeft en waarde `v_r`. De quotiëntwaarde wordt berekend als:  
+  `quotiëntwaarde = (v_d × 10^(s_r)) // v_r`  
+  waarbij `//` staat voor gehele deling die afkapt richting nul. De schaal van het resultaat is `s_d`. Dit levert een vaste‑komma getal op met dezelfde fractionele precisie als het deeltal.
+
+- **Vergelijking**: Twee vaste‑komma waarden moeten worden vergeleken zonder rekenkundige overloop. Engines moeten een algoritme gebruiken dat equivalent is aan: vergelijk `v_d × 10^(max(s_d, s_r))` met `v_r × 10^(max(s_d, s_r))` met behulp van rekenkunde met willekeurige precisie (of een veilig alternatief) om overloop te voorkomen. Het resultaat moet overeenkomen met exacte rationale vergelijking.
+
+Als bij optellen of aftrekken ongelijke schalen worden gebruikt, is de IR ongeldig en moet deze worden afgewezen.
+
+**Deling door nul** – Elke delingsbewerking (geheel getal of vaste komma) waarbij de deler tijdens de evaluatie van de expressie nul oplevert, is een fatale conformiteitsfout (uitvoering stopt).
+
+**Overloop** – Elke rekenkundige overloop (inclusief tussenresultaten bij vaste‑komma vergelijkingen) is een fatale conformiteitsfout.
+
+**Geen‑Effect Schrijfbewerking** – Een schrijfbewerking die de gehele‑getal weergave van een veld niet verandert, is een Geen‑Effect Update (SPEC 015).
+
+De volgende tellers mogen nooit overloop veroorzaken (fataal als ze dat zouden doen):
+- `tick_counter`
+- volgnumertellers (per type)
+- `match_age`
+- `existence_version` (knoop en rand)
+- `field_version`
+- `predicate_version`
+- `ordering_dependency_version` (hernoemd van `ordering_version`)
+- `extent_version`
+- `edge_type_version`
+- `adjacency_version`
+- `edge_predicate_version`
+- `edge_ordering_dependency_version`
+
+---
+
+## SPEC 002 TYPESYSTEEM
+
+**Grammatica voor typenaam** – Een typenaam moet voldoen aan:
+```
+type_name = [A-Za-z_][A-Za-z0-9_-]*
+```
+(ASCII letters, onderstrepingsteken, cijfers, koppelteken; moet beginnen met een letter of onderstrepingsteken; dubbele punt `:` is verboden). Hoofdlettergevoelig.
+
+**Generieke typen** – Het typesysteem ondersteunt parametrische typen:
+- `List<T>` – homogene lijst van elementen van type `T`.
+- `Map<K, V>` – kaart van sleutels van type `K` naar waarden van type `V`. `K` moet `String` zijn (sleutels zijn altijd tekenreeksen). `V` kan elk type zijn (inclusief geneste lijsten/kaarten).
+
+**Toegestane basisveldtypen**:
+- `Integer`
+- `FixedPoint(schaal)` waarbij `schaal` een niet-negatief geheel getal is
+- `Boolean`
+- `String`
+- `Identifier`
+- `List<T>` waarbij `T` een toegestaan type is
+- `Map<String, V>` waarbij `V` een toegestaan type is
+
+**Verplichte veldsemantiek** – Alle gedeclareerde velden zijn verplicht. Elke knoop of rand moet precies de velden bevatten die door zijn type zijn gedefinieerd, zonder nulwaarden.
+
+**Tekenreeksemantiek** – Tekenreeksen zijn onveranderlijke Unicode tekst. Serialisatie: UTF‑8. Vergelijking: binaire Unicode codepunt volgorde. Gelijkgelijkheid: exacte codepunt gelijkheid. Geen normalisatie, geen case folding.
+
+**Lijstemantiek** – Homogene geordende lijst van `T`.
+- Gelijkgelijkheid: elementsgewijs dezelfde volgorde.
+- Lexicografische ordening is gedefinieerd **dan en slechts dan als** `T` ordelijk is (zie hieronder). Als `T` niet ordelijk is, dan is `List<T>` niet ordelijk.
+- Iteratievolgorde is de expliciete elementvolgorde.
+
+**Kaartemantiek** – Sleutels zijn tekenreeksen.
+- Sleuteluniciteit: exacte tekenreeksgelijkheid.
+- Gelijkgelijkheid: twee kaarten zijn gelijk dan en slechts dan als ze dezelfde verzameling sleutels hebben en voor elke sleutel de waarden gelijk zijn (recursief). De volgorde van sleutels doet er niet toe.
+- Iteratievolgorde tijdens uitvoering is niet gedefinieerd.
+- Kaarten zijn **niet ordelijk**.
+- Dubbele kaartsleutels in bron IR of literalen zijn **ongeldig**.
+- Canonieke serialisatie ordent sleutels lexicografisch (SPEC 018).
+
+**Ordelijkheid** – Een type `T` is ordelijk als het een deterministische totale ordening heeft:
+- `Integer`, `FixedPoint`, `Boolean`, `String`, `Identifier` zijn ordelijk.
+- `List<T>` is ordelijk **dan en slechts dan als** `T` ordelijk is (lexicografische volgorde).
+- `Map` is niet ordelijk.
+- Elk type dat een niet-ordelijk onderdeel bevat, is niet ordelijk.
+
+Bewerkingen die ordening vereisen (bijv. `min`, `max`, `sorteer`, `ordenen op`) op een niet-ordelijk type zijn **ongeldige IR**.
+
+**Gelijkgelijkheid voor samengestelde typen** – Recursieve gelijkgelijkheid voor alle geneste structuren (gebruikt bij Geen‑Effect detectie, golden file vergelijking en matchsleutelconstructie).
+
+**Lege veldverzamelingen** – Een knoop‑ of randtype kan nul velden declareren. Alle per veld gedefinieerde versietellers zijn leeg; creatie verhoogt nog steeds `extent_version` enz., maar er bestaan geen per‑veld tellers.
+
+---
+
+## SPEC 003 IDENTIFICATIEMODEL
+
+**Grammatica** – Een identificatie heeft de vorm:
+```
+identifier = type_name ":" nonNegativeInteger
+```
+waarbij `type_name` voldoet aan SPEC 002 grammatica (geen dubbele punt), en `nonNegativeInteger` een decimaal geheel getal is zonder voorloopnullen (behalve het getal `0` zelf). Voorbeelden: `Persoon:0`, `Taak_12:5`.
+
+**Volgnumertellers** – Worden onafhankelijk per type bijgehouden. Beginnen bij `0`, worden monotoon met `1` verhoogd bij elke toewijzing, nooit verlaagd, nooit teruggewikkeld, nooit hergebruikt. Toewijzing alleen tijdens commit.
+
+**Ordening van identificaties** – Globale ordening van identificaties wordt gedefinieerd door:
+1. Lexicografische volgorde op `type_name` met behulp van **UTF‑8 bytegewijze vergelijking** (aangezien typenamen ASCII zijn, is dit equivalent aan ASCII volgorde).
+2. Numeriek oplopend op het volgnummer.
+
+**Matchsleutelserialisatie** – In matchsleutels worden bindingen opgeslagen als `naam=identificatie`; de identificatietekenreeks gebruikt het exacte hierboven gedefinieerde formaat. Geen escaping nodig omdat identificaties geen `=` of controlekarakters bevatten.
+
+---
+
+## SPEC 004 TOESTANDSMODEL
+
+Deterministische toestand bestaat uit: Knopen, Randen, Versietellers, Volgnumertellers, Tikteller.
+
+**Knoop**:
+- `id` (identificatie)
+- `type` (typenaam)
+- `velden` (kaart van veldnaam naar waarde)
+- `existence_version` (positief geheel getal, alleen gedefinieerd terwijl knoop bestaat)
+- `field_versions` (één teller per veld, alleen gedefinieerd terwijl knoop bestaat)
+
+**Rand**:
+- `id`, `type`, `bron`, `doel`, `velden`
+- `existence_version` (positief geheel getal, alleen gedefinieerd terwijl rand bestaat)
+- `field_versions` (één teller per veld, alleen gedefinieerd terwijl rand bestaat)
+
+**Globale versietellers**:
+- `extent_version[knooptype]`
+- `predicate_version[knooptype][veldnaam]` (knoopveld)
+- `ordering_dependency_version[knooptype][veldnaam]` (knoopveld)
+- `edge_predicate_version[randtype][veldnaam]` (randveld)
+- `edge_ordering_dependency_version[randtype][veldnaam]` (randveld)
+- `edge_type_version[randtype]` (houdt veranderingen in verzamellidmaatschap bij)
+- `adjacency_version[knoop_id][randtype][richting]` waarbij richting = `incoming` of `outgoing`
+
+Alle versietellers **beginnen bij 1** in de begintoestand.
+
+**Begintoestand versietoewijzing** – Voor elke knoop en rand die in de begintoestand aanwezig is (zoals gedefinieerd in Canonische IR):
+- `existence_version = 1`
+- `field_versions[veld] = 1` voor elk veld
+- Globale tellers worden op 1 gezet. De begintoestand wordt behandeld alsof deze vóór de eerste tik is aangemaakt, met alle versietellers op basiswaarde.
+
+**Toestandsinvarianten** (moeten altijd na commit gelden):
+- Knoopidentificaties uniek
+- Randidentificaties uniek
+- Geen hangende randen (elke rand verwijst naar bestaande knopen)
+- Alle velden typegeldig
+- Alle beperkingen voldaan
+
+---
+
+## SPEC 005 CANONISCHE IR
+
+Canonische IR is de enige uitvoerbare weergave van een GRISP-manifest. Alle manifesten moeten compileren naar Canonische IR vóór uitvoering.
+
+Canonische IR bevat: Typedefinities, Functiedefinities, Regeldefinities, Begintoestand, Constanten.
+
+Canonische IR moet bevatten: Geen syntactische suiker, geen impliciete standaarden, geen runtime-metadata, geen engine-specifieke structuren.
+
+**Stabiliteit van Regelidentificaties** – Elke regeldefinitie moet een expliciete `rule_id` bevatten. Een `rule_id` is een tekenreeks die voldoet aan dezelfde grammatica als typenamen (SPEC 002): ASCII letters, cijfers, onderstrepingsteken, koppelteken; begin met letter of onderstrepingsteken. `rule_id` moet uniek zijn, stabiel bij hercompilatie en behouden bij serialisatie. Compilers mogen geen regelidentificaties genereren.
+
+**Functiebeëindiging** – Recursieve functiedefinities (direct of wederzijds) zijn verboden. De expressietaal heeft geen iteratieve constructies (`while`, `for`, enz.). Daarom beëindigen alle functies gegarandeerd. Implementaties moeten elke functie die recursie bevat afwijzen.
+
+**IR Geldigheid** – De IR moet vóór uitvoering worden gevalideerd. Als deze ongeldig is, moet de engine deze afwijzen (geen uitvoering).
+
+Round‑trip serialisatie (parsen + opnieuw serialiseren) moet byte‑identieke uitvoer produceren.
+
+---
+
+## SPEC 006 FUNCTIEMODEL
+
+Functies zijn ofwel `pure` ofwel `effect_deterministic`.
+
+**Pure functies**:
+- Referentieel transparant
+- Mogen alleen afhangen van argumenten
+- Mogen geen toestand lezen
+
+**Effect‑deterministische functies**:
+- Referentieel transparant
+- Mogen toestand lezen
+- Mogen toestand niet wijzigen
+
+**Gedeclareerde Leesbewerkingen** – Elke `effect_deterministic` functie moet `declared_reads` declareren, een **conservatieve bovenset** van alle afhankelijkheidstypen die tijdens functie-evaluatie kunnen worden gelezen. Onderdeclaratie (het missen van een afhankelijkheid die daadwerkelijk wordt gelezen) is een conformiteitsfout. Overdeclaratie (het declareren van een afhankelijkheid die nooit wordt gelezen) is toegestaan. Het extraheren van afhankelijkheden moet alle `declared_reads` omvatten.
+
+Geen recursie, geen niet-deterministische functies.
+
+---
+
+## SPEC 007 EXPRESSIEMODEL
+
+Expressies vertegenwoordigen pure berekening.
+
+Expressies mogen bevatten: letterlijke waarden, bindingen, rekenkunde, booleaanse logica, collectie-expressies, functieaanroepen.
+
+Expressies mogen niet: toestand muteren, identificaties toewijzen, runtime-metadata observeren, gebeurtenissen observeren, niet-deterministische bewerkingen uitvoeren.
+
+Kortsluitevaluatie is toegestaan.
+
+Afhankelijkheidsextractie moet alle vertakkingen analyseren.
+
+---
+
+## SPEC 008 PATROONMODEL
+
+Patronen binden graafelementen. Evaluatie is deterministisch.
+
+Knoopopsomming gebruikt oplopende `node_id` ordening (SPEC 003). Randopsomming gebruikt oplopende `edge_id` ordening.
+
+Patroonbeperkingen mogen expressies gebruiken. Patronen mogen `let` bindingen bevatten.
+
+`let` bindingen: geëvalueerd tijdens ontdekking, onveranderlijk, uitgesloten van matchidentiteit.
+
+Patroonevaluatie mag toestand niet muteren.
+
+---
+
+## SPEC 009 MATCHONTDECKINGSMODEL
+
+Ontdekking vindt precies één keer per tik plaats. Produceert een bevroren momentopname.
+
+Een match bestaat uit: `rule_id`, `bindingen`, `let_waarden`, `afhankelijkheden`, `afhankelijkheidsmomentopname`, `matchsleutel`.
+
+**Matchsleuteldefinitie** – De matchsleutel is de **canonieke serialisatie** (SPEC 018) van de volgende kaart (record):
+
+```
+{
+  "rule_id": <rule_id>,
+  "bindings": {
+    <bindingsnaam_1>: <identificatie_1>,
+    <bindingsnaam_2>: <identificatie_2>,
+    ...
+  }
+}
+```
+
+- `rule_id` is een tekenreeks.
+- `bindings` is een kaart waarbij sleutels bindingsnamen zijn en waarden identificatietekenreeksen.
+- Bindingsnamen moeten voldoen aan dezelfde grammatica als typenamen (ASCII letters, cijfers, onderstrepingsteken, koppelteken; begin met letter of onderstrepingsteken). Ze worden lexicografisch gesorteerd op UTF‑8 bytevolgorde voor canonieke serialisatie.
+- De kaart wordt geserialiseerd volgens SPEC 018 (sleutels gesorteerd, UTF‑8, geen extra witruimte).
+- `let_waarden` zijn uitgesloten.
+
+**Matchsleutelordening** – Wanneer matchsleutels moeten worden vergeleken (bijv. beslissingen bij gelijke score in SPEC 012), is de ordening de lexicografische volgorde van hun canoniek geserialiseerde UTF‑8 bytereeksen.
+
+**Ontdekkingsbeperkingen** – Mag geen toestand muteren, geen identificaties toewijzen, geen runtime-metadata observeren en geen gebeurtenissen observeren.
+
+---
+
+## SPEC 010 AFHANKELIJKHEIDSMODEL
+
+**Afhankelijkheidstypen** en hun koppeling aan versietellers:
+
+| Afhankelijkheid | Koppeling naar |
+|----------------|----------------|
+| `NodeExistence(knoop_id)` | `knoop.existence_version` (als knoop bestaat) |
+| `EdgeExistence(rand_id)` | `rand.existence_version` (als rand bestaat) |
+| `Field(element_id, veldnaam)` | `field_versions[veldnaam]` op die knoop/rand |
+| `Predicate(knooptype, veldnaam)` | `predicate_version[knooptype][veldnaam]` |
+| `Ordering(knooptype, veldnaam)` | `ordering_dependency_version[knooptype][veldnaam]` |
+| `EdgePredicate(randtype, veldnaam)` | `edge_predicate_version[randtype][veldnaam]` |
+| `EdgeOrdering(randtype, veldnaam)` | `edge_ordering_dependency_version[randtype][veldnaam]` |
+| `Extent(knooptype)` | `extent_version[knooptype]` |
+| `EdgeType(randtype)` | `edge_type_version[randtype]` |
+| `Adjacency(knoop_id, randtype, richting)` | `adjacency_version[knoop_id][randtype][richting]` |
+
+**Afhankelijkheidsextractie** is verplicht voor: patronen, `where` clausules, `let` expressies, prioriteitsexpressies, actieargumentexpressies, gebeurtenispayloadexpressies en functie `declared_reads`. Extractie moet alle vertakkingen analyseren en moet **volledig** zijn (geen onderbenadering). Overbenadering is toegestaan.
+
+**Collectie‑afhankelijkheidsregel** – Voor elke bewerking die over een collectie itereert (aggregaten, patronen over aanpalendheid, enz.), moet afhankelijkheidsextractie elke afhankelijkheid omvatten die kan veranderen:
+1. lidmaatschap van de collectie,
+2. ordening van de collectie (als ordening wordt gebruikt), of
+3. waarden die door de collectie worden geproduceerd.
+
+**Normatieve extractietabel** – De volgende tabel geeft voorbeelden van vereiste extracties (engines moeten ten minste deze extraheren; overextractie is toegestaan):
+
+| Expressiepatroon | Afhankelijkheden |
+|------------------|------------------|
+| `knoop.veld` | `Field(knoop, veld)`, `Predicate(knoop.type, veld)`, `NodeExistence(knoop)` |
+| `rand.veld` | `Field(rand, veld)`, `EdgePredicate(rand.type, veld)`, `EdgeExistence(rand)` |
+| `aantal(Knooptype)` | `Extent(Knooptype)` |
+| `som(Knooptype.veld)` | `Extent(Knooptype)`, `Predicate(Knooptype, veld)` |
+| `min(Knooptype.veld)`, `max(Knooptype.veld)` | `Extent(Knooptype)`, `Ordering(Knooptype, veld)` |
+| `sorteer(Knooptype op veld)` | `Extent(Knooptype)`, `Ordering(Knooptype, veld)` |
+| iteratie over `knoop.uitgaand(Randtype)` | `Adjacency(knoop, Randtype, uitgaand)`, `EdgeType(Randtype)` |
+| `bestaat(rand)` | `EdgeExistence(rand)` |
+
+Een match valideert **dan en slechts dan als** elke afhankelijkheidsversie gelijk is aan zijn momentopnameversie **en** elke bestaansafhankelijkheid verwijst naar een bestaand element (d.w.z. het element is niet verwijderd).
+
+Er bestaat geen extra correctheidsmechanisme.
+
+---
+
+## SPEC 011 MATCHLEVENSCYCLUSMODEL
+
+Definieer `match_age` recursief:
+- Als de `matchsleutel` **niet** aanwezig was in de matches van de vorige tik → nieuwe match: `leeftijd = 0`.
+- Als de `matchsleutel` **wel** aanwezig was in de vorige tik → `leeftijd = vorige_leeftijd + 1`.
+
+**Vergeten** – Alleen de direct vorige tik is van belang. Als een match één of meer tikken verdwijnt en later terugkeert, wordt deze behandeld als een nieuwe match (`leeftijd = 0`). Er is geen langetermijngeheugen.
+
+Overloop van `match_age` is een fatale conformiteitsfout.
+
+---
+
+## SPEC 012 SELECTIEMODEL
+
+Selectie werkt uitsluitend op de ontdekkingsmomentopname.
+
+Voor elke match:  
+`score = (basisprioriteit × prioriteitsschaal) + (match_leeftijd × eerlijkheidsschaal)`
+
+Alle berekeningen gebruiken ondertekende 64‑bits rekenkunde. Overloop is fataal.
+
+Matches worden geordend door:
+1. `score` aflopend
+2. `matchsleutel` oplopend (zoals gedefinieerd in SPEC 009)
+
+Selectie mag geen toestand muteren, geen identificaties toewijzen en geen validatie uitvoeren.
+
+---
+
+## SPEC 013 ACTIEMODEL
+
+Acties: `CreateNode`, `CreateEdge`, `UpdateField`, `DeleteEdge`, `DeleteNode`, `EmitEvent`. Actie-evaluatie is puur en produceert een gefaseerde transactie.
+
+**Tijdelijke aanmaakhendels** – Wanneer `CreateNode` of `CreateEdge` wordt gefaseerd, mag de actie naar het nieuw aangemaakte element verwijzen met behulp van een **tijdelijke hendel** die lokaal is voor de transactie. Hendels worden tijdens de commit omgezet naar definitief toegewezen identificaties.
+
+**Identificatietoewijzingsvolgorde** – Binnen elke commitfase (eerst CreateNode, dan CreateEdge) worden identificaties toegewezen in dezelfde volgorde als de gefaseerde acties in de transactie voorkomen.
+
+**Hendelzichtbaarheid** – Hendels mogen niet voorkomen in gebeurtenispayloadexpressies, noch worden opgeslagen in velden. Elke Canonische IR die probeert een tijdelijke hendel te gebruiken in een `EmitEvent` of `UpdateField` is **ongeldig**.
+
+**Afhankelijkheidsextractie voor gebeurtenispayload** – De expressies binnen `EmitEvent` worden geanalyseerd op afhankelijkheden **tijdens de ontdekking** (vóór validatie en commit), net als elke andere expressie. Deze analyse vindt plaats ongeacht of de gebeurtenis uiteindelijk zal worden gepubliceerd (bijv. als de transactie wordt afgewezen). Engines mogen afhankelijkheidsextractie van gebeurtenispayloads niet wegoptimaliseren.
+
+Een gefaseerde transactie moet voldoen aan de geldigheidsregels (SPEC 014) voordat deze wordt gecommit. Ongeldige gefaseerde transacties worden afgewezen (geen toestandsverandering, geen gebeurtenissen).
+
+---
+
+## SPEC 014 TRANSACTIEMODEL
+
+Een transactie bestaat uit:
+1. Afhankelijkheidsvalidatie (SPEC 010)
+2. Actie-evaluatie (SPEC 013) → gefaseerde schrijfbewerkingen met tijdelijke hendels
+3. Omzetten van tijdelijke hendels
+4. Validatie van gefaseerde transactie
+5. Commit (SPEC 015)
+6. Gebeurtenispublicatie
+
+Slechts één transactie mag per tik worden gecommit. Als een validatie mislukt, wordt de kandidaatmatch weggegooid en wordt de volgende match in de rangorde beschouwd.
+
+**Validatie van gefaseerde transactie** moet waarborgen:
+- Alle `UpdateField`, `DeleteNode`, `DeleteEdge` doelwitten bestaan (hetzij reeds bestaand, hetzij eerder in de transactie aangemaakt).
+- De bron- en doelknopen van `CreateEdge` bestaan **na** toepassing van de transactie (reeds bestaand of aangemaakt door `CreateNode`).
+- Geen hangende verwijzingen in de uiteindelijke gecommitte toestand.
+- Alle toestandsinvarianten (SPEC 004) gelden.
+- Geen zelf-conflicterende schrijfbewerkingen, behalve waar automatisch samengevoegd (zie hieronder).
+
+**Automatische verwijdering van invallende randen uitzondering** – Wanneer `DeleteNode` wordt gefaseerd, wordt daarmee impliciet de verwijdering van alle randen die op die knoop invallen (bepaald op basis van de toestand vóór commit plus eventuele gefaseerde creaties) gefaseerd. Als een rand expliciet in dezelfde transactie is aangemaakt en vervolgens automatisch wordt verwijderd omdat de bron- of doelknoop wordt verwijderd, is dat **geldig** (de rand verschijnt niet in de eindtoestand). Expliciete `DeleteEdge` van een rand die ook automatisch wordt verwijderd, wordt samengevoegd (geen conflict). Expliciete `DeleteEdge` van een rand die in dezelfde transactie is aangemaakt en automatisch verwijderd, is eveneens geldig.
+
+Als validatie mislukt, wordt de kandidaatmatch weggegooid.
+
+---
+
+## SPEC 015 COMMITMODEL
+
+Commit past gefaseerde schrijfbewerkingen atomair toe. Gedeeltelijke commit is verboden.
+
+Commitvolgorde:
+1. `CreateNode`
+2. `CreateEdge`
+3. `UpdateField` (alleen gewijzigde waarden)
+4. `DeleteEdge`
+5. `DeleteNode`
+
+**Geen‑Effect Updates** – `UpdateField` is een Geen‑Effect bewerking als `nieuwe_waarde` gelijk is aan `bestaande_waarde` (exacte typegelijkheid, recursief voor samengestelde typen). Geen‑Effect updates worden genegeerd: ze wijzigen de toestand niet en verhogen geen enkele versieteller.
+
+**Versietellerverhogingsregels** – Alleen voor gewijzigde waarden (Geen‑Effect uitgesloten):
+
+| Bewerking | `extent_version` | `predicate_version` (knoopveld) | `ordering_dependency_version` (knoopveld) | `edge_predicate_version` (randveld) | `edge_ordering_dependency_version` (randveld) | `edge_type_version` | `adjacency_version` | knoop/rand `existence_version` | knoop/rand `field_versions` |
+|-----------|------------------|--------------------------------|---------------------------------------------|---------------------------------------|------------------------------------------------|---------------------|---------------------|-------------------------------|-----------------------------|
+| `CreateNode` | +1 (knooptype) | +1 (alle velden) | +1 (alle velden) | n.v.t. | n.v.t. | n.v.t. | n.v.t. | wordt 1 | elk wordt 1 |
+| `DeleteNode` | +1 | +1 (alle velden) | +1 (alle velden) | n.v.t. | n.v.t. | n.v.t. | +1 per invallende rand (beide richtingen, per randtype) | (verwijderd) | (verwijderd) |
+| `CreateEdge` | n.v.t. | n.v.t. | n.v.t. | +1 (alle velden) | +1 (alle velden) | +1 | +1 bron.uitgaand, doel.inkomend | wordt 1 | elk wordt 1 |
+| `DeleteEdge` | n.v.t. | n.v.t. | n.v.t. | n.v.t. | n.v.t. | +1 | +1 bron.uitgaand, doel.inkomend | (verwijderd) | (verwijderd) |
+| `UpdateField` (knoopveld) | n.v.t. | +1 (dat veld) | +1 (dat veld) | n.v.t. | n.v.t. | n.v.t. | n.v.t. | n.v.t. | +1 (dat veld) |
+| `UpdateField` (randveld) | n.v.t. | n.v.t. | n.v.t. | +1 (dat veld) | +1 (dat veld) | n.v.t. | n.v.t. | n.v.t. | +1 (dat veld) |
+
+**Opmerking:** `edge_type_version` wordt alleen verhoogd bij het aanmaken of verwijderen van een rand (veranderingen in de verzameling randen van dat type), niet bij veldupdates.
+
+**Geldigheid van transactieschrijfbewerkingen** – Het volgende is **ongeldig** tenzij de verwijdering automatisch plaatsvindt door `DeleteNode` (zoals in SPEC 014):
+- `UpdateField(X)` gevolgd door `DeleteNode(X)` (zelfde voor randen)
+- `DeleteNode(X)` gevolgd door nog een expliciete `DeleteNode(X)`
+- `DeleteEdge(E)` gevolgd door nog een expliciete `DeleteEdge(E)`
+- `CreateNode(X)` gevolgd door expliciete `DeleteNode(X)` (automatische verwijdering van een nieuw aangemaakte knoop is onmogelijk omdat `DeleteNode` een bestaande knoop als doel heeft; het aanmaken en verwijderen van dezelfde knoop in één transactie is niet toegestaan).
+
+Een rand die wordt aangemaakt en vervolgens automatisch wordt verwijderd vanwege verwijdering van de bron- of doelknoop is **toegestaan**.
+
+Commit moet alle toestandsinvarianten behouden.
+
+---
+
+## SPEC 016 GEBEURTENISMODEL
+
+Gebeurtenissen zijn deterministische uitvoer. Elke gebeurtenis bestaat uit `rule_id` en een payload (een waarde van elk type).
+
+Gebeurtenissen worden pas zichtbaar na een succesvolle commit.
+
+Gebeurtenispayloadexpressies zijn puur, nemen deel aan afhankelijkheidsextractie (zoals in SPEC 010 en SPEC 013) en mogen geen nieuwe leesbewerkingen introduceren.
+
+Gebeurtenissen mogen het matchen of de uitvoering niet beïnvloeden.
+
+---
+
+## SPEC 017 TIKMODEL
+
+Tikuitvoering verloopt:
+1. Verhoog `tick_counter`
+2. Ontdek matches (bevroren momentopname)
+3. Bereken scores
+4. Rangschik matches (SPEC 012)
+5. Selecteer kandidaat
+6. Valideer afhankelijkheden (SPEC 010)
+7. Indien ongeldig, ga verder met rangorde
+8. Indien geldig, evalueer acties (SPEC 013)
+9. Valideer gefaseerde transactie (SPEC 014)
+10. Indien ongeldig, ga verder met rangorde
+11. Commit transactie (SPEC 015)
+12. Publiceer gebeurtenissen
+13. Einde tik
+
+Ontdekking vindt precies één keer plaats. Herontdekking binnen een tik is verboden. Hoogstens één transactie mag worden gecommit.
+
+---
+
+## SPEC 018 CANONIEKE SERIALISATIE
+
+Canonieke serialisatie gebruikt:
+- UTF‑8 codering
+- LF regelafsluitingen
+- Deterministische ordening van sleutels
+- Deterministische lijstordening
+- Canonieke gehele-getalcodering
+
+**Algemene regels** – Voor elk geserialiseerd object (kaart/record) worden sleutels geserialiseerd in oplopende lexicografische volgorde met behulp van **UTF‑8 bytegewijze vergelijking**. Lijsten behouden hun expliciete volgorde.
+
+**Gehele getallen** – Grondtal 10, geen voorloopnullen, minteken alleen voor negatieve waarden.
+
+**Tekenreeksen** – Tussen dubbele aanhalingstekens (`"`). De volgende karakters worden geëscaped:
+- backslash → `\\`
+- dubbel aanhalingsteken → `\"`
+- nieuwe regel (U+000A) → `\n`
+- terugloop (U+000D) → `\r`
+- tab (U+0009) → `\t`
+- Andere controlekarakters (U+0000–U+001F, U+007F) → `\uXXXX` (hoofdletters hexadecimaal, opgevuld tot 4 cijfers).
+Alle andere Unicode‑karakters worden letterlijk als UTF‑8 bytes geschreven.
+
+**Kaarten en records** – Een kaart (of record) wordt geserialiseerd als `{` gevolgd door komma‑gescheiden sleutel‑waarde paren, elk paar als `"sleutel": waarde`, gevolgd door `}`. Sleutels worden lexicografisch gesorteerd (UTF‑8). Er wordt geen witruimte toegevoegd.
+
+**Lijsten** – Geserialiseerd als `[` gevolgd door komma‑gescheiden waarden, gevolgd door `]`. Geen witruimte.
+
+**Dubbele kaartsleutels** – Elke kaart (inclusief de matchsleutelkaart) die dubbele sleutels bevat is **ongeldig**.
+
+**Recursieve canonicalisatie** – Toegepast op alle geneste waarden.
+
+Round‑trip serialisatie moet byte‑identieke uitvoer produceren.
+
+---
+
+## SPEC 019 GOLDEN FILE MODEL
+
+Golden files leggen alleen waarneembaar gedrag vast.
+
+Normatieve velden:
+- `initial_state` (canonieke serialisatie van de begintoestand)
+- `ticks` (array van tikrecords)
+- `final_state` (canonieke serialisatie van de eindtoestand)
+
+Elk tikrecord bevat:
+- `tick_number`
+- `selected_match_key` (canonieke serialisatie van de match die is gecommit, of `null` als er geen match is gecommit)
+- `committed_changes` (lijst van toegepaste acties in commitvolgorde, met definitieve identificaties)
+- `events` (lijst van uitgezonden gebeurtenissen, elk met `rule_id` en payload)
+
+**Fatale conformiteitsfout** – Als een fatale fout optreedt (SPEC 000), moet de golden file de foutindicator bevatten (bijv. een speciaal `"error"` veld) en de toestand tot dat punt. Het exacte formaat wordt gedefinieerd in een bijbehorend document, maar alle conforme engines moeten voor dezelfde foutconditie identieke uitvoer produceren.
+
+Diagnostische informatie (commentaar, tijdstempels, engineversie) is niet-normatief. Als deze aanwezig is, moet deze worden genegeerd voor conformiteit.
+
+---
+
+## SPEC 020 CONFORMITEIT
+
+Een conforme engine moet:
+- elke normatieve regel in deze specificatie implementeren
+- ongeldige Canonische IR afwijzen (zoals hierin gedefinieerd)
+- niet-determinisme, rekenen met drijvende komma, hergebruik van identificaties, telleroverloop verbieden
+- identiek waarneembaar gedrag produceren (gecommitte veranderingen, gebeurtenissen, eindtoestand, golden files) voor identieke Canonische IR en begintoestand.
+
+**Over volledigheid van afhankelijkheidsextractie** – De eis dat afhankelijkheidsextractie volledig moet zijn (SPEC 010) is normatief. Conformiteitstests zullen gevallen omvatten die alle afhankelijkheidstypen oefenen; elke weglating zal waarneembare divergentie in die tests veroorzaken. Engines die conformiteit claimen, moeten dergelijke tests doorstaan.
+
+Conformiteit wordt uitsluitend bepaald door het waarneembare gedrag zoals gedefinieerd in deze specificatie.
+
+---
+
+## EINDE VAN GRISP DETERMINISTIC KERNEL SPECIFICATION v0.29 (herschreven)
+
+*Deze specificatie is de bevroren kandidaat voor v1.0.*
