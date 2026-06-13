@@ -1,0 +1,1038 @@
+================================================================================
+            GRISP DETERMINISTIC KERNEL SPECIFICATION v0.33
+================================================================================
+
+Preamble
+--------
+
+This specification supersedes all previous versions. It is a complete,
+self-contained definition of the GRISP Deterministic Kernel. All normative
+rules herein are mandatory for conformance. This version is considered the
+**release candidate** for v1.0.
+
+================================================================================
+SPEC 000  CORE PRINCIPLES
+================================================================================
+
+The GRISP Deterministic Kernel defines a fully deterministic execution model
+for rule-driven state transitions over a typed graph.
+
+For identical Canonical IR and identical initial state, all conformant engines
+must produce identical observable behavior.
+
+Observable behavior consists solely of:
+
+* Committed state transitions
+* Emitted events
+* Golden file output
+
+All other implementation details are non-normative.
+
+The kernel is governed by the following principles:
+
+1. Determinism
+   All observable behavior must be deterministic. Forbidden: floating point
+   arithmetic, random number generation, system time, memory addresses,
+   pointer identity, thread scheduling, hash-based ordering, runtime metadata,
+   engine-specific behavior.
+
+2. Explicitness
+   All reads, writes, dependencies, identifiers, ordering rules, and version
+   counters must be explicitly represented. No implicit reads are permitted.
+
+3. Frozen Discovery
+   Match discovery occurs exactly once per tick. The resulting discovery
+   snapshot is immutable for the remainder of the tick.
+
+4. Dependency Validation
+   Dependency validation is the sole correctness mechanism. Conflict detection
+   does not exist.
+
+5. Single Commit
+   At most one transaction may commit per tick.
+
+6. Canonical Ordering
+   Every ordered operation must have an explicitly defined deterministic
+   ordering.
+
+7. Canonical Serialization
+   All deterministic artifacts must serialize canonically.
+
+8. Referential Transparency
+   Expressions are pure. Actions are effectful only during commit.
+
+9. No Identifier Reuse
+   Identifiers are unique for the lifetime of the graph. Deleted identifiers
+   must never be reused.
+
+10. Cross-Engine Reproducibility
+    All conformant engines must produce identical golden files.
+
+Fatal Conformance Error
+-----------------------
+
+A fatal conformance error is an unrecoverable error that occurs during
+execution (e.g., arithmetic overflow, division by zero, counter overflow).
+Upon such an error, the engine must immediately halt execution. No further
+ticks are processed. The golden file must record the error and the state at
+the point of error in a deterministic manner. All conformant engines must
+produce identical golden file output for the same error condition. The
+normative representation of a fatal error is defined in SPEC 019.
+
+================================================================================
+SPEC 001  NUMERIC MODEL
+================================================================================
+
+All numeric values are signed 64-bit integers. Floating point values
+forbidden.
+
+Fixed-point representation
+--------------------------
+
+Fixed-point values are represented as scaled integers. The scale factor is
+declared per field (SPEC 002) as a non-negative integer denoting the number
+of fractional decimal digits. Example: scale 2 means the integer 123
+represents 1.23.
+
+**Scale bounds:** The scale factor must be between 0 and 18 inclusive.
+Any FixedPoint declaration with scale outside this range is invalid IR
+and must be rejected.
+
+Fixed-point arithmetic
+----------------------
+
+Operations follow integer rules with scale handling:
+
+- Addition, subtraction: scale factors must be equal; result has same scale.
+- Multiplication: result scale = scale1 + scale2. **If the resulting scale
+  exceeds 18, the operation is invalid and the IR must be rejected.**
+- Division: Let dividend have scale s_d and value v_d, divisor have scale s_r
+  and value v_r. The quotient is computed as:
+      quotient_value = (v_d * 10^(s_r)) // v_r
+  where // denotes integer division truncating toward zero. The result scale
+  is s_d. This yields a fixed-point number with the same fractional precision
+  as the dividend.
+- Comparison: Two fixed-point values must be compared without arithmetic
+  overflow. Engines must use an algorithm equivalent to:
+      compare v_d * 10^(max(s_d, s_r)) and v_r * 10^(max(s_d, s_r))
+  using arbitrary-precision arithmetic (or a safe alternative) to avoid
+  overflow. The result must match exact rational comparison.
+
+**Overflow handling for fixed-point division:** All intermediate calculations
+required by fixed-point arithmetic must be performed with sufficient
+precision to determine whether the final result fits in signed 64-bit range.
+Overflow is determined on the final result, not on intermediate
+implementation-specific calculations. Engines may use arbitrary-precision
+intermediates (e.g., big integers) to safely compute the quotient and then
+check if the final value fits within signed 64-bit range.
+
+If incompatible scales are used in addition or subtraction, the IR is invalid
+and must be rejected.
+
+Division by zero
+----------------
+
+Any division operation (integer or fixed-point) where the divisor evaluates
+to zero during expression evaluation is a fatal conformance error (execution
+halts).
+
+Overflow
+--------
+
+Any arithmetic overflow (including final result overflow in fixed-point
+operations) is a fatal conformance error.
+
+No-Op Arithmetic
+----------------
+
+A write operation that does not change the integer representation of a field
+is a No-Op Update (SPEC 015).
+
+Counters that must never overflow (fatal error if they would):
+- tick_counter
+- sequence counters (per type)
+- match_age
+- existence_version (node and edge)
+- field_version
+- predicate_version
+- ordering_dependency_version
+- extent_version
+- edge_type_version
+- adjacency_version
+- edge_predicate_version
+- edge_ordering_dependency_version
+
+================================================================================
+SPEC 002  TYPE SYSTEM
+================================================================================
+
+Type name grammar
+-----------------
+
+A type name must match:
+    type_name = [A-Za-z_][A-Za-z0-9_-]*
+(ASCII letters, underscore, digits, hyphen; must start with letter or
+underscore; colon ':' is forbidden). Case-sensitive.
+
+Generic types
+-------------
+
+The type system supports parametric types:
+- List<T> – homogeneous list of elements of type T.
+- Map<K, V> – map from keys of type K to values of type V. K must be String
+  (keys are always strings). V can be any type (including nested lists/maps).
+
+Allowed base field types
+------------------------
+
+- Integer
+- FixedPoint(scale) where scale is a non-negative integer literal between 0 and 18 inclusive
+- Boolean
+- String
+- Identifier
+- List<T> where T is any allowed type
+- Map<String, V> where V is any allowed type
+
+Expression typing rules
+-----------------------
+
+All expressions in Canonical IR are statically typed. Type checking is part of
+IR validation. The following rules apply:
+
+**Numeric literals:** An integer literal has type `Integer`. A fixed-point
+literal is not directly representable; fixed-point values are created via
+arithmetic or field reads.
+
+**Arithmetic operators:** `+`, `-`, `*`, `/`, `//`, `%` require both operands
+to be numeric (`Integer` or `FixedPoint(s)`). If both are `Integer`, the
+result is `Integer`. If one operand is `FixedPoint(s1)` and the other is
+`FixedPoint(s2)`, the result is `FixedPoint(s)` where `s` is determined by
+the operator:
+- `+`, `-`: requires `s1 == s2`, result scale = `s1`.
+- `*`: result scale = `s1 + s2`; if this exceeds 18, the expression is
+  invalid IR.
+- `/`: result scale = `s1` (scale of dividend).
+Mixed `Integer` and `FixedPoint(s)` are disallowed; the IR must insert
+explicit conversions (not yet defined) or the expression is invalid.
+
+**Comparison operators:** `<`, `<=`, `>`, `>=`, `==`, `!=` require both
+operands to be orderable (SPEC 002) and of the same type, except that
+`Integer` and `FixedPoint(s)` may be compared if the integer is treated as
+`FixedPoint(0)`. The result is `Boolean`.
+
+**Boolean operators:** `&&`, `||`, `!` operate on `Boolean`.
+
+**String operations:** Concatenation (`+`) produces `String`. Equality and
+ordering produce `Boolean`.
+
+**List operations:** Construction `[e1, e2, ...]` requires all elements to
+have the same type `T`, resulting in `List<T>`. Indexing `list[index]`
+requires `Integer` index and returns `T`. Length `len(list)` returns
+`Integer`.
+
+**Map operations:** Construction `{ "k1": v1, ... }` requires all values to
+have the same type `V`, resulting in `Map<String, V>`. Access `map["key"]`
+returns `V`.
+
+**Identifier type:** Variables bound to node/edge identifiers have type
+`Identifier`. No operations are defined on `Identifier` except equality and
+canonical serialization.
+
+**Type equivalence:** Two types are equivalent if they are identical after
+expanding all generic parameters. `List(Integer)` is not equivalent to
+`List(FixedPoint(0))`. `Map(String, Integer)` is not equivalent to
+`Map(String, FixedPoint(0))`.
+
+**Invalid expressions:** Any expression that does not satisfy these rules
+(as well as the type validity rules of SPEC 002) must be rejected during IR
+validation.
+
+Field mandatory semantics
+-------------------------
+
+All declared fields are mandatory. Every node or edge must contain exactly
+the fields defined by its type, with no null values.
+
+**UpdateField on a non‑existent field:** Any Canonical IR that contains an
+UpdateField action targeting a field not declared in the target node or edge
+type is invalid and must be rejected.
+
+String semantics
+----------------
+
+Strings are immutable Unicode text. Serialization: UTF-8. Comparison: binary
+Unicode code point order. Equality: exact code point equality. No
+normalization, no case folding.
+
+List semantics
+--------------
+
+Homogeneous ordered list of T.
+- Equality: element-wise same order.
+- Lexicographic ordering is defined iff T is orderable (see below). If T is
+  not orderable, List<T> is not orderable.
+- Iteration order is the explicit element order.
+
+Map semantics
+-------------
+
+Keys are strings.
+- Key uniqueness: exact string equality.
+- Equality: two maps are equal iff they have the same set of keys and for
+  each key the values are equal (recursively). Order of keys does not matter.
+- Iteration order during execution is undefined.
+- Maps are not orderable.
+- Duplicate map keys in source IR or literals are invalid.
+- Canonical serialization orders keys lexicographically (SPEC 018).
+
+Orderability
+------------
+
+A type T is orderable if it has a deterministic total order:
+- Integer, FixedPoint, Boolean, String, Identifier are orderable.
+- List<T> is orderable iff T is orderable (lexicographic order).
+- Map is not orderable.
+- Any type containing a non-orderable component is not orderable.
+
+Operations that require ordering (e.g., min, max, sort, order by) on a
+non-orderable type are invalid IR.
+
+Equality for compound types
+---------------------------
+
+Recursive equality for all nested structures (used in No-Op detection,
+golden file comparison, and match key construction).
+
+Empty field sets
+----------------
+
+A node or edge type may declare zero fields. All version counters defined
+per field are vacuous; creation still increments extent_version etc., but no
+per-field counters exist.
+
+================================================================================
+SPEC 003  IDENTIFIER MODEL
+================================================================================
+
+Grammar
+-------
+
+An identifier has the form:
+    identifier = type_name ":" nonNegativeInteger
+where type_name matches SPEC 002 grammar (no colon), and nonNegativeInteger
+is a decimal integer without leading zeros (except the number 0 itself).
+Examples: Person:0, Task_12:5.
+
+Sequence counters
+-----------------
+
+Maintained independently per type. Start at 0, increment monotonically by 1
+each allocation, never decrease, never wrap, never reused. Allocation only
+during commit.
+
+Identifier ordering
+-------------------
+
+Global ordering of identifiers is defined by:
+1. Lexicographic order on type_name using UTF-8 bytewise comparison (since
+   type names are ASCII, this is equivalent to ASCII order).
+2. Numeric ascending on the sequence number.
+
+Match key serialization
+-----------------------
+
+In match keys, bindings are stored as name=identifier; the identifier string
+uses the exact format defined above. No escaping needed because identifiers
+contain no '=' or control characters.
+
+================================================================================
+SPEC 004  STATE MODEL
+================================================================================
+
+Deterministic state consists of: Nodes, Edges, Version Counters, Sequence
+Counters, Tick Counter.
+
+Node
+----
+- id (identifier)
+- type (type name)
+- fields (map from field name to value)
+- existence_version (positive integer, defined only while node exists)
+- field_versions (one counter per field, defined while node exists)
+
+Edge
+----
+- id, type, source, target, fields
+- existence_version (positive integer, defined only while edge exists)
+- field_versions (one counter per field, defined while edge exists)
+
+Global version counters
+-----------------------
+- extent_version[node_type]
+- predicate_version[node_type][field_name] (node field)
+- ordering_dependency_version[node_type][field_name] (node field)
+- edge_predicate_version[edge_type][field_name] (edge field)
+- edge_ordering_dependency_version[edge_type][field_name] (edge field)
+- edge_type_version[edge_type] (tracks set membership changes)
+- adjacency_version[node_id][edge_type][direction] where direction =
+  incoming or outgoing
+
+All global version counters referenced by the Canonical IR exist from
+initialization and begin at 1 even when the corresponding extent or type is
+empty.
+
+All version counters begin at 1 in the initial state.
+
+Tick counter
+------------
+The tick counter starts at 0 before the first tick. It is incremented at the
+beginning of each tick (SPEC 017).
+
+Initial state version assignment
+--------------------------------
+For every node and edge present in the initial state (as defined in Canonical
+IR):
+- existence_version = 1
+- field_versions[field] = 1 for each field
+- Global counters are set to 1. The initial state is treated as if it had
+  been created before the first tick, with all version counters at base
+  value.
+
+State invariants (must hold at all times after commit)
+------------------------------------------------------
+- Node identifiers unique
+- Edge identifiers unique
+- No dangling edges (every edge's source and target refer to existing nodes)
+- All fields type-valid
+- All constraints satisfied
+
+================================================================================
+SPEC 005  CANONICAL IR
+================================================================================
+
+Canonical IR is the sole executable representation of a GRISP manifest. All
+manifests must compile into Canonical IR before execution.
+
+Canonical IR contains: Type Definitions, Function Definitions, Rule
+Definitions, Initial State, Constants.
+
+Canonical IR must contain: No syntactic sugar, no implicit defaults, no
+runtime metadata, no engine-specific structures.
+
+Rule Identifier Stability
+-------------------------
+Every rule definition must contain an explicit rule_id. A rule_id is a string
+conforming to the same grammar as type names (SPEC 002): ASCII letters,
+digits, underscore, hyphen; start with letter or underscore. rule_id must be
+unique, stable across compilations, and preserved by serialization.
+Compilers must not generate rule identifiers.
+
+Function Termination
+--------------------
+Recursive function definitions (direct or mutual) are forbidden. The
+expression language has no iterative constructs (while, for, etc.). Therefore
+all functions terminate by construction. Implementations must reject any
+function containing recursion.
+
+IR Validity
+-----------
+The IR must be validated before execution. If invalid, the engine must reject
+it (no execution). Validation includes type checking of all expressions
+according to SPEC 002.
+
+Round-trip serialization (parse + reserialize) must produce byte-identical
+output.
+
+================================================================================
+SPEC 006  FUNCTION MODEL
+================================================================================
+
+Functions are either pure or effect_deterministic.
+
+Pure functions
+--------------
+- Referentially transparent
+- May only depend on arguments
+- May not read state
+
+Effect-deterministic functions
+------------------------------
+- Referentially transparent
+- May read state
+- May not modify state
+
+Declared Reads
+--------------
+Every effect_deterministic function must declare declared_reads, a
+conservative superset of all dependency types that may be read during
+function evaluation. Under-declaration (missing a dependency that is actually
+read) is a conformance error. Over-declaration (declaring a dependency never
+read) is permitted. Dependency extraction must include all declared_reads.
+
+No recursion, no nondeterministic functions.
+
+================================================================================
+SPEC 007  EXPRESSION MODEL
+================================================================================
+
+Expressions represent pure computation.
+
+Expressions may contain: literals, bindings, arithmetic, boolean logic,
+collection expressions, function calls.
+
+Expressions must not: mutate state, allocate identifiers, observe runtime
+metadata, observe events, perform nondeterministic operations.
+
+Short-circuit evaluation is permitted. Dependency extraction is independent
+of runtime evaluation; all branches are analyzed (SPEC 010).
+
+================================================================================
+SPEC 008  PATTERN MODEL
+================================================================================
+
+Patterns bind graph elements. Evaluation is deterministic.
+
+Node enumeration uses ascending node_id ordering (SPEC 003). Edge enumeration
+uses ascending edge_id ordering.
+
+Pattern constraints may use expressions. Patterns may contain let bindings.
+
+let bindings: evaluated during discovery, immutable, excluded from match
+identity.
+
+Pattern evaluation must not mutate state.
+
+================================================================================
+SPEC 009  MATCH DISCOVERY MODEL
+================================================================================
+
+Discovery occurs exactly once per tick. Produces a frozen snapshot.
+
+A match consists of: rule_id, bindings, let_values, dependencies,
+dependency_snapshot, match_key.
+
+Match key definition
+--------------------
+The match key is the canonical serialization (SPEC 018) of the following map
+(record):
+
+{
+  "rule_id": <rule_id>,
+  "bindings": {
+    <binding_name_1>: <identifier_1>,
+    <binding_name_2>: <identifier_2>,
+    ...
+  }
+}
+
+- rule_id is a string.
+- bindings is a map where keys are binding names and values are identifier
+  strings.
+- Binding names must conform to the same grammar as type names (ASCII
+  letters, digits, underscore, hyphen; start with letter or underscore).
+- The top-level map is serialized according to the canonical map ordering
+  rules of SPEC 018 (keys sorted lexicographically by UTF-8 byte order).
+- let_values are excluded.
+
+Match key ordering
+------------------
+When match keys must be compared (e.g., tie-breaking in SPEC 012), the
+ordering is the lexicographic order of their canonical serialized UTF-8 byte
+sequences.
+
+Discovery constraints
+---------------------
+Must not mutate state, allocate identifiers, observe runtime metadata, or
+observe events.
+
+================================================================================
+SPEC 010  DEPENDENCY MODEL
+================================================================================
+
+Dependency types and their mappings to version counters:
+
+  Dependency                         | Maps to
+  -----------------------------------+----------------------------------------
+  NodeExistence(node_id)             | node.existence_version (if node exists)
+  EdgeExistence(edge_id)             | edge.existence_version (if edge exists)
+  Field(element_id, field_name)      | field_versions[field_name]
+  Predicate(node_type, field_name)   | predicate_version[node_type][field_name]
+  Ordering(node_type, field_name)    | ordering_dependency_version[node_type]
+                                     |   [field_name]
+  EdgePredicate(edge_type, field_name)| edge_predicate_version[edge_type]
+                                     |   [field_name]
+  EdgeOrdering(edge_type, field_name) | edge_ordering_dependency_version
+                                     |   [edge_type][field_name]
+  Extent(node_type)                  | extent_version[node_type]
+  EdgeType(edge_type)                | edge_type_version[edge_type]
+  Adjacency(node_id, edge_type, dir) | adjacency_version[node_id][edge_type][dir]
+
+Dependency extraction is mandatory for: patterns, where clauses, let
+expressions, priority expressions, action argument expressions, event payload
+expressions, and function declared_reads. Extraction must analyze all
+branches and must be complete (no under-approximation). Over-approximation is
+permitted. Dependency extraction is independent of runtime evaluation (i.e.,
+all branches are considered even if short-circuiting would skip some at
+runtime).
+
+Collection dependency rule
+--------------------------
+For any operation that iterates over a collection (aggregates, patterns over
+adjacency, etc.), dependency extraction must include every dependency capable
+of changing:
+1. membership of the collection,
+2. ordering of the collection (if ordering is used), or
+3. values produced by the collection.
+
+Normative extraction mapping
+----------------------------
+The following table provides examples of required extractions (engines must
+extract at least these; over-extraction allowed):
+
+  Expression pattern            | Dependencies
+  ------------------------------+------------------------------------------
+  node.field                    | Field(node, field),
+                                | Predicate(node.type, field),
+                                | NodeExistence(node)
+  edge.field                    | Field(edge, field),
+                                | EdgePredicate(edge.type, field),
+                                | EdgeExistence(edge)
+  count(NodeType)               | Extent(NodeType)
+  sum(NodeType.field)           | Extent(NodeType),
+                                | Predicate(NodeType, field)
+  min(NodeType.field)           | Extent(NodeType),
+                                | Predicate(NodeType, field),
+                                | Ordering(NodeType, field)
+  max(NodeType.field)           | Extent(NodeType),
+                                | Predicate(NodeType, field),
+                                | Ordering(NodeType, field)
+  sort(NodeType by field)       | Extent(NodeType),
+                                | Predicate(NodeType, field),
+                                | Ordering(NodeType, field)
+  iteration over                | Adjacency(node, EdgeType, outgoing),
+  node.outgoing(EdgeType)       | EdgeType(EdgeType)
+  exists(edge)                  | EdgeExistence(edge)
+
+A match validates iff:
+- For every existence dependency, the referenced element exists **and**
+  the element's current existence_version equals the snapshot version.
+- For every non‑existence dependency, the current version counter equals
+  the snapshot version.
+
+No additional correctness mechanism exists.
+
+================================================================================
+SPEC 011  MATCH LIFECYCLE MODEL
+================================================================================
+
+Define match_age recursively:
+- If the match_key was not present in the previous tick's match set -> new
+  match: age = 0.
+- If the match_key was present in the previous tick -> age = previous_age + 1.
+
+Because rule_id participates in match_key construction, changing a rule's
+rule_id causes all matches of that rule to be treated as new matches (age = 0)
+for the purpose of age tracking. No semantic equivalence of rules is
+considered; match_key equality is purely syntactic.
+
+Forgetting
+----------
+Only the immediate previous tick matters. If a match disappears for one or
+more ticks and later reappears, it is treated as a new match (age = 0). There
+is no long-term memory.
+
+match_age overflow is a fatal conformance error.
+
+================================================================================
+SPEC 012  SELECTION MODEL
+================================================================================
+
+Selection operates exclusively on the discovery snapshot.
+
+For each match:
+    score = (base_priority * priority_scale) + (match_age * fairness_scale)
+
+All calculations use signed 64-bit arithmetic. Overflow is fatal.
+
+Matches are ordered by:
+1. score descending
+2. match_key ascending (as defined in SPEC 009)
+
+Selection must not mutate state, allocate identifiers, or perform validation.
+
+================================================================================
+SPEC 013  ACTION MODEL
+================================================================================
+
+Actions: CreateNode, CreateEdge, UpdateField, DeleteEdge, DeleteNode,
+EmitEvent. Action evaluation is pure and produces a staged transaction.
+
+Temporary creation handles
+--------------------------
+When CreateNode or CreateEdge is staged, the action may refer to the newly
+created element using a temporary handle local to the transaction. Handles
+are resolved to final allocated identifiers during commit.
+
+Identifier allocation order
+---------------------------
+Within each commit phase (CreateNode, then CreateEdge), identifiers are
+allocated in the same order as the staged actions appear in the transaction.
+
+Handle observability
+--------------------
+Handles may not appear in event payload expressions, nor be stored in fields.
+Any Canonical IR that attempts to use a temporary handle in an EmitEvent or
+UpdateField is invalid.
+
+Event payload dependency extraction
+-----------------------------------
+The expressions inside EmitEvent are analyzed for dependencies during
+discovery (before validation and commit) exactly like any other expression.
+This analysis occurs regardless of whether the event will eventually be
+published (e.g., if the transaction is rejected). Engines must not optimize
+away dependency extraction from event payloads.
+
+**Event payload evaluation timing:** Event payload expressions are evaluated
+during action evaluation (when constructing the staged transaction) against
+the same pre-commit state used for other action argument evaluation. The
+resulting payload value is stored in the staged transaction. This ensures
+that even if the referenced elements are deleted later in the same
+transaction (e.g., after DeleteNode), the payload has already been computed
+from the pre-commit state.
+
+Staged transaction must satisfy validity rules (SPEC 014) before commit.
+Invalid staged transactions are rejected (no state change, no events).
+
+================================================================================
+SPEC 014  TRANSACTION MODEL
+================================================================================
+
+A transaction consists of:
+1. Dependency validation (SPEC 010)
+2. Action evaluation (SPEC 013) -> staged writes with temporary handles
+3. Resolve temporary handles
+4. Staged transaction validation
+5. Commit (SPEC 015)
+6. Event publication
+
+Only one transaction may commit per tick. If any validation fails, discard
+the candidate match and consider the next ranked match.
+
+Staged transaction validation must ensure:
+- All UpdateField, DeleteNode, DeleteEdge targets exist (either pre-existing
+  or created earlier in the transaction).
+- CreateEdge source and target nodes exist after transaction application
+  (pre-existing or created by CreateNode).
+- No dangling references in the final committed state.
+- All state invariants (SPEC 004) hold.
+- No self-conflicting writes except where automatically merged (see below).
+
+Automatic incident edge deletion exception
+-------------------------------------------
+When DeleteNode is staged, it implicitly stages deletion of all edges
+incident to that node (determined from the pre-commit state plus any staged
+creations). **This behaves exactly as if each incident edge were individually
+deleted** (i.e., the adjacency version counters for both the deleted node and
+the neighbor node are incremented appropriately, as specified in SPEC 015).
+If an edge was explicitly created in the same transaction and then
+automatically deleted because its source or target node is deleted, that is
+valid (the edge does not appear in the final state). Explicit DeleteEdge of
+an edge that is also automatically deleted is merged (no conflict). Explicit
+DeleteEdge of an edge that was created and automatically deleted in the same
+transaction is also valid.
+
+**Ordering of automatic edge deletions:** For the purpose of commit (SPEC 015)
+and golden file output, implicit DeleteEdge actions are ordered as follows:
+
+- Each DeleteNode action generates a sequence of implicit DeleteEdge actions
+  for its incident edges, ordered by ascending edge_id of the edge being
+  deleted.
+- These sequences are placed in the overall DeleteEdge phase **immediately
+  after the explicit DeleteEdge actions** and **before the DeleteNode action
+  that triggered them**.
+- When multiple DeleteNode actions exist in the transaction, the implicit
+  deletions are ordered by the position of their generating DeleteNode
+  action in the staged transaction (i.e., the same relative order as the
+  DeleteNode actions themselves). Within the implicit deletions of a single
+  DeleteNode, the edge_id ordering applies.
+- Explicit and implicit deletions of the same edge are merged into a single
+  DeleteEdge entry in the committed_changes list, appearing at the position
+  of the explicit deletion if any, otherwise at the position of the first
+  implicit deletion according to the ordering rule.
+
+If validation fails, the candidate match is discarded.
+
+================================================================================
+SPEC 015  COMMIT MODEL
+================================================================================
+
+Commit applies staged writes atomically. Partial commit is forbidden.
+
+Commit order:
+1. CreateNode
+2. CreateEdge
+3. UpdateField (changed values only)
+4. DeleteEdge
+5. DeleteNode
+
+**Within each commit phase, actions are applied in the same order as they
+appear in the staged transaction** (the order produced by action evaluation).
+For DeleteEdge, this includes both explicit and implicit deletions ordered
+according to SPEC 014.
+
+No-Op Updates
+-------------
+UpdateField is a No-Op when new_value == existing_value (exact type equality,
+recursive for compound types). No-Op updates are ignored: they do not modify
+state, do not increment any version counters.
+
+Version increment rules (only for changed values; No-Op excluded)
+------------------------------------------------------------------
+The following table shows which counters are incremented per operation.
+(Entries marked '-' are not incremented; entries marked '+' are incremented
+by 1; node/edge existence_version and field_versions are set to 1 on creation
+or removed on deletion.)
+
++-------------------+--------+-------------+--------------+-----------+-----------+
+| Operation         | extent | pred (node) | order (node) | edge_pred | edge_order|
++-------------------+--------+-------------+--------------+-----------+-----------+
+| CreateNode        | +1     | +1 (all)    | +1 (all)     | -         | -         |
+| DeleteNode        | +1     | +1 (all)    | +1 (all)     | -         | -         |
+| CreateEdge        | -      | -           | -            | +1 (all)  | +1 (all)  |
+| DeleteEdge        | -      | -           | -            | -         | -         |
+| UpdateField (node)| -      | +1 (that)   | +1 (that)    | -         | -         |
+| UpdateField (edge)| -      | -           | -            | +1 (that) | +1 (that) |
++-------------------+--------+-------------+--------------+-----------+-----------+
+
++-------------------+-----------+--------------------------+---------------------+---------------------+
+| Operation         | edge_type | adjacency                | node/edge existence | node/edge field_vers|
++-------------------+-----------+--------------------------+---------------------+---------------------+
+| CreateNode        | -         | -                        | set to 1            | set to 1 each       |
+| DeleteNode        | -         | +1 per incident edge:    | removed             | removed             |
+|                   |           |   source.outgoing,       |                     |                     |
+|                   |           |   target.incoming        |                     |                     |
+| CreateEdge        | +1        | +1 source.outgoing,      | set to 1            | set to 1 each       |
+|                   |           | +1 target.incoming       |                     |                     |
+| DeleteEdge        | +1        | +1 source.outgoing,      | removed             | removed             |
+|                   |           | +1 target.incoming       |                     |                     |
+| UpdateField (node)| -         | -                        | -                   | +1 (that)           |
+| UpdateField (edge)| -         | -                        | -                   | +1 (that)           |
++-------------------+-----------+--------------------------+---------------------+---------------------+
+
+Notes:
+- edge_type_version increments only on edge creation or deletion (changes to
+  the set of edges of that type), not on field updates.
+- adjacency_version increments for source.outgoing and target.incoming on
+  edge create/delete. On node deletion, adjacency_version increments once
+  for each incident edge, affecting the deleted node's outgoing adjacency
+  (for edges where it is the source) and incoming adjacency (for edges where
+  it is the target), as well as the neighbor's corresponding adjacency
+  counters. This is equivalent to deleting each incident edge individually.
+
+Transaction write validity
+--------------------------
+The following are invalid unless the deletion is automatic from DeleteNode
+(as per SPEC 014):
+- UpdateField(X) then DeleteNode(X) (same for edges)
+- DeleteNode(X) then another explicit DeleteNode(X)
+- DeleteEdge(E) then another explicit DeleteEdge(E)
+- CreateNode(X) then explicit DeleteNode(X) (automatic deletion of a newly
+  created node is impossible because DeleteNode targets an existing node;
+  creation and deletion of the same node in one transaction is disallowed).
+
+Edge created and then auto-deleted due to source/target node deletion is
+allowed.
+
+Commit must preserve all state invariants.
+
+================================================================================
+SPEC 016  EVENT MODEL
+================================================================================
+
+Events are deterministic outputs. Each event consists of rule_id and a
+payload (a value of any type).
+
+Events become visible only after successful commit.
+
+Event payload expressions are pure, participate in dependency extraction (as
+per SPEC 010 and SPEC 013), and may not introduce new reads.
+
+Events must not influence matching or execution.
+
+================================================================================
+SPEC 017  TICK MODEL
+================================================================================
+
+Tick execution proceeds:
+1. Increment tick_counter (starting from 0 before first tick)
+2. Discover matches (frozen snapshot)
+3. Compute scores
+4. Rank matches (SPEC 012)
+5. Select candidate
+6. Validate dependencies (SPEC 010)
+7. If invalid, continue ranking
+8. If valid, evaluate actions (SPEC 013)
+9. Validate staged transaction (SPEC 014)
+10. If invalid, continue ranking
+11. Commit transaction (SPEC 015)
+12. Publish events
+13. End tick
+
+Discovery occurs exactly once. Rediscovery within a tick is forbidden. At
+most one transaction may commit.
+
+================================================================================
+SPEC 018  CANONICAL SERIALIZATION
+================================================================================
+
+Canonical serialization uses:
+- UTF-8 encoding
+- LF line endings
+- Deterministic ordering of keys
+- Deterministic list ordering
+- Canonical integer encoding
+
+General rules
+-------------
+For any serialized object (map/record), keys are serialized in ascending
+lexicographic order using UTF-8 bytewise comparison. Lists preserve their
+explicit order.
+
+Integers
+--------
+Base 10, no leading zeros, minus sign only for negative values.
+
+Booleans
+--------
+Serialized as `true` or `false` (lowercase, no quotes).
+
+Null
+----
+The literal `null` is used exclusively in golden files (SPEC 019) to denote
+the absence of a selected match. It is not part of the graph type system.
+Serialized as `null` (lowercase, no quotes).
+
+Strings
+-------
+Enclosed in double quotes ("). The following characters are escaped:
+- backslash -> \\
+- double quote -> \"
+- newline (U+000A) -> \n
+- carriage return (U+000D) -> \r
+- tab (U+0009) -> \t
+- Other control characters (U+0000-U+001F, U+007F) -> \uXXXX (uppercase
+  hexadecimal, zero-padded to 4 digits).
+All other Unicode characters are written literally as UTF-8 bytes.
+
+Maps and records
+----------------
+A map (or record) is serialized as { followed by comma-separated key-value
+pairs, each pair as "key": value, followed by }. Keys are sorted
+lexicographically (UTF-8). No whitespace is added.
+
+Lists
+-----
+Serialized as [ followed by comma-separated values, followed by ]. No
+whitespace.
+
+Duplicate map keys
+------------------
+Any map (including the match key map) that contains duplicate keys is
+invalid.
+
+Recursive canonicalization
+--------------------------
+Applied to all nested values.
+
+Round-trip serialization must produce byte-identical output.
+
+================================================================================
+SPEC 019  GOLDEN FILE MODEL
+================================================================================
+
+Golden files capture observable behavior only.
+
+Top-level structure
+-------------------
+A golden file is a canonical serialization (SPEC 018) of a record with the
+following fields:
+
+- `initial_state`: canonical serialization of the initial state (as defined
+  in the Canonical IR).
+- `final_state`: canonical serialization of the final state (after all ticks
+  have completed, or at the point of a fatal error).
+- Exactly one of:
+  - `ticks`: an array of tick records (as defined below) when execution
+    completes normally without a fatal error.
+  - `error`: an error object (as defined below) when a fatal conformance
+    error halts execution.
+
+No other top-level fields are permitted.
+
+Tick record
+-----------
+Each tick record contains:
+- `tick_number`: integer
+- `selected_match_key`: canonical serialization of the match that committed,
+  or `null` if no match committed
+- `committed_changes`: list of applied actions in commit order (as defined
+  in SPEC 015, with ordering within each phase according to the staged
+  transaction order)
+- `events`: list of emitted events, each with `rule_id` and `payload`
+
+Fatal conformance error representation
+---------------------------------------
+If a fatal conformance error occurs (SPEC 000), the golden file must contain
+an `error` object instead of the `ticks` array. The error object has the
+following canonical form:
+
+{
+  "tick_number": <integer>,
+  "error_type": <string>
+}
+
+The `error_type` string must be one of the following, and only these:
+
+- `"INTEGER_OVERFLOW"`
+- `"DIVISION_BY_ZERO"`
+- `"COUNTER_OVERFLOW"`
+
+No other error types are permitted. Any other failure (e.g., internal
+consistency check) indicates a non‑conformant engine and must not be
+represented as observable golden‑file output.
+
+After recording the error, the golden file must also include the
+`final_state` as it existed at the point of error (before any partial commit,
+since the error halts execution before any commit occurs). No further ticks
+are recorded.
+
+Diagnostic information (comments, timestamps, engine version) is
+non-normative. If present, it must be ignored for conformance.
+
+================================================================================
+SPEC 020  CONFORMANCE
+================================================================================
+
+A conformant engine must:
+- implement every normative rule in this specification
+- reject invalid Canonical IR (as defined herein)
+- prohibit nondeterminism, floating point arithmetic, identifier reuse,
+  counter overflow
+- produce identical observable behavior (committed changes, events, final
+  state, golden files) for identical Canonical IR and initial state.
+
+On dependency extraction completeness
+-------------------------------------
+The requirement that dependency extraction be complete (SPEC 010) is
+normative. Conformance testing will include cases that exercise all
+dependency types; any omission will cause observable divergence in those
+tests. Engines that claim conformance must pass such tests.
+
+Conformance is determined exclusively through observable behavior defined by
+this specification.
+
+================================================================================
+END OF GRISP DETERMINISTIC KERNEL SPECIFICATION v0.33
+
+This specification is the release candidate for v1.0.
+================================================================================

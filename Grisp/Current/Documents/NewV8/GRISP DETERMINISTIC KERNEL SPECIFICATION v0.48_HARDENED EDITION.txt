@@ -1,0 +1,717 @@
+# GRISP DETERMINISTIC KERNEL SPECIFICATION v0.48
+
+
+---
+
+## SPEC 000 – CORE PRINCIPLES (Informative)
+
+The GRISP Deterministic Kernel defines a fully deterministic execution model for rule‑driven state transitions over a typed graph.
+
+For identical Canonical IR and identical initial state, all conformant engines **must** produce identical observable behavior.
+
+Observable behavior consists solely of:
+- Committed state transitions
+- Emitted events
+- Golden file output
+
+All other implementation details are non‑normative.
+
+The kernel is governed by the following principles (informative, not independently enforceable):
+1. **Determinism** – No floating point, random numbers, system time, pointer identity, thread scheduling, hash‑based ordering, runtime metadata, or engine‑specific behavior.
+2. **Explicitness** – All reads, writes, dependencies, identifiers, ordering rules, and version counters explicitly represented. No implicit reads.
+3. **Frozen Discovery** – Match discovery occurs exactly once per tick; the snapshot is immutable for the remainder of the tick.
+4. **Dependency Validation** – Primary correctness mechanism. The only additional structural check is duplicate‑field‑write rejection (SPEC 014). No other conflict detection.
+5. **Single Commit** – At most one transaction per tick.
+6. **Canonical Ordering** – Every ordered operation has an explicit deterministic ordering.
+7. **Canonical Serialization** – All deterministic artifacts serialize canonically.
+8. **Referential Transparency** – Expressions pure; actions effectful only during commit.
+9. **No Identifier Reuse** – Identifiers unique for graph lifetime; deleted identifiers never reused.
+10. **Cross‑Engine Reproducibility** – All conformant engines produce identical golden files.
+
+**Fatal Conformance Error vs Transaction Validation Failure** (normative, see SPEC 015 for details):
+- **Fatal conformance error** – An unrecoverable error (overflow, division by zero, counter overflow, out‑of‑bounds, missing map key, invariant violation, cycle detection). The engine **must** halt immediately, roll back any in‑progress transaction, and record the error in the golden file. No further ticks.
+- **Transaction validation failure** – A non‑fatal error (e.g., duplicate `UpdateField`, missing target, dangling reference). The engine **must** abort the transaction, discard the candidate match, and continue with the next ranked match (if any). This does **not** halt execution.
+
+---
+
+## SPEC 001 – NUMERIC MODEL
+
+All numeric values are signed 64‑bit integers. Floating point values forbidden.
+
+### Fixed‑point representation
+
+Fixed‑point values are scaled integers. Scale factor per field (SPEC 002) is a non‑negative integer (0–18 inclusive) denoting fractional decimal digits. Example: scale 2, integer 123 → 1.23.
+
+**Scale bounds:** 0–18 inclusive. Outside → invalid IR.
+
+**Fixed‑point literals:** Decimal number with mandatory decimal point (e.g., 12.50, 0.001, 100.0). Negative literals allowed with leading minus. Scale = number of fractional digits. Integer value = signed integer formed by removing decimal point. More than 18 fractional digits → invalid IR.
+
+**Literal‑to‑type conversion (normative):**  
+When converting to target scale `s_target`:
+- If literal scale > `s_target` and any truncated digit non‑zero → invalid IR.
+- If literal scale < `s_target`, pad with zeros (multiply integer value by 10^(s_target‑literal_scale)), checking overflow.
+- Sign preserved after scaling.
+
+### Fixed‑point arithmetic
+
+Operations follow integer rules with scale handling:
+
+| Operation | Rule |
+|-----------|------|
+| Addition, subtraction | Scales must be equal; result same scale. Mixed scales → invalid IR. |
+| Multiplication | Result scale = scale1 + scale2. If result scale > 18 → invalid IR. |
+| Division (FixedPoint ÷ FixedPoint) | Dividend scale s_d, value v_d; divisor scale s_r, value v_r. Quotient value = (v_d * 10^s_r) // v_r (integer division truncating toward zero). Result scale = s_d. **Asymmetry warning:** Result scale depends solely on dividend. Swapping operands changes result scale. This is intentional and deterministic. |
+| Comparison (FixedPoint with FixedPoint or Integer) | Compare rational numbers v1/10^s1 and v2/10^s2. Use arbitrary‑precision cross‑multiplication: compare v1 * 10^s2 with v2 * 10^s1. Integer treated as FixedPoint(0). |
+
+**Integer division and modulo (Integer operands only):**
+- `/` → FixedPoint(0) with quotient truncated toward zero. Example: 5/2 → FixedPoint(0) value 2.
+- `//` → Integer quotient truncated toward zero.
+- `%` → Integer remainder with sign of dividend: a % b = a - b * (a // b).
+
+**Mixed Integer and FixedPoint in operations:**  
+- For `+` and `-`, mixed operands disallowed (must insert explicit conversion).  
+- For `*` and `/`, Integer implicitly promoted to FixedPoint(0) before operation.  
+- For `//` and `%`, both operands must be Integer.  
+- Implicit promotion multiplies integer by 10^s using checked signed 64‑bit arithmetic; overflow → fatal `INTEGER_OVERFLOW`.
+
+**Overflow handling:** Any arithmetic overflow (including final result overflow in fixed‑point operations) is a fatal conformance error.
+
+**Fixed‑point division intermediate calculations:** MUST use arbitrary‑precision (big integers) for `v_d * 10^s_r`. Overflow checked only on final result.
+
+**Division by zero:** Any division (integer or fixed‑point) where divisor evaluates to zero → fatal conformance error `DIVISION_BY_ZERO`. If during discovery → halt immediately. If during action execution or commit → roll back transaction (if commit phase) and halt.
+
+**No‑Op Arithmetic:** A write operation that does not change the integer representation of a field is a No‑Op Update (SPEC 015).
+
+**Counters (fatal overflow if exceeded):** tick_counter, sequence counters (per type), match_age, existence_version, field_version, predicate_version, ordering_dependency_version, extent_version, edge_type_version, adjacency_version, edge_predicate_version, edge_ordering_dependency_version.
+
+**Maximum integer value:** `INT64_MAX = 9223372036854775807`.
+
+---
+
+## SPEC 002 – TYPE SYSTEM
+
+### Identifier name grammar
+
+`ident = [A-Za-z_][A-Za-z0-9_-]*` (ASCII letters, underscore, digits, hyphen; must start with letter or underscore). Colon `:` forbidden (reserved for identifiers, SPEC 003). Case‑sensitive.
+
+### Generic types
+
+- `List<T>` – homogeneous list.
+- `Map<K, V>` – keys must be `String`; values any type.
+
+### Allowed base field types
+
+- `Integer`
+- `FixedPoint(scale)` with scale 0–18
+- `Boolean`
+- `String`
+- `Identifier`
+- `List<T>` where T any allowed type
+- `Map<String, V>` where V any allowed type
+
+### Expression grammar and typing rules
+
+Expressions statically typed. Type checking part of IR validation.
+
+**Operator precedence (highest to lowest):**
+1. Primary: literals, identifiers, parenthesized, function calls, list literals `[...]`, map literals `{...}`
+2. Unary: `-`, `!`
+3. Multiplicative: `*`, `/`, `//`, `%`
+4. Additive: `+`, `-`
+5. Relational: `<`, `<=`, `>`, `>=`
+6. Equality: `==`, `!=`
+7. Logical AND: `&&`
+8. Logical OR: `||`
+Associativity left‑to‑right.
+
+**Typing rules:**
+
+- **Numeric literals:** Integer literal → `Integer`. Fixed‑point literal → `FixedPoint(s)`.
+- **Arithmetic operators:** See SPEC 001.
+- **Comparison operators:** Operands orderable; Integer vs FixedPoint allowed (Integer as FixedPoint(0)). Result `Boolean`.
+- **Boolean operators:** Operands `Boolean`.
+- **String operations:** `+` concatenation → `String`. Equality and ordering → `Boolean`. Comparison: binary Unicode code point order.
+- **List operations:** `[e1, e2, ...]` → homogeneous `List<T>`. Empty list `[]` must have explicit type annotation: `[] as List<T>`. Indexing `list[index]` → `T`; out‑of‑bounds → fatal `INDEX_OUT_OF_BOUNDS`. `len(list)` → `Integer`.
+- **Map operations:** `{ "k1": v1, ... }` → `Map<String, V>`. Empty map `{}` must have explicit type annotation: `{} as Map<String, V>`. Access `map["key"]` → `V`; missing key → fatal `MISSING_MAP_KEY`. **All map traversals that affect observable behavior or dependency extraction MUST iterate keys in lexicographic UTF‑8 byte order.** (This includes dependency extraction, event construction, match key generation, and any serialization.)
+- **Identifier type:** Variables bound to node/edge identifiers have type `Identifier`. Only equality and canonical serialization defined. A valid state must never contain an Identifier field that references a deleted node or edge, **recursively through any level of nested lists or maps**. This invariant is checked during commit (SPEC 014). UpdateField may set an Identifier field to any identifier; if target does not exist → transaction invalid.
+- **Identifier reference dependency (normative algorithm):** When an expression reads an Identifier field AND then dereferences it (field access, existence check, further traversal), dependency extraction MUST fully traverse the concrete value at discovery time and emit `NodeExistence(id)` or `EdgeExistence(id)` for every identifier encountered. This applies recursively through all nested Lists/Maps. No extent‑level or type‑level approximations permitted. Cycle detection: If the traversal would follow an identifier back to a node that contains the original identifier (creating a cycle), the engine must abort with fatal `INVARIANT_VIOLATION`. To avoid infinite recursion, a deterministic depth limit of 1000 is imposed; exceeding it is fatal `INVARIANT_VIOLATION`.
+- **Type equivalence:** Identical after expanding generics. `List<Integer>` ≠ `List<FixedPoint(0)>`. `Map<String, Integer>` ≠ `Map<String, FixedPoint(0)>`.
+- **Invalid expressions:** Must be rejected during IR validation.
+
+### Let binding semantics
+
+Let bindings evaluated during discovery, values stored in match, but **not** in `match_key`. Two matches differing only in let values (identical `rule_id` and bindings) are considered the same match for identity and age tracking. Dependencies from let expressions are extracted normally and included in the match's dependency snapshot.
+
+### Counter initialization for empty extents
+
+For a node type with zero nodes, `extent_version[node_type]` exists and is 1. `adjacency_version` counters exist only for node_ids that actually exist. If expression attempts to read `adjacency_version` for a non‑existent node → fatal `ADJACENCY_COUNTER_MISSING`. When a node is created, `adjacency_version` for all edge types and both directions initialized to 1.
+
+### Field mandatory semantics
+
+All declared fields mandatory. No null values.
+
+**UpdateField on non‑existent field:** IR invalid.
+
+### Orderability
+
+Orderable types: Integer, FixedPoint, Boolean, String, Identifier. List<T> orderable iff T orderable (lexicographic). Map not orderable. Any type containing non‑orderable component not orderable.
+
+**Tie‑breaking for sort/min/max:** When sorting nodes/edges by a field, total order defined as: first by field value (natural order), then by element’s identifier ascending (SPEC 003). For `min`/`max` over a field, if multiple elements have same extreme value, the result is that value (no tie‑break needed).
+
+### Equality for compound types
+
+Recursive equality for all nested structures (used in No‑Op detection, golden file comparison, match key construction).
+
+### Empty field sets
+
+Node or edge type may declare zero fields. Then per‑field version increments are vacuous.
+
+### Constraints
+
+Node and edge types may declare `constraints` – a list of boolean expressions. Evaluated after mutation application (Phase F, SPEC 015). Violation → rollback and fatal `INVARIANT_VIOLATION`. Dependency extraction treats constraints like action expressions. If multiple constraints fail, the first in lexicographic order of source position is reported. Constraints affect `type_definitions_hash`.
+
+### Explicit conversion functions (pure)
+
+- `to_fixed(value, scale)`: Converts Integer or FixedPoint to FixedPoint with target scale (0–18). Integer → `value * 10^scale` (checked overflow). FixedPoint(s) → if scale ≥ s: multiply by 10^(scale‑s); if scale < s: integer division by 10^(s‑scale) truncating toward zero. Overflow or precision loss (non‑zero truncated digits) → fatal error.
+- `to_integer(value)`: Converts FixedPoint to Integer by truncating toward zero (discarding fractional digits). For Integer, returns unchanged.
+
+---
+
+## SPEC 003 – IDENTIFIER MODEL
+
+**Grammar:** `identifier = type_name ":" nonNegativeInteger`  
+`type_name` matches SPEC 002 ident grammar. `nonNegativeInteger` decimal without leading zeros (except `0`). Examples: `Person:0`, `Task_12:5`.
+
+**Parsing:** Split on first colon; left must be valid type_name, right valid non‑negative integer. Malformed identifiers → IR invalid.
+
+**Sequence counters:** Per type, start at 0. Increment by 1 per allocation, never reused, never wrap. Overflow check: if `current + count > INT64_MAX` → fatal `COUNTER_OVERFLOW`. Initial counter = max(sequence number in initial state) + 1 (or 0 if none).
+
+**Identifier ordering:** 1) Lexicographic on type_name (UTF‑8 bytewise), 2) numeric ascending on sequence number.
+
+---
+
+## SPEC 004 – STATE MODEL
+
+Deterministic state consists of: Nodes, Edges, Version Counters, Sequence Counters, Tick Counter, Previous Match Set.
+
+**Node:** id, type, fields (map), existence_version (positive integer), field_versions (per field).  
+**Edge:** id, type, source, target, fields, existence_version, field_versions.
+
+**Global version counters:**  
+- `extent_version[node_type]`  
+- `predicate_version[node_type][field_name]` (node)  
+- `ordering_dependency_version[node_type][field_name]` (node)  
+- `edge_predicate_version[edge_type][field_name]` (edge)  
+- `edge_ordering_dependency_version[edge_type][field_name]` (edge)  
+- `edge_type_version[edge_type]` (tracks set membership)  
+- `adjacency_version[node_id][edge_type][direction]` (direction = incoming/outgoing)
+
+All global counters exist from initialization with value 1, except `adjacency_version` which exists only for existing node_ids (created with node). On node deletion, its adjacency counters are removed.
+
+**Tick counter:** starts 0, incremented before each tick. Overflow → fatal before discovery.
+
+**Previous Match Set:** stores `match_key` and `match_age` for every match in the **previous** tick's discovery snapshot. Initialized empty. Updated after each tick (SPEC 011). Not part of graph but part of execution state.
+
+**Initial state version assignment:** For each node/edge in initial state: existence_version = 1, field_versions[field] = 1, global counters set to 1.
+
+**Initial state validation:** Must satisfy state invariants (below). Violation → IR invalid.
+
+**State invariants (must hold after every commit):**  
+- Unique node and edge identifiers.  
+- No dangling edges (source/target exist).  
+- No dangling identifier references: recursively through all nested lists/maps, every Identifier field refers to an existing node or edge.  
+- All fields type‑valid.  
+- All constraints satisfied.  
+- No cycles in identifier references (detected during validation; see SPEC 002 cycle rule).  
+
+---
+
+## SPEC 005 – CANONICAL IR
+
+Canonical IR is the sole executable representation. Contains: IR Version, Type Definitions, Function Definitions, Rule Definitions, Initial State, Constants.
+
+**IR version:** top‑level `"ir_version"` must be `"1.0"`. Others rejected.
+
+**Canonical IR must contain:** No syntactic sugar, no implicit defaults, no runtime metadata, no engine‑specific structures.
+
+**Rule Definition Fields (all mandatory):**  
+- `rule_id` (string matching ident grammar)  
+- `base_priority` (Integer)  
+- `priority_scale` (Integer, ≥0)  
+- `fairness_scale` (Integer, ≥0)  
+- `pattern` (pattern specification)  
+- `actions` (action specification)
+
+Score overflow (SPEC 012) is fatal.
+
+**Rule Identifier Stability:** `rule_id` unique, stable across compilations, preserved by serialization. Compilers must not generate rule ids.
+
+**Function Termination:** Recursion (direct or mutual) forbidden. Functions must be pure or deterministic read‑only. No iterative constructs.
+
+**IR Validity:** Validate before execution. Type checking, initial state invariants, rule_id uniqueness, priority fields present and correct type.
+
+**Round‑trip serialization:** parse + reserialize → byte‑identical.
+
+**Type definitions hash calculation:** SHA‑256 hex digest of canonical JSON of type definitions section:  
+- Types ordered lexicographically by type_name.  
+- Within each type, fields ordered lexicographically by field_name.  
+- Each type serialized as `{"type": type_name, "fields": {...}, "constraints": [...]}` (constraints array optional).  
+- Field types: base types as strings, FixedPoint as `{"type":"FixedPoint","scale":n}`, List as `{"type":"List","element":...}`, Map as `{"type":"Map","key":"String","value":...}`.  
+- All JSON canonical (no whitespace, keys sorted). Constraints array ordered as in IR.
+
+---
+
+## SPEC 006 – FUNCTION MODEL
+
+**Pure functions:** Only depend on arguments, do not read state. Dependency extraction limited to arguments.
+
+**Deterministic read‑only functions:** May read state, may not modify. Body inlined for dependency extraction; no separate declared_reads.
+
+**No recursion, no nondeterministic functions.**
+
+---
+
+## SPEC 007 – EXPRESSION MODEL
+
+Expressions represent pure computation. May contain literals, bindings, arithmetic, boolean logic, collections, function calls. Must not mutate state, allocate identifiers, observe runtime metadata, observe events. Short‑circuit allowed. Dependency extraction analyzes all branches independent of runtime evaluation.
+
+---
+
+## SPEC 008 – PATTERN MODEL
+
+Patterns bind graph elements. Deterministic enumeration using ascending node_id order (SPEC 003) and ascending edge_id order. Pattern constraints may use expressions. let bindings evaluated during discovery, excluded from match identity. No mutation.
+
+---
+
+## SPEC 009 – MATCH DISCOVERY MODEL
+
+Discovery occurs exactly once per tick. Produces a frozen snapshot.
+
+A match consists of: `rule_id`, `bindings`, `let_values`, `dependencies`, `dependency_snapshot`, `match_key`.
+
+**Dependency snapshot:** For every dependency D, stores the version counter value observed during discovery. For existence dependencies, stores `existence_version`.
+
+**Duplicate matches:** For given `(rule_id, binding assignment)` (identifiers only), at most one match exists in snapshot.
+
+**Match key definition (canonical serialization of):**  
+```json
+{
+  "rule_id": <string>,
+  "bindings": {
+    "<binding_name>": "<identifier>",
+    ...
+  }
+}
+```
+Keys sorted lexicographically. `let_values` excluded.
+
+**Match key ordering:** Lexicographic order of canonical UTF‑8 bytes.
+
+**Discovery constraints:** No mutation, no allocation, no runtime metadata, no events.
+
+**Discovery snapshot serialization:** Used in golden file errors (SPEC 018). Includes `let_values` for diagnostics.
+
+**Fatal error during discovery:** Abort tick with no selection. Golden file records partial snapshot (only fully‑formed matches discovered before error, sorted by match_key ascending) and error details.
+
+---
+
+## SPEC 010 – DEPENDENCY MODEL
+
+### Dependency types and version counter mappings
+
+| Dependency | Maps to |
+|------------|---------|
+| `NodeExistence(node_id)` | node.existence_version (if exists) |
+| `EdgeExistence(edge_id)` | edge.existence_version |
+| `Field(element_id, field_name)` | field_versions[field_name] |
+| `Predicate(node_type, field_name)` | predicate_version[node_type][field_name] |
+| `Ordering(node_type, field_name)` | ordering_dependency_version[node_type][field_name] |
+| `EdgePredicate(edge_type, field_name)` | edge_predicate_version[edge_type][field_name] |
+| `EdgeOrdering(edge_type, field_name)` | edge_ordering_dependency_version[edge_type][field_name] |
+| `Extent(node_type)` | extent_version[node_type] |
+| `EdgeType(edge_type)` | edge_type_version[edge_type] |
+| `Adjacency(node_id, edge_type, dir)` | adjacency_version[node_id][edge_type][dir] |
+
+### Extraction requirements
+
+Mandatory for: patterns, where clauses, let expressions, priority expressions, action arguments, event payloads, function bodies (inlined). Must be complete (no under‑approximation). Over‑approximation not permitted except as explicitly allowed below.
+
+### Identifier reference and collection dependency (normative algorithm)
+
+When an expression dereferences identifiers from a collection, the engine MUST:
+
+1. **Include a dependency on the collection expression itself** (e.g., `Field` if a field access, dependencies of let binding, etc.).
+2. **At discovery time, recursively traverse the collection** (including nested lists/maps) to find all concrete identifier values that are dereferenced in the loop body (or any nested iteration). For maps, traverse keys in lexicographic order.
+3. **Include `NodeExistence(id)` or `EdgeExistence(id)` for each such identifier.**
+4. **Detect cycles** (if an identifier refers back to a node that contains the original collection) – if cycle detected, fatal `INVARIANT_VIOLATION`. Depth limit 1000; exceed → fatal.
+
+**No extent‑level approximations allowed.**
+
+### Additional dependency rules
+
+- `len(collection)` → include dependencies of the collection expression plus the membership‑determining dependency (Extent or Adjacency).
+- Map read → include `Field` (if field access) and `Predicate` (for map content changes).
+- `min`/`max`/`sort` over node field → include `Extent`, `Predicate`, `Ordering`.
+
+### Normative extraction examples (non‑exhaustive)
+
+| Expression pattern | Dependencies |
+|-------------------|--------------|
+| `node.field` | `Field(node, field)`, `Predicate(node.type, field)`, `NodeExistence(node)` |
+| `edge.field` | `Field(edge, field)`, `EdgePredicate(edge.type, field)`, `EdgeExistence(edge)` |
+| `count(NodeType)` | `Extent(NodeType)` |
+| `sum(NodeType.field)` | `Extent(NodeType)`, `Predicate(NodeType, field)` |
+| `min(NodeType.field)` | `Extent(NodeType)`, `Predicate(NodeType, field)`, `Ordering(NodeType, field)` |
+| `sort(NodeType by field)` | `Extent(NodeType)`, `Predicate(NodeType, field)`, `Ordering(NodeType, field)` |
+| `node.outgoing(EdgeType)` | `Adjacency(node, EdgeType, outgoing)`, `EdgeType(EdgeType)` |
+| `exists(edge)` | `EdgeExistence(edge)` |
+| `ref = person.manager; something(ref.field)` | `Field(person, manager)`, `NodeExistence(person)`, `NodeExistence(ref)` |
+
+### Match validation
+
+A match is valid iff:
+- For every existence dependency, the element exists AND its current `existence_version` equals the snapshot version.
+- For every non‑existence dependency, the current version counter equals the snapshot version.
+
+No other correctness mechanism.
+
+---
+
+## SPEC 011 – MATCH LIFECYCLE MODEL
+
+**Match age definition (using Previous Match Set):**  
+- If `match_key` not in previous tick's set → age = 0 (new).  
+- Else age = `previous_age + 1`.
+
+**Update after tick:** After commit (or if no commit, after discovery), the Previous Match Set is updated with the current tick's discovery snapshot matches, each with `age = match.age + 1`. Overflow check: if increment would exceed `INT64_MAX` → fatal `COUNTER_OVERFLOW` before update.
+
+**Forgetting:** Only immediate previous tick matters. Disappearing matches are forgotten.
+
+**Scoring use of age:** The `match_age` used in score computation (SPEC 012) is the age **before** increment (i.e., the value stored in the previous Previous Match Set, or 0 for new matches).
+
+---
+
+## SPEC 012 – SELECTION MODEL
+
+Selection operates on the discovery snapshot.
+
+For each match:  
+`score = (base_priority * priority_scale) + (match_age * fairness_scale)`
+
+All calculations using checked signed 64‑bit arithmetic. Overflow → fatal `INTEGER_OVERFLOW`.
+
+Matches ordered by:
+1. Score descending
+2. `match_key` ascending (lexicographic byte order)
+
+**Tie‑breaking:** If scores and match_keys identical → same match (duplicate impossible).
+
+**If match set empty:** End tick with no commit, no events, state unchanged.
+
+**Transaction selection (deterministic):**
+1. Rank matches as above.
+2. For each candidate in order:
+   - Validate dependencies (SPEC 010). If invalid → next candidate.
+   - Evaluate actions (SPEC 013) to produce staged transaction.
+   - Validate staged transaction (SPEC 014). If invalid → next candidate.
+   - Commit (SPEC 015). If commit succeeds → selected; else (fatal error) halt.
+3. If no candidate leads to valid transaction → end tick with no commit.
+
+**Note:** Transaction validation failures (e.g., duplicate UpdateField, missing target) are **not** fatal; they simply skip the match.
+
+---
+
+## SPEC 013 – ACTION MODEL
+
+**Actions:** `CreateNode`, `CreateEdge`, `UpdateField`, `DeleteEdge`, `DeleteNode`, `EmitEvent`. Evaluation is pure, produces a staged transaction.
+
+**Action execution order:** IR action list fully expanded, executed in order. No runtime generation of actions. Higher‑level constructs desugared.
+
+**Implicit edge deletions (simplified):**  
+For every `DeleteNode(node_id)` action, the engine computes the set of edges incident to `node_id` (from pre‑commit state plus any staged creations). These edges are added to a global **edge deletion set** for the transaction, associated with the **earliest action index** (the position of the `DeleteNode` that causes the deletion). If an edge is incident to multiple deleted nodes, the earliest action index among those `DeleteNode`s is kept.
+
+After processing all actions, the effective action list is the original action list **plus** `DeleteEdge` actions inserted **immediately before** the earliest `DeleteNode` that caused them, ordered by `(earliest_action_index, edge_id)`. Duplicate `DeleteEdge` for the same edge are merged (kept at earliest position).
+
+**Example:** Original actions: `[DeleteNode(A), DeleteNode(B)]`. A has incident edges [E1, E3], B has [E2]. Effective list becomes `[DeleteEdge(E1), DeleteEdge(E3), DeleteNode(A), DeleteEdge(E2), DeleteNode(B)]` provided E1, E3 have lower action index than E2? Actually both come from A's action index (0) vs B's (1), so all of A's edges come before B's edge, and within A's edges sorted by edge_id.
+
+**Temporary creation handles:** `CreateNode`/`CreateEdge` may refer to newly created element via temporary handle. Handles resolved to final identifiers during commit (SPEC 015 Phase C). Handles **may** appear in `EmitEvent` payload expressions (resolved before evaluation).
+
+**Event payload evaluation timing:** Payload expressions evaluated during action evaluation against **pre‑commit state**, stored in staged transaction. Later deletions do not affect already‑computed payloads.
+
+**Staged transaction validation:** See SPEC 014.
+
+---
+
+## SPEC 014 – TRANSACTION MODEL
+
+A transaction consists of:
+1. Dependency validation (SPEC 010)
+2. Action evaluation (SPEC 013) → staged writes with temporary handles
+3. Resolve temporary handles
+4. Staged transaction validation
+5. Commit (SPEC 015)
+6. Event publication
+
+Only one transaction per tick. If any validation fails (non‑fatal), discard candidate and consider next match.
+
+**Staged transaction validation must ensure (non‑fatal failures → skip match):**
+- All `UpdateField`, `DeleteNode`, `DeleteEdge` targets exist (pre‑existing or created earlier in transaction).
+- **No duplicate `UpdateField` actions on same `(element_id, field)` pair** (checked **before** No‑Op elimination). Values may differ; still invalid.
+- `CreateEdge` source and target nodes exist after transaction application.
+- No dangling references: recursively, all `Identifier` fields refer to existing nodes/edges; all edge source/target exist.
+- All state invariants (SPEC 004) hold.
+- No self‑conflicting writes except automatic merges (see deduplication below).
+
+**Deduplication of edge deletions (normative):**  
+After implicit insertion (SPEC 013), the engine computes the final edge deletion set. Each edge is deleted at most once. The merged `DeleteEdge` entry appears at the position of the earliest action (explicit `DeleteEdge` or implicit from `DeleteNode`) according to the effective action list order. `adjacency_version` increments for each endpoint at most once per edge.
+
+**Automatic incident edge deletion:** When `DeleteNode` staged, all incident edges are implicitly deleted as described. Edges explicitly created then auto‑deleted are allowed.
+
+**If validation fails:** candidate match discarded, no state change.
+
+---
+
+## SPEC 015 – COMMIT MODEL
+
+**Strict atomic rollback:** If any fatal conformance error occurs during commit (Phases A–F), all mutations from the current transaction are rolled back, and the state recorded in the golden file is the **pre‑commit state**. Fatal errors after counter advancement (Phase G) are impossible because overflow is checked before Phase E.
+
+**Commit phases (normative, overriding any earlier descriptions):**
+
+```
+function commit_transaction(staged_transaction, discovery_snapshot):
+    // Phase A: Revalidate dependencies (read‑only)
+    if not revalidate_dependencies(discovery_snapshot):
+        return ABORT   // non‑fatal, match skipped
+
+    // Phase B: Allocate identifiers and check counters (no visible mutation)
+    required_node_counts = per_type_count(CreateNode in staged)
+    required_edge_counts = per_type_count(CreateEdge in staged)
+    for each node_type, count in required_node_counts:
+        if sequence_counter[node_type] + count > INT64_MAX:
+            FATAL_ERROR("COUNTER_OVERFLOW")
+    for each edge_type, count in required_edge_counts:
+        if sequence_counter[edge_type] + count > INT64_MAX:
+            FATAL_ERROR("COUNTER_OVERFLOW")
+    allocated_ids = allocate_identifiers_in_staged_order(staged)
+
+    // Phase C: Resolve temporary handles (pure mapping)
+    resolve_temporary_handles(staged, allocated_ids)
+
+    // Phase D: Final staged transaction validation (read‑only)
+    if not validate_staged_transaction(staged):   // duplicate updates, missing targets, etc.
+        return ABORT   // non‑fatal, match skipped
+
+    // Pre‑commit overflow checks for all counters to be incremented in Phase G
+    // and for match_age increments (Phase I)
+    for each version counter to be incremented (predicate_version, ordering_version,
+         extent_version, edge_type_version, adjacency_version, field_version,
+         existence_version, tick_counter) and for match_age increments:
+        compute post‑increment value using 128‑bit arithmetic
+        if any would exceed INT64_MAX:
+            FATAL_ERROR("COUNTER_OVERFLOW")
+
+    // Phase E: Apply mutations in effective action order (after implicit insertion)
+    begin_atomic_mutation()
+    try:
+        for each action in effective_action_list (SPEC 013):
+            apply_action(action)
+    catch FatalConformanceError as e:
+        rollback_mutations()
+        FATAL_ERROR(e)   // rolls back and halts
+
+    // Phase F: Check invariants (read‑only, after all mutations)
+    if not check_state_invariants():
+        rollback_mutations()
+        FATAL_ERROR("INVARIANT_VIOLATION")
+
+    // Phase G: Advance counters (atomic)
+    advance_sequence_counters(allocated_ids)
+    apply_version_counter_increments(staged)   // per table below
+
+    // Phase H: Publish events (already evaluated)
+    publish_events(staged.events_in_order)
+
+    // Phase I: Update Previous Match Set (overflow already checked)
+    update_previous_match_set(current_discovery_snapshot)
+
+    return COMMIT_OK
+```
+
+**Atomicity guarantee:** From start of Phase E through end of Phase G, the transaction is atomic. Any fatal error before Phase G causes rollback to pre‑commit state. Fatal error during Phase G is impossible due to pre‑check; but if it occurs (e.g., hardware fault), behavior undefined – not a conformance issue.
+
+**Version increment rules (only for changed values; No‑Op excluded):**
+
+| Operation | extent | pred(node) | order(node) | edge_pred | edge_order | edge_type | adjacency | existence | field_vers |
+|-----------|--------|------------|-------------|-----------|------------|-----------|-----------|-----------|------------|
+| CreateNode | +1 | +1 (all) | +1 (all) | - | - | - | - | set to 1 | set to 1 each |
+| DeleteNode | +1 | +1 (all) | +1 (all) | - | - | - | +1 per incident edge (after dedup) | removed | removed |
+| CreateEdge | - | - | - | +1 (all) | +1 (all) | +1 | +1 source.out, +1 target.in | set to 1 | set to 1 each |
+| DeleteEdge | - | - | - | - | - | +1 | +1 source.out, +1 target.in | removed | removed |
+| UpdateField (node) | - | +1 (that) | +1 (that) | - | - | - | - | - | +1 (that) |
+| UpdateField (edge) | - | - | - | +1 (that) | +1 (that) | - | - | - | +1 (that) |
+
+**Notes:**
+- `edge_type_version` increments only on creation/deletion (set membership changes).
+- `adjacency_version` increments for source.outgoing and target.incoming on edge create/delete. On node deletion, increments once per incident edge after deduplication.
+- Deduplication ensures each edge increments each endpoint's adjacency_version at most once.
+
+**Transaction write validity (non‑fatal if violated, skip match):**  
+- `UpdateField(X)` then `DeleteNode(X)` (same for edges)  
+- `DeleteNode(X)` then another explicit `DeleteNode(X)`  
+- `DeleteEdge(E)` then another explicit `DeleteEdge(E)`  
+- `CreateNode(X)` then explicit `DeleteNode(X)` (auto‑deletion not allowed for newly created nodes)  
+Edge created then auto‑deleted due to node deletion is allowed.
+
+Commit must preserve all state invariants.
+
+---
+
+## SPEC 016 – EVENT MODEL
+
+Events are deterministic outputs. Each event: `rule_id` and payload (any type). Visible only after successful commit.
+
+Event payload expressions pure, participate in dependency extraction, evaluated during action evaluation against pre‑commit state.
+
+Events must not influence matching or execution.
+
+**Event ordering:** In golden file, events appear in same order as `EmitEvent` actions in staged transaction (action evaluation order).
+
+---
+
+## SPEC 017 – TICK MODEL
+
+Tick execution proceeds:
+1. Increment `tick_counter`. If overflow → fatal `COUNTER_OVERFLOW` before discovery.
+2. Discover matches (frozen snapshot).
+3. Compute scores (SPEC 012), rank matches.
+4. Select candidate (SPEC 012). If none → end tick (no commit).
+5. Validate dependencies (SPEC 010). If invalid → next candidate.
+6. Evaluate actions (SPEC 013) → staged transaction.
+7. Validate staged transaction (SPEC 014). If invalid → next candidate.
+8. Commit transaction (SPEC 015). If fatal error → halt and rollback.
+9. Publish events (SPEC 016).
+10. Update Previous Match Set (SPEC 011).
+11. End tick.
+
+Discovery occurs exactly once per tick. At most one transaction commits.
+
+---
+
+## SPEC 018 – CANONICAL SERIALIZATION
+
+All serialized output must be valid UTF‑8.
+
+**Primitive types:**
+- **Integer:** JSON number, base‑10, no leading zeros, minus sign. Example: `42`
+- **Boolean:** `true` or `false` (lowercase)
+- **Null:** `null` (lowercase, used only in golden files)
+- **String:** double‑quoted, escaping: `\`, `"`, `\n`, `\r`, `\t`, other controls as `\uXXXX` (uppercase hex, 4 digits). Other Unicode literal.
+- **Identifier:** double‑quoted string containing exact identifier text, e.g., `"Person:5"`
+- **FixedPoint:** **JSON string** containing decimal literal with exactly scale fractional digits, dot separator, no exponent, integer part never omitted. Example: scale 2, value 1250 → `"12.50"`. For scale 0: `"42.0"`. Negative: `"-12.50"`.
+
+**Note:** `Integer 42` serializes as JSON number `42`; `FixedPoint(0) 42` serializes as JSON string `"42.0"`. Not equal.
+
+**Compound types:**
+- **List:** `[element1,element2,...]` no spaces.
+- **Map:** `{"key1":value1,"key2":value2,...}` keys sorted lexicographically by UTF‑8 bytes, no spaces.
+
+**Top‑level golden file structure:** JSON object with lexicographically sorted keys: `error` (mutually exclusive with `ticks`), `final_state`, `initial_state`, `ir_schema_version`, `ticks`, `type_definitions_hash`.
+
+**Discovery snapshot serialization (for error contexts):** JSON array of match objects, each with keys sorted: `rule_id`, `bindings`, `let_values`, `dependencies` (array of strings), `dependency_snapshot` (map), `match_key`. Matches ordered by `match_key` ascending.
+
+**Golden‑file equality:** Full serialized snapshot, excluding `let_values` (diagnostic only).
+
+**Test vectors (normative):**
+- `Integer 0` → `0`
+- `FixedPoint(2)` value 100 → `"1.00"`
+- `FixedPoint(0)` value 42 → `"42.0"`
+- Empty list → `[]`
+- Empty map → `{}`
+- Map `{"b":2,"a":1}` → `{"a":1,"b":2}`
+- String `"hello\nworld"` → `"hello\\nworld"`
+- Identifier `Person:5` → `"Person:5"`
+
+---
+
+## SPEC 019 – GOLDEN FILE MODEL
+
+Golden files capture observable behavior.
+
+**Top‑level fields (lexicographic order):**
+- `error` (object) – present only if fatal conformance error occurred.
+- `final_state` – canonical serialization of state after all ticks or at error (pre‑commit state after rollback).
+- `initial_state` – canonical serialization of initial state.
+- `ir_schema_version` – must be `"1.0"`.
+- `ticks` (array) – present only if normal completion (no error).
+- `type_definitions_hash` – SHA‑256 hex digest per SPEC 005.
+
+Exactly one of `ticks` or `error` present.
+
+**Tick record fields:**
+- `tick_number` (integer)
+- `selected_match_key` (canonical serialization of match that committed, or `null` if none)
+- `committed_changes` (list of action records, per SPEC 015 commit order)
+- `events` (list of `{"rule_id":..., "payload":...}`)
+
+**Action record schemas** (keys sorted lexicographically):
+- `CreateNode`: `{"type":"CreateNode","node_type":...,"node_id":...,"fields":{...}}`
+- `CreateEdge`: `{"type":"CreateEdge","edge_type":...,"edge_id":...,"source":...,"target":...,"fields":{...}}`
+- `UpdateField`: `{"type":"UpdateField","target":...,"field":...,"old_value":...,"new_value":...}` (omitted if No‑Op)
+- `DeleteEdge`: `{"type":"DeleteEdge","edge_id":...}`
+- `DeleteNode`: `{"type":"DeleteNode","node_id":...}`
+
+**Error object (fatal conformance error):**
+```json
+{
+  "code": "<string>",
+  "context": {
+    "location": 0,
+    "snapshot": <discovery snapshot array per SPEC 018>
+  },
+  "state": <canonical serialization of state at error (pre‑commit)>,
+  "tick": <integer>
+}
+```
+Allowed error codes: `"INTEGER_OVERFLOW"`, `"DIVISION_BY_ZERO"`, `"COUNTER_OVERFLOW"`, `"INDEX_OUT_OF_BOUNDS"`, `"MISSING_MAP_KEY"`, `"INVALID_IR"`, `"INVARIANT_VIOLATION"`, `"ADJACENCY_COUNTER_MISSING"`. No other codes.
+
+`location` is reserved for deterministic indexing; in v1.0 always `0`. `tick` is tick counter after increment for that tick (or `0` if error before first tick).
+
+Diagnostic information (comments, timestamps) non‑normative.
+
+---
+
+## SPEC 020 – CONFORMANCE
+
+A conformant engine **must**:
+- Implement every normative rule in this specification.
+- Reject invalid Canonical IR.
+- Prohibit nondeterminism, floating point, identifier reuse, counter overflow.
+- Produce identical observable behavior (committed changes, events, final state, golden files) for identical IR and initial state.
+
+**Dependency extraction completeness** (SPEC 010) is normative. Conformance tests will exercise all dependency types.
+
+Conformance determined exclusively through observable behavior.
+
+---
+
+## ANNEX A – CONFORMANCE TEST SUITE REQUIREMENTS (Normative)
+
+A conformant engine must pass tests in these categories:
+1. Fixed‑point arithmetic edge cases (overflow, scale conversion, division by zero, mixed scale comparison).
+2. Dependency extraction for collections using exact algorithm (SPEC 010).
+3. Identifier reference deletion and validation (including nested collections, cycle detection).
+4. Transaction conflict resolution (multiple candidates, invalid transactions).
+5. Canonical serialization round‑trip (maps, lists, fixed‑point, strings, Integer vs FixedPoint(0) distinction).
+6. Fatal error reporting (all eight error types, correct tick, rollback, snapshot serialization).
+7. Commit phase atomicity and rollback (no partial commit).
+8. Match age tracking (forgetting, overflow).
+9. Priority parameters (base_priority, priority_scale, fairness_scale) and score overflow.
+10. Duplicate `UpdateField` detection.
+11. Implicit `DeleteEdge` insertion and ordering.
+12. Deduplication of edge deletions and adjacency_version increments.
+
+The companion document (same version number) provides exact IR inputs and expected golden file outputs. Any deviation indicates non‑conformance.
+
+---
+
+**END OF GRISP DETERMINISTIC KERNEL SPECIFICATION v0.48 (HARDENED EDITION)**
