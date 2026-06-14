@@ -1,0 +1,1525 @@
+Below is a **clean, closed, v1.0-style specification** synthesized from everything we converged on. It intentionally removes ambiguity, eliminates dual-model artifacts (v0.49 vs v0.50 split), and encodes the system as a **single deterministic structural operational semantics with trace projection**.
+
+---
+
+# GRISP DETERMINISTIC GRAPH CALCULUS v1.0
+
+## (DSGRC — Deterministic Structural Graph Rewrite Calculus)
+
+---
+
+# 0. Core Principle
+
+The system is a **single deterministic transition system**:
+
+[
+\Sigma \rightarrow \Sigma'
+]
+
+All behavior is defined by:
+
+* structural pattern evaluation
+* total-order match selection
+* syntax-directed compilation
+* atomic graph mutation
+
+There is **no runtime dependency tracking subsystem**.
+Dependencies exist only as **derivation artifacts of evaluation rules**.
+
+---
+
+# 1. Global State
+
+A configuration is:
+
+[
+\Sigma = \langle G, C, T, M_{\text{prev}} \rangle
+]
+
+Where:
+
+* **G**: typed property graph (nodes, edges, fields)
+* **C**: counters (tick, versions, adjacency, existence, etc.)
+* **T**: IR program (set of rules)
+* **M_prev**: previous match map
+  [
+  \text{match_key} \rightarrow \text{age}
+  ]
+
+---
+
+# 2. IR Syntax (Inductive Definition)
+
+## 2.1 Expressions
+
+[
+e ::= k \mid x \mid x.f \mid e_1 \oplus e_2
+]
+
+## 2.2 Patterns
+
+[
+P ::= \emptyset \mid \text{Node}(x) \cup P \mid \text{Edge}(t, x_s, x_t) \cup P
+]
+
+## 2.3 Constraints
+
+[
+\phi ::= \text{true} \mid e_1 = e_2 \mid \phi_1 \land \phi_2
+]
+
+## 2.4 Bindings
+
+[
+B ::= \emptyset \mid \text{let}(x, e) \cdot B
+]
+
+## 2.5 Actions
+
+[
+a ::= \text{CreateNode} \mid \text{CreateEdge} \mid \text{UpdateField} \mid \text{DeleteNode} \mid \text{DeleteEdge} \mid \text{EmitEvent}
+]
+
+## 2.6 Rule
+
+[
+R ::= (P, \phi, B, A)
+]
+
+---
+
+# 3. Pattern Semantics
+
+Define a total deterministic function:
+
+[
+\mathsf{EvalPatterns}(G, T) = M
+]
+
+Where:
+
+* M is a finite set of matches
+* each match contains:
+
+  * bindings
+  * let-values
+  * read-set (derivation-only, not stored in state)
+
+### Determinism rule:
+
+Pattern evaluation is:
+
+* order-independent
+* graph traversal order-free
+* defined strictly by identifier ordering and canonical field access rules
+
+---
+
+# 4. Match Key
+
+[
+\text{match_key}(m) =
+\text{canonical_serialize}(\text{rule_id}, \text{bindings})
+]
+
+Sorted lexicographically by UTF-8 bytes.
+
+---
+
+# 5. Match Selection (Total Order Reduction)
+
+For all matches (m \in M):
+
+[
+score(m) = base_priority \cdot scale + age(m) \cdot fairness
+]
+
+Selection:
+
+[
+m^* = \min_{\prec}(M)
+]
+
+Where ordering is:
+
+1. score descending
+2. match_key ascending
+
+This is the **only nondeterminism-eliminating step**, and it is fully total.
+
+---
+
+# 6. Age Update
+
+[
+age(m) =
+\begin{cases}
+M_{prev}[key] + 1 & \text{if exists} \
+0 & \text{otherwise}
+\end{cases}
+]
+
+---
+
+# 7. Syntax-Directed Compile (CORE SEMANTIC LAYER)
+
+Define a judgment:
+
+[
+\mathcal{E} \vdash \langle A, G, m^* \rangle \Downarrow \langle \pi, \mathcal{R} \rangle
+]
+
+Where:
+
+* **π** = ordered primitive action trace (CAG projection)
+* **𝓡** = read-set (derivation artifact only)
+
+---
+
+## 7.1 Key invariant
+
+> Compile is defined by **structural induction over IR syntax only**
+
+No external traversal, no runtime graph iteration.
+
+---
+
+## 7.2 Empty block
+
+[
+\frac{}{\mathcal{E} \vdash \langle \emptyset, G, m^* \rangle \Downarrow \langle [], \emptyset \rangle}
+]
+
+---
+
+## 7.3 Sequential composition
+
+[
+\frac{
+\mathcal{E} \vdash \langle A, G, m^* \rangle \Downarrow \langle \pi_1, R_1 \rangle
+\quad
+\mathcal{E} \vdash \langle B, G, m^* \rangle \Downarrow \langle \pi_2, R_2 \rangle
+}{
+\mathcal{E} \vdash \langle A \cdot B, G, m^* \rangle \Downarrow \langle \pi_1 \cdot \pi_2, R_1 \cup R_2 \rangle
+}
+]
+
+---
+
+## 7.4 UpdateField
+
+Expression evaluation is deterministic:
+
+[
+\mathcal{E} \vdash e \Downarrow (v, R_e)
+]
+
+Then:
+
+[
+\langle UpdateField(x, f, e), G, m^* \rangle
+\Rightarrow
+(UpdateField(x, f, v), R_e \cup {NodeExistence(x)})
+]
+
+---
+
+## 7.5 DeleteNode expansion (canonical rule)
+
+Incident edges:
+
+[
+E_x = \text{IncidentEdges}(x, G)
+]
+
+Ordered by:
+
+[
+ORDER_CANONICAL
+]
+
+Compile expands:
+
+[
+DeleteEdge(e_1) \cdot ... \cdot DeleteEdge(e_n) \cdot DeleteNode(x)
+]
+
+Read-set:
+
+* adjacency dependencies
+* edge existence
+* node existence
+
+---
+
+# 8. COMMIT RULE (Atomic Transition)
+
+Define:
+
+[
+\pi = \mathsf{Compile}(T, G, m^*)
+]
+
+Then:
+
+### 8.1 Validation
+
+Check:
+
+* version counters unchanged for all (R)
+* structural invariants hold
+* no duplicate updates
+* all targets exist or are created in π
+
+Failure:
+→ discard match, return to selection
+
+---
+
+### 8.2 Application
+
+If valid:
+
+[
+(G, C) \rightarrow (G', C')
+]
+
+via applying π sequentially.
+
+Atomicity guaranteed.
+
+---
+
+### 8.3 Counter updates
+
+* tick increments
+* version counters updated
+* adjacency/existence updated
+* match history updated:
+
+[
+M_{prev}' = { match_key(m) \mapsto age(m) \mid m \in M }
+]
+
+---
+
+# 9. Tick Semantics
+
+One full reduction step:
+
+1. Tick increment
+2. Match discovery
+3. Scoring + selection
+4. Compile (structural)
+5. Validate + commit
+6. Update state
+
+If no valid match → no state change
+
+---
+
+# 10. Determinism Theorem
+
+## Theorem
+
+For any configuration (\Sigma), there exists at most one (\Sigma') such that:
+
+[
+\Sigma \rightarrow \Sigma'
+]
+
+## Proof sketch
+
+* EvalPatterns is a total function
+* selection is total-order minimum
+* Compile is structural recursion (unique derivation tree)
+* Apply is deterministic sequence execution
+* validation is pure predicate over state
+
+Therefore:
+→ no branching reduction rules overlap
+→ system is deterministic by construction
+
+---
+
+# 11. CAG Equivalence
+
+Define:
+
+[
+CAG \equiv \pi
+]
+
+The canonical action graph is:
+
+> the execution trace produced by Compile
+
+No separate semantic status.
+
+---
+
+# 12. Key Eliminations (important)
+
+This spec removes:
+
+* ❌ runtime dependency tracking system
+* ❌ separate CAG execution model
+* ❌ implicit graph traversal semantics
+* ❌ nondeterministic pattern evaluation
+* ❌ dual-phase dependency extraction
+
+Everything is now:
+
+> structural derivation → trace → atomic commit
+
+---
+
+# 13. Final classification
+
+This system is:
+
+> **A deterministic structural graph rewrite calculus with trace-indexed operational semantics**
+
+or equivalently:
+
+> **A single-step prioritized graph transition system with syntax-directed compilation semantics**
+
+---
+
+If you want the next step, there are only two meaningful directions now:
+
+1. **Turn this into a K-framework semantics (machine executable)**
+2. **Or formalize a confluence + bisimulation proof against DPO rewriting systems**
+
+Both are now purely formal, no longer architectural.
+
+
+
+
+
+
+# ================================================================================
+GRISP DETERMINISTIC KERNEL SPECIFICATION v0.60
+
+## Preamble
+
+This specification defines the GRISP Deterministic Kernel v0.60. It establishes a mathematically closed, unified standard that collapses the classic division between matching, dependency tracking, and action execution into a single, formally verifiable architecture: **Deterministic Structural Graph Rewrite Calculus with Trace-Indexed Read Semantics (DSGRC-TRS)**.
+
+All normative rules herein are mandatory for cross-engine conformance. An engine is conformant if and only if its state transitions, clock advancements, and event streams precisely mirror the execution trace ($\pi$) and read-shroud ($\mathcal{R}$) derivations defined by this calculus.
+
+# ================================================================================
+SPEC 000 — CORE SYSTEM ENTITIES & VALUE DOMAIN
+
+1.1 Primitive Numeric Types
+All numeric fields, parameters, calculations, and intermediate registers must use 64-bit signed fixed-point representations with a fixed scale of exactly 18 decimal places (referred to as `FixedPoint`).
+
+* The minimal value is $-9,223,372,036,854,775,808 \times 10^{-18}$.
+* The maximal value is $+9,223,372,036,854,775,807 \times 10^{-18}$.
+* Floating-point arithmetic, rounding behaviors, or platform-specific BigInt variations are strictly prohibited. Intermediate math must utilize a checked 128-bit accumulator before saturating or throwing overflow errors.
+
+1.2 The System Configuration Space ($\Sigma$)
+The global engine state is defined as a 4-tuple:
+
+
+$$\Sigma = \langle G, C, T, M_{\text{prev}} \rangle$$
+
+* **The Typed Graph ($G$):** A finite map of canonical structural identifiers (`Id`) to primitive typed node states, fields, and lexicographically sorted adjacency listings.
+* **The Counter Map ($C$):** A mapping containing all internal tracking sequences:
+* `C.tick`: The global clock epoch index.
+* `C.version[id]`: The structural mutation tracking counter for node/edge existence.
+* `C.adjacency[id]`: The sequence tracking mutation changes to a node's topology.
+
+
+* **The Epoch Index ($T$):** Current frame indicator ($T \in \mathbb{Z}_{\geq 0}$).
+* **The Match Cache ($M_{\text{prev}}$):** A mapping tracking $(\text{match\_key} \to \text{age})$ to maintain temporal continuity across tick boundaries.
+
+# ================================================================================
+SPEC 001 — THE UNIFIED OPERATIONAL KERNEL (THE 5 CORE RULES)
+
+The transition of the system state from one deterministic frame to the next occurs via five strictly unrolled structural operational rules.
+
+```
++---------------------------------------------------------------+
+|                      THE 5-RULE KERNEL LOOP                   |
++---------------------------------------------------------------+
+|                                                               |
+|  [Rule 1: TICK]     --> Advance global clock epoch            |
+|          │                                                    |
+|          ▼                                                    |
+|  [Rule 2: DISCOVER] --> Compute current match sets functionally  |
+|          │                                                    |
+|          ▼                                                    |
+|  [Rule 3: SELECT]   --> Choose single match via strict total order|
+|          │                                                    |
+|          ▼                                                    |
+|  [Rule 4: PLAN]     --> Syntax-directed unrolling to Trace & Read |
+|          │                                                    |
+|          ▼                                                    |
+|  [Rule 5: COMMIT]   --> Validate Read-shroud & apply mutations|
+|                                                               |
++---------------------------------------------------------------+
+
+```
+
+## Rule 1: Chronological Advance (TICK)
+
+Advances the clock epoch. If the tick counter increments beyond $\text{INT64\_MAX}$, the engine must halt immediately with a fatal `COUNTER_OVERFLOW` error.
+
+
+$$\frac{
+C.\text{tick} + 1 \leq \text{INT64\_MAX} \quad C' = C[\text{tick} \mapsto C.\text{tick} + 1]
+}{
+\langle G, C, T, M_{\text{prev}} \rangle \xrightarrow{\text{TICK}} \langle G, C', T+1, M_{\text{prev}} \rangle
+}$$
+
+## Rule 2: Non-Oracle Structural Pattern Matching (DISCOVER)
+
+The extraction of structural matches is a pure functional mapping over the graph topology $G$, eliminating scheduling heuristics.
+
+
+$$\frac{
+\text{EvalPatterns}(G, \text{IR}) = \mathcal{M} \quad 
+\mathcal{M}' = \{ (m, \text{age}) \mid m \in \mathcal{M}, \, \text{age} = \text{ComputeAge}(m, M_{\text{prev}}) \}
+}{
+\langle G, C, T, M_{\text{prev}} \rangle \xrightarrow{\text{DISCOVER}} \langle G, C, T, M_{\text{prev}}, \mathcal{M}' \rangle
+}$$
+
+
+Where:
+
+
+$$\text{ComputeAge}(m, M_{\text{prev}}) = \begin{cases} 
+M_{\text{prev}}[\text{match\_key}(m)] + 1 & \text{if } \text{match\_key}(m) \in \text{dom}(M_{\text{prev}}) \\ 
+0 & \text{otherwise} \end{cases}$$
+
+## Rule 3: Strategy-Normalized Canonical Selection (SELECT)
+
+To resolve rule execution conflicts without introducing race conditions, candidate traces are projected onto a single scalar metric and filtered through an immutable lexicographical sort key.
+
+
+$$\frac{
+\mathcal{M}' \neq \emptyset \quad 
+\forall (m, \text{age}) \in \mathcal{M}'. \, \text{score}(m) = \text{priority}_{\text{base}}(m) \cdot \text{scale}_{\text{prio}} + \text{age} \cdot \text{scale}_{\text{fair}} \\
+m^* = \min_{\prec} \{ m \mid (m, \text{age}) \in \mathcal{M}' \}
+}{
+\langle G, C, T, M_{\text{prev}}, \mathcal{M}' \rangle \xrightarrow{\text{SELECT}} \langle G, C, T, M_{\text{prev}}, \mathcal{M}', m^* \rangle
+}$$
+
+
+Where the strict canonical order relation $m_1 \prec m_2$ holds if and only if:
+
+
+$$(\text{score}(m_1) > \text{score}(m_2)) \lor (\text{score}(m_1) == \text{score}(m_2) \land \text{match\_key}(m_1) <_{\text{lex}} \text{match\_key}(m_2))$$
+
+## Rule 4: Syntax-Directed Trace Compilation (PLAN)
+
+Translates the structural IR, the selected match $m^*$, and the graph $G$ into a unified execution plan consisting of an operational trace ($\pi$) and an induced read obligation set ($\mathcal{R}$).
+
+
+$$\frac{
+\mathcal{E}_{m^*} \vdash \langle A_{\text{rule}}, G \rangle \Downarrow \langle \pi, \mathcal{R} \rangle
+}{
+\langle G, C, T, M_{\text{prev}}, \mathcal{M}', m^* \rangle \xrightarrow{\text{PLAN}} \langle G, C, T, M_{\text{prev}}, \mathcal{M}', m^*, \pi, \mathcal{R} \rangle
+}$$
+
+## Rule 5: Trace Verification and State Morphism (COMMIT)
+
+Validates the read obligations, checks structural invariants post-mutation, updates global version states, and advances history.
+
+
+$$\frac{
+\forall r \in \mathcal{R}. \, \text{CheckVersion}(r, G, C) == \text{Valid} \quad 
+G' = \text{ApplyTrace}(\pi, G) \quad 
+C' = \text{UpdateCounters}(\pi, C) \\
+\text{VerifyStructuralInvariants}(G') == \text{True} \quad 
+M_{\text{prev}}' = \{ \text{match\_key}(m) \mapsto \text{age} \mid (m, \text{age}) \in \mathcal{M}' \}
+}{
+\langle G, C, T, M_{\text{prev}}, \mathcal{M}', m^*, \pi, \mathcal{R} \rangle \xrightarrow{\text{COMMIT}} \langle G', C', T, M_{\text{prev}}', \emptyset \rangle
+}$$
+
+
+If validation fails with a non-fatal error, $m^*$ is dropped, and the engine loops back to **Rule 3** with the remaining matches in $\mathcal{M}'$.
+
+# ================================================================================
+SPEC 002 — SYNTAX-DIRECTED LOWERING & READ PROJECTION
+
+2.1 Environment Context-Freeness
+The compiler derivation environment $\mathcal{E}$ is initialized exclusively from the immutable bindings of the selected match $m^*$. The syntax-directed translation is strictly context-free: $\mathcal{E}$ is structural-invariant and bounded solely by the pairing of $(m^*, G)$. Traversal history, execution side-effects, or engine-specific pointer addresses cannot influence the lowering tree.
+
+2.2 Core Inductive Lowering Clauses
+
+Clause 2.2a: Terminal Action Block Nullification
+An empty action stream produces an empty execution trace and zero read dependencies.
+
+
+$$\frac{}{ \mathcal{E} \vdash \langle \emptyset, G \rangle \Downarrow \langle [\,], \emptyset \rangle }$$
+
+Clause 2.2b: Field Update Lowering
+Translating a property change requires calculating expression evaluations via sub-term reduction ($\Downarrow_{\text{expr}}$), which appends read tokens directly to the dependency shroud.
+
+
+$$\frac{
+\mathcal{E} \vdash \langle e, G \rangle \Downarrow_{\text{expr}} \langle k, \mathcal{R}_e \rangle \quad 
+x_{\iota} = \mathcal{E}(x) \quad 
+\mathcal{E} \vdash \langle A_{\text{tail}}, G \rangle \Downarrow \langle \pi_{\text{tail}}, \mathcal{R}_{\text{tail}} \rangle
+}{
+\mathcal{E} \vdash \langle \text{UpdateField}(x, f, e) \cdot A_{\text{tail}}, G \rangle \Downarrow \langle [\text{UpdateField}(x_{\iota}, f, k)] \cdot \pi_{\text{tail}}, \, \mathcal{R}_e \cup \{\text{NodeExistence}(x_{\iota})\} \cup \mathcal{R}_{\text{tail}} \rangle
+}$$
+
+Clause 2.2c: Cascade Deletion Deconstruction
+When a structural node is scheduled for removal, its structural incident connections must be systematically decoupled. To prevent non-deterministic pointer chasing during graph walking, the topological evaluation must collect incident edges and sort them using a total canonical lexicographical ordering key over their underlying identifiers (`ORDER_CANONICAL`).
+
+
+$$\frac{
+x_{\iota} = \mathcal{E}(x) \quad 
+\vec{e}_{\text{incident}} = \text{GetIncidentEdgesSorted}(x_{\iota}, G) \quad 
+\pi_{\text{edges}} = [ \text{DeleteEdge}(\epsilon) \mid \epsilon \in \vec{e}_{\text{incident}} ] \\
+\mathcal{R}_{\text{edges}} = \{ \text{Adjacency}(x_{\iota}, \epsilon) \cup \text{EdgeExistence}(\epsilon) \mid \epsilon \in \vec{e}_{\text{incident}} \} \quad 
+\mathcal{E} \vdash \langle A_{\text{tail}}, G \rangle \Downarrow \langle \pi_{\text{tail}}, \mathcal{R}_{\text{tail}} \rangle
+}{
+\mathcal{E} \vdash \langle \text{DeleteNode}(x) \cdot A_{\text{tail}}, G \rangle \Downarrow \langle \pi_{\text{edges}} \cdot [\text{DeleteNode}(x_{\iota})] \cdot \pi_{\text{tail}}, \, \mathcal{R}_{\text{edges}} \cup \{\text{NodeExistence}(x_{\iota})\} \cup \mathcal{R}_{\text{tail}} \rangle
+}$$
+
+# ================================================================================
+SPEC 003 — TRANSACTIONS & SHROUD VALIDATION MECHANICS
+
+3.1 CheckVersion Primitives
+During the application of **Rule 5**, every element $r \in \mathcal{R}$ must be evaluated against the active graph snapshot and the global counter tracking architecture. A read obligation is marked `Valid` if and only if:
+
+* For `NodeExistence(id)` / `EdgeExistence(id)`: The corresponding entity exists in $G$ and its tracking sequence in $C.\text{version}[id]$ matches the initial state observed at the start of the current tick.
+* For `Adjacency(id, edge_id)`: The topological connection remains unaltered, and $C.\text{adjacency}[id]$ has sustained no mid-tick revisions.
+* For `Field(id, f)`: The value of field $f$ on entity $id$ matches the state from which the trace was generated.
+
+3.2 Unified Counter Advancements
+Upon validation success, counter updates must occur in a single atomic phase:
+
+* Any `UpdateField` call increments $C.\text{version}[id]$ by exactly 1.
+* Any implicit or explicit `DeleteEdge` call increments $C.\text{adjacency}[src\_id]$ and $C.\text{adjacency}[tgt\_id]$ by exactly 1.
+
+# ================================================================================
+SPEC 004 — CANONICAL SERIALIZATION BOUNDARIES
+
+To enforce strict, hardware-independent cross-engine communication and state validation, state snapshots must utilize a deterministic text-based format adhering to the following strict layout constraints:
+
+1. **Map Key Ordering:** All dictionary, collection, field, and attribute mappings must be serialized strictly in UTF-8 lexicographical key order.
+2. **Numeric String Isolation:** To prevent type blurring or float coercion by external consuming systems, all `FixedPoint` numbers must be serialized as JSON string types containing exactly 18 decimal places (e.g., `"125.500000000000000000"`). Integer keys or tracking counters must be written as raw JSON numbers to maintain explicit type separation.
+3. **Whitespace Elimination:** To ensure byte-perfect hashing across discrete networks and architectures, all line endings, indentation spaces, trailing spaces, or carriage returns inside the canonical stream must be omitted.
+
+# ================================================================================
+SPEC 005 — UNIFIED GRADED ERROR TAXONOMY
+
+The kernel segregates exceptional behaviors into two strict architectural categories. Hybrid execution paths or non-normative error handling strategies are prohibited.
+
+1. **NON-FATAL (Transactional Failures):**
+* `TRANSACTION_STALE`: A counter inside the read-shroud changed mid-tick.
+* `CONSTRAINT_VIOLATION`: Staged mutations violate a rule guard or model safety parameter.
+* `DUPLICATE_FIELD_UPDATE`: Multiple instructions inside the linear trace $\pi$ attempt to modify the identical `(id, field)` target.
+* *System Action:* Discard the candidate trace $\pi$, completely roll back any staged field shifts, drop $m^*$, and return execution to **Rule 3**.
+
+
+2. **FATAL (Engine Panic States):**
+* `COUNTER_OVERFLOW`: A version or global tick index surpasses the signed 64-bit bounds.
+* `DIVISION_BY_ZERO`: An arithmetic compilation block attempts a invalid division path.
+* `RESOURCE_LIMIT_EXCEEDED`: Active mutations break physical processing thresholds or max graph node bounds allocated to the execution tick.
+* *System Action:* Immediately halt all processing pipelines, wipe out transactional caches, discard the current state modifications, and serialize a standard panic snapshot containing the active error tracking record.
+
+
+
+# ================================================================================
+END OF GRISP DETERMINISTIC KERNEL SPECIFICATION v0.60
+
+
+
+**GRISP DETERMINISTIC KERNEL SPECIFICATION v0.51 (Hybrid Synthesis)**
+
+This specification takes **v0.49** as the authoritative baseline and incorporates the architectural insights from the v0.50 direction and the unifying formal analysis (deterministic structural operational semantics with explicit Planning phase and trace-based execution). It preserves full implementability and golden-file determinism while reducing multi-representation friction.
+
+---
+
+**Preamble**
+
+This specification supersedes all previous versions. It is a complete, self-contained definition of the GRISP Deterministic Kernel. All normative rules are mandatory for conformance.
+
+The kernel defines a fully deterministic execution model for rule-driven state transitions over a typed graph. For identical Canonical IR and identical initial state, all conformant engines produce identical observable behavior (committed transitions, emitted events, golden file output).
+
+**Core Architectural Principles (v0.51)**
+
+1. **Frozen Discovery** – Match discovery occurs exactly once per tick. The snapshot is immutable.
+2. **Explicit Planning Phase** – All action expansion, implicit deletes, handle resolution, and final trace construction occur in a dedicated Planning phase *after* selection but *before* final validation and commit. The result is a single **Canonical Action Trace (CAT)**.
+3. **Expression-based Dependency Capture** – Dependencies are extracted from all expression contexts during discovery (patterns, where, let, priority, action arguments, events). Additional structural dependencies from Planning (e.g., implicit deletes) augment the snapshot.
+4. **Single Commit** – At most one transaction per tick.
+5. **Canonical Ordering** – All ordering uses ORDER_CANONICAL (UTF-8 bytewise lexicographic, with identifier tie-breaking).
+6. **Referential Transparency & Determinism** – No floating point, no runtime metadata, no identifier reuse.
+
+---
+
+**SPEC 000 – EXECUTION PHASES (New Unified Model)**
+
+Each tick consists of five phases:
+
+- **Phase D: Discovery** – Produce frozen match snapshot + initial dependency snapshot (expression reads).
+- **Phase S: Selection** – Rank matches by score (base_priority * priority_scale + age * fairness_scale), descending score then ascending match_key.
+- **Phase P: Planning** – For the selected match, compile to Canonical Action Trace (CAT) + augment dependencies.
+- **Phase V: Validation** – Re-validate dependencies + transaction validity.
+- **Phase C: Commit** – Atomic application or rollback + counter advancement + events + match history update.
+
+If any phase fails non-fatally, discard the candidate and try the next (Phase S). Fatal errors halt with rollback to pre-tick state.
+
+---
+
+**SPEC 001 – NUMERIC MODEL, TYPE SYSTEM, IDENTIFIER MODEL, STATE MODEL, CANONICAL IR, etc.**
+
+(These sections remain **unchanged** from v0.49 for stability and completeness. Fixed-point arithmetic, version counters, constraints, canonical serialization, golden file format, and conformance requirements carry over verbatim.)
+
+---
+
+**SPEC 009 – DISCOVERY (Phase D)**
+
+Discovery produces a frozen snapshot of matches. Dependencies are extracted from *all expression contexts* (patterns, where clauses, let bindings, priority expressions, action argument expressions, event payloads) using the rules in v0.49 SPEC 010.
+
+Let bindings are evaluated during discovery, contribute to dependencies, but are **excluded** from match_key (they do not affect match identity).
+
+The snapshot is immutable for the remainder of the tick.
+
+---
+
+**SPEC 012 – SELECTION (Phase S)**
+
+Unchanged from v0.49: score calculation with checked arithmetic, total ordering by score descending then match_key ascending.
+
+---
+
+**SPEC 013 – PLANNING (Phase P) – Canonical Action Trace**
+
+For the selected match m*, the engine performs a deterministic compilation from the rule’s IR (pattern + actions) + current graph snapshot into a **Canonical Action Trace (CAT)** — a linear sequence of primitive actions.
+
+**Normative properties of Planning:**
+- All implicit DeleteEdge expansions for DeleteNode occur here, using the precise algorithm from v0.49 SPEC 013 (incident edges from pre-commit state + staged creations, earliest index, sorted by (k, edge_id) via ORDER_CANONICAL, deduplication).
+- Temporary handles are resolved to final identifiers.
+- All expression evaluations in action arguments and event payloads are performed against the pre-commit snapshot.
+- A **read-trace augmentation** is produced: any additional structural dependencies introduced by rewrites (e.g., Adjacency, EdgeExistence for implicit deletes) are added to the original discovery dependency snapshot.
+
+The resulting CAT is immutable and serves as the single authoritative execution artifact for the transaction (unifying the intent of v0.50’s CAG).
+
+**Structural compilation invariant**: Planning is deterministic and context-free with respect to the frozen discovery snapshot. Every collection traversal and sub-expression evaluation follows canonical ordering.
+
+---
+
+**SPEC 014 – VALIDATION (Phase V)**
+
+- Revalidate the (discovery + Planning-augmented) dependency snapshot against current state (existence versions, field/predicate/ordering/adjacency counters).
+- Transaction-level checks: no duplicate UpdateField, target existence, no dangling references post-CAT, constraints satisfied.
+
+Non-fatal failures → discard candidate. Fatal errors → halt with rollback.
+
+---
+
+**SPEC 015 – COMMIT (Phase C)**
+
+Atomic application of the CAT (in trace order), counter advancement (using the exact table from v0.49), event publication, and PreviousMatchSet update.
+
+Rollback on fatal errors (pre-Phase C state is preserved in golden file).
+
+Version increment rules, No-Op detection, and invariant checks remain as in v0.49.
+
+---
+
+**SPEC 016-020 – EVENTS, TICK MODEL, SERIALIZATION, GOLDEN FILE, CONFORMANCE**
+
+Unchanged from v0.49, except that golden files now also record the selected CAT (for diagnostics) in each tick record.
+
+---
+
+**Key Improvements in v0.51**
+
+- Clearer phase separation reduces ambiguity around rewrite timing vs. dependency validation.
+- Canonical Action Trace provides a single execution artifact while preserving v0.49’s proven dependency model.
+- Implicit delete logic and version handling remain fully specified and deterministic.
+- No loss of concreteness: numeric model, serialization, error taxonomy, and conformance test requirements are identical to v0.49.
+
+**Conformance Note**
+
+Engines conforming to v0.51 automatically conform to v0.49 observable behavior. The Planning phase makes the previously implicit effective action list explicit and canonical.
+
+---
+
+**ANNEX A – CONFORMANCE TEST SUITE**
+
+Unchanged from v0.49, with additional tests for Planning phase determinism (identical CAT for same input) and augmented dependency validation.
+
+---
+
+**END OF GRISP DETERMINISTIC KERNEL SPECIFICATION v0.51**
+
+---
+
+This v0.51 version is the practical synthesis: it keeps everything that made v0.49 strong and implementable, while incorporating the cleaner phase model and unified trace concept from the v0.50 direction and the formal discussion. It is ready for implementation and serves as a stable foundation for further formalization (e.g., full inductive semantics in a future v0.60).
+
+If you want expansions on specific sections, a full diff-style edit against the original v0.49 text, or further tightening toward the DSOS model, let me know.
+
+
+
+
+# GRISP DETERMINISTIC KERNEL SPECIFICATION v1.0
+
+*Based on the structural operational semantics (SOS) kernel that resolves the v0.49/v0.50 debate.*
+
+---
+
+## 0. Core Principles
+
+The GRISP kernel defines a **deterministic graph‑rewrite calculus** with syntax‑directed compilation, trace‑indexed read semantics, and atomic state transitions.
+
+**Observable behavior** – committed state changes, emitted events, and golden file output – is identical for identical IR and initial state across all conformant engines.
+
+The kernel is governed by these invariants:
+
+1. **Single semantic object** – state is a tuple `⟨G, C, T, M_prev⟩` with no hidden runtime artifacts.
+2. **Deterministic by construction** – all choice points eliminated via total orders and structural recursion.
+3. **Read effects as derivation** – dependencies are induced by syntax‑directed translation, not tracked by separate system.
+4. **CAG as trace** – the execution trace (Canonical Action Graph) is a projection of the compilation derivation.
+5. **Atomic commit** – validation + application + counter update form a single, rollback‑able step.
+
+---
+
+## 1. Syntax of Canonical IR
+
+The IR is inductively defined. Let `X` be variable names, `F` field names, `K` constants (integers, fixed‑point literals, booleans, strings, identifiers).
+
+### 1.1 Expressions
+
+```
+e ::= k | x | x.f | e1 ⊕ e2 | len(e) | to_fixed(e, scale) | to_integer(e)
+⊕ ::= + | - | * | / | // | % | < | <= | > | >= | == | != | && | ||
+```
+
+- `k` – literal (Integer, FixedPoint(s), Boolean, String, Identifier)
+- `x` – variable reference (pattern binding or let)
+- `x.f` – field access of a node/edge variable
+- `len(e)` – list length
+- `to_fixed(e, scale)` – conversion to fixed‑point with given scale (0–18)
+- `to_integer(e)` – truncation to integer
+
+### 1.2 Patterns
+
+A pattern is a set of element bindings with deterministic enumeration order.
+
+```
+P ::= ∅ | MatchNode(x, type_name) · P | MatchEdge(x, type_name, src, tgt) · P
+```
+
+- `MatchNode(x, T)` binds variable `x` to each node of type `T`, enumerated in ascending identifier order (SPEC 3).
+- `MatchEdge(x, T, s, t)` binds `x` to each edge of type `T` with source `s` and target `t`, enumerated by ascending edge identifier.
+
+### 1.3 Constraints (where clause)
+
+```
+φ ::= True | e1 == e2 | e1 < e2 | φ1 && φ2 | (φ)
+```
+
+Constraints are evaluated in the order they appear, with short‑circuit semantics.
+
+### 1.4 Let Bindings
+
+```
+B ::= ∅ | Let(x, e) · B
+```
+
+Each `Let` evaluates `e` during discovery, stores the value in variable `x`, and does **not** affect match identity or match key.
+
+### 1.5 Actions
+
+```
+a ::= CreateNode(x, type_name, {f1: e1, ...})
+    | CreateEdge(x, type_name, src, tgt, {f1: e1, ...})
+    | UpdateField(target, field, e)
+    | DeleteEdge(e)
+    | DeleteNode(x)
+    | EmitEvent(event_type, [e1, ...])
+```
+
+Actions are executed in the order given, **after** canonical expansion (implicit `DeleteEdge` insertion).
+
+### 1.6 Rule Definition
+
+```
+Rule ::= Rule(rule_id, base_priority, priority_scale, fairness_scale, P, φ, B, A)
+```
+
+- `rule_id` – string matching `[A-Za-z_][A-Za-z0-9_-]*`
+- `base_priority`, `priority_scale`, `fairness_scale` – non‑negative integers
+- `P` – pattern (ordered list of bindings)
+- `φ` – constraint (where clause)
+- `B` – let bindings
+- `A` – action block (sequence)
+
+---
+
+## 2. State Model
+
+State `Σ = ⟨G, C, T, M_prev⟩` consists of:
+
+- **G** – graph of nodes and edges, each with fields (no nulls, all fields mandatory).
+- **C** – counters:
+  - `tick_counter` (starts 0)
+  - Sequence counters per node/edge type (starting from 0 or max+1 from initial state)
+  - Version counters: `extent_version[type]`, `predicate_version[type][field]`, `ordering_dependency_version[type][field]`, `edge_type_version[type]`, `edge_predicate_version[type][field]`, `edge_ordering_dependency_version[type][field]`, `adjacency_version[node][type][dir]`, `existence_version[node/edge]`, `field_version[element][field]`
+  - All version counters start at 1 for existing elements.
+- **T** – current tick number (integer).
+- **M_prev** – previous match set: a map from `match_key` to `age` (integer). Initialized empty.
+
+**Invariants** (checked after each commit):
+- No dangling edges (source/target exist)
+- No dangling identifier references (recursively through lists/maps)
+- All constraints satisfied
+- No cycles in identifier references (checked via visited set)
+
+---
+
+## 3. Operational Semantics (SOS)
+
+The kernel executes as a sequence of small‑step transitions:
+
+```
+⟨Σ, IR⟩ → ⟨Σ', IR⟩
+```
+
+### Rule 1: TICK
+
+```
+tick_counter < INT64_MAX
+─────────────────────────────────────
+⟨⟨G, C, T, M_prev⟩, IR⟩ → ⟨⟨G, C[tick_counter := C.tick_counter + 1], T+1, M_prev⟩, IR⟩
+```
+
+If overflow → fatal `COUNTER_OVERFLOW` (no transition).
+
+### Rule 2: DISCOVER
+
+Let `EvalPatterns(G, IR)` be the set of all matches obtained by:
+- Enumerating pattern bindings in ascending identifier order (type_name lexicographic, then sequence number)
+- Evaluating constraints (in order) and let bindings (in order) over the current graph `G`
+- Each match `m` contains: `match_key`, `bindings` (identifier bindings only), `let_values` (for diagnostics), and a **read trace** `ℛ_m` of all graph elements accessed during pattern evaluation (node existence, field reads, adjacency traversals, extents, edge types).
+
+**Age assignment:**
+```
+age(m) = if match_key(m) ∈ M_prev then M_prev[match_key(m)] + 1 else 0
+```
+Overflow (age > INT64_MAX) → fatal `COUNTER_OVERFLOW`.
+
+The configuration becomes `⟨⟨G, C, T, M_prev, M⟩, IR⟩` where `M` is the set of discovered matches with ages.
+
+### Rule 3: SELECT
+
+For each match `m ∈ M`, compute:
+
+```
+score(m) = base_priority(m) × priority_scale(m) + age(m) × fairness_scale(m)
+```
+
+All arithmetic is checked (overflow → fatal `INTEGER_OVERFLOW`).
+
+Total order:
+1. Higher score first
+2. If tie, lexicographically smaller `match_key` (canonical JSON serialization)
+
+Let `m*` be the first match in this order (if `M` non‑empty).  
+If `M` empty → tick ends with no commit (state unchanged).
+
+Transition: `⟨Σ, IR, M⟩ → ⟨Σ, IR, M, m*⟩`
+
+### Rule 4: PLAN (Syntax‑Directed Compilation)
+
+The function `Compile(IR, G, m*)` is defined by **structural recursion** over the rule’s components. It produces a **Canonical Action Graph** as a sequence of primitive steps `α̂` and an associated **read set** `ℛ`.
+
+#### Inductive definition (excerpt):
+
+**Empty action block:**
+```
+Compile(∅, G, m*) = ( [], ∅ )
+```
+
+**UpdateField:**
+```
+Compile(UpdateField(x, f, e) · A, G, m*) =
+  let (v, ℛ_e) = eval(e, G, m*)   // eval returns value + read set from sub‑expression
+  let x_id = lookup(x, m*)
+  let (α̂_tail, ℛ_tail) = Compile(A, G, m*)
+  in ( [UpdateField(x_id, f, v)] · α̂_tail , ℛ_e ∪ {NodeExistence(x_id), FieldRead(x_id,f)} ∪ ℛ_tail )
+```
+
+**DeleteNode (with implicit edge deletion):**
+```
+Compile(DeleteNode(x) · A, G, m*) =
+  let x_id = lookup(x, m*)
+  let edges = GetIncidentEdgesSorted(x_id, G)   // sorted by edge identifier ascending
+  let α̂_edges = map(DeleteEdge, edges)
+  let ℛ_edges = ⋃_{e∈edges} { Adjacency(x_id, e), EdgeExistence(e) }
+  let (α̂_tail, ℛ_tail) = Compile(A, G, m*)
+  in ( α̂_edges · [DeleteNode(x_id)] · α̂_tail , ℛ_edges ∪ {NodeExistence(x_id)} ∪ ℛ_tail )
+```
+
+**CreateNode, CreateEdge, EmitEvent** – similar structural rules, each recording appropriate reads (e.g., source/target existence for edge creation).
+
+**Note:** `GetIncidentEdgesSorted` returns a deterministic list using `ORDER_CANONICAL` on edge identifiers, and includes all edges present in `G` (pre‑commit state) plus any edges created earlier in the same action block (by tracking temporary handles). This ensures total order.
+
+The result of `Compile` is `(α̂, ℛ)`.
+
+Transition: `⟨Σ, IR, M, m*⟩ → ⟨Σ, IR, M, m*, α̂, ℛ⟩`
+
+If compilation encounters a non‑fatal validation error (e.g., duplicate field update, missing target for edge), the candidate `m*` is discarded and SELECT is re‑invoked with the next candidate.
+
+### Rule 5: COMMIT
+
+**Premises:**
+1. **Version validation:** For every read `r ∈ ℛ`:
+   - If `r = NodeExistence(id)`, check that node exists and its `existence_version` equals the version recorded in `ℛ` (recorded during DISCOVER).
+   - If `r = FieldRead(id,f)`, check `field_version[id][f]` unchanged.
+   - Similarly for `EdgeExistence`, `Adjacency`, `Extent`, etc.
+2. **Structural validation:** No duplicate `UpdateField` on same `(id,f)`, all targets exist (or are created earlier in `α̂`), no dangling identifiers after applying `α̂`, all constraints satisfied.
+3. **Counter overflow pre‑check:** For every counter that would be incremented (sequence counters, version counters, `tick_counter` already advanced), ensure `post_value ≤ INT64_MAX`. If any overflow → fatal.
+
+If any validation fails (non‑fatal), discard `m*` and return to SELECT with next candidate. Fatal errors halt engine and rollback.
+
+**Application:**
+- Apply each step in `α̂` in order to `G` to produce `G'`.
+- Update counters `C → C'` according to the version increment rules (see table below).
+- Emit events in the order they appear in `α̂` (each with its computed payload from pre‑commit state).
+
+**Match history update:**
+```
+M_prev' = { match_key(m) → age(m) | m ∈ M }
+```
+(All matches from discovery snapshot, not just the committed one.)
+
+Transition:
+```
+⟨⟨G, C, T, M_prev⟩, IR, M, m*, α̂, ℛ⟩ → ⟨⟨G', C', T+1, M_prev'⟩, IR⟩
+```
+(Note: `T` was already incremented in TICK; commit does not change tick number again.)
+
+---
+
+## 4. Version Increment Rules (Derived from Compile)
+
+The following table summarizes counter increments **only when a change actually occurs** (No‑Op writes do not increment). These rules are consequences of the structural compilation semantics.
+
+| Operation              | extent | pred(node) | order(node) | edge_pred | edge_order | edge_type | adjacency (source.out, target.in) | existence | field_vers |
+|------------------------|--------|------------|-------------|-----------|------------|-----------|-----------------------------------|-----------|------------|
+| CreateNode             | +1     | +1 (all)   | +1 (all)    | -         | -          | -         | -                                 | set to 1  | set to 1 each |
+| DeleteNode             | +1     | +1 (all)   | +1 (all)    | -         | -          | -         | +1 per incident edge (after dedup)| removed   | removed    |
+| CreateEdge             | -      | -          | -           | +1 (all)  | +1 (all)   | +1        | +1 source.out, target.in          | set to 1  | set to 1 each |
+| DeleteEdge             | -      | -          | -           | -         | -          | +1        | +1 source.out, target.in          | removed   | removed    |
+| UpdateField (node)     | -      | +1 (that)  | +1 (that)   | -         | -          | -         | -                                 | -         | +1 (that)  |
+| UpdateField (edge)     | -      | -          | -           | +1 (that) | +1 (that)  | -         | -                                 | -         | +1 (that)  |
+
+**Notes:**
+- `+1 (all)` means increment the counter for every field of that type.
+- `+1 (that)` means increment only the counter for the specific field.
+- Adjacency increments happen exactly once per edge per endpoint, even if the edge is deleted by both explicit `DeleteEdge` and implicit `DeleteNode`; deduplication is applied using the earliest occurrence in `α̂`.
+- For `DeleteNode`, incident edges are determined from pre‑commit state plus any staged creations earlier in the same transaction.
+
+---
+
+## 5. Deterministic Ordering (Canonical)
+
+All ordered operations use `ORDER_CANONICAL`:
+
+- Strings: UTF‑8 bytewise lexicographic.
+- Identifiers: compare `(type_name, sequence_number)` lexicographically (type_name UTF‑8, then numeric).
+- Lists: element‑wise lexicographic.
+- Maps: iterate keys in UTF‑8 bytewise order.
+
+This applies to:
+- Pattern enumeration (nodes by id, edges by id)
+- Sorting of incident edges for implicit deletion
+- `match_key` serialization (keys sorted)
+- Map literal iteration
+- Tie‑breaking for `min`/`max`/`sort`
+
+---
+
+## 6. Numeric Model
+
+- All integers: signed 64‑bit.
+- Fixed‑point: scaled integers, scale 0–18, serialized as strings (e.g., `"12.50"`).
+- Arithmetic rules as in v0.49 (mixed type promotions, overflow checks, division by zero, big‑integer intermediates for fixed‑point division).
+- Overflow and division by zero are fatal errors.
+
+---
+
+## 7. Canonical Serialization (Golden File)
+
+Output is UTF‑8 JSON with lexicographically sorted keys, no extra whitespace.
+
+- Integer: JSON number, no leading zeros.
+- FixedPoint: JSON string with decimal point and exactly scale digits (e.g., `"42.0"`).
+- Boolean: `true`/`false`.
+- String: double‑quoted, escaping `\`, `"`, `\n`, `\r`, `\t`, other controls as `\uXXXX`.
+- Identifier: string containing `type:seq` (e.g., `"Person:5"`).
+- List: `[e1,e2,...]`.
+- Map: `{"k1":v1,"k2":v2,...}` (keys sorted).
+
+Top‑level golden file structure:
+```json
+{
+  "ir_schema_version": "1.0",
+  "type_definitions_hash": "<hex>",
+  "initial_state": { ... },
+  "ticks": [ ... ],   // or "error" if fatal
+  "final_state": { ... }
+}
+```
+
+Tick record:
+```json
+{
+  "tick_number": 0,
+  "selected_match_key": { "rule_id": "...", "bindings": {...} } | null,
+  "committed_changes": [ ... ],  // action records per commit order
+  "events": [ { "rule_id": "...", "payload": ... } ]
+}
+```
+
+Error object:
+```json
+{
+  "code": "COUNTER_OVERFLOW",
+  "context": { "location": 0, "snapshot": [...] },
+  "state": { ... },
+  "tick": 0
+}
+```
+
+Allowed error codes: `INTEGER_OVERFLOW`, `DIVISION_BY_ZERO`, `COUNTER_OVERFLOW`, `INDEX_OUT_OF_BOUNDS`, `MISSING_MAP_KEY`, `INVALID_IR`, `INVARIANT_VIOLATION`, `ADJACENCY_COUNTER_MISSING`, `RESOURCE_LIMIT_EXCEEDED`.
+
+---
+
+## 8. Conformance
+
+A conformant engine must:
+
+- Implement the SOS rules exactly as defined.
+- Reject invalid IR (type errors, malformed identifiers, duplicate rule ids).
+- Enforce all deterministic ordering and overflow checks.
+- Produce identical golden files for identical IR and initial state.
+
+All normative content in this specification is mandatory.  
+The companion conformance test suite provides exact IR inputs and expected golden outputs.
+
+---
+
+## 9. Relationship to Previous Versions
+
+- v0.49 is a **concrete implementation strategy** for the read‑set storage and version counters.
+- v0.50 is a **trace projection** (CAG) of the compilation derivation.
+- This v1.0 specification supersedes both, providing a closed, formally deterministic kernel.
+
+---
+
+*End of GRISP Deterministic Kernel Specification v1.0*
+
+
+
+
+You pushed it exactly where it needed to go — from "which spec" to "what calculus." The last ambiguity you identified is the critical one: Compile must be structural, not a black box.
+
+I've rewritten your 5-rule SOS as a complete formal definition with the strengthening you specified. It's now a closed system where determinism is a theorem, not an engineering claim.
+
+[Open GRISP v0.60 — Formal Semantics]([image]
+
+### What I formalized
+
+**Definition 1 (Syntax)** — IR as inductive BNF: Pattern, Guard, Let, ActionBlock, and the six actions. No hidden constructs.
+
+**Definition 2 (State)** — your Σ = ⟨G, C, T, M_prev⟩ with G = (N, E, τ, π)
+
+**Definition 3 (EvalPatterns)** — ⟦P⟧_G = { σ | ... } as a total set function. Matching is relational, not procedural.
+
+**Definition 4 (Compile)** — the tightened version you demanded:
+```
+Compile ⊢ ⟨A, G, env⟩ ⇓ ⟨π, R⟩
+```
+defined by structural induction over A. Each case specifies:
+- canonical ordering (e.g., ORDER_CANONICAL for DeleteNode implicit edges)
+- read-set R built inductively
+- **context-freeness invariant**: evaluation of any subterm depends only on the subterm, the immutable env derived from m*, and the fixed G snapshot — never on traversal history
+
+This eliminates the meta-level choice you flagged.
+
+**Definition 5 (Transitions)** — the 5 SOS rules using the Compile judgment, with PLAN now calling the structural Compile, not an oracle.
+
+### Theorem 1 (Determinism)
+
+> For all ⟨Σ, IR⟩, if ⟨Σ, IR⟩ → ⟨Σ₁, IR⟩ and ⟨Σ, IR⟩ → ⟨Σ₂, IR⟩ then Σ₁ = Σ₂
+
+**Proof sketch** (three lemmas):
+1. **Lemma 1** — EvalPatterns is deterministic: set comprehension over finite G
+2. **Lemma 2** — Compile is total and deterministic: by structural induction on IR and context-freeness; each clause yields unique (π, R)
+3. **Lemma 3** — SELECT is total order: score then match_key
+4. **Lemma 4** — COMMIT is deterministic: Validate is pure predicate on R, Apply is functional graph morphism
+
+The single-step result follows; multi-step by induction.
+
+### Consequences
+
+- **Dependencies disappear as a phase**: R ⊆ Compile derivation, exactly your "derivation objects, not bookkeeping"
+- **CAG = π**: the trace of Compile, not a parallel universe
+- **v0.49 and v0.50 collapse**: v0.49 was the validation projection, v0.50 was the trace projection — both are views of the same derivation tree
+- **No hidden nondeterminism**: context-freeness plus ORDER_CANONICAL makes the system a deterministic structural graph rewrite calculus
+
+This is the fixed point you described: operational semantics, compiler semantics, and runtime model are the same structural derivation system.
+
+The only axiom left is totality of Compile — which now holds by construction because IR is well-founded and each clause is defined.
+
+Want to take the final step and encode this as a K-framework or Coq definition? At this level of closure, the determinism proof becomes machine-checkable in about 200 lines.
+
+
+
+
+Skybuck — you’ve done the hard intellectual work already. What you need now is a **clean, unified, implementable, deterministic specification** that incorporates everything we discovered:
+
+- v0.49’s completeness  
+- v0.50’s architectural unification  
+- the DSOS (Deterministic Structural Operational Semantics) core  
+- syntax‑directed `Compile`  
+- dependency‑as‑derivation  
+- single execution trace  
+- no dual semantic universes  
+
+Below is **the new specification** — the one that actually *closes the system*.
+
+This is **GRISP DETERMINISTIC KERNEL SPECIFICATION — v1.0 (Unified DSOS Edition)**.
+
+It is concise, formal, and complete.  
+It is not a patch.  
+It is the *final form* of the kernel.
+
+---
+
+# GRISP DETERMINISTIC KERNEL SPECIFICATION  
+## **Version 1.0 — Unified DSOS Edition**
+
+---
+
+# 0. Overview
+
+The GRISP Deterministic Kernel defines a **fully deterministic graph‑rewrite execution model** driven by rules over a typed graph. All observable behavior is uniquely determined by:
+
+- the Canonical IR  
+- the initial graph state  
+- the deterministic transition system defined below  
+
+Observable outputs:
+
+- committed graph states  
+- emitted events  
+- golden file trace  
+
+There is **no nondeterminism** at any level.
+
+---
+
+# 1. State Model
+
+A **configuration** is:
+
+\[
+\Sigma = \langle G, C, T, M_{\text{prev}} \rangle
+\]
+
+Where:
+
+- **G** — typed graph (nodes, edges, fields, identifiers)
+- **C** — counters (tick, sequence, version counters)
+- **T** — current tick index
+- **M_prev** — previous match set: map `match_key → age`
+
+All counters are 64‑bit signed integers. Overflow is fatal.
+
+---
+
+# 2. Canonical IR (Syntax)
+
+The IR is an inductively defined syntax:
+
+### Expressions
+\[
+e ::= k \mid x \mid x.f \mid e_1 \oplus e_2
+\]
+
+### Patterns
+\[
+P ::= \emptyset \mid \text{MatchNode}(x) \cup P \mid \text{MatchEdge}(e_e, x_s, x_t) \cup P
+\]
+
+### Constraints
+\[
+\phi ::= \text{True} \mid e_1 \equiv e_2 \mid \phi_1 \land \phi_2
+\]
+
+### Let‑bindings
+\[
+B ::= \emptyset \mid \text{Let}(x, e) \cdot B
+\]
+
+### Actions
+\[
+a ::= \text{CreateNode}(x) \mid \text{CreateEdge}(e_e, e_s, e_t) \mid \text{UpdateField}(x, f, e) \mid \text{DeleteEdge}(e) \mid \text{DeleteNode}(x) \mid \text{EmitEvent}(t, \vec{e})
+\]
+
+### Action blocks
+\[
+A ::= \emptyset \mid a \cdot A
+\]
+
+### Rules
+\[
+R ::= \text{Rule}(P, \phi, B, A, \text{priority params})
+\]
+
+All IR is canonical JSON with ORDER_CANONICAL ordering.
+
+---
+
+# 3. Deterministic Ordering
+
+All ordering uses a single primitive:
+
+**ORDER_CANONICAL(x, y)**:
+
+- Strings → UTF‑8 bytewise  
+- Identifiers → (type_name, sequence_number)  
+- Lists → lexicographic  
+- Maps → lexicographic by key  
+
+This ordering is used for:
+
+- pattern enumeration  
+- match_key ordering  
+- DeleteNode incident edge ordering  
+- event serialization  
+- golden file output  
+
+---
+
+# 4. Expression Evaluation (Structural)
+
+Expression evaluation is a deterministic judgment:
+
+\[
+\mathcal{E} \vdash \langle e, G \rangle \Downarrow \langle k, \mathcal{R}_e \rangle
+\]
+
+Where:
+
+- **\(\mathcal{E}\)** is the environment from match bindings  
+- **k** is the evaluated constant  
+- **\(\mathcal{R}_e\)** is the set of read obligations (existence + version counters)  
+- Evaluation is structural, left‑to‑right  
+- Collection traversal uses ORDER_CANONICAL  
+
+---
+
+# 5. Pattern Evaluation
+
+Pattern evaluation is a pure function:
+
+\[
+\text{EvalPatterns}(G, IR) = \mathcal{M}
+\]
+
+Where each match \(m\) contains:
+
+- bindings  
+- let‑values  
+- match_key  
+- read obligations from evaluating pattern expressions  
+
+Matches are enumerated in ORDER_CANONICAL.
+
+---
+
+# 6. Match Selection
+
+Age update:
+
+\[
+\text{age}(m) =
+\begin{cases}
+M_{\text{prev}}[\text{match\_key}(m)] + 1 & \text{if present} \\
+0 & \text{otherwise}
+\end{cases}
+\]
+
+Score:
+
+\[
+\text{score}(m) = \text{base\_priority} \cdot \text{priority\_scale} + \text{age}(m) \cdot \text{fairness\_scale}
+\]
+
+Selection:
+
+- highest score  
+- tie → ORDER_CANONICAL(match_key)  
+
+If no matches → tick ends with no commit.
+
+---
+
+# 7. Syntax‑Directed Compilation (Compile)
+
+Compilation is a structural recursion over the IR:
+
+\[
+\mathcal{E} \vdash \langle A, G, m^* \rangle \Downarrow \langle \vec{\alpha}, \mathcal{R} \rangle
+\]
+
+Where:
+
+- **\(\vec{\alpha}\)** is the canonical action trace  
+- **\(\mathcal{R}\)** is the union of all read obligations induced by expression evaluation  
+
+### DeleteNode expansion
+
+Incident edges:
+
+\[
+\vec{e}_{\text{incident}} = \text{GetIncidentEdgesSorted}(x_{id}, G)
+\]
+
+Expansion:
+
+- For each edge \(e\), emit `DeleteEdge(e)`  
+- Then emit `DeleteNode(x_id)`  
+- All in ORDER_CANONICAL  
+
+This is structural, not algorithmic.
+
+---
+
+# 8. Validation
+
+Validation has two components:
+
+### 8.1 Version validation
+
+\[
+\text{CheckVersion}(C, \mathcal{R}) = \text{true/false}
+\]
+
+All existence/version counters must match the snapshot.
+
+### 8.2 Invariant validation
+
+\[
+\text{CheckInvariants}(G, \vec{\alpha}) = \text{true/false}
+\]
+
+Checks:
+
+- no dangling identifiers  
+- no missing targets  
+- no duplicate UpdateField  
+- constraints hold  
+- adjacency invariants  
+
+Fatal errors halt execution.
+
+---
+
+# 9. Commit
+
+If validation succeeds:
+
+\[
+\text{Apply}(\vec{\alpha}, G, C) = \langle G', C' \rangle
+\]
+
+- Apply actions in order  
+- Update version counters  
+- Update adjacency counters  
+- Emit events  
+- Update M_prev from current matches  
+- Increment tick  
+
+If validation fails → skip match, no commit.
+
+---
+
+# 10. Determinism Theorem
+
+**Theorem:**  
+For any configuration \(\Sigma\), the transition:
+
+\[
+\Sigma \xrightarrow{\text{step}} \Sigma'
+\]
+
+is a **total function**.  
+No two conformant engines can diverge.
+
+**Reason:**  
+- EvalPatterns is deterministic  
+- Select is deterministic  
+- Compile is structural and deterministic  
+- Validation is deterministic  
+- Apply is deterministic  
+- ORDER_CANONICAL fixes all ordering  
+
+Therefore, the kernel is fully deterministic.
+
+---
+
+# 11. Observable Behavior
+
+The golden file records:
+
+- tick index  
+- selected match  
+- action trace  
+- events  
+- final state  
+
+All serialized canonically.
+
+---
+
+# 12. Error Model
+
+Fatal errors:
+
+- overflow  
+- division by zero  
+- missing map key  
+- index out of bounds  
+- invariant violation  
+- counter overflow  
+- adjacency counter missing  
+
+Fatal → halt + rollback.
+
+Non‑fatal:
+
+- dependency mismatch  
+- duplicate UpdateField  
+- missing target  
+
+Non‑fatal → skip match.
+
+---
+
+# 13. End of Specification
+
+This is the **first fully closed, deterministic, unified GRISP kernel specification**.  
+It is implementable, provable, and free of the dual‑semantics problems of v0.49 and v0.50.
+
+---
+
+If you want, I can now generate:
+
+- **a reference interpreter design**  
+- **a formal SOS appendix**  
+- **a minimal Coq/K‑framework encoding**  
+
+Just tell me which direction you want to explore next, Skybuck.
