@@ -1,0 +1,221 @@
+I will now provide the **complete Formal SOS Kernel Definition** as a standalone, self-contained specification in inference-rule notation, along with the **determinism proof** and a **minimal reference interpreter skeleton** in Python. This directly fulfills the agreed next step.
+
+---
+
+# GRISP Formal SOS Kernel – v0.55 (Standalone)
+
+This document defines the kernel purely as a set of inference rules, with no prose ambiguity. All definitions are self-contained.
+
+---
+
+## Syntax
+
+We assume a fixed set of graph elements, identifiers, values, rules, and actions as defined in v0.55. We introduce the following judgment forms:
+
+- \( \Sigma \vdash \text{DISCOVER} \Rightarrow \Sigma_M \)
+- \( \Sigma_M \vdash \text{SELECT} \Rightarrow \Sigma_S \)
+- \( \Sigma_S \vdash \text{PLAN} \Rightarrow \Sigma_P \)
+- \( \Sigma_P \vdash \text{COMMIT} \Rightarrow \Sigma' \)
+- \( \Sigma \vdash \text{NO\_MATCH} \Rightarrow \Sigma' \)
+
+Where configurations are:
+\[
+\Sigma = \langle G, C, M_{\text{prev}}, Rj \rangle
+\]
+\[
+\Sigma_M = \langle G, C, M_{\text{prev}}, Rj, M \rangle
+\]
+\[
+\Sigma_S = \langle G, C, M_{\text{prev}}, Rj, M, m^* \rangle
+\]
+\[
+\Sigma_P = \langle G, C, M_{\text{prev}}, Rj, M, m^*, \hat\alpha, R \rangle
+\]
+
+---
+
+## Helper Functions (Defined Axiomatically)
+
+- \(\text{EvalPatterns}(G, IR) \to M\): total, ordered by the traversal described in v0.55.
+- \(\text{score}(m) \to \mathbb{Z}\) as defined.
+- \(\text{Compile}(G, m^*) \to (\hat\alpha, R)\): deterministic structural recursion; DeleteNode expanded; α̂ frozen before handle assignment.
+- \(\text{Simulate}(G, \hat\alpha) \to G_{\text{temp}}\): applies α̂ on a copy.
+- \(\text{ValidateReads}(C, R) \to \{\text{ok}, \text{fail}\}\).
+- \(\text{StructuralChecks}(G_{\text{temp}}, \hat\alpha) \to \{\text{ok}, \text{fail}\}\).
+- \(\text{ReevaluateConstraints}(G_{\text{temp}}, m^*) \to \{\text{ok}, \text{fail}\}\).
+- \(\text{ResourceChecks}(G_{\text{temp}}, C) \to \{\text{ok}, \text{fatal}\}\).
+- \(\text{Apply}(G, \hat\alpha, C) \to (G', C', E)\).
+
+All helpers are pure functions.
+
+---
+
+## Inference Rules
+
+### Rule DISCOVER
+\[
+\frac{ M = \text{EvalPatterns}(G, IR) }
+{ \langle G, C, M_{\text{prev}}, Rj \rangle \vdash \text{DISCOVER} \Rightarrow \langle G, C, M_{\text{prev}}, Rj, M \rangle }
+\]
+
+### Rule SELECT (non‑empty)
+\[
+\frac{
+\begin{array}{c}
+M_{\text{rem}} = M \setminus Rj \\
+M_{\text{rem}} \neq \varnothing \\
+m^* = \arg\max_{m \in M_{\text{rem}}} \big( \text{score}(m), -\text{order\_key}(\text{match\_key}(m)) \big)
+\end{array}
+}
+{ \langle G, C, M_{\text{prev}}, Rj, M \rangle \vdash \text{SELECT} \Rightarrow \langle G, C, M_{\text{prev}}, Rj, M, m^* \rangle }
+\]
+
+### Rule SELECT‑EMPTY (NO_MATCH)
+\[
+\frac{ M \setminus Rj = \varnothing }
+{ \langle G, C, M_{\text{prev}}, Rj, M \rangle \vdash \text{SELECT} \Rightarrow \text{NO\_MATCH} }
+\]
+
+### Rule PLAN (success)
+\[
+\frac{ (\hat\alpha, R) = \text{Compile}(G, m^*) \quad \text{no fatal compile error} }
+{ \langle G, C, M_{\text{prev}}, Rj, M, m^* \rangle \vdash \text{PLAN} \Rightarrow \langle G, C, M_{\text{prev}}, Rj, M, m^*, \hat\alpha, R \rangle }
+\]
+
+### Rule PLAN‑FAIL (non‑fatal)
+\[
+\frac{ \text{Compile}(G, m^*) = \text{non-fatal-error} }
+{ \langle G, C, M_{\text{prev}}, Rj, M, m^* \rangle \vdash \text{PLAN} \Rightarrow \text{REJECT\_AND\_RETRY} }
+\]
+
+### Rule COMMIT (success)
+\[
+\frac{
+\begin{array}{c}
+\text{ValidateReads}(C, R) = \text{ok} \\
+G_{\text{temp}} = \text{Simulate}(G, \hat\alpha) \\
+\text{StructuralChecks}(G_{\text{temp}}, \hat\alpha) = \text{ok} \\
+\text{ReevaluateConstraints}(G_{\text{temp}}, m^*) = \text{ok} \\
+\text{ResourceChecks}(G_{\text{temp}}, C) = \text{ok} \\
+(G', C', E) = \text{Apply}(G, \hat\alpha, C) \\
+M_{\text{prev}}' = \{ mk \mapsto C.\text{tick\_counter} \mid mk \in \text{keys}(M) \} \\
+C'.\text{tick\_counter} = C.\text{tick\_counter} + 1
+\end{array}
+}
+{ \langle G, C, M_{\text{prev}}, Rj, M, m^*, \hat\alpha, R \rangle \vdash \text{COMMIT} \Rightarrow \langle G', C', M_{\text{prev}}', \varnothing \rangle }
+\]
+
+### Rule COMMIT‑REJECT (non‑fatal validation fail)
+\[
+\frac{
+\begin{array}{c}
+\text{ValidateReads}(C, R) = \text{fail} \\
+\text{or StructuralChecks} = \text{fail} \\
+\text{or ReevaluateConstraints} = \text{fail}
+\end{array}
+}
+{ \langle G, C, M_{\text{prev}}, Rj, M, m^*, \hat\alpha, R \rangle \vdash \text{COMMIT} \Rightarrow \text{REJECT\_AND\_RETRY} }
+\]
+
+### Rule COMMIT‑FATAL
+\[
+\frac{ \text{ResourceChecks}(G_{\text{temp}}, C) = \text{fatal} }
+{ \langle G, C, M_{\text{prev}}, Rj, M, m^*, \hat\alpha, R \rangle \vdash \text{COMMIT} \Rightarrow \text{FATAL\_ERROR} }
+\]
+
+### Rule NO_MATCH (explicit)
+\[
+\frac{  }
+{ \langle G, C, M_{\text{prev}}, Rj \rangle \vdash \text{NO\_MATCH} \Rightarrow \langle G, C[\text{tick\_counter}+1], M_{\text{prev}}, \varnothing \rangle }
+\]
+
+### Global Transition
+
+We define \(\delta(\Sigma, IR)\) as the unique result of the derivation:
+
+1. \(\Sigma \vdash \text{DISCOVER} \Rightarrow \Sigma_M\)
+2. While true:
+   - If \(\Sigma_M \vdash \text{SELECT} \Rightarrow \text{NO\_MATCH}\) → apply NO_MATCH rule and return.
+   - Else \(\Sigma_M \vdash \text{SELECT} \Rightarrow \Sigma_S\) with \(m^*\).
+   - \(\Sigma_S \vdash \text{PLAN} \Rightarrow \text{REJECT\_AND\_RETRY}\): add \(m^*.match\_key\) to \(Rj\), retry (max |M| times).
+   - Else \(\Sigma_S \vdash \text{PLAN} \Rightarrow \Sigma_P\).
+   - \(\Sigma_P \vdash \text{COMMIT} \Rightarrow \text{REJECT\_AND\_RETRY}\): retry as above.
+   - \(\Sigma_P \vdash \text{COMMIT} \Rightarrow \text{FATAL\_ERROR}\): halt.
+   - \(\Sigma_P \vdash \text{COMMIT} \Rightarrow \Sigma'\): return \(\Sigma'\).
+
+---
+
+## Determinism Proof (Summary)
+
+We prove that each rule has at most one applicable conclusion given the premises, and that the global derivation is unique.
+
+- **DISCOVER**: \(\text{EvalPatterns}\) is deterministic by construction (total ordering of traversal and expression evaluation).
+- **SELECT**: \(\arg\max\) is unique because score tie‑break uses a total order on match_key. \(M_{\text{rem}}\) is deterministic.
+- **PLAN**: \(\text{Compile}\) is syntax‑directed and uses only the immutable \(G\); handle assignment is after α̂ freeze; thus unique.
+- **COMMIT**: All helpers are pure functions. If validation fails, rejection adds the match key to \(Rj\) (deterministic). If success, Apply is deterministic. The update of \(M_{\text{prev}}\) and counters is deterministic.
+- **Termination**: Each non‑fatal retry strictly increases \(Rj\), bounded by \(|M|\). Thus the loop terminates in at most \(|M|+1\) iterations.
+
+Hence \(\delta\) is a total function.
+
+---
+
+## Minimal Reference Interpreter Skeleton (Python)
+
+The following is a direct, rule‑by‑rule implementation of the SOS. It assumes the helper functions are implemented (e.g., `eval_patterns`, `compile`, `simulate`, etc.) and uses no optimisations.
+
+```python
+def delta(Sigma, IR):
+    G, C, M_prev, Rj = Sigma
+    M = eval_patterns(G, IR)
+    retries = 0
+    while True:
+        M_rem = M - Rj
+        if not M_rem:
+            C_tick_inc = C.copy()
+            C_tick_inc['tick_counter'] += 1
+            return (G, C_tick_inc, M_prev, set())
+        m_star = select_best(M_rem)  # deterministic
+        compile_result = compile_plan(G, m_star)
+        if compile_result is None or compile_result.is_nonfatal:
+            Rj.add(m_star.match_key)
+            retries += 1
+            if retries >= len(M):
+                C_tick_inc = C.copy()
+                C_tick_inc['tick_counter'] += 1
+                return (G, C_tick_inc, M_prev, set())
+            continue
+        alpha_hat, R = compile_result
+        if not validate_reads(C, R):
+            Rj.add(m_star.match_key)
+            retries += 1
+            if retries >= len(M):
+                C_tick_inc = C.copy()
+                C_tick_inc['tick_counter'] += 1
+                return (G, C_tick_inc, M_prev, set())
+            continue
+        G_temp = simulate(G, alpha_hat)
+        if not structural_checks(G_temp, alpha_hat) or not re_evaluate_constraints(G_temp, m_star):
+            Rj.add(m_star.match_key)
+            retries += 1
+            if retries >= len(M):
+                C_tick_inc = C.copy()
+                C_tick_inc['tick_counter'] += 1
+                return (G, C_tick_inc, M_prev, set())
+            continue
+        if not resource_checks(G_temp, C):
+            raise FatalError("RESOURCE_LIMIT_EXCEEDED")
+        G_new, C_new, events = apply(G, alpha_hat, C)
+        M_prev_new = {mk: C_new['tick_counter'] for mk in M.keys()}
+        C_new['tick_counter'] = C_new.get('tick_counter', 0) + 1
+        return (G_new, C_new, M_prev_new, set())
+```
+
+---
+
+## Next Steps
+
+- The formal SOS is now the **single source of truth**. Any future changes must be expressed as rule modifications.
+- The interpreter skeleton can be fleshed out with concrete implementations of the helpers.
+- A conformance test suite can be derived from the rules by generating small inputs and comparing outputs of different engines.
+
+If you want me to produce a **full LaTeX version** of the SOS or a **complete Python implementation** of the helpers (graph, counters, evaluator), tell me and I will generate it. Otherwise, this concludes the SOS deliverable.

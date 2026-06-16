@@ -1,0 +1,425 @@
+GRISP DETERMINISTIC KERNEL SPECIFICATION – Version 0.53
+
+Unified DSOS + Implementor’s Appendix Edition
+
+Supersedes v0.49, v0.52. All normative rules mandatory.
+
+-------------------------------------------------------------------------------
+Part A: Formal DSOS Semantics (from v0.52, clarified)
+-------------------------------------------------------------------------------
+
+A.1 Core Principles
+
+1. Determinism by construction – All observable behavior (committed state transitions, emitted events, golden file output) is identical for identical initial state and Canonical IR.
+2. Single semantic object – State = <G, C, M_prev> with no hidden runtime artifacts.
+3. Read effects as derivation – Dependencies are induced by syntax-directed translation; version snapshots are recorded at read time.
+4. Canonical Action Trace (CAT) – Execution trace is a projection of the compilation derivation.
+5. Atomic commit – Validation, application, and counter update form a single, rollback-able step.
+
+A.2 State Model
+
+A configuration is:
+Sigma = <G, C, M_prev>
+
+- G – Typed property graph (nodes, edges, fields, identifiers). No nulls; all fields defined per type schema.
+- C – Counters (signed 64-bit integers):
+    tick_counter (starts at 0)
+    sequence_counter[type] (per node/edge type) – starts at max(initial_seq)+1 or 0.
+    element_version[id] – increments on any mutation of that element.
+    type_extent_version[type] – increments on creation/deletion of an element of that type.
+    adjacency_version[node][type][dir] – increments when an edge of given type and direction is added/removed.
+- M_prev – Previous match state: map from match_key to last tick seen (integer). Initialized empty.
+
+Invariants (checked after each commit):
+- No dangling edges (source/target exist).
+- No dangling identifier references (recursively through lists/maps).
+- All declared constraints satisfied.
+- No cycles in identifier references (detected via visited set).
+
+A.3 Canonical IR (Abstract Syntax)
+
+The IR is a deterministic JSON format with the following inductive definitions.
+
+Expressions:
+e ::= k                           // literal (Integer, FixedPoint(s), Boolean, String, Identifier)
+    | x                           // variable
+    | x.f                         // field access
+    | e1 ⊕ e2                     // binary operator
+    | len(e)                      // list length
+    | to_fixed(e, scale)          // conversion to FixedPoint
+    | to_integer(e)               // truncation to Integer
+    | [e1, e2, ...]               // list literal
+    | { "k1": e1, "k2": e2, ... } // map literal (keys sorted)
+    | e1[e2]                      // list index or map key lookup
+    | !e                          // logical NOT (boolean)
+
+⊕ includes + - * / // % < <= > >= == != && ||. Short-circuit for &&, ||; only evaluated branches affect read set.
+
+Patterns:
+P ::= ∅ | MatchNode(x, type_name) · P | MatchEdge(x, type_name, src, tgt) · P
+Pattern enumeration is deterministic (see Part B).
+
+Constraints (where clause):
+φ ::= True | e1 == e2 | e1 != e2 | e1 < e2 | e1 <= e2 | e1 > e2 | e1 >= e2 | φ1 && φ2 | φ1 || φ2 | (φ)
+
+Let Bindings:
+B ::= ∅ | Let(x, e) · B – evaluated during discovery, not part of match_key.
+
+Actions:
+a ::= CreateNode(x, type_name, {f1: e1, ...})
+    | CreateEdge(x, type_name, src, tgt, {f1: e1, ...})
+    | UpdateField(target, field, e)
+    | DeleteEdge(e)
+    | DeleteNode(x)
+    | EmitEvent(event_type, [e1, ...])
+
+Rule Definition:
+Rule ::= Rule(rule_id, base_priority, priority_scale, fairness_scale, P, φ, B, A)
+- rule_id matches [A-Za-z_][A-Za-z0-9_-]*
+- Priorities: non-negative integers.
+
+A.4 Deterministic Ordering (ORDER_CANONICAL)
+
+For any two values x and y:
+- Strings: NFC normalized, then UTF-8 bytewise lexicographic.
+- Identifiers: compare (type_name, sequence_number) lexicographically.
+- Lists: element-wise lexicographic.
+- Maps: compare keys in UTF-8 order, then values.
+- Booleans: false < true.
+- Integers and FixedPoint: numeric order (align scales for FixedPoint).
+- Mixed types: order by type tag Integer < FixedPoint < Boolean < String < Identifier < List < Map.
+
+Used for: pattern enumeration, sorting incident edges, match_key ordering, map literal iteration, tie-breaking for min/max/sort.
+
+A.5 Numeric Model
+
+- Integers: signed 64-bit; overflow -> fatal INTEGER_OVERFLOW.
+- FixedPoint: scaled integers, scale 0-18 inclusive.
+  Serialisation: scale 0 -> JSON number (e.g., 42). Scale >0 -> JSON string with exactly scale digits after decimal (e.g., "12.5000").
+- Arithmetic:
+  Promotion: Integer -> FixedPoint(0) when combined with FixedPoint.
+  Scale propagation:
+    +, -: result_scale = max(scale_left, scale_right)
+    *: result_scale = scale_left + scale_right (if >18 -> fatal FIXED_POINT_SCALE_OVERFLOW)
+    /: result_scale = scale_left (truncation toward zero)
+  Division by zero -> fatal.
+- // (integer division) on Integers yields Integer, truncated toward zero.
+- % (remainder) on Integers: sign follows dividend.
+- Comparisons: align scales to max of the two, then compare numeric values.
+- to_fixed(e, scale): convert to rational, truncate toward zero to new scale; precision loss -> invalid IR.
+- to_integer(e): truncate toward zero.
+
+A.6 Operational Semantics (Small-Step SOS)
+
+The kernel executes via deterministic transitions over extended configurations that include ephemeral derivation artifacts. The official transition is:
+<G, C, M_prev> -> <G', C', M_prev'>
+
+Rule 1: DISCOVER – Match Generation
+EvalPatterns(G, IR) = M deterministic set of matches. Each match contains:
+- match_key = (rule_id, sorted_binding_list)
+- bindings, let_values, read_trace (with version snapshots)
+- age(m) = if match_key in M_prev then current_tick - M_prev[match_key] else 0 (saturates at INT64_MAX)
+
+Rule 2: SELECT – with retry semantics
+score(m) = base_priority * priority_scale + age * fairness_scale (128-bit, saturate at INT64_MAX)
+Total order: higher score first, then lexicographically smaller match_key.
+Maintain Rejected set. MAX_RETRIES = |M|. If no candidate, go to Rule 5.
+
+Rule 3: PLAN – Syntax-Directed Compilation
+Compile(IR, G, m*) produces Canonical Action Trace α̂ (primitive action sequence) and read set R. All expressions evaluate against immutable snapshot G. See Part B for concrete algorithm.
+
+Rule 4: COMMIT – Two-phase validation and application
+Phase 1: Version validation – all reads in R match current versions.
+Phase 2: Structural validation (simulate α̂ on a clone), check invariants, constraints, duplicate updates, dangling references, overflow pre-checks.
+If any non-fatal failure -> add m* to Rejected and retry SELECT.
+If fatal -> halt with rollback.
+Otherwise apply mutations atomically, update counters, emit events, set M_prev' = { match_key(m) -> current_tick for all m in M }.
+
+Rule 5: NO_MATCH
+<G, C, M_prev> -> <G, C[tick_counter+1], M_prev> – tick counter advances, M_prev unchanged.
+
+A.7 Error Model
+
+Category   | Examples                                      | Effect
+---------------------------------------------------------------------------------------------------
+Fatal      | Counter overflow, division by zero, invariant breach, missing map key, index out of bounds, resource limit exceeded, fixed-point scale overflow, constraint violation (during commit) | Immediate halt, rollback to pre-tick state, emit error snapshot
+Non-fatal  | Stale read, duplicate field update, missing target, duplicate delete, constraint failure during commit validation (structural phase) | Discard current match, add to Rejected, retry SELECT
+
+Allowed error codes (fatal): INTEGER_OVERFLOW, DIVISION_BY_ZERO, COUNTER_OVERFLOW, FIXED_POINT_SCALE_OVERFLOW, INDEX_OUT_OF_BOUNDS, MISSING_MAP_KEY, INVALID_IR, INVARIANT_VIOLATION, RESOURCE_LIMIT_EXCEEDED, CONSTRAINT_VIOLATION.
+
+A.8 Conformance
+
+A conformant engine MUST implement every normative rule in this specification, reject invalid IR, prohibit nondeterminism, and produce byte-identical golden files for identical IR and initial state.
+
+-------------------------------------------------------------------------------
+Part B: Implementor's Appendix (Normative)
+-------------------------------------------------------------------------------
+
+This appendix supplies concrete algorithms that implement the abstract rules of Part A. These algorithms are normative; any engine claiming conformance MUST follow them exactly.
+
+B.1 ORDER_CANONICAL Implementation
+
+function order_canonical(x, y):
+    if type(x) != type(y):
+        return compare_type_tags(x, y)
+    switch type(x):
+        case Integer: return compare_integer(x, y)
+        case FixedPoint: return compare_fixedpoint(x, y)  // cross-multiply
+        case Boolean: return compare_bool(x, y)
+        case String:
+            x_nfc = normalize_NFC(x)
+            y_nfc = normalize_NFC(y)
+            return utf8_bytewise_compare(x_nfc, y_nfc)
+        case Identifier:
+            compare_type_name(x.type, y.type)   // UTF-8 bytewise
+            if equal: compare_sequence(x.seq, y.seq)
+        case List:
+            for i in 0..min(len(x),len(y))-1:
+                cmp = order_canonical(x[i], y[i])
+                if cmp != 0: return cmp
+            return compare_integer(len(x), len(y))
+        case Map:
+            // maps are not orderable; compare by type tag only
+            return 0  // should not be called
+
+B.2 Expression Evaluator (Deterministic)
+
+See reference implementation in Python/Delphi.
+Evaluates expression e against environment env and frozen graph G.
+Short-circuit rules: for && and ||, only evaluate the branch needed for the result; record reads only from evaluated subexpressions.
+Error handling: raise fatal error for division by zero, missing map key, index OOB, overflow, etc.
+Fixed-point division: use arbitrary-precision (big integer) intermediate v_d * 10^s_r; check overflow only on final result.
+
+B.3 ExtractReads(expr, env, G) – Canonical Algorithm
+
+Returns an ordered set (list) of ReadEntry objects.
+
+function ExtractReads(expr, env, G):
+    reads = []
+    visited = set()
+
+    function traverse_value(val):
+        if is_identifier(val):
+            if val in visited: fatal("INVARIANT_VIOLATION", "cycle")
+            visited.add(val)
+            add_existence_read(val, reads)
+            // recurse into fields of the referenced element
+            if is_node(val):
+                node = G.get_node(val)
+                for field in sorted(node.fields.keys()):
+                    traverse_value(node.fields[field])
+            else:
+                edge = G.get_edge(val)
+                for field in sorted(edge.fields.keys()):
+                    traverse_value(edge.fields[field])
+            visited.remove(val)
+        else if is_list(val):
+            for elem in val: traverse_value(elem)
+        else if is_map(val):
+            for key in sorted(val.keys()):  // ORDER_CANONICAL
+                traverse_value(val[key])
+        // else primitive: nothing
+
+    function eval_and_record(e):
+        match e.kind:
+            Literal:
+                if e.type == Identifier:
+                    traverse_value(e.value)
+                else if e.type == List:
+                    for elem in e.elements: eval_and_record(elem)
+                else if e.type == Map:
+                    for key in sorted(e.keys): eval_and_record(e[key])
+                // other literals: no reads
+            Variable:
+                if env.contains(e.name):
+                    traverse_value(env[e.name])
+                else: fatal("INVALID_IR")
+            FieldAccess:
+                rec_val = eval_no_record(e.receiver)  // shallow eval for existence
+                if not is_identifier(rec_val): fatal("INVALID_IR")
+                add_existence_read(rec_val, reads)
+                add_field_read(rec_val, e.field_name, reads)
+                field_val = G.get_field(rec_val, e.field_name)
+                traverse_value(field_val)
+            IndexAccess:
+                eval_and_record(e.container)
+                eval_and_record(e.index)
+                cont_val = eval_no_record(e.container)
+                idx_val = eval_no_record(e.index)
+                if is_map(cont_val):
+                    if idx_val not in cont_val: fatal("MISSING_MAP_KEY")
+                    traverse_value(cont_val[idx_val])
+                else if is_list(cont_val):
+                    if idx_val < 0 or idx_val >= len(cont_val): fatal("INDEX_OUT_OF_BOUNDS")
+                    traverse_value(cont_val[idx_val])
+            BinaryOp:
+                if e.op in ("&&", "||"):
+                    left_val = eval_no_record(e.left)
+                    eval_and_record(e.left)
+                    if (e.op == "&&" and is_truthy(left_val)) or
+                       (e.op == "||" and not is_truthy(left_val)):
+                        eval_and_record(e.right)
+                else:
+                    eval_and_record(e.left)
+                    eval_and_record(e.right)
+            // UnaryOp, FunctionCall: similar recursion
+
+    eval_and_record(expr)
+    return reads
+
+add_existence_read and add_field_read append appropriate ReadEntry with the current version counter from G (snapshot).
+eval_no_record evaluates an expression for its value without recording reads (used for short-circuit decision and index/map checks).
+
+B.4 Pattern Enumeration (DISCOVER)
+
+function enumerate_matches(IR, G):
+    M = []
+    // Precompute sorted node and edge lists per type
+    nodes_by_type = {t: sorted(G.nodes_of_type(t), key=order_key) for t in IR.node_types}
+    edges_by_type = {t: sorted(G.edges_of_type(t), key=order_key) for t in IR.edge_types}
+
+    for rule in IR.rules_in_canonical_order():
+        pattern = rule.pattern
+        // Recursive enumeration
+        function enumerate(idx, env):
+            if idx == len(pattern):
+                // Evaluate lets and where
+                let_values, let_reads = eval_lets(rule.lets, env, G)
+                ok, where_reads = eval_where(rule.where, env, G)
+                if not ok: return
+                read_trace = combine(reads_from_pattern_bindings(env), let_reads, where_reads)
+                match_key = build_match_key(rule.rule_id, env)
+                M.append( (rule_id, env, let_values, read_trace, match_key) )
+                return
+            pe = pattern[idx]
+            if pe.kind == MatchNode:
+                for node_id in nodes_by_type[pe.type_name]:
+                    env2 = env.copy()
+                    env2[pe.var] = node_id
+                    add_read(NodeExistence(node_id, G.element_version(node_id)))
+                    enumerate(idx+1, env2)
+            else: // MatchEdge
+                // Cases based on which endpoints are bound (deterministic)
+                // See v0.49 for full details; use ORDER_CANONICAL for incident edge iteration.
+                ...
+        enumerate(0, {})
+    // Sort M by match_key
+    sort(M, key=order_key_matchkey)
+    return M
+
+order_key implements ORDER_CANONICAL for identifiers.
+match_key canonical JSON: {"rule_id":..., "bindings":{...}} with binding keys sorted.
+
+B.5 PLAN (Canonical Action Trace Compilation)
+
+function compile_plan(rule, match_bindings, let_values, G, C):
+    alpha = []
+    reads = []
+    created_nodes = set()
+    created_edges = set()
+
+    for action in rule.actions:
+        switch action.kind:
+            case CreateNode:
+                handle = new_handle()
+                created_nodes.add(handle, action.node_type)
+                reads.add(TypeExtentRead(action.node_type, C.type_extent_version(action.node_type)))
+                reads.add(SequenceCounterRead(action.node_type, C.sequence_counter(action.node_type)))
+                for field, expr in action.fields:
+                    reads.extend(ExtractReads(expr, match_bindings ∪ let_values, G))
+                alpha.append(CreateNode(handle, action.node_type, action.fields))
+            case CreateEdge:
+                ... similar, add adjacency and existence reads for src/tgt if they are not newly created
+            case DeleteNode:
+                node_id = resolve(action.node, match_bindings, created_nodes)
+                reads.add(NodeExistence(node_id, G.element_version(node_id)))
+                reads.add(TypeExtentRead(G.type_of(node_id), C.type_extent_version(G.type_of(node_id))))
+                // Add reads for incident edges (for version validation)
+                for edge in sorted(G.incident_edges(node_id), key=order_key):
+                    reads.add(EdgeExistence(edge.id, G.element_version(edge.id)))
+                    reads.add(AdjacencyRead(edge.source, edge.type, 'outgoing', ...))
+                    reads.add(AdjacencyRead(edge.target, edge.type, 'incoming', ...))
+                alpha.append(DeleteNode(node_id))
+            case UpdateField:
+                target = resolve(action.target, ...)
+                reads.add(FieldRead(target, action.field, G.element_version(target)))
+                reads.extend(ExtractReads(action.value_expr, ...))
+                alpha.append(UpdateField(target, action.field, action.value_expr))
+            case EmitEvent:
+                for expr in action.payloads:
+                    reads.extend(ExtractReads(expr, ...))
+                alpha.append(EmitEvent(action.event_type, action.payloads))
+    // Ensure deterministic ordering of reads (optional)
+    sort(reads, key=canonical_read_key)
+    return alpha, reads
+
+Note: DeleteNode expansion into DeleteEdge actions is not done in PLAN; it is performed in COMMIT (see below). The reads for incident edges are included in reads for version validation.
+
+B.6 COMMIT (Two-Phase)
+
+See the Delphi Commit unit for full implementation. The algorithm:
+
+Phase 1 – Version Validation
+For each read entry in R, compare the snapshot version with the current version in G and C. Any mismatch -> non-fatal (reject match).
+
+Phase 2 – Structural Validation & Simulation
+1. Clone G to G_sim, clone C to C_sim.
+2. Expand DeleteNode actions: for each DeleteNode(node_id), collect incident edges from G_sim (including edges created earlier in α̂), sort by edge id, and insert DeleteEdge(edge_id) actions immediately before the DeleteNode.
+3. Deduplicate DeleteEdge actions: keep the earliest occurrence (by original index).
+4. Simulate the effective action list in order:
+   - CreateNode: allocate a fresh identifier using C_sim.sequence_counter[type] (pre-increment) -> store mapping handle -> real ID.
+   - CreateEdge: resolve src/tgt (may be handles), check existence, allocate similarly.
+   - UpdateField: check duplicate update on (id, field), evaluate new value against original G, apply to G_sim if changed.
+   - DeleteEdge: check duplicate delete, remove edge.
+   - DeleteNode: remove node (incident edges already removed).
+   - EmitEvent: store event payload (evaluated against original G).
+5. After simulation, check state invariants and constraints on G_sim. Failure -> non-fatal (reject match).
+6. Pre-check overflow for all counter increments to be performed (type extent, adjacency, element version, sequence counters). Overflow -> fatal.
+7. Apply all mutations to real G and C atomically, emit events in order, update M_prev to current tick for all matches in discovery snapshot.
+8. Commit succeeded.
+
+B.7 Version Increment Rules (Normative Table)
+
+Operation                      | type_extent_version[type] | element_version[id] | adjacency_version[node][type][dir] | sequence_counter[type]
+-----------------------------------------------------------------------------------------------
+CreateNode(type)               | +1                        | set to 1            | –                                   | +1 (node type)
+DeleteNode(node)               | +1 (type of node)         | removed             | +1 per incident edge (dedup)        | –
+CreateEdge(type, src, tgt)     | +1 (edge type)            | set to 1            | +1 (src,out), +1 (tgt,in)           | +1 (edge type)
+DeleteEdge(edge)               | +1 (edge type)            | removed             | +1 (src,out), +1 (tgt,in)           | –
+UpdateField(target, field)     | –                         | +1                  | –                                   | –
+
+All increments are by exactly 1. Deduplication of adjacency increments: scan the effective action list left-to-right and increment each unique (node, edge_type, direction) at most once per commit.
+
+B.8 Canonical Serialization (Golden File)
+
+- Integers: JSON number, no leading zeros.
+- FixedPoint: scale 0 -> JSON number; scale >0 -> JSON string with exactly scale digits after decimal.
+- Booleans: true / false.
+- Strings: double-quoted, escaping \, ", \n, \r, \t, other controls as \uXXXX.
+- Identifiers: string "Type:seq".
+- List: [e1,e2,...] no spaces.
+- Map: {"k1":v1,"k2":v2,...} keys sorted by ORDER_CANONICAL.
+- Top-level golden file: {"ir_schema_version":"1.0","type_definitions_hash":"...","initial_state":{...},"final_state":{...},"ticks":[...]} or "error" instead of "ticks".
+
+B.9 Error Classification (Fatal vs Non-Fatal)
+
+Error Code                      | Fatal? | Context
+-----------------------------------------------------------------------------------------------
+INTEGER_OVERFLOW                | Yes    | Arithmetic overflow during expression eval or scoring
+DIVISION_BY_ZERO                | Yes    | Any division where divisor is zero
+COUNTER_OVERFLOW                | Yes    | Increment would exceed INT64_MAX
+FIXED_POINT_SCALE_OVERFLOW      | Yes    | Multiplication result scale >18
+INDEX_OUT_OF_BOUNDS             | Yes    | List index out of range
+MISSING_MAP_KEY                 | Yes    | Map key not found
+INVALID_IR                      | Yes    | IR fails validation
+INVARIANT_VIOLATION             | Yes    | State invariant broken (e.g., cycle, dangling ref)
+RESOURCE_LIMIT_EXCEEDED         | Yes    | Exceeded deterministic limit
+CONSTRAINT_VIOLATION            | No     | Type constraint false after mutation; match rejected (non-fatal)
+Stale read (version mismatch)   | No     | Match rejected, retry
+Duplicate UpdateField           | No     | Match rejected
+Missing target (Delete/Update)  | No     | Match rejected
+Duplicate Delete                | No     | Match rejected
+
+-------------------------------------------------------------------------------
+End of v0.53 Specification
+-------------------------------------------------------------------------------
