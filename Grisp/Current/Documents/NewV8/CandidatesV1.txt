@@ -1,0 +1,2691 @@
+specification candidate 1:
+
+# GRISP DETERMINISTIC KERNEL SPECIFICATION
+
+## Version 1.0 Candidate
+
+### Unified Deterministic Graph Rewrite Calculus (UDGRC)
+
+---
+
+# 000. Preamble
+
+This specification defines the GRISP Deterministic Kernel as a closed, deterministic, graph-rewrite execution model.
+
+The kernel executes Canonical IR programs over a typed property graph.
+
+The specification is self-contained.
+
+No external specifications are normative.
+
+No behavior may be inferred from previous versions.
+
+---
+
+# 001. Goals
+
+The kernel SHALL provide:
+
+1. Determinism
+2. Atomicity
+3. Replayability
+4. Golden-file reproducibility
+5. Implementation independence
+6. Efficient native execution
+
+---
+
+# 002. Determinism Requirement
+
+For identical:
+
+```text
+Canonical IR
+Initial Graph
+Initial Counter State
+```
+
+all conforming implementations MUST produce identical:
+
+```text
+Selected Matches
+Committed Actions
+Version Counters
+Events
+Final Graph
+Golden Files
+```
+
+---
+
+# 003. State Model
+
+Kernel state:
+
+```text
+Σ = ⟨G,C,A⟩
+```
+
+where:
+
+```text
+G = Graph
+C = Counters
+A = AgingTable
+```
+
+No additional mutable state exists.
+
+---
+
+# 004. Graph Model
+
+Graph:
+
+```text
+G = (N,E)
+```
+
+Nodes:
+
+```text
+N : NodeId → Node
+```
+
+Edges:
+
+```text
+E : EdgeId → Edge
+```
+
+---
+
+# 005. Identifiers
+
+Node identifiers:
+
+```text
+NodeId =
+(
+    type_id,
+    sequence
+)
+```
+
+Edge identifiers:
+
+```text
+EdgeId =
+(
+    type_id,
+    sequence
+)
+```
+
+---
+
+# 006. Canonical Identifier Ordering
+
+Identifiers are ordered lexicographically:
+
+```text
+(type_id, sequence)
+```
+
+Example:
+
+```text
+(Person,1)
+<
+(Person,2)
+<
+(Ship,1)
+```
+
+String comparison uses:
+
+```text
+UTF-8
+NFC normalized
+bytewise ordering
+```
+
+---
+
+# 007. Types
+
+Node types define fields.
+
+Example:
+
+```text
+Person
+{
+    Name : String
+    Age  : Integer
+}
+```
+
+Edge types define:
+
+```text
+SourceType
+TargetType
+Fields
+```
+
+---
+
+# 008. Primitive Types
+
+Supported primitive types:
+
+```text
+Boolean
+Integer
+FixedPoint
+String
+NodeId
+EdgeId
+```
+
+---
+
+# 009. Fixed Point
+
+Representation:
+
+```text
+FixedPoint
+{
+    value : Integer
+    scale : UInt16
+}
+```
+
+Meaning:
+
+```text
+real_value =
+value / (10^scale)
+```
+
+Example:
+
+```text
+1234 scale 2
+=
+12.34
+```
+
+---
+
+# 010. Fixed Point Arithmetic
+
+Addition:
+
+```text
+scale =
+max(lhs.scale,rhs.scale)
+```
+
+Subtraction:
+
+```text
+scale =
+max(lhs.scale,rhs.scale)
+```
+
+Multiplication:
+
+```text
+scale =
+lhs.scale + rhs.scale
+```
+
+Division:
+
+```text
+scale =
+lhs.scale
+```
+
+Rounding:
+
+```text
+truncate toward zero
+```
+
+---
+
+# 011. Counter Model
+
+Counters:
+
+```text
+C =
+{
+    tick,
+    versions
+}
+```
+
+Tick:
+
+```text
+tick : UInt64
+```
+
+Single authoritative time source.
+
+---
+
+# 012. Version Counters
+
+Each node contains:
+
+```text
+existence_version
+```
+
+Each edge contains:
+
+```text
+existence_version
+```
+
+Each field contains:
+
+```text
+field_version
+```
+
+Each extent contains:
+
+```text
+extent_version
+```
+
+Each adjacency relation contains:
+
+```text
+adjacency_version
+```
+
+---
+
+# 013. Adjacency Version
+
+Adjacency version key:
+
+```text
+(
+    node_id,
+    edge_type,
+    direction
+)
+```
+
+Direction:
+
+```text
+IN
+OUT
+UNDIRECTED
+```
+
+---
+
+# 014. Aging Table
+
+```text
+A :
+MatchIdentity → UInt64
+```
+
+Stores match age.
+
+Ages saturate at:
+
+```text
+UINT64_MAX
+```
+
+---
+
+# 015. Match Identity
+
+Match identity:
+
+```text
+(
+    rule_id,
+    binding_tuple
+)
+```
+
+Example:
+
+```text
+(
+    MoveShip,
+    [Ship(1),Planet(3)]
+)
+```
+
+---
+
+# 016. Match Ordering
+
+Match identities are ordered lexicographically:
+
+```text
+rule_id
+then
+binding_tuple
+```
+
+Binding tuple comparison is component-wise.
+
+---
+
+# 017. Tick Lifecycle
+
+Each tick consists of:
+
+```text
+DISCOVER
+SELECT
+PLAN
+VALIDATE
+COMMIT
+```
+
+---
+
+# 018. DISCOVER
+
+DISCOVER computes:
+
+```text
+M
+```
+
+where:
+
+```text
+M = all valid matches
+```
+
+Each match contains:
+
+```text
+identity
+priority
+read_trace
+```
+
+---
+
+# 019. Read Trace
+
+Every read records:
+
+```text
+(kind,target,version)
+```
+
+No read entry may omit version.
+
+---
+
+# 020. Read Types
+
+Supported read types:
+
+```text
+NodeExistenceRead
+EdgeExistenceRead
+FieldRead
+ExtentRead
+AdjacencyRead
+```
+
+---
+
+# 021. NodeExistenceRead
+
+```text
+(
+ node_id,
+ existence_version
+)
+```
+
+---
+
+# 022. EdgeExistenceRead
+
+```text
+(
+ edge_id,
+ existence_version
+)
+```
+
+---
+
+# 023. FieldRead
+
+```text
+(
+ element_id,
+ field_name,
+ field_version
+)
+```
+
+---
+
+# 024. ExtentRead
+
+```text
+(
+ type_name,
+ extent_version
+)
+```
+
+---
+
+# 025. AdjacencyRead
+
+```text
+(
+ node_id,
+ edge_type,
+ direction,
+ adjacency_version
+)
+```
+
+---
+
+# 026. Boolean Evaluation
+
+Evaluation order:
+
+```text
+left-to-right
+```
+
+Short-circuiting:
+
+```text
+mandatory
+```
+
+---
+
+# 027. Dependency Extraction
+
+Read traces include only expressions actually evaluated.
+
+Example:
+
+```text
+false && expensive()
+```
+
+`expensive()` is not evaluated.
+
+No read recorded.
+
+---
+
+# 028. Score Calculation
+
+Score:
+
+```text
+priority
++
+(age × fairness)
+```
+
+Computed using:
+
+```text
+signed 128-bit intermediate
+```
+
+Result:
+
+```text
+saturating Int64
+```
+
+---
+
+# 029. SELECT
+
+Initialize:
+
+```text
+Remaining = M
+Rejected = {}
+```
+
+---
+
+# 030. Candidate Selection
+
+Choose:
+
+```text
+highest score
+```
+
+Tie-break:
+
+```text
+Match Ordering
+```
+
+---
+
+# 031. Non-Fatal Failure
+
+On non-fatal failure:
+
+```text
+Rejected :=
+Rejected ∪ {m*}
+```
+
+and
+
+```text
+Remaining :=
+Remaining \ {m*}
+```
+
+---
+
+# 032. Empty Remaining Set
+
+If:
+
+```text
+Remaining = {}
+```
+
+the tick ends without commit.
+
+Proceed to:
+
+```text
+NO_MATCH
+```
+
+---
+
+# 033. PLAN
+
+PLAN generates:
+
+```text
+ActionTrace
+```
+
+---
+
+# 034. ActionTrace
+
+ActionTrace contains only fully evaluated values.
+
+Example:
+
+```text
+UpdateField(
+  node=5,
+  field=Health,
+  value=42
+)
+```
+
+Expressions are eliminated.
+
+---
+
+# 035. Primitive Actions
+
+Supported primitive actions:
+
+```text
+CreateNode
+DeleteNode
+CreateEdge
+DeleteEdge
+UpdateField
+EmitEvent
+```
+
+---
+
+# 036. CreateNode
+
+Creates a node.
+
+All mandatory fields MUST be supplied.
+
+Otherwise:
+
+```text
+INVALID_IR
+```
+
+---
+
+# 037. DeleteNode
+
+Deletes node.
+
+All incident edges MUST be expanded into explicit:
+
+```text
+DeleteEdge
+```
+
+operations during PLAN.
+
+---
+
+# 038. CreateEdge
+
+Creates edge.
+
+Endpoints MUST exist.
+
+Otherwise:
+
+```text
+non-fatal failure
+```
+
+---
+
+# 039. DeleteEdge
+
+Deletes edge.
+
+Missing edge:
+
+```text
+non-fatal failure
+```
+
+---
+
+# 040. UpdateField
+
+Updates a field.
+
+Type mismatch:
+
+```text
+INVALID_IR
+```
+
+---
+
+# 041. EmitEvent
+
+Stores:
+
+```text
+event_type
+payload
+```
+
+Payload already evaluated.
+
+---
+
+# 042. VALIDATE
+
+Validation compares current versions with recorded versions.
+
+---
+
+# 043. Validation Rule
+
+For every read:
+
+```text
+current_version
+=
+recorded_version
+```
+
+must hold.
+
+Otherwise:
+
+```text
+non-fatal failure
+```
+
+---
+
+# 044. Constraint Re-Evaluation
+
+Forbidden.
+
+Constraints are not re-evaluated during VALIDATE.
+
+---
+
+# 045. Expression Re-Evaluation
+
+Forbidden.
+
+Expressions are not re-evaluated during VALIDATE.
+
+---
+
+# 046. Event Re-Evaluation
+
+Forbidden.
+
+Events are not re-evaluated during COMMIT.
+
+---
+
+# 047. COMMIT
+
+COMMIT is atomic.
+
+Either:
+
+```text
+all actions apply
+```
+
+or:
+
+```text
+none apply
+```
+
+---
+
+# 048. Counter Updates
+
+Version updates are derived only from committed primitive actions.
+
+---
+
+# 049. CreateNode Version Updates
+
+Increment:
+
+```text
+node existence_version
+extent_version(node_type)
+```
+
+---
+
+# 050. DeleteNode Version Updates
+
+Increment:
+
+```text
+node existence_version
+extent_version(node_type)
+```
+
+---
+
+# 051. CreateEdge Version Updates
+
+Increment:
+
+```text
+edge existence_version
+source adjacency_version
+target adjacency_version
+```
+
+---
+
+# 052. DeleteEdge Version Updates
+
+Increment:
+
+```text
+edge existence_version
+source adjacency_version
+target adjacency_version
+```
+
+---
+
+# 053. UpdateField Version Updates
+
+Increment:
+
+```text
+field_version
+```
+
+only.
+
+---
+
+# 054. No-Op Update
+
+If canonical old value equals canonical new value:
+
+```text
+no-op
+```
+
+No version increment.
+
+---
+
+# 055. Duplicate Actions
+
+Duplicate primitive actions affecting the same target are forbidden.
+
+Detected during PLAN.
+
+Result:
+
+```text
+INVALID_PLAN
+```
+
+---
+
+# 056. Event Emission
+
+Events are emitted after successful commit.
+
+Order:
+
+```text
+ActionTrace order
+```
+
+---
+
+# 057. Aging Update
+
+After tick completion:
+
+If match reappears:
+
+```text
+age++
+```
+
+Otherwise:
+
+```text
+remove age entry
+```
+
+New match:
+
+```text
+age=0
+```
+
+---
+
+# 058. Tick Advancement
+
+After:
+
+```text
+COMMIT
+```
+
+or
+
+```text
+NO_MATCH
+```
+
+execute:
+
+```text
+tick++
+```
+
+exactly once.
+
+---
+
+# 059. Resource Limits
+
+Implementations MAY define:
+
+```text
+max_matches
+max_actions
+max_trace_size
+```
+
+---
+
+# 060. Resource Limit Exceeded
+
+If a limit is exceeded:
+
+```text
+RESOURCE_LIMIT_EXCEEDED
+```
+
+Fatal termination.
+
+---
+
+# 061. Canonical Serialization
+
+Canonical serialization is used only for:
+
+```text
+golden files
+```
+
+Not runtime identity.
+
+---
+
+# 062. Serialization Rules
+
+Strings:
+
+```text
+UTF-8
+NFC
+```
+
+Maps:
+
+```text
+sorted by canonical key ordering
+```
+
+Lists:
+
+```text
+preserve order
+```
+
+---
+
+# 063. Determinism Theorem
+
+For identical:
+
+```text
+IR
+Initial Graph
+Initial Counters
+```
+
+the following are uniquely determined:
+
+```text
+Match Set
+Selected Match
+Action Trace
+Committed State
+Events
+Counter Values
+Golden File
+```
+
+---
+
+# 064. Conformance Requirement
+
+An implementation is conformant if and only if:
+
+1. It obeys all rules in this specification.
+2. It produces identical golden files for all conformance tests.
+3. It does not introduce implementation-defined behavior.
+
+---
+
+# 065. End of Specification
+
+This specification is complete and self-contained.
+
+
+
+
+Specification candidate 2:
+
+This is an ambitious, mathematically elegant architecture that has now been scrubbed of its contradictions. The time-drift bugs, unbounded memory traps, and non-deterministic evaluation gaps have been formally closed.
+
+Here is the fully resolved, implementation-ready candidate for the GRISP Deterministic Kernel Specification v1.0.
+
+---
+
+# GRISP DETERMINISTIC KERNEL SPECIFICATION – Version 1.0
+
+## Unified DSOS (Deterministic Structural Operational Semantics) Edition
+
+---
+
+### Preamble
+
+This specification defines the GRISP Deterministic Kernel as a **closed, formally deterministic graph-rewrite calculus**. It explicitly resolves the architectural inconsistencies of v0.50 and earlier by establishing a unified structural operational semantics, atomic derivation traces, exact version snapshots, and total ordering.
+
+For identical Canonical IR and identical initial state, all conformant engines MUST produce identical observable behavior:
+
+* Committed state transitions
+* Emitted events
+* Golden file output
+
+All normative rules are mandatory. No hidden nondeterminism, runtime inference, open dependencies, or dual semantic models are permitted.
+
+---
+
+## 0. Core Principles
+
+1. **Single Semantic Object:** The system transitions purely from $\Sigma \to \Sigma'$. Ephemeral matching state is explicitly scoped to the derivation tick.
+2. **Determinism by Construction:** All choice points are eliminated via total orders (NFC UTF-8, component-wise tuple sorting) and structured recursion.
+3. **Exact Dependency Snapshots:** Read effects explicitly record the exact version counter at the moment of evaluation. Validation is a strict equality check.
+4. **Canonical Action Trace (CAT):** The execution trace is a projection of the compilation derivation. Event payloads are evaluated pre-commit.
+5. **Liveness Guarantee:** Infinite validation loops are prevented via monotonic rejection sets. Score arithmetic is saturating.
+
+---
+
+## 1. State Model
+
+A quiescent configuration is defined strictly as:
+
+$$\Sigma = \langle G, C, M_{prev} \rangle$$
+
+* **$G$** – Typed property graph (nodes, edges, fields, identifiers). No nulls. All declared fields are mandatory.
+* **$C$** – Counters (signed 64-bit integers):
+* `tick_counter` (The single, authoritative logical time. Starts at 0).
+* Sequence counters per node/edge type.
+* Version counters: `extent_version`, `existence_version`, `field_version`, `predicate_version`, `edge_type_version`, `adjacency_version` (with direction $dir \in \{in, out, undirected\}$).
+
+
+* **$M_{prev}$** – Previous match set: a map from a structured `match_key` to `age` (integer).
+
+**Ephemeral Derivation Artifacts:**
+During a tick loop, the engine utilizes temporary state: $M$ (discovered matches), $M_{remaining}$ (valid candidates), $Rejected$ (failed candidates), $\hat{\alpha}$ (action trace), and $\mathcal{R}$ (read trace). These are cleared at the end of every tick.
+
+---
+
+## 2. Numeric Model & Fixed-Point Arithmetic
+
+To maintain a closed specification, numeric evaluation strictly adheres to the following rules:
+
+1. **Types:** All integers are signed 64-bit.
+2. **Fixed-Point Operations:**
+* **Rounding:** Truncation toward zero.
+* **Scale Propagation:** - Addition/Subtraction: $scale = \max(scale_{left}, scale_{right})$
+* Multiplication: $scale = scale_{left} + scale_{right}$
+* Division: $scale = scale_{left}$
+
+
+* **Promotion:** Mixed operations promote Integer to FixedPoint(0) prior to execution.
+
+
+3. **Canonical Serialization:** Fixed-point literals must always include a decimal point and exactly $scale$ digits (e.g., `"42.0"` for scale 0, `"12.5000"` for scale 4).
+4. **Overflow Limits:** Arithmetic overflows trigger a fatal `INTEGER_OVERFLOW`, *except* for fairness score and age arithmetic, which must use 128-bit intermediates and **saturate** to $INT64\_MAX$.
+
+---
+
+## 3. Deterministic Ordering (ORDER_CANONICAL)
+
+To guarantee identical selection across platforms, `ORDER_CANONICAL` is defined as:
+
+1. **Strings:** NFC normalized, then UTF-8 bytewise lexicographic.
+2. **Identifiers:** Structured as `type:seq`. Compared by `type` (UTF-8), then by `seq` numerically (ignoring leading zeros).
+3. **Maps:** Keys are sorted by `ORDER_CANONICAL` before iteration or comparison.
+4. **Lists & Tuples:** Component-wise `ORDER_CANONICAL` left-to-right.
+
+---
+
+## 4. Canonical IR Syntax & Type System
+
+### 4.1 Expressions & Constraints
+
+```text
+e ::= k | x | x.f | e1 ⊕ e2 | len(e) | to_fixed(e, scale) | to_integer(e)
+⊕ ::= + | - | * | / | // | % | < | <= | > | >= | == | != | && | ||
+
+```
+
+**Constraint Evaluation:** For logical operators `&&` and `||`, the logical result must evaluate with **left-to-right short-circuiting**. However, for dependency extraction, **both operands are always evaluated** to build the read trace $\mathcal{R}_m$, ensuring identical traces regardless of the runtime short-circuit state. Expressions must be pure.
+
+### 4.2 Patterns, Lets, and Actions
+
+```text
+P ::= ∅ | MatchNode(x, type_name) · P | MatchEdge(x, type_name, src, tgt) · P [ | MatchAbsent(x, ...) ]
+B ::= ∅ | Let(x, e) · B
+a ::= CreateNode(x, type, {f: e}) | CreateEdge(x, type, src, tgt, {f: e}) | UpdateField(tgt, f, e) | DeleteEdge(e) | DeleteNode(x) | EmitEvent(evt, [e])
+
+```
+
+*Note: The `!` suffix or `MatchAbsent` is reserved for future Negative Application Conditions (NACs).*
+
+---
+
+## 5. Operational Semantics (The Execution Loop)
+
+The kernel execution loop governs the transition $\Sigma \to \Sigma'$.
+
+### 5.1 Phase A: DISCOVER
+
+Generate the set of all matches $M$.
+
+1. **Total Pattern Order:** Match tuples are enumerated via nested recursion. The resulting matches are strictly ordered lexicographically by their complete bound identifier tuple `(id1, id2, ...)` using `ORDER_CANONICAL`.
+2. **Let Bindings:** Evaluated sequentially. Their reads contribute to the trace, but their values **do not** affect the `match_key` identity.
+3. **Read Trace Definition:** $\mathcal{R}_m$ records strict version snapshots:
+* `FieldRead(id, f, current_field_version)`
+* `NodeExistence(id, current_existence_version)`
+* `ExtentRead(type, current_extent_version)`
+* `AdjacencyRead(node, type, dir, current_adjacency_version)`
+
+
+4. **Age assignment:** If $match\_key \in M_{prev}$, $age(m) = \min(M_{prev}[match\_key] + 1, INT64\_MAX)$. Else $0$.
+
+### 5.2 Phase B: SELECT & REJECT
+
+Initialize ephemeral state: $M_{remaining} = M$, $Rejected = \emptyset$.
+
+1. If $M_{remaining} = \emptyset$, transition immediately to **Phase E (NO_MATCH)**.
+2. For each candidate $m \in M_{remaining}$, calculate:
+
+$$score(m) = \min(base \times scale + age(m) \times fairness, INT64\_MAX)$$
+
+
+3. Select $m^*$ with the highest score. Tie-break via `ORDER_CANONICAL` on the `match_key` tuple.
+
+### 5.3 Phase C: PLAN
+
+Compile $m^*$ into a Canonical Action Trace $\hat{\alpha}$ and aggregate reads $\mathcal{R} = \mathcal{R}_m \cup \mathcal{R}_{args}$.
+
+1. **Static Validation:** Missing mandatory fields in `CreateNode`, or duplicate explicit `UpdateField` / `DeleteEdge` actions on the same target yield a non-fatal rejection.
+2. **Event Payloads:** `EmitEvent` expressions are evaluated pre-commit against the DISCOVER snapshot. Their concrete values are stored in $\hat{\alpha}$.
+3. **No-Op Writes:** `UpdateField` operations where the new value equals the canonical old value are removed from $\hat{\alpha}$.
+
+If any non-fatal validation fails, update $Rejected := Rejected \cup \{m^*\}$, $M_{remaining} := M_{remaining} \setminus \{m^*\}$, and loop back to **5.2 SELECT**.
+
+### 5.4 Phase D: COMMIT
+
+Perform atomic validation and application.
+
+1. **Version Validation:** For every entry in $\mathcal{R}$, verify $current\_version == recorded\_version\_snapshot$.
+2. **Apply & Increment:** If valid, apply $\hat{\alpha}$ left-to-right. Update global counters $C$ according to the increment algorithm.
+3. **Tick Advance:** Increment `C.tick_counter` by 1.
+4. **M_prev Update:** `M_prev'` is formed from all $m \in M$ using their discovery ages. Prune any entries exceeding `AGE_MAX`. Emit events.
+
+Transition: $\langle G, C, M_{prev} \rangle \to \langle G', C', M_{prev}' \rangle$
+
+### 5.5 Phase E: NO_MATCH
+
+Triggered when $M_{remaining}$ is empty.
+
+1. Increment `C.tick_counter` by 1.
+2. Prune $M_{prev}$ of entries older than `AGE_MAX`. Do not modify $G$.
+
+Transition: $\langle G, C, M_{prev} \rangle \to \langle G, C', M_{prev}' \rangle$
+
+---
+
+## 6. Version Increment Rules & Counter Application
+
+Counters are updated deterministically by scanning the finalized $\hat{\alpha}$ left-to-right.
+
+| Operation | `extent` | `existence` | `field` | `predicate` | `edge_type` | `adjacency` |
+| --- | --- | --- | --- | --- | --- | --- |
+| **CreateNode** | +1 | set to 1 | set to 1 each | +1 (that field) | - | - |
+| **CreateEdge** | - | set to 1 | set to 1 each | - | +1 | +1 (source.out, target.in) |
+| **DeleteEdge** | - | removed | removed | - | +1 | +1 (source.out, target.in) |
+| **DeleteNode** | +1 | removed | removed | +1 (all declared) | - | - |
+| **UpdateField** | - | - | +1 (that field) | +1 (that field) | - | - |
+
+**Counter Application Algorithm:**
+
+1. Maintain a `dedup_map`.
+2. As $\hat{\alpha}$ applies, any primitive action that dictates an adjacency increment records its `(edge_id, endpoint)` in the map.
+3. Adjacency versions are incremented **strictly once** per unique `(edge_id, endpoint)` based on their first appearance in the map. *Note: Implicit `DeleteEdge` actions generated by `DeleteNode` handle adjacency correctly. The `DeleteNode` action itself does not touch adjacency versions.*
+
+---
+
+## 7. Error Handling & Resource Limits
+
+| Category | Conditions | Engine Effect |
+| --- | --- | --- |
+| **Non-Fatal** | Stale read, missing action target, duplicate primitive mutation. | Discard $m^*$ to $Rejected$. Re-invoke `SELECT`. |
+| **Fatal** | Missing map key, index out of bounds, invariant breach, zero-division, `INT64` overflow on global counters. | Halt execution. Rollback $G$ to pre-tick snapshot. Emit error configuration. |
+| **Limits** | $M$ exceeds `MAX_MATCHES`, $\hat{\alpha}$ length > `MAX_TRACE`. | Halt with `RESOURCE_LIMIT_EXCEEDED`. |
+| **Wrap** | `C.tick_counter == INT64_MAX` | Reset all versions to 0, emit `COUNTER_WRAP`, continue. |
+
+---
+
+## 8. Golden File & Match Key Canonicalization
+
+**Match Key Identity:**
+Internally, $match\_key$ is a structured binary tuple: `(rule_id, [(var_name, type, seq), ...])`. Let bindings do not affect this tuple.
+
+**Golden File Output:**
+For conformance and debugging, the engine serializes data to minified JSON.
+
+* No whitespace.
+* Keys sorted strictly by `ORDER_CANONICAL`.
+* Strings NFC normalized.
+* Output includes `tick_number` (derived directly from `C.tick_counter`).
+
+```json
+{
+  "ir_schema_version": "1.0",
+  "tick_number": 42,
+  "selected_match_key": { "rule_id": "rule_alpha", "bindings": [ ... ] },
+  "committed_changes": [ ... ],
+  "events": [ { "rule_id": "rule_alpha", "payload": [ ... ] } ]
+}
+
+```
+
+
+Specification candidate 3:
+
+```markdown
+# GRISP DETERMINISTIC KERNEL SPECIFICATION – Version 0.51
+
+## Unified DSOS (Deterministic Structural Operational Semantics) Edition
+
+---
+
+### Preamble
+
+This specification defines the GRISP Deterministic Kernel as a **closed, formally deterministic graph-rewrite calculus**. It incorporates fixes for all critical issues identified in v0.50 (double-tick advancement, missing version snapshots, infinite retry loops, short-circuit nondeterminism, incomplete numeric model, and state-machine closure).
+
+For identical Canonical IR and identical initial state, all conformant engines **MUST** produce identical observable behavior:
+- Committed state transitions
+- Emitted events
+- Golden file output
+
+All normative rules are mandatory. No hidden nondeterminism is permitted.
+
+---
+
+## 0. Core Principles
+
+1. **Single semantic object** – State is `⟨G, C, M_prev⟩`.
+2. **Determinism by construction** – Total orders, structural recursion, explicit derivation artifacts.
+3. **Read effects as derivation** – Dependencies captured with version snapshots during DISCOVER and PLAN.
+4. **Canonical Action Trace (CAT)** – `α̂` is the projection of compilation.
+5. **Atomic commit** – Validation, application, counter update, and `M_prev` refresh form one rollbackable step.
+
+---
+
+## 1. State Model
+
+A configuration (committed state) is:
+
+```
+Σ = ⟨G, C, M_prev⟩
+```
+
+- **G** – Typed property graph (nodes, edges, fields, identifiers). No nulls; all declared fields mandatory.
+- **C** – Counters (signed 64-bit integers):
+  - `tick_counter` (starts at 0; authoritative tick number)
+  - Sequence counters per node/edge type
+  - Version counters: `extent_version[type]`, `predicate_version[type][field]`, `edge_type_version[type]`, `field_version[element][field]`, `adjacency_version[node][type][dir]` (dir ∈ {in, out}), `existence_version[element]`, etc. (see §6)
+- **M_prev** – Map from `match_key` to age (saturating integer). Pruned per retention policy (see §5).
+
+**Invariants** (checked on successful commit):
+- No dangling edges or identifier references (recursive check on lists/maps via visited set).
+- All declared constraints and mandatory fields satisfied.
+
+**Extended configurations** (derivation artifacts for SOS rules):
+- DISCOVER_STATE = ⟨G, C, M_prev, M⟩
+- SELECT_STATE = ⟨G, C, M_prev, M, m*, Rejected⟩
+- PLAN_STATE = ⟨G, C, M_prev, M, m*, α̂, ℛ⟩
+
+These are **ephemeral**; final transition returns to Σ.
+
+---
+
+## 2. Canonical IR Syntax (Inductive)
+
+(Abbreviated; full JSON schema in appendix.)
+
+### 2.1 Expressions & Evaluation
+
+Expressions evaluated left-to-right with **mandatory short-circuit** for `&&` and `||`:
+- `e1 && e2`: evaluate `e1`; if false, result=false and ℛ=ℛ_e1; else evaluate `e2`.
+- `e2 || e1`: symmetric.
+- Dependency extraction (ℛ) follows actual evaluation path (pure expressions only; no side effects).
+
+All other operators fully evaluated. Overflow/division-by-zero → fatal.
+
+Fixed-point rules (complete):
+- Scale propagation: `max(s1,s2)` for `+`/`-`; `s1+s2` for `*`; `s1` for `/` (result truncated toward zero).
+- Integer mixed with FixedPoint promotes to FixedPoint(0).
+- Serialization: decimal point + exactly `scale` digits (e.g., `"42.0"` for scale 0).
+
+### 2.2 Patterns, Constraints, Lets, Actions, Rules
+
+(Unchanged inductive structure from v0.50, with explicit total ordering: matches generated by nested enumeration in pattern order; total order on binding tuples via ORDER_CANONICAL lexicographic comparison.)
+
+---
+
+## 3. Deterministic Ordering (ORDER_CANONICAL)
+
+- Strings: NFC-normalized UTF-8 bytewise lexicographic.
+- Identifiers: `(type_name, sequence_number)`.
+- Lists/Maps: element-wise / sorted-keys lexicographic.
+- Binding tuples: component-wise on identifiers in pattern declaration order.
+
+---
+
+## 4. Operational Semantics (Small-Step SOS)
+
+Five main rules operating over extended configurations.
+
+### Rule 1: TICK (Prepare)
+
+```
+tick_counter < INT64_MAX
+──────────────────────────────────────────────────────────────
+⟨G, C, M_prev⟩ → DISCOVER_STATE⟨G, C[tick_counter + 1], M_prev, ∅⟩
+```
+
+### Rule 2: DISCOVER
+
+`EvalPatterns(G, IR)` produces `M` (all matches with `match_key`, bindings, `ℛ_m` containing versioned reads).  
+`age(m)` from `M_prev` (saturating).  
+Transition to DISCOVER_STATE.
+
+### Rule 3: SELECT
+
+```
+M_remaining = M \ Rejected
+m* = highest score (base_priority * priority_scale + age * fairness_scale, saturating) then smallest match_key
+```
+
+If no `m*` → NO_MATCH.  
+Transition to SELECT_STATE.
+
+### Rule 4: PLAN
+
+Structural recursion over actions producing `α̂` (primitive actions with values) and `ℛ` (versioned reads from argument evaluation + implicit operations).  
+Context-free on discovery snapshot.  
+Duplicate `UpdateField` / missing mandatory fields / duplicate `DeleteEdge` → non-fatal (reject match).
+
+### Rule 5: COMMIT
+
+**Validation**:
+- All reads in `ℛ` have matching current versions.
+- Structural checks (no dangling, no duplicate mutations, targets exist or created earlier in `α̂`).
+- Counter pre-checks.
+
+On **non-fatal failure**: add to `Rejected`, return to SELECT.  
+On **success**:
+- Apply `α̂` left-to-right to temporary `G_temp` → `G'`.
+- Update counters per §6 (derived from `α̂`; adjacency deduplicated by earliest occurrence).
+- Emit events (pre-computed payloads from `α̂`).
+- `M_prev' = {k → age(m) for m in M}` (with pruning).
+- `C' = C with tick_counter already advanced`.
+
+**NO_MATCH** (empty or exhausted):
+- No changes to G.
+- `M_prev'` from current M (or previous, per policy).
+- Advance tick if not already done.
+
+Fatal errors: rollback, emit error snapshot.
+
+---
+
+## 5. Version Increment Rules
+
+Increments derived strictly from primitive actions in final `α̂` (post-expansion). No global "(all)" bumps. No double-counting on implicit `DeleteEdge`.
+
+| Operation     | extent | predicate | edge_type | adjacency | existence | field_version |
+|---------------|--------|-----------|-----------|-----------|-----------|---------------|
+| CreateNode    | +1     | -         | -         | -         | set 1     | set 1 (per field) |
+| CreateEdge    | -      | -         | +1        | +1 (src.out, tgt.in) | set 1 | set 1 |
+| DeleteEdge    | -      | -         | +1        | +1 (src.out, tgt.in) | remove | remove |
+| DeleteNode    | +1     | -         | -         | (via expanded DeleteEdges) | remove | remove |
+| UpdateField   | -      | +1 (field)| -         | -         | -         | +1 (field) |
+
+Adjacency deduplication: once per unique `(node, edge)` via earliest index in `α̂`.
+
+**No-op writes**: skipped (value equality under canonical form); no version bump.
+
+**M_prev pruning**: optional retention policy (e.g., age ≤ 1_000_000 or present in recent ticks). Deterministic.
+
+---
+
+## 6. Canonical Serialization (Golden File)
+
+(Unchanged core format; full canonical JSON algorithm in appendix: NFC, sorted keys, no whitespace, exact FixedPoint format.)
+
+---
+
+## 7. Error Model & Conformance
+
+Fatal: rollback to pre-tick, emit error.  
+Non-fatal: retry via Rejected.  
+Conformance requires identical golden files on test suite.
+
+**Determinism Theorem**: With explicit derivation artifacts, total orders, versioned reads, and closed rules, the transition to next committed Σ is unique.
+
+---
+
+## 8. Relationship to Grammar & Extensions
+
+Fully compatible with Grisp Grammar v0.01 (patterns, lets, where, actions map directly).  
+Recommended extensions: NACs (`NOT` patterns contribute absence reads), explicit type system section (mandatory fields, typing rules).
+
+---
+
+*End of GRISP Deterministic Kernel Specification v0.51*
+
+**Appendices** (summary):
+- A: Full Canonical JSON / MatchKey algorithm + test vectors.
+- B: ReadTraceSchema and validation pseudocode.
+- C: Complete numeric model examples.
+- D: Counter application pseudocode with deduplication.
+- E: Conformance test vectors (idle ticks, rejection, short-circuit, version staleness, etc.).
+```
+
+This v0.51 candidate incorporates the full consensus: tick unification, versioned reads, Rejected/NO_MATCH, mandatory short-circuit with conditional dependencies, structured match_key, cleaned increments, inline numerics, pre-commit events, saturation, etc. It is now closed, liveness-safe, and ready for implementation while preserving the original vision. 
+
+Let me know if you want expansions (e.g., full appendices, grammar v0.02, or pseudocode details) or further tweaks!
+
+
+
+Specification candidate 4:
+
+Here is the candidate next revision — **GRISP Deterministic Kernel Specification v0.51 (Unified DSOS)**. It incorporates every Tier-1 consensus fix from your reviews, closes the state machine, and makes the numeric model self-contained.
+
+---
+
+# GRISP DETERMINISTIC KERNEL SPECIFICATION – Version 0.51
+
+## Unified DSOS Edition
+
+### Preamble
+
+This specification defines the GRISP Deterministic Kernel as a closed, formally deterministic graph-rewrite calculus. It supersedes v0.50 and resolves the architectural inconsistencies identified in independent reviews.
+
+For identical Canonical IR and identical initial state, all conformant engines MUST produce identical observable behavior:
+- Committed state transitions
+- Emitted events
+- Golden file output
+
+All normative rules are mandatory. No hidden nondeterminism, runtime inference, or dual semantic models are permitted.
+
+---
+
+## 0. Core Principles
+
+1. **Single time source** – `tick_counter` in C is the only clock.
+2. **Determinism by construction** – all choice points eliminated via total orders.
+3. **Read effects as versioned derivation** – dependencies are recorded with snapshots.
+4. **Canonical Action Trace (CAT)** – execution trace is a projection of compilation.
+5. **Atomic commit** – validation, application, and counter update form one step.
+
+---
+
+## 1. State Model
+
+### 1.1 Base configuration
+```
+Σ0 = ⟨G, C, M_prev⟩
+```
+- **G** – Typed property graph. No nulls, all declared fields mandatory.
+- **C** – Counters (signed 64-bit):
+  - `tick_counter` (starts 0)
+  - `seq_counter[type]` per node/edge type
+  - `existence_version[id]`
+  - `field_version[id][field]`
+  - `extent_version[type]`
+  - `adjacency_version[node][type][dir]` where dir ∈ {in, out}
+- **M_prev** – map `match_key → age` (age is unsigned 64-bit, capped at 2^63-1)
+
+### 1.2 Extended configurations (execution phases)
+```
+Σ1 = ⟨G, C, M_prev, M⟩ // after DISCOVER
+Σ2 = ⟨G, C, M_prev, M, Rejected, m*⟩ // after SELECT
+Σ3 = ⟨G, C, M_prev, M, Rejected, m*, α̂, ℛ⟩ // after PLAN
+```
+M is the set of matches discovered this tick. Rejected is initially ∅.
+
+**Invariants** (checked after COMMIT):
+- No dangling edges
+- No dangling identifier references
+- All mandatory fields present
+- No cycles in identifier references
+
+---
+
+## 2. Canonical IR
+
+Same inductive syntax as v0.50, with these clarifications:
+
+- Expressions are always evaluated left-to-right. `&&` and `||` evaluate both operands. This guarantees identical read sets.
+- Constraints φ are any boolean-typed expression, not limited to &&.
+- Rule definition: `Rule(rule_id, base_priority, priority_scale, fairness_scale, P, φ, B, A)` where scales are non-negative int64.
+
+---
+
+## 3. Deterministic Ordering (ORDER_CANONICAL)
+
+- Strings: NFC-normalized UTF-8, then bytewise lexicographic.
+- Identifiers: compare `(type_name, seq)` lexicographically.
+- Lists: element-wise.
+- Maps: keys sorted by ORDER_CANONICAL, then compare value sequences.
+- Binding tuples: lexicographic over variables in pattern declaration order.
+
+Used for pattern enumeration, incident-edge sorting, match_key tie-breaking, map literal iteration.
+
+---
+
+## 4. Numeric Model (complete, no external reference)
+
+- Integers: signed 64-bit two's complement. Overflow → fatal INTEGER_OVERFLOW.
+- FixedPoint: scaled integer with scale s ∈. Value = unscaled / 10^s. Serialized as JSON string with exactly s digits after decimal point.[0][18]
+- Promotion: Integer → FixedPoint(0) for any mixed operation.
+- Scale propagation:
+  - `+, -`: result scale = max(s1, s2)
+  - `*`: result scale = s1 + s2 (must be ≤18 else fatal)
+  - `/`: result scale = s1, division truncates toward zero
+- All intermediate calculations use signed 128-bit, checked before narrowing to 64-bit.
+
+---
+
+## 5. Operational Semantics
+
+### Rule 1: DISCOVER
+```
+EvalPatterns(G, IR) = M
+```
+Enumeration: patterns in declaration order, bindings enumerated in ORDER_CANONICAL. For each candidate:
+- Evaluate φ and B left-to-right, building read trace ℛ_m where each read records the version snapshot:
+  - `NodeExistence(id, existence_version[id])`
+  - `FieldRead(id, f, field_version[id][f])`
+  - `ExtentRead(type, extent_version[type])`
+  - `AdjacencyRead(node, type, dir, adjacency_version[node][type][dir])`
+- Compute `age(m) = (key∈M_prev? min(M_prev[key]+1, AGE_MAX) : 0)`
+- `match_key = (rule_id, tuple of (var, id))` – structured, not JSON
+
+Transition: Σ0 → Σ1
+
+### Rule 2: SELECT
+```
+M_remaining = M \ Rejected
+if M_remaining = ∅ → goto NO_MATCH
+score(m) = saturate64(base*priority_scale + age*fairness_scale)
+m* = argmax score, tie-break by match_key ORDER_CANONICAL
+```
+saturate64 computes in 128-bit then clamps to [0, INT64_MAX].
+
+Transition: Σ1 → Σ2
+
+### Rule 3: PLAN
+Compile action block structurally over fixed G and environment ℰ from m*. Produces:
+- `α̂` – primitive action sequence with all arguments evaluated to values
+- `ℛ` – union of ℛ_m and reads from argument evaluation
+
+Context-freeness holds because G is immutable during PLAN.
+
+If compilation detects duplicate primitive mutation on same target, reject as INVALID_IR (fatal).
+
+Transition: Σ2 → Σ3
+
+### Rule 4: COMMIT
+Validate every r ∈ ℛ against current versions. If any mismatch → non-fatal STALE_READ.
+
+Structural validation:
+- No duplicate UpdateField on same (id,f) in α̂
+- All targets exist or are created earlier in α̂
+- No dangling identifiers after α̂
+- All mandatory fields supplied in CreateNode/CreateEdge
+
+If non-fatal fails: `Rejected := Rejected ∪ {m*}`, return to SELECT.
+
+If passes:
+- Apply α̂ to G → G'
+- Update counters per §6 (skip no-ops)
+- Emit events from α̂ in order
+- `C' = C with tick_counter+1` (checked for overflow; on overflow execute COUNTER_WRAP procedure)
+- `M_prev' = { key→age | (key→age) ∈ M_prev ∪ {(key(m),age(m)) for m∈M}, age ≤ AGE_MAX }` – prune entries not in M to bound memory
+
+Transition: Σ3 → Σ0' = ⟨G', C', M_prev'⟩
+
+### Rule 5: NO_MATCH
+```
+M = ∅
+────────────────────────
+Σ1 → ⟨G, C[tick_counter+1], M_prev⟩
+```
+Tick advances with no state change. M_prev is retained (ages do not increase on idle ticks).
+
+---
+
+## 6. Version Increment Rules
+
+| Operation | extent | field | existence | adjacency |
+|-----------|--------|-------|-----------|-----------|
+| CreateNode | +1 type | set 1 per field | set 1 | – |
+| DeleteNode | +1 type | removed | removed | – (edges handled by explicit DeleteEdge) |
+| CreateEdge | – | set 1 per field | set 1 | +1 source.out, +1 target.in |
+| DeleteEdge | – | removed | removed | +1 source.out, +1 target.in |
+| UpdateField | – | +1 if value changed | – | – |
+
+No-op definition: new value equals old value under canonical serialization. No-ops do not increment versions.
+
+`predicate_version` and `ordering_dependency_version` removed – they were unused.
+
+---
+
+## 7. Canonical Serialization
+
+Golden file is UTF-8 JSON with keys sorted by ORDER_CANONICAL, no whitespace.
+
+- Integer: JSON number
+- FixedPoint: JSON string with exactly scale digits
+- Identifier: "type:seq"
+- match_key in golden file: JSON object `{ "rule_id": "...", "bindings": {"x":"Type:1",...} }` using canonical rules above
+
+---
+
+## 8. Determinism Theorem
+
+**Theorem:** For any Σ0, there is at most one Σ0' such that Σ0 →* Σ0' via rules 1-5.
+
+**Proof sketch:** DISCOVER is total over G, SELECT uses total order with saturating score, PLAN is structural recursion over fixed inputs, COMMIT validation is pure equality on version snapshots. NO_MATCH is deterministic. No other rules exist.
+
+---
+
+## 9. Error Model
+
+Fatal: INTEGER_OVERFLOW, DIVISION_BY_ZERO, COUNTER_OVERFLOW, INVALID_IR, INVARIANT_VIOLATION, RESOURCE_LIMIT_EXCEEDED. Halts, rollback, emit error object.
+
+Non-fatal: STALE_READ, DUPLICATE_UPDATE, MISSING_TARGET. Causes rejection and reselection, not recorded in golden file.
+
+Resource limits (configurable): |M| ≤ 1,000,000, |α̂| ≤ 10,000, |M_prev| ≤ 5,000,000. Exceeding triggers RESOURCE_LIMIT_EXCEEDED.
+
+Counter wrap: on tick_counter overflow, reset all version counters to 0, emit COUNTER_WRAP event, continue.
+
+---
+
+## 10. Conformance
+
+A conformant engine must:
+- Implement Σ0-Σ3 exactly
+- Use versioned read traces
+- Implement Rejected set and NO_MATCH
+- Use saturating score arithmetic
+- Produce identical golden files
+
+---
+
+## 11. Relationship to Grisp Grammar v0.01
+
+- `priority` → base_priority, `scale` → priority_scale, `fairness` → fairness_scale
+- `where` accepts full boolean expressions
+- `let` bindings do not affect match_key but their reads are added to ℛ_m
+- `CreateNode`/`CreateEdge` must supply all mandatory fields else INVALID_IR
+- Map literals must be processed in key-sorted order
+
+This v0.51 resolves all Tier-1 defects, closes the SOS, and is ready for implementation in Object Pascal without JSON per-match allocation.
+
+
+
+Specification candidate 5:
+
+### GRISP DETERMINISTIC KERNEL — Version 0.51 (Unified DSOS, Candidate)
+
+> “This specification defines the GRISP Deterministic Kernel as a closed, formally deterministic graph‑rewrite calculus.”  
+> “For identical Canonical IR and identical initial state, all conformant engines MUST produce identical observable behavior: Committed state transitions; Emitted events; Golden file output.”
+
+This v0.51 release is a candidate revision of v0.50 that resolves the critical correctness, liveness, and canonicalization defects identified by multiple independent reviews. It preserves the original architecture (single SOS, canonical action trace, optimistic read‑trace validation, atomic commit) while making the machine **closed**, **implementable**, and **deterministic by construction**.
+
+---
+
+### 1. Core principles and scope
+
+- **Single authoritative tick.** The state uses a single tick counter `C.tick_counter`. The separate `T` is removed. Time advances exactly once per tick end.  
+- **Closed configuration model.** Intermediate artifacts produced during a tick are explicitly modeled as ephemeral machine states or derivation judgments; the transition relation and determinism theorem quantify over the public configuration `Σ`.  
+- **Determinism by construction.** All choice points are resolved by total orders and canonical serialization rules. Evaluation order for expressions that affect dependency extraction is explicit.  
+- **Read traces record versions.** Every read recorded during DISCOVER or PLAN includes the exact version integer observed. COMMIT validates equality against those snapshots.  
+- **Liveness safeguards.** A per‑tick `Rejected` set prevents infinite reselection loops. Score arithmetic uses widened intermediates and saturating semantics to avoid fatal overflow from long runs.  
+- **Performance pragmatics.** `match_key` is a structured, in‑memory tuple for tie‑breaking; canonical JSON is used only for golden files.
+
+---
+
+### 2. State model and invariants
+
+#### 2.1 Public configuration
+```
+Σ = ⟨G, C, M_prev⟩
+```
+- **G** — Typed property graph (nodes, edges, fields, identifiers). No nulls; fields have declared types.  
+- **C** — Counters (signed 64‑bit integers) including:
+  - **tick_counter** (authoritative tick; starts at 0)
+  - sequence counters per node/edge type
+  - version counters: `extent_version[type]`, `predicate_version[type][field]`, `edge_type_version[type]`, `adjacency_version[node][type][dir]`, `existence_version[element]`, `field_version[element][field]`  
+- **M_prev** — Map `match_key → age` (integer, saturating). `M_prev` is compacted by policy (see §8).
+
+#### 2.2 Ephemeral derivation states (explicit)
+During a tick the machine may be in one of the following ephemeral states:
+- **DISCOVER_STATE:** `⟨G, C, M_prev, M⟩` where `M` is the discovered match set.
+- **SELECT_STATE:** `⟨G, C, M_prev, M, M_remaining, Rejected, m*⟩`.
+- **PLAN_STATE:** `⟨G, C, M_prev, M, M_remaining, Rejected, m*, α̂, ℛ⟩`.
+
+These ephemeral states are not part of the long‑term `Σ` but are part of the SOS transitions and are cleared at tick end.
+
+#### 2.3 Invariants (checked at COMMIT)
+- No dangling edges or identifier references.
+- All declared type constraints satisfied.
+- No cycles in identifier references unless explicitly allowed by type.
+- All version counters remain within `INT64` bounds (saturating checks applied earlier).
+
+---
+
+### 3. Canonical IR and ordering
+
+#### 3.1 IR overview
+The Canonical IR is a deterministic JSON schema describing rules, types, and initial graph. The inductive grammar from v0.50 is preserved with clarified semantics for expressions, patterns, constraints, lets, and actions.
+
+#### 3.2 Deterministic ordering (ORDER_CANONICAL)
+- **Strings:** UTF‑8 **NFC** normalized, compared bytewise lexicographically.  
+- **Identifiers:** `(type_name, sequence_number)` compared lexicographically.  
+- **Lists:** element‑wise lexicographic.  
+- **Maps:** keys sorted by ORDER_CANONICAL; values compared in that key order.  
+- **Pattern match enumeration:** For a pattern binding that yields a tuple of bound ids `(b1,...,bn)`, matches are enumerated in lexicographic order of the binding tuple using ORDER_CANONICAL component‑wise.
+
+#### 3.3 match_key (canonical identity)
+- **Internal representation:** `match_key = (rule_id, ordered_binding_tuple)` where `ordered_binding_tuple` is the sequence of bound identifiers in pattern declaration order. This structured tuple is used for tie‑breaking and map keys in memory.  
+- **Golden file serialization:** When writing golden files, `match_key` is serialized to canonical JSON using the canonicalization rules in §7.
+
+---
+
+### 4. Read trace schema and numeric model
+
+#### 4.1 Read trace entries
+Every read recorded during DISCOVER or PLAN is a tuple that includes the observed version integer:
+
+- `FieldRead(element_id, field_name, field_version_value)`  
+- `NodeExistence(node_id, existence_version_value)`  
+- `AdjacencyRead(node_id, edge_type, dir, adjacency_version_value)`  
+- `ExtentRead(type_name, extent_version_value)`  
+- `EdgeExistence(edge_id, existence_version_value)`
+
+These exact integers are recorded at the time of the read and used for equality checks at COMMIT.
+
+#### 4.2 Numeric model (self-contained)
+- **Integers:** signed 64‑bit. Overflow in user arithmetic is fatal except where noted for scoring/age.  
+- **FixedPoint:** scaled integers with scale `0..18`. Represented internally as integer `value` and `scale`.  
+- **Scale propagation:**  
+  - `+` / `-`: result scale = `max(scale_left, scale_right)`; operands promoted by scaling.  
+  - `*`: result scale = `scale_left + scale_right`.  
+  - `/`: result scale = user‑specified target scale or `scale_left` if unspecified; division uses big‑integer intermediate and truncates toward zero by default.  
+- **Rounding:** truncation toward zero unless otherwise specified in an action.  
+- **Serialization:** FixedPoint is serialized as a JSON string with exactly `scale` digits after the decimal point.  
+- **Scoring arithmetic:** computed using 128‑bit intermediates and saturated to `INT64_MAX` on overflow; overflow in scoring is **not fatal**.
+
+---
+
+### 5. Operational semantics (SOS) — rules
+
+All transitions are deterministic. The public transition relation is `⟨Σ, IR⟩ → ⟨Σ', IR⟩`. Intermediate derivation judgments are explicit.
+
+#### 5.1 Tick semantics (NO_MATCH and start)
+At tick start the engine performs DISCOVER. If `M = ∅` then the **NO_MATCH** transition ends the tick:
+
+```
+NO_MATCH
+M = ∅
+────────────────────────────────────────
+⟨⟨G, C, M_prev⟩, IR⟩ → ⟨⟨G, C[tick_counter + 1], M_prev⟩, IR⟩
+```
+
+`M_prev` update policy is defined in §8.
+
+#### 5.2 DISCOVER (EvalPatterns)
+`EvalPatterns(G, IR)` deterministically enumerates all matches `M` using ORDER_CANONICAL and records for each match `m`:
+- `match_key` (structured tuple)
+- `bindings`
+- `let_values` (diagnostic only)
+- **read trace** `ℛ_m` with version snapshots as in §4.1
+
+**Age assignment:**
+```
+age(m) = if match_key(m) ∈ M_prev then saturating_add(M_prev[match_key(m)], 1) else 0
+```
+
+Transition:
+```
+⟨⟨G, C, M_prev⟩, IR⟩ → ⟨⟨G, C, M_prev, M⟩, IR⟩
+```
+
+#### 5.3 SELECT (score and tie‑break)
+For each `m ∈ M` compute:
+```
+score(m) = base_priority(m) × priority_scale(m) + age(m) × fairness_scale(m)
+```
+- Use 128‑bit intermediates; saturate to `INT64_MAX` on overflow.
+
+Total order:
+1. Higher `score` first.
+2. If tie, lexicographically smaller `match_key` (ORDER_CANONICAL).
+
+Selection loop pseudocode:
+```
+M_remaining := M
+Rejected := ∅
+loop:
+  if M_remaining \ Rejected = ∅ then NO_MATCH
+  m* := argmin_by_order(M_remaining \ Rejected)
+  proceed to PLAN with m*
+```
+
+Transition:
+```
+⟨⟨G, C, M_prev, M⟩, IR⟩ → ⟨⟨G, C, M_prev, M, M_remaining, Rejected, m*⟩, IR⟩
+```
+
+#### 5.4 PLAN (structural compilation)
+`Compile(IR, G, m*)` is a pure, syntax‑directed function producing:
+- `α̂` — Canonical Action Trace (primitive actions in deterministic order)
+- `ℛ` — read set with version snapshots (merged with `ℛ_m*`)
+
+Rules:
+- Evaluate action arguments deterministically using left‑to‑right evaluation rules.
+- **Short‑circuit policy:** left‑to‑right short‑circuiting is mandatory for `&&` and `||`. Only actually evaluated subexpressions contribute reads to `ℛ`.
+- `EmitEvent` arguments are **evaluated during PLAN** and stored as values in `α̂`.
+
+If PLAN detects a non‑fatal validation error (missing target, duplicate field update in `α̂`, invalid reference) then `m*` is discarded for this tick:
+```
+Rejected := Rejected ∪ {m*}
+return to SELECT
+```
+
+Transition:
+```
+⟨..., m*⟩ → ⟨..., m*, α̂, ℛ⟩
+```
+
+#### 5.5 COMMIT (validation and application)
+**Premises:**
+1. **Version validation:** For every read `r ∈ ℛ` compare current version in `G` to the recorded `version_snapshot`. If any mismatch → non‑fatal discard (add `m*` to `Rejected` and re‑SELECT).
+2. **Structural validation:** No duplicate `UpdateField` on same `(id,f)` in `α̂`. All targets exist or are created earlier in `α̂`. No dangling identifiers after applying `α̂`.
+3. **Counter pre‑check:** For all counters that would be incremented, ensure post values ≤ `INT64_MAX` (saturating policy for ages and scores; fatal only for structural invariants).
+
+**Application algorithm (deterministic):**
+- Let `G' := G` (copy or transactional view).
+- `dedup_map := {}`.
+- For each primitive action `act` in `α̂` in left‑to‑right order:
+  - Apply `act` to `G'`.
+  - For each counter update implied by `act`:
+    - If adjacency update keyed by `(edge_id, endpoint)` and key ∉ `dedup_map` then increment adjacency counter and record key in `dedup_map`.
+    - Else apply counter increments immediately.
+- Update `C` deterministically according to the counter application algorithm above.
+- Emit events in the order they appear in `α̂` using the payload values recorded in `α̂`.
+
+**Match history update:**
+```
+M_prev' = { match_key(m) → age(m) | m ∈ M }
+```
+Aging values are stored with saturating arithmetic.
+
+Final transition:
+```
+⟨⟨G, C, M_prev, M, m*, α̂, ℛ⟩, IR⟩ → ⟨⟨G', C', M_prev'⟩, IR⟩
+```
+
+If any fatal invariant is violated, halt and emit an error object (see §7).
+
+---
+
+### 6. Version increment rules (deterministic derivation)
+
+- **Principle:** All counter increments are derived from the final primitive actions in `α̂` after expansion. No global “+1 (all fields)” increments unless explicitly required by a primitive action.
+
+**Summary table (semantic view)**
+
+| Primitive action | Counters incremented |
+|---|---|
+| `CreateNode` (new id) | `extent_version[type] +1`; `existence_version[new] := 1`; `field_version[new][f] := 1` for each provided field |
+| `DeleteNode` (expanded) | `existence_version[deleted]` removed; adjacency increments occur only via the explicit `DeleteEdge` primitives produced during expansion |
+| `CreateEdge` | `edge_type_version[type] +1`; `existence_version[new_edge] := 1`; `adjacency_version[source][type][out] +1` and `adjacency_version[target][type][in] +1` (deduped by `(edge_id,endpoint)`) |
+| `DeleteEdge` | `edge_type_version[type] +1`; adjacency increments for endpoints (deduped) |
+| `UpdateField(id,f)` | `field_version[id][f] +1`; `predicate_version[type][f] +1` |
+| No‑op writes | No counter changes (no‑op defined by canonical value equality) |
+
+**Adjacency deduplication:** deduplication key is `(edge_id, endpoint)` and the first occurrence in `α̂` determines the adjacency increment.
+
+---
+
+### 7. Canonical serialization and golden files
+
+- **Unicode normalization:** All strings normalized to **NFC** before comparison or serialization.  
+- **Golden file JSON:** UTF‑8, lexicographically sorted keys, no extra whitespace. Use canonical JSON rules in Appendix A.  
+- **FixedPoint serialization:** JSON string with decimal point and exactly `scale` digits after the point. Example: scale 0 → `"42.0"`.  
+- **Tick record structure:** includes `tick_number` = `C.tick_counter`, `selected_match_key` (canonical JSON), `committed_changes`, `events` (with payloads as recorded in PLAN).  
+- **Error object:** includes `code`, `context`, `state_snapshot`, `tick_number`. Allowed codes include `INTEGER_OVERFLOW`, `DIVISION_BY_ZERO`, `COUNTER_OVERFLOW`, `INDEX_OUT_OF_BOUNDS`, `INVALID_IR`, `INVARIANT_VIOLATION`, `RESOURCE_LIMIT_EXCEEDED`.
+
+---
+
+### 8. Resource, retention, and safety policies
+
+- **M_prev retention:** Implementations MUST provide a configurable retention policy. Default recommended policy: retain entries for the last `K = 10000` ticks; entries older than `K` are evicted. Engines may also implement LRU or per‑rule caps. Eviction is deterministic given the same policy and parameters.  
+- **Score and age saturation:** Ages saturate at `INT64_MAX`. Score arithmetic uses 128‑bit intermediates and saturates to `INT64_MAX`. Saturation is **not fatal**.  
+- **Resource limits:** If `EvalPatterns` or `α̂` length exceeds configured resource budgets, the engine must return `RESOURCE_LIMIT_EXCEEDED` as a fatal error for that tick. The budget is a conformance parameter.
+
+---
+
+### 9. Determinism theorem and proof sketch (revised)
+
+**Theorem (v0.51):** For any public configuration `Σ` and Canonical IR, there is at most one successor `Σ'` such that `⟨Σ, IR⟩ → ⟨Σ', IR⟩` under the deterministic evaluation rules and canonicalization policies defined in this document.
+
+**Sketch:**  
+- `EvalPatterns` is total and deterministic because pattern enumeration, expression evaluation (including mandatory short‑circuit rules), and binding tuple ordering are fully specified.  
+- `ComputeAge` is a pure lookup with saturating arithmetic.  
+- `SELECT` uses a total order (score then `match_key`) where `match_key` is a structured tuple compared by ORDER_CANONICAL.  
+- `Compile` (PLAN) is structural and deterministic; it records evaluated payloads and read versions.  
+- `COMMIT` validation and application follow a deterministic left‑to‑right application algorithm with deterministic counter application and adjacency deduplication.  
+Therefore the public transition relation is deterministic.
+
+---
+
+### 10. Conformance and test vectors
+
+A conformant engine **must**:
+- Implement the SOS rules and canonicalization exactly as specified.
+- Use `C.tick_counter` as the single tick source.
+- Record versioned reads as specified and validate them at COMMIT.
+- Maintain per‑tick `Rejected` semantics to avoid livelock.
+- Use the match_key structured tuple for tie‑breaking.
+- Produce identical golden files for identical IR, initial state, and conformance parameters.
+
+**Conformance test suite (recommended minimum):**
+- Tick semantics: idle tick vs commit tick behavior.
+- Read trace validation: stale field read causes discard.
+- Rejection loop: failing candidate removed for tick.
+- Short‑circuit: `A || B` where `B` reads a field yields identical ℛ across engines.
+- Adjacency dedup: create/delete edge sequences in same `α̂`.
+- Score saturation: extremely large age and fairness_scale saturate, do not fatal.
+- Event payload: payloads reflect PLAN‑evaluated values.
+
+---
+
+### Appendix pointers (normative additions for v0.51)
+- **Appendix A:** Canonical JSON algorithm and test vectors.  
+- **Appendix B:** ReadTrace schema and validation pseudocode.  
+- **Appendix C:** Numeric model full rules and examples.  
+- **Appendix D:** Pseudocode for DISCOVER, SELECT, PLAN, COMMIT including `Rejected` handling and counter application.  
+- **Appendix E:** Conformance test vectors and golden file examples.
+
+---
+
+This v0.51 candidate implements the consensus fixes required to make the kernel formally closed, deterministic, and implementable in native environments. I can now:
+
+- Produce the **v0.51 redline** (diff) replacing §1, §5, and §6 in the original document, or  
+- Generate the **20+ conformance test vectors** (IR inputs and expected golden outputs) exercising the critical edge cases listed above, or  
+- Draft **Appendix D** with executable pseudocode for DISCOVER/SELECT/PLAN/COMMIT.
+
+Choose one of these and I will produce it immediately.
+
+
+Specification candidate 6:
+
+# GRISP DETERMINISTIC KERNEL SPECIFICATION – Version 1.0
+
+## Unified DSOS (Deterministic Structural Operational Semantics) Edition  
+### (Consensus‑Based Revision, incorporating fixes from v0.50 analysis)
+
+---
+
+### Preamble
+
+This specification defines the GRISP Deterministic Kernel as a **closed, formally deterministic graph‑rewrite calculus**. It supersedes all previous versions (v0.49, v0.50, v0.51, v0.60) and resolves their architectural inconsistencies by unifying pattern matching, dependency tracking, action compilation, and commit into a **single structural operational semantics with trace projection**.
+
+For identical Canonical IR and identical initial state, all conformant engines MUST produce identical observable behavior:
+- Committed state transitions
+- Emitted events
+- Golden file output
+
+All normative rules are mandatory. No hidden nondeterminism, runtime inference, or dual semantic models are permitted.
+
+---
+
+## 0. Core Principles
+
+1. **Single semantic object** – State is a tuple `⟨G, C, M_prev⟩` with no hidden runtime artifacts.
+2. **Determinism by construction** – All choice points eliminated via total orders and structural recursion.
+3. **Read effects as derivation** – Dependencies are induced by syntax‑directed translation, with version snapshots recorded at read time.
+4. **Canonical Action Trace (CAT)** – The execution trace is a projection of the compilation derivation.
+5. **Atomic commit** – Validation, application, and counter update form a single, rollback‑able step.
+
+---
+
+## 1. State Model
+
+A configuration is:
+
+```
+Σ = ⟨G, C, M_prev⟩
+```
+
+- **G** – Typed property graph (nodes, edges, fields, identifiers). No nulls, all fields mandatory.
+- **C** – Counters (signed 64‑bit integers):
+  - `tick_counter` (starts at 0) – the authoritative tick number.
+  - Sequence counters per node/edge type (start at 0 or max+1 from initial state)
+  - Version counters:  
+    `extent_version[type]`,  
+    `predicate_version[type][field]`,  
+    `edge_type_version[type]`,  
+    `edge_predicate_version[type][field]`,  
+    `adjacency_version[node][type][dir]`,  
+    `existence_version[node/edge]`,  
+    `field_version[element][field]`
+- **M_prev** – Previous match set: a map from `match_key` to `age` (integer). Initialized empty.
+
+**Invariants** (checked after each commit):
+- No dangling edges (source/target exist)
+- No dangling identifier references (recursively through lists/maps)
+- All declared constraints satisfied
+- No cycles in identifier references (detected via visited set)
+
+---
+
+## 2. Canonical IR Syntax (Inductive)
+
+The IR is a deterministic, canonical JSON format. Below is its inductive definition.
+
+### 2.1 Expressions
+
+```
+e ::= k                           // literal (Integer, FixedPoint(s), Boolean, String, Identifier)
+    | x                           // variable (pattern binding or let)
+    | x.f                         // field access
+    | e1 ⊕ e2                     // binary operator
+    | len(e)                      // list length
+    | to_fixed(e, scale)          // conversion to FixedPoint
+    | to_integer(e)               // truncation to Integer
+
+⊕ ::= + | - | * | / | // | % | < | <= | > | >= | == | != | && | ||
+```
+
+All operations have checked semantics (overflow → fatal). **Short‑circuit evaluation is required left‑to‑right** for `&&` and `||`. Dependency extraction includes **both operands** for the purpose of building the read trace (i.e., the read set is the union of reads from both sides, regardless of the runtime short‑circuit result).
+
+### 2.2 Patterns
+
+```
+P ::= ∅
+    | MatchNode(x, type_name) · P
+    | MatchEdge(x, type_name, src, tgt) · P
+```
+
+Patterns are enumerated in **lexicographic order of the tuple of bound identifiers** (in pattern order), using `ORDER_CANONICAL` for each component.
+
+### 2.3 Constraints (where clause)
+
+```
+φ ::= True
+    | e1 == e2
+    | e1 < e2
+    | φ1 && φ2
+    | (φ)
+```
+
+`e1` and `e2` are boolean‑typed expressions. `&&` follows the same short‑circuit and dependency rules as §2.1.
+
+### 2.4 Let Bindings
+
+```
+B ::= ∅
+    | Let(x, e) · B
+```
+
+Evaluated during discovery; do **not** affect match identity or `match_key`. Reads induced by `e` are recorded in the read trace.
+
+### 2.5 Actions
+
+```
+a ::= CreateNode(x, type_name, {f1: e1, ...})
+    | CreateEdge(x, type_name, src, tgt, {f1: e1, ...})
+    | UpdateField(target, field, e)
+    | DeleteEdge(e)
+    | DeleteNode(x)
+    | EmitEvent(event_type, [e1, ...])
+```
+
+### 2.6 Rule Definition
+
+```
+Rule ::= Rule(rule_id, base_priority, priority_scale, fairness_scale, P, φ, B, A)
+```
+
+- `rule_id` – string matching `[A-Za-z_][A-Za-z0-9_-]*`
+- Priorities: non‑negative integers
+- `A` – action block (sequence of actions)
+
+---
+
+## 3. Deterministic Ordering (ORDER_CANONICAL)
+
+For any two values `x` and `y`:
+
+- **Strings**: UTF‑8 bytewise lexicographic, after **NFC normalization**.
+- **Identifiers**: compare `(type_name, sequence_number)` lexicographically (type_name UTF‑8, then numeric).
+- **Lists**: element‑wise lexicographic.
+- **Maps**: compare keys in UTF‑8 order, then values.
+
+Used for:
+- Pattern enumeration (tuple ordering)
+- Sorting incident edges for implicit `DeleteNode` expansion
+- `match_key` ordering
+- Map literal iteration
+- Tie‑breaking for `min`/`max`/`sort`
+
+---
+
+## 4. Numeric Model
+
+- All integers: signed 64‑bit.
+- Fixed‑point: scaled integers, scale 0–18 inclusive, serialized as **strings** with a decimal point and exactly `scale` digits (e.g., `"42.0"` for scale 0, `"12.5000"` for scale 4).
+- Arithmetic rules (fully defined here):
+  - **Promotion**: Integer → FixedPoint(0) when combined with FixedPoint in any operation (`+`, `-`, `*`, `/`, comparisons).
+  - **Scale propagation**:
+    - `+`, `-`: `result_scale = max(scale_left, scale_right)`
+    - `*`: `result_scale = scale_left + scale_right`
+    - `/`: `result_scale = scale_left`
+  - **Rounding**: truncation toward zero (for division and conversion).
+  - Overflow and division by zero → **fatal**.
+  - Fixed‑point division uses big‑integer intermediates, checked on final result.
+- Literal conversion: `to_fixed(e, scale)` truncates toward zero; `to_integer(e)` truncates toward zero.
+
+---
+
+## 5. Operational Semantics (Small‑Step SOS)
+
+The kernel executes via **deterministic transitions** over extended configurations that include ephemeral derivation artifacts. The official configuration is `⟨G, C, M_prev⟩`. The following rules describe the derivation steps; the overall transition `⟨G, C, M_prev⟩ → ⟨G', C', M_prev'⟩` is deterministic.
+
+### Rule 1: DISCOVER
+
+Define `EvalPatterns(G, IR) = M` as the total set of matches obtained by:
+
+- Enumerating pattern bindings in **lexicographic order of the tuple of bound identifiers** (pattern order).
+- Evaluating constraints and let bindings left‑to‑right with required short‑circuit for `&&`.
+- Each match `m` contains:
+  - `match_key` = structured tuple `(rule_id, sorted_binding_list)` compared by `ORDER_CANONICAL`.
+  - `bindings` (identifier bindings only)
+  - `let_values` (diagnostic only)
+  - **read trace** `ℛ_m` of all graph elements accessed, **including version snapshots**:
+    - `NodeExistence(id, existence_version)`
+    - `FieldRead(id, f, field_version)`
+    - `ExtentRead(type_name, extent_version)`
+    - `AdjacencyRead(node_id, edge_type, dir, adjacency_version)`
+    - `EdgeExistence(edge_id, existence_version)`
+
+Age assignment:
+
+```
+age(m) = if match_key(m) ∈ M_prev then M_prev[match_key(m)] + 1 else 0
+```
+
+Ages saturate at `INT64_MAX` (no overflow).
+
+Transition (ephemeral):
+
+```
+⟨⟨G, C, M_prev⟩, IR⟩ ⇒ ⟨⟨G, C, M_prev, M⟩, IR⟩
+```
+
+### Rule 2: SELECT (with retry semantics)
+
+Let `M_remaining = M`. Also maintain a per‑tick `Rejected` set, initially empty.
+
+Define:
+
+```
+score(m) = base_priority(m) × priority_scale(m) + age(m) × fairness_scale(m)
+```
+
+Computed using **128‑bit intermediate arithmetic**; if the result exceeds `INT64_MAX` it saturates to `INT64_MAX`; if below `INT64_MIN` it saturates to `INT64_MIN`. Overflow never fatal.
+
+Total order:
+1. Higher score first.
+2. If tie, lexicographically smaller `match_key` (using structured tuple comparison, not JSON).
+
+Select `m* = argmax_{m ∈ M_remaining \ Rejected} score(m)`.
+
+If `M_remaining \ Rejected = ∅`, the tick ends with **no commit** (see Rule 6).
+
+Transition:
+
+```
+⟨⟨G, C, M_prev, M⟩, IR⟩ ⇒ ⟨⟨G, C, M_prev, M, m*, Rejected⟩, IR⟩
+```
+
+### Rule 3: PLAN (Syntax‑Directed Compilation)
+
+Define `Compile(IR, G, m*)` by structural recursion over the rule’s action block `A`. It produces a **Canonical Action Trace** `α̂` (primitive action sequence) and a **read set** `ℛ`.
+
+The judgment:
+
+```
+ℰ ⊢ ⟨A, G⟩ ⇓ ⟨α̂, ℛ⟩
+```
+
+where `ℰ` is the environment from `m*` bindings.
+
+**Base case (empty block):**
+
+```
+ℰ ⊢ ⟨∅, G⟩ ⇓ ⟨[], ∅⟩
+```
+
+**UpdateField:**
+
+```
+ℰ ⊢ ⟨e, G⟩ ⇓ ⟨v, ℛ_e⟩   x_id = ℰ(x)   ℰ ⊢ ⟨A_tail, G⟩ ⇓ ⟨α̂_tail, ℛ_tail⟩
+────────────────────────────────────────────────────────────────────────────
+ℰ ⊢ ⟨UpdateField(x, f, e) · A_tail, G⟩ ⇓ ⟨[UpdateField(x_id, f, v)] · α̂_tail,
+                                            ℛ_e ∪ {FieldRead(x_id, f, field_version)} ∪ ℛ_tail⟩
+```
+
+**DeleteNode (with implicit edge deletion):**
+
+```
+x_id = ℰ(x)
+edges = GetIncidentEdgesSorted(x_id, G)   // ORDER_CANONICAL by edge identifier
+α̂_edges = [DeleteEdge(e) for e in edges]
+ℛ_edges = ⋃_{e∈edges} {AdjacencyRead(x_id, e.type, out, adj_version), EdgeExistence(e, existence_version)}
+ℰ ⊢ ⟨A_tail, G⟩ ⇓ ⟨α̂_tail, ℛ_tail⟩
+──────────────────────────────────────────────────────────────────────────────
+ℰ ⊢ ⟨DeleteNode(x) · A_tail, G⟩ ⇓ ⟨α̂_edges · [DeleteNode(x_id)] · α̂_tail,
+                                    ℛ_edges ∪ {NodeExistence(x_id, existence_version)} ∪ ℛ_tail⟩
+```
+
+**CreateNode, CreateEdge, EmitEvent** – similar structural rules, each recording appropriate reads and version snapshots. For `EmitEvent`, payload expressions are evaluated to values during PLAN; `α̂` stores the evaluated payload.
+
+**Context‑freeness invariant:** Evaluation depends only on the subterm, the immutable environment `ℰ`, and the fixed graph snapshot `G`.
+
+If compilation encounters a non‑fatal validation error (duplicate field update, missing mandatory field), the candidate `m*` is added to `Rejected` and SELECT is re‑invoked.
+
+Transition:
+
+```
+⟨⟨G, C, M_prev, M, m*, Rejected⟩, IR⟩ ⇒ ⟨⟨G, C, M_prev, M, m*, Rejected, α̂, ℛ⟩, IR⟩
+```
+
+### Rule 4: COMMIT
+
+**Premises:**
+
+1. **Version validation:** For every read `r ∈ ℛ`:
+   - `NodeExistence(id, v)` → node exists and `existence_version[id] == v`.
+   - `FieldRead(id, f, v)` → `field_version[id][f] == v`.
+   - `ExtentRead(type, v)` → `extent_version[type] == v`.
+   - `AdjacencyRead(node, type, dir, v)` → `adjacency_version[node][type][dir] == v`.
+   - (Analogous for edge reads.)
+
+2. **Structural validation:**
+   - No duplicate `UpdateField` on same `(id, f)`.
+   - No duplicate `DeleteEdge` on same edge.
+   - All targets exist (or are created earlier in `α̂`).
+   - No dangling identifiers after applying `α̂`.
+   - All constraints satisfied (re‑evaluated if desired, but version validation suffices; the spec leaves this optional but deterministic).
+
+3. **Counter overflow pre‑check:** For every counter that would be incremented, ensure `post_value ≤ INT64_MAX`. Overflow → fatal.
+
+If any validation fails (non‑fatal) → add `m*` to `Rejected` and go back to SELECT. Fatal errors halt and rollback.
+
+**Application:**
+
+- Apply each step in `α̂` in order to a **copy** `G_temp`.
+- Update counters `C → C'` according to the version increment table (see §6). Adjacency increments are deduplicated using the earliest occurrence in `α̂` (scan left‑to‑right, maintain a set of already‑processed `(node, edge)` pairs).
+- Emit events in the order they appear in `α̂` (payloads already evaluated, stored in `α̂`).
+
+**Match history update:**
+
+```
+M_prev' = { match_key(m) → age(m) | m ∈ M }
+```
+
+(All matches from the discovery snapshot, not only the committed one.)
+
+Transition:
+
+```
+⟨⟨G, C, M_prev, M, m*, Rejected, α̂, ℛ⟩, IR⟩ → ⟨⟨G', C', M_prev'⟩, IR⟩
+```
+
+where `C'.tick_counter = C.tick_counter + 1`.
+
+### Rule 5: NO_MATCH (Empty Match Set)
+
+```
+M_remaining \ Rejected = ∅
+──────────────────────────────────────────────────────────────
+⟨⟨G, C, M_prev, M⟩, IR⟩ → ⟨⟨G, C[tick_counter+1], M_prev'⟩, IR⟩
+```
+
+`M_prev'` is implementation‑defined but deterministic: either `M_prev` unchanged or cleared (recommended: keep `M_prev` to preserve ages across idle ticks).
+
+---
+
+## 6. Version Increment Rules (Derived from Compile)
+
+The following table shows counter changes **only when a mutation actually occurs** (No‑Op writes do nothing). These are consequences of the structural compilation semantics.
+
+| Operation              | extent | pred(node) | edge_type | edge_pred | adjacency (source.out, target.in) | existence | field_vers |
+|------------------------|--------|------------|-----------|-----------|-----------------------------------|-----------|------------|
+| CreateNode             | +1     | +1 (each field in supplied map) | -         | -         | -                                 | set to 1  | set to 1 each |
+| DeleteNode             | +1     | +1 (each field) | -         | -         | (handled by expanded DeleteEdge)  | removed   | removed    |
+| CreateEdge             | -      | -          | +1        | +1 (each field in supplied map)   | +1 source.out, target.in          | set to 1  | set to 1 each |
+| DeleteEdge             | -      | -          | +1        | -                                 | +1 source.out, target.in          | removed   | removed    |
+| UpdateField (node)     | -      | +1 (that field) | -         | -         | -                                 | -         | +1 (that)  |
+| UpdateField (edge)     | -      | -          | -         | +1 (that field)                   | -                                 | -         | +1 (that)  |
+
+- `+1 (each field)` – increment for every field of that type (only for actually supplied fields in Create).
+- Adjacency increments occur once per edge per endpoint, deduplicated using the earliest occurrence in `α̂`.
+
+---
+
+## 7. Canonical Serialization (Golden File)
+
+Output is UTF‑8 JSON with lexicographically sorted keys, no extra whitespace.
+
+- **Integer** – JSON number, no leading zeros.
+- **FixedPoint** – JSON string with decimal point and exactly `scale` digits (e.g., `"42.0"` for scale 0).
+- **Boolean** – `true`/`false`.
+- **String** – double‑quoted, escaping `\`, `"`, `\n`, `\r`, `\t`, other controls as `\uXXXX`.
+- **Identifier** – string containing `type:seq` (e.g., `"Person:5"`).
+- **List** – `[e1,e2,...]`.
+- **Map** – `{"k1":v1,"k2":v2,...}` (keys sorted by ORDER_CANONICAL).
+
+### Top‑level golden file structure
+
+```json
+{
+  "ir_schema_version": "1.0",
+  "type_definitions_hash": "<hex>",
+  "initial_state": { ... },
+  "ticks": [ ... ],
+  "final_state": { ... }
+}
+```
+
+If a fatal error occurs, the `"ticks"` array is replaced by an `"error"` object.
+
+### Tick record
+
+```json
+{
+  "tick_number": 0,
+  "selected_match_key": { "rule_id": "...", "bindings": {...} } | null,
+  "committed_changes": [ ... ],
+  "events": [ { "rule_id": "...", "payload": ... } ]
+}
+```
+
+### Error object
+
+```json
+{
+  "code": "COUNTER_OVERFLOW",
+  "context": { "location": 0, "snapshot": [...] },
+  "state": { ... },
+  "tick": 0
+}
+```
+
+Allowed error codes:  
+`INTEGER_OVERFLOW`, `DIVISION_BY_ZERO`, `COUNTER_OVERFLOW`, `INDEX_OUT_OF_BOUNDS`, `MISSING_MAP_KEY`, `INVALID_IR`, `INVARIANT_VIOLATION`, `ADJACENCY_COUNTER_MISSING`, `RESOURCE_LIMIT_EXCEEDED`.
+
+---
+
+## 8. Determinism Theorem
+
+**Theorem:** For any configuration `⟨Σ, IR⟩`, there is at most one `⟨Σ', IR⟩` such that `⟨Σ, IR⟩ → ⟨Σ', IR⟩`. Consequently, for a given initial state and IR, all conformant engines produce identical observable behavior.
+
+**Proof sketch:**
+
+- `EvalPatterns` is a total function over `G` and `IR` – ordering fixed by tuple lexicographic order.
+- `ComputeAge` is a pure lookup.
+- `SELECT` uses a total order (score descending, then `match_key` ascending); `Rejected` set ensures progress.
+- `Compile` is defined by structural induction; each clause yields a unique `(α̂, ℛ)` due to canonical ordering and context‑freeness.
+- `COMMIT` validation and application are pure functions, with version snapshots enabling deterministic staleness checks.
+- `NO_MATCH` handles empty candidate set deterministically.
+- No other transition rules exist.
+
+Thus the transition relation is deterministic.
+
+---
+
+## 9. Error Model
+
+| Category | Example | Effect |
+|----------|---------|--------|
+| **Fatal** | counter overflow, division‑by‑zero, invariant breach, missing map key, index out of bounds, resource limit exceeded | Immediate halt, rollback to pre‑tick state, emit error snapshot |
+| **Non‑fatal** | stale read, duplicate field update, missing target | Discard current match, add to `Rejected`, retry SELECT |
+
+Fatal errors use the codes in §7. Non‑fatal errors are not recorded in golden files.
+
+---
+
+## 10. Conformance
+
+A conformant engine **must**:
+
+- Implement the SOS rules exactly as defined.
+- Reject invalid IR (type errors, malformed identifiers, duplicate rule ids, etc.).
+- Enforce all deterministic ordering, overflow checks, and version snapshot validation.
+- Produce identical golden files for identical IR and initial state.
+
+All normative content in this specification is mandatory.  
+The companion conformance test suite provides exact IR inputs and expected golden outputs.
+
+---
+
+## 11. Relationship to Previous Versions
+
+- **v0.49** – A complete, implementable specification whose dependency extraction and validation rules are preserved as a concrete implementation strategy.
+- **v0.50** – An architectural proposal whose Canonical Action Graph (CAG) corresponds to the trace `α̂` in this specification.
+- **v0.60/v0.51** – Intermediate synthesis steps.
+- **This v1.0 (Unified DSOS)** – The closed, formally deterministic kernel that resolves earlier contradictions and provides a single semantic foundation.
+
+---
+
+*End of GRISP Deterministic Kernel Specification v1.0*
+
+
+Specification candidate 7:
+
+Below is a **drop‑in patch** for the GRISP Deterministic Kernel that implements the Phase A fixes (tick handling, empty‑match transition, rejected‑set semantics, and deterministic `match_key` canonicalisation).  
+All other sections of the original v0.50 spec remain unchanged – they will be updated later in Phases B‑D.
+
+---  
+
+## 1. Revised State Model  (§1)
+
+```text
+State Σ  ::=  ⟨G, C, M_prev⟩
+G   – Typed property graph (nodes, edges, fields, identifiers).  
+C   – Counters (signed 64‑bit integers).  The only time‑related counter
+     is C.tick_counter, which is the *single* authoritative tick number.
+M_prev – Map from match_key → age (non‑negative integer).  Initially empty.
+```
+
+*All references to a separate `T` have been removed.*  
+All rules that previously mentioned `T` now refer to `C.tick_counter` (or to the
+implicit “current tick” derived from it).
+
+---  
+
+## 2. Tick Rule – (§5.1 TICK)
+
+```text
+TICK
+──────────────────────────────────────────────────────
+⟨⟨G, C, M_prev⟩, IR⟩
+   →  ⟨⟨G, C[tick_counter+1], M_prev⟩, IR⟩
+```
+
+*The rule now only increments the **single** tick counter.  
+`C.tick_counter` is guaranteed to stay ≤ INT64_MAX; overflow raises
+`COUNTER_OVERFLOW` (fatal).*
+
+---  
+
+## 3. Empty‑Match Transition – (§5.2 NO_MATCH)
+
+```text
+NO_MATCH
+──────────────────────────────────────────────────────
+⟨⟨G, C, M_prev⟩, IR⟩   with   M = ∅
+   →  ⟨⟨G, C[tick_counter+1], M_prev⟩, IR⟩
+```
+
+*When the DISCOVER phase yields an empty match set, the engine advances the
+tick counter, leaves the graph unchanged, and starts the next tick.  
+`M_prev` is **unchanged** (ages are preserved) – this is the standard
+fairness‑preserving behaviour.*
+
+---  
+
+## 4. Revised SELECT Rule – (§5.3 SELECT)
+
+A per‑tick **rejection set** `R` is introduced.  At the start of a tick
+`R = ∅`.  The rule now selects from the *remaining* matches.
+
+```text
+SELECT
+Let   M_rem  =  M \ R                // matches not yet rejected this tick
+score(m) = base_priority(m)·priority_scale(m) +
+           age(m)·fairness_scale(m)          // arithmetic performed in 128‑bit,
+                                            // result saturated to INT64_MAX
+
+Total order:
+   1. higher score first
+   2. tie → lexicographically smaller match_key (see §7)
+
+If M_rem ≠ ∅ then
+   m* = the first element of M_rem in the total order
+   →  ⟨⟨G, C, M_prev, M, M_rem, m*⟩, IR⟩
+else
+   →  apply NO_MATCH rule (see §3)
+```
+
+*The rejection set `R` is *mutable* only within the current tick; it is cleared
+when the tick ends (after COMMIT or NO_MATCH).  This guarantees termination
+even when every candidate fails a non‑fatal validation.*
+
+---  
+
+## 5. Rejection Handling – (§5.4 REJECT)
+
+When a candidate `m*` fails a non‑fatal validation (stale read, duplicate
+update, missing target, etc.) the engine executes the following transition
+instead of looping back to SELECT unchanged:
+
+```text
+REJECT
+──────────────────────────────────────────────────────
+⟨⟨G, C, M_prev, M, M_rem, m*⟩, IR⟩
+   →  ⟨⟨G, C, M_prev, M, M_rem \ {m*}, R ∪ {m*}⟩, IR⟩
+```
+
+After the REJECT step the engine immediately re‑enters SELECT on the
+updated `M_rem`.  If `M_rem` becomes empty, the NO_MATCH rule fires.
+
+---  
+
+## 6. Canonical `match_key` – (§7.1 Match‑Key Canonicalisation)
+
+The `match_key` is **not** a JSON string in the runtime engine; it is a
+structured tuple that can be compared directly with lexicographic order.
+Only when a golden file is produced is the tuple rendered as canonical JSON.
+
+```
+match_key = ( rule_id , [ (var_name₁ , element_id₁) ,
+                         (var_name₂ , element_id₂) , … ] )
+```
+
+*Ordering of the binding list*  
+- The list is sorted **by the variable name** (lexicographic, UTF‑8 bytewise).  
+- Each `element_id` is the canonical identifier string `type:seq` where `type`
+  is NFC‑normalized and `seq` is a decimal integer with no leading zeros.
+
+*Lexicographic comparison*  
+`match_key₁ < match_key₂` iff  
+
+1. `rule_id₁` < `rule_id₂` (UTF‑8 bytewise), or  
+2. the rule ids are equal and the first differing pair `(var_name, element_id)`
+   is smaller under the same bytewise order.
+
+*Golden‑file representation*  
+When a `match_key` must be written to a golden file, it is serialized as
+compact JSON according to the canonical rules already present in §7
+(UTF‑8 NFC, sorted map keys, no whitespace, fixed‑point strings with
+exact `scale` digits).  This serialization is **only for output**, not for
+run‑time comparison.
+
+---  
+
+## 7. Minor Cross‑References Updated
+
+- All occurrences of `T` in the SOS rules have been removed.
+- The transition in COMMIT now ends with `C[tick_counter+1]` (no extra `T+1`).
+- The definition of `age(m)` in §5.2 now reads the tick number from
+  `C.tick_counter` instead of a separate `T`.
+- The deterministic theorem statement (end of the spec) now quantifies over
+  the **closed state** `Σ = ⟨G, C, M_prev⟩` and the *derivation artefacts*
+  (`M`, `M_rem`, `R`, `α̂`, `ℛ`) that are explicitly scoped to a tick.
+
+---  
+
+### How to Apply the Patch
+
+1. Replace the original **State Model** (§1) with the block above.  
+2. Replace the original **Rule 1 – TICK** with the new version.  
+3. Insert the **NO_MATCH** rule after the DISCOVER rule.  
+4. Replace the original **SELECT** rule with the revised version that
+   references `M_rem` and the rejection set.  
+5. Add the **REJECT** rule immediately after the SELECT rule.  
+6. Replace the original **match_key** description with the canonical tuple
+   definition and the golden‑file rendering note.  
+7. Update any textual references to `T` (e.g., in the determinism theorem)
+   to refer to `C.tick_counter`.
+
+All remaining sections (expressions, patterns, actions, version‑increment
+table, etc.) stay unchanged for now and will be revisited in Phases B‑D.
+
+---  
+
+**Next steps** (outside the scope of this patch):  
+- Phase B – add the version‑snapshot schema to read traces, fix short‑circuit
+  semantics, complete the fixed‑point arithmetic model.  
+- Phase C – address adjacency‑counter deduplication, `M_prev` pruning, and
+  resource‑limit handling.  
+- Phase D – introduce the full type system, NACs, and the final
+  determinism proof.
+
+Feel free to let me know if you need the next set of sections drafted or a
+complete “v1.0” document assembled from all phases.
+

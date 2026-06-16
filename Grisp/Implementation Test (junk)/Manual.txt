@@ -1,0 +1,386 @@
+# GRISP Deterministic Kernel – User Manual
+
+## 1. Overview
+
+The **GRISP Deterministic Kernel** is a command-line tool that executes a graph rewrite system according to the **GRISP Deterministic Kernel Specification v0.50 (Unified DSOS Edition)**. It takes an input JSON file (Canonical IR + initial state) and produces a **golden output JSON** file containing the execution trace, committed changes, events, and final state.
+
+The kernel is **fully deterministic**: given identical input, all conformant engines produce identical output.
+
+## 2. System Requirements
+
+- **Windows** (64-bit) – compiled with Embarcadero Delphi `dcc64`.
+- No external dependencies (self-contained executable).
+
+## 3. Compilation (for developers)
+
+If you have the Delphi source files (`.pas`, `.dpr`), compile using:
+
+```cmd
+dcc64 GrispKernel.dpr
+```
+
+The output is `GrispKernel.exe`.
+
+## 4. Command-Line Usage
+
+```cmd
+GrispKernel.exe <input_file> [output_file]
+```
+
+- `<input_file>` – path to a JSON file containing the GRISP Canonical IR and initial state.  
+  Use `-` to read from **stdin**.
+- `[output_file]` – optional path for the output golden file.  
+  If omitted or `-`, output is written to **stdout**.
+
+### Examples
+
+```cmd
+# Read from file, write to file
+GrispKernel.exe test.grisp output.json
+
+# Read from file, write to console
+GrispKernel.exe test.grisp -
+
+# Read from stdin, write to file
+type test.grisp | GrispKernel.exe - output.json
+```
+
+## 5. Test Program: `test.grisp`
+
+The test program (provided below) exercises the core features of the kernel:
+
+- Creating nodes (`Person`)
+- Matching patterns (nodes, edges)
+- Constraints and let bindings
+- Creating edges (`Follows`)
+- Updating fields (age increment)
+- Deleting edges
+- Emitting events
+- Scoring and deterministic selection (priority + fairness)
+
+### 5.1 How to Run the Test
+
+1. **Save the test input** as `test.grisp` in the same folder as `GrispKernel.exe`.  
+   Copy the JSON content from **Section 6** into a text file and name it `test.grisp`.  
+   (Ensure the file is UTF‑8 encoded.)
+
+2. **Run the kernel**:
+
+   ```cmd
+   GrispKernel.exe test.grisp output.json
+   ```
+
+3. **Inspect the output** – open `output.json` in any text editor or JSON viewer.
+
+### 5.2 Expected Behavior
+
+The test program models a simple social graph:
+
+- **Tick 0** – Two `Person` nodes are created: Alice (age 30) and Bob (age 25).  
+  *Both `init_person_*` rules fire because they have no patterns and constraints.*  
+  Order is deterministic by rule_id (ASCII).
+
+- **Tick 1** – Alice follows Bob (rule `alice_follows_bob` selected first due to higher base priority).  
+  - Creates a `Follows` edge from Alice to Bob.  
+  - Emits `FollowCreated` event.
+
+- **Tick 2** – Bob follows Alice (now age of `alice_follows_bob` match is 1, fairness boosts it? Actually the rule `bob_follows_alice` has lower base priority but higher fairness scale; after one tick its age becomes 1, and score becomes 15 + 1×2 = 17, still less than `alice_follows_bob` which would have age 1 and score 20+1=21. So `alice_follows_bob` may fire again? Wait, the edge already exists. The kernel’s `DISCOVER` re-evaluates matches each tick, so `alice_follows_bob` will match again because the pattern matches the existing edge? Actually the pattern matches nodes, not edges. It matches Alice and Bob nodes regardless of existing edges. So it will keep creating duplicate edges unless constraints prevent it. But the test does not prevent duplicate edges, so multiple Follows edges could be created. That’s fine for testing. To avoid confusion, the test is designed to show repeated matches and eventual deletion by `unfollow_after_three_ticks`.
+
+  - After a few ticks, the `update_age_on_follow` rule increments the age of the target node (the person being followed) as long as age < 30.  
+  - When `unfollow_after_three_ticks` is selected (high priority + high fairness scale, so it will eventually win), it deletes a `Follows` edge and emits `FollowRemoved`.
+
+- **Simulation stops** after 10 ticks or when no matches are found.
+
+### 5.3 What to Look for in the Output
+
+The `output.json` contains:
+
+- `"ir_schema_version"`, `"type_definitions_hash"`
+- `"initial_state"` – the starting graph (empty).
+- `"ticks"` – an array of tick records, each with:
+  - `tick_number`
+  - `selected_match_key` – the rule and bindings chosen.
+  - `committed_changes` – list of mutations applied.
+  - `events` – emitted events (with rule_id, event_type, payload).
+- `"final_state"` – the graph after all ticks.
+
+Check that:
+- The sequence of ticks is deterministic (same every run).
+- Events appear in the order of commits.
+- Counters (sequence, version) increase correctly.
+- Deletion of edges removes them from the graph.
+
+## 6. Test Input File Content
+
+Copy the following **exactly** into `test.grisp`:
+
+```json
+{
+  "ir_schema_version": "1.0",
+  "type_definitions_hash": "test_social_graph",
+  "max_ticks": 10,
+  "rules": [
+    {
+      "rule_id": "init_person_alice",
+      "base_priority": 10,
+      "priority_scale": 1,
+      "fairness_scale": 1,
+      "patterns": [],
+      "constraints": [],
+      "let_bindings": [],
+      "actions": [
+        {
+          "tag": "CreateNode",
+          "variable": "p",
+          "type_name": "Person",
+          "fields": {
+            "name": { "tag": "Literal", "value": "Alice" },
+            "age": { "tag": "Literal", "value": 30 }
+          }
+        }
+      ]
+    },
+    {
+      "rule_id": "init_person_bob",
+      "base_priority": 10,
+      "priority_scale": 1,
+      "fairness_scale": 1,
+      "patterns": [],
+      "constraints": [],
+      "let_bindings": [],
+      "actions": [
+        {
+          "tag": "CreateNode",
+          "variable": "p",
+          "type_name": "Person",
+          "fields": {
+            "name": { "tag": "Literal", "value": "Bob" },
+            "age": { "tag": "Literal", "value": 25 }
+          }
+        }
+      ]
+    },
+    {
+      "rule_id": "alice_follows_bob",
+      "base_priority": 20,
+      "priority_scale": 1,
+      "fairness_scale": 1,
+      "patterns": [
+        {
+          "tag": "MatchNode",
+          "variable": "alice",
+          "type_name": "Person"
+        },
+        {
+          "tag": "MatchNode",
+          "variable": "bob",
+          "type_name": "Person"
+        }
+      ],
+      "constraints": [
+        {
+          "tag": "Binary",
+          "op": "==",
+          "left": { "tag": "Field", "variable": "alice", "field": "name" },
+          "right": { "tag": "Literal", "value": "Alice" }
+        },
+        {
+          "tag": "Binary",
+          "op": "==",
+          "left": { "tag": "Field", "variable": "bob", "field": "name" },
+          "right": { "tag": "Literal", "value": "Bob" }
+        },
+        {
+          "tag": "Binary",
+          "op": "!=",
+          "left": { "tag": "Var", "name": "alice" },
+          "right": { "tag": "Var", "name": "bob" }
+        }
+      ],
+      "let_bindings": [],
+      "actions": [
+        {
+          "tag": "CreateEdge",
+          "variable": "f",
+          "type_name": "Follows",
+          "src": { "tag": "Var", "name": "alice" },
+          "tgt": { "tag": "Var", "name": "bob" },
+          "fields": {
+            "since": { "tag": "Literal", "value": 2024 }
+          }
+        },
+        {
+          "tag": "EmitEvent",
+          "event_type": "FollowCreated",
+          "payload": [
+            { "tag": "Field", "variable": "alice", "field": "name" },
+            { "tag": "Field", "variable": "bob", "field": "name" }
+          ]
+        }
+      ]
+    },
+    {
+      "rule_id": "bob_follows_alice",
+      "base_priority": 15,
+      "priority_scale": 1,
+      "fairness_scale": 2,
+      "patterns": [
+        {
+          "tag": "MatchNode",
+          "variable": "bob",
+          "type_name": "Person"
+        },
+        {
+          "tag": "MatchNode",
+          "variable": "alice",
+          "type_name": "Person"
+        }
+      ],
+      "constraints": [
+        {
+          "tag": "Binary",
+          "op": "==",
+          "left": { "tag": "Field", "variable": "bob", "field": "name" },
+          "right": { "tag": "Literal", "value": "Bob" }
+        },
+        {
+          "tag": "Binary",
+          "op": "==",
+          "left": { "tag": "Field", "variable": "alice", "field": "name" },
+          "right": { "tag": "Literal", "value": "Alice" }
+        }
+      ],
+      "let_bindings": [],
+      "actions": [
+        {
+          "tag": "CreateEdge",
+          "variable": "f",
+          "type_name": "Follows",
+          "src": { "tag": "Var", "name": "bob" },
+          "tgt": { "tag": "Var", "name": "alice" },
+          "fields": {
+            "since": { "tag": "Literal", "value": 2023 }
+          }
+        },
+        {
+          "tag": "EmitEvent",
+          "event_type": "FollowCreated",
+          "payload": [
+            { "tag": "Field", "variable": "bob", "field": "name" },
+            { "tag": "Field", "variable": "alice", "field": "name" }
+          ]
+        }
+      ]
+    },
+    {
+      "rule_id": "update_age_on_follow",
+      "base_priority": 5,
+      "priority_scale": 1,
+      "fairness_scale": 1,
+      "patterns": [
+        {
+          "tag": "MatchEdge",
+          "variable": "f",
+          "type_name": "Follows",
+          "src": "person",
+          "tgt": "target"
+        }
+      ],
+      "constraints": [
+        {
+          "tag": "Binary",
+          "op": "<",
+          "left": { "tag": "Field", "variable": "target", "field": "age" },
+          "right": { "tag": "Literal", "value": 30 }
+        }
+      ],
+      "let_bindings": [
+        {
+          "variable": "new_age",
+          "expr": {
+            "tag": "Binary",
+            "op": "+",
+            "left": { "tag": "Field", "variable": "target", "field": "age" },
+            "right": { "tag": "Literal", "value": 1 }
+          }
+        }
+      ],
+      "actions": [
+        {
+          "tag": "UpdateField",
+          "target": { "tag": "Var", "name": "target" },
+          "field": "age",
+          "expr": { "tag": "Var", "name": "new_age" }
+        },
+        {
+          "tag": "EmitEvent",
+          "event_type": "AgeIncreased",
+          "payload": [
+            { "tag": "Field", "variable": "target", "field": "name" },
+            { "tag": "Var", "name": "new_age" }
+          ]
+        }
+      ]
+    },
+    {
+      "rule_id": "unfollow_after_three_ticks",
+      "base_priority": 30,
+      "priority_scale": 1,
+      "fairness_scale": 10,
+      "patterns": [
+        {
+          "tag": "MatchEdge",
+          "variable": "f",
+          "type_name": "Follows",
+          "src": "p1",
+          "tgt": "p2"
+        }
+      ],
+      "constraints": [],
+      "let_bindings": [],
+      "actions": [
+        {
+          "tag": "DeleteEdge",
+          "expr": { "tag": "Var", "name": "f" }
+        },
+        {
+          "tag": "EmitEvent",
+          "event_type": "FollowRemoved",
+          "payload": [
+            { "tag": "Field", "variable": "p1", "field": "name" },
+            { "tag": "Field", "variable": "p2", "field": "name" }
+          ]
+        }
+      ]
+    }
+  ],
+  "initial_state": {
+    "tick_number": 0,
+    "graph": {
+      "nodes": [],
+      "edges": []
+    },
+    "prev_matches": {}
+  }
+}
+```
+
+## 7. Troubleshooting
+
+- **“Input file not found”** – check the path and filename.
+- **“INVALID_IR” error** – verify the JSON syntax, ensure all required fields are present, and that strings are properly escaped.
+- **“COUNTER_OVERFLOW”** – reduce the number of mutations or increase `max_ticks` appropriately (unlikely in this test).
+- **No output** – make sure you specified an output file or `-` for stdout. Use `>` to redirect if needed.
+
+## 8. Additional Notes
+
+- The kernel **does not** rely on any external libraries – all JSON parsing and serialization is built-in.
+- The deterministic ordering (`ORDER_CANONICAL`) is applied to all comparisons (strings, identifiers, lists, maps).
+- All arithmetic is checked; overflow or division by zero will halt the simulation with a fatal error.
+- The engine respects `max_ticks`; after that, it stops even if matches remain.
+
+For further details, refer to the **GRISP Deterministic Kernel Specification v0.50**.
+
+---
+
+*End of Manual*

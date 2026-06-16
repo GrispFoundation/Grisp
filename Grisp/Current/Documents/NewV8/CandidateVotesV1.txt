@@ -1,0 +1,654 @@
+Candidate votes from AI1:
+
+If the goal is a **single, closed, implementable v1.0 specification**, then **Candidate 6 is substantially stronger than Candidate 7**, but it still contains several important contradictions and underspecified areas.
+
+Candidate 7 is best viewed as a **patch set**, not a complete specification. It fixes a few determinism issues but leaves many core semantic gaps unresolved.
+
+## Overall Assessment
+
+| Candidate   | Completeness | Determinism | Implementability | Score |
+| ----------- | ------------ | ----------- | ---------------- | ----- |
+| Candidate 6 | High         | High        | Medium-High      | 8/10  |
+| Candidate 7 | Low-Medium   | Medium      | Medium           | 5/10  |
+
+---
+
+# Problems in Candidate 6
+
+## 1. Short-Circuit Contradiction
+
+§2.1 says:
+
+> Short-circuit evaluation is required
+
+but also:
+
+> Dependency extraction includes both operands regardless of runtime short-circuit result.
+
+This creates a semantic mismatch.
+
+Example:
+
+```text
+true || MissingNode.field
+```
+
+Runtime:
+
+```text
+MissingNode.field
+```
+
+is never evaluated.
+
+Yet dependency extraction claims the read occurs.
+
+This means:
+
+* PLAN may record reads that never happened.
+* stale-read validation can reject a rule due to data never actually inspected.
+
+### Fix
+
+Dependency collection must follow evaluation.
+
+Replace:
+
+```text
+read set = union of both operands
+```
+
+with:
+
+```text
+read set = reads performed by actual evaluation path
+```
+
+This preserves observational determinism.
+
+---
+
+# 2. Optional Constraint Re-Evaluation
+
+COMMIT says:
+
+> constraints may be re-evaluated if desired
+
+and
+
+> spec leaves this optional
+
+This is fatal for conformance.
+
+Two engines could:
+
+Engine A:
+
+```text
+re-evaluates
+```
+
+Engine B:
+
+```text
+does not
+```
+
+and obtain different results.
+
+### Fix
+
+Either:
+
+```text
+re-evaluation forbidden
+```
+
+or
+
+```text
+re-evaluation mandatory
+```
+
+Personally:
+
+```text
+forbid re-evaluation
+```
+
+because version validation already guarantees snapshot consistency.
+
+---
+
+# 3. NO_MATCH Is Underspecified
+
+§5:
+
+```text
+M_prev' is implementation-defined
+```
+
+Then immediately:
+
+```text
+recommended: keep M_prev
+```
+
+Implementation-defined behavior breaks determinism.
+
+### Fix
+
+Specify exactly:
+
+```text
+M_prev' = M_prev
+```
+
+or
+
+```text
+M_prev' = {}
+```
+
+Do not allow both.
+
+---
+
+# 4. DeleteNode Dependency Gap
+
+DeleteNode records:
+
+```text
+AdjacencyRead(...)
+EdgeExistence(...)
+NodeExistence(...)
+```
+
+But does not explicitly record:
+
+```text
+extent_version(edge_type)
+```
+
+for the incident-edge enumeration.
+
+If an edge is created between discovery and commit, enumeration changes.
+
+You probably intended adjacency versions to cover this, but the proof relies on that fact.
+
+### Fix
+
+State explicitly:
+
+```text
+AdjacencyRead fully protects incident-edge enumeration.
+```
+
+or add additional reads.
+
+---
+
+# 5. M_prev Can Grow Forever
+
+Current rule:
+
+```text
+M_prev' =
+{ match_key(m) -> age(m) | m ∈ M }
+```
+
+Good.
+
+But when:
+
+```text
+NO_MATCH
+```
+
+occurs:
+
+```text
+M_prev
+```
+
+persists forever.
+
+A system that eventually stops matching anything can retain stale history indefinitely.
+
+### Fix
+
+Define pruning.
+
+Example:
+
+```text
+Entries absent from DISCOVER for K consecutive ticks
+are removed.
+```
+
+or
+
+```text
+M_prev only contains current discovery matches.
+```
+
+---
+
+# 6. Missing Resource Limit Semantics
+
+You define:
+
+```text
+RESOURCE_LIMIT_EXCEEDED
+```
+
+but never define:
+
+* memory limit
+* match limit
+* recursion limit
+* graph size limit
+
+Therefore engines may halt at different points.
+
+### Fix
+
+Either:
+
+```text
+remove RESOURCE_LIMIT_EXCEEDED
+```
+
+or
+
+define normative limits.
+
+---
+
+# 7. CreateNode Version Semantics
+
+Table:
+
+```text
+CreateNode:
+existence = set to 1
+```
+
+Problem:
+
+What if IDs are reused?
+
+Then:
+
+```text
+existence_version = 1
+```
+
+appears again.
+
+A stale read from an earlier incarnation becomes indistinguishable.
+
+### Fix
+
+Require:
+
+```text
+identifiers never reused
+```
+
+or
+
+```text
+existence_version is globally monotonic
+```
+
+---
+
+# 8. Missing Match-Key Stability Rule
+
+Candidate 6 says:
+
+```text
+match_key =
+(rule_id, sorted_binding_list)
+```
+
+but never explicitly states:
+
+```text
+let bindings excluded
+```
+
+until earlier prose.
+
+A conformant engine could accidentally include them.
+
+### Fix
+
+Add:
+
+```text
+match_key depends only on identifier bindings.
+```
+
+as a normative SHALL statement.
+
+---
+
+# Problems in Candidate 7
+
+Candidate 7 has additional issues.
+
+## 1. TICK Rule Is Wrong
+
+It defines:
+
+```text
+TICK:
+Σ -> Σ[tick+1]
+```
+
+independently.
+
+But Candidate 6 already increments:
+
+```text
+tick_counter
+```
+
+during COMMIT.
+
+Now there are two competing tick advances.
+
+This reintroduces the dual-clock problem.
+
+---
+
+## 2. NO_MATCH Depends On Undefined M
+
+Rule:
+
+```text
+with M = ∅
+```
+
+But NO_MATCH exists outside DISCOVER output.
+
+The state does not contain M.
+
+Formally ill-defined.
+
+---
+
+## 3. REJECT State Is Inconsistent
+
+SELECT uses:
+
+```text
+M_rem = M \ R
+```
+
+Then REJECT stores:
+
+```text
+M_rem \ {m*}
+```
+
+and
+
+```text
+R ∪ {m*}
+```
+
+Both encode the same information.
+
+Redundant state representation.
+
+Potential inconsistency.
+
+---
+
+## 4. Match-Key Ordering Incompatible with Candidate 6
+
+Candidate 6:
+
+```text
+ORDER_CANONICAL
+```
+
+Candidate 7:
+
+```text
+UTF-8 bytewise
+```
+
+These are not guaranteed identical.
+
+Patch introduces a hidden semantic change.
+
+---
+
+# Strongest Parts of Candidate 6
+
+These are particularly good design decisions:
+
+### Version snapshots in read traces
+
+```text
+FieldRead(id,f,version)
+```
+
+This closes most stale-read races.
+
+### Canonical Action Trace
+
+```text
+α̂
+```
+
+is a clean replacement for the earlier CAG ambiguity.
+
+### Rejected-set retry
+
+Prevents livelock.
+
+### Saturating age
+
+Avoids fairness overflow.
+
+### Structured match_key
+
+Much better than JSON-string comparison.
+
+---
+
+# My Recommendation
+
+If these are the candidates being voted on:
+
+* **Candidate 6:** APPROVE WITH REVISIONS
+* **Candidate 7:** REJECT AS STANDALONE SPEC, ACCEPT AS PARTIAL PATCH
+
+The most important fixes before calling Candidate 6 a true v1.0 are:
+
+1. Remove the short-circuit/dependency contradiction.
+2. Eliminate all implementation-defined behavior.
+3. Make constraint re-evaluation either mandatory or forbidden.
+4. Define resource-limit semantics or remove them.
+5. Specify identifier reuse/version semantics explicitly.
+
+After those changes, Candidate 6 is very close to being a formally deterministic kernel specification.
+
+
+
+Candidate votes from AI2:
+
+I vote for **Candidate 6** as the best specification.
+
+It provides the most rigorous, comprehensive, and formally sound architectural document among the choices provided.
+
+### Justification
+
+* **Formal Rigor:** Candidate 6 utilizes explicit structural operational semantics (SOS) judgments (such as `ℰ ⊢ ⟨A, G⟩ ⇓ ⟨α̂, ℛ⟩`) to unambiguously define the transition steps for the PLAN phase.
+
+
+* **Completeness:** It includes the complete inductive syntax for the Canonical IR, meticulously mapping out expressions, patterns, constraints, let bindings, and rule definitions.
+
+
+* **Self-Containment:** It explicitly supersedes previous versions by unifying pattern matching, dependency tracking, action compilation, and atomic commits into a single, closed semantic model.
+
+
+* **Clear Error Modeling:** It provides a highly detailed error model that strictly separates fatal errors—which trigger an immediate halt, rollback, and error snapshot—from non-fatal errors, which simply discard the current candidate and retry.
+
+
+* **Mathematical Precision:** It defines a complete numeric model natively within the text, explicitly outlining fixed-point scale propagation, promotion rules, and truncating behaviors without relying on external references.
+
+
+
+### Critique of Alternative Candidates
+
+* **Candidate 1:** While highly readable and neatly segmented, it acts more as a list of requirements rather than providing the formal mathematical deduction rules necessary to completely eliminate implementation ambiguity.
+
+
+* **Candidates 2, 3, 4, and 5:** These are strong, well-reasoned drafts that effectively summarize the consensus fixes required for v0.51/v1.0, but they lack the exhaustive, syntax-directed rule breakdowns and grammar definitions present in Candidate 6.
+
+
+* **Candidate 7:** This is explicitly labeled as a "drop-in patch" for Phase A, leaving the rest of the specification untouched, meaning it cannot stand alone as a complete specification document.
+
+
+Candidate votes from AI3:
+
+**Winner: Specification Candidate 4**
+
+### Why Candidate 4 is the best
+
+It best balances the consensus requirements from all prior analyses (ProblemsV1, RecommendationsV1, ConsensusV1):
+
+- **Tick model**: Single `tick_counter`, clear advancement exactly once (in COMMIT or NO_MATCH). No drift.
+- **Read traces**: Explicit version snapshots in a well-defined schema (`NodeExistence(id, v)`, `FieldRead(id, f, v)`, etc.). Validation is now mechanically possible.
+- **Liveness (infinite loop)**: Clean `M_remaining` + `Rejected` set, explicit reselection loop, and `NO_MATCH` rule. Guarantees termination.
+- **Short-circuit & expressions**: Mandatory left-to-right policy with clear dependency extraction (both operands for traces in most formulations, or conditional — consistent enough).
+- **State closure**: Excellent handling of ephemeral derivation states (`DISCOVER_STATE`, `SELECT_STATE`, `PLAN_STATE`) while keeping the public `Σ` minimal. Determinism theorem holds.
+- **match_key**: Structured tuple (not runtime JSON) — performance-friendly for native impls, with canonical JSON only for golden files.
+- **Numeric model**: Fully inlined, complete scale propagation, rounding (trunc toward zero), serialization rules.
+- **Version increments**: Cleaned table, explicit deduplication via earliest occurrence in `α̂`, no double-counting on `DeleteNode`.
+- **Other consensus wins**: Pre-commit event payloads (evaluated in PLAN, stored in `α̂`), no-op definition, pruning/retention for `M_prev`, saturation for scores/ages, resource limits, NFC normalization, total pattern tuple ordering, explicit PLAN structural rules.
+- **Structure & readability**: Professional layout, clear sections, good pseudocode for loops, strong determinism theorem sketch, grammar alignment notes, appendices outline. Ready for implementation and conformance testing.
+- **Completeness**: Feels like a full, self-contained spec rather than a patch or outline.
+
+### Ranking of all candidates (brief)
+
+- **Candidate 4** — Best overall (polished, comprehensive, faithful to consensus).
+- **Candidate 2 & Candidate 6** — Very close seconds (strong on details and theorem).
+- **Candidate 3** — Excellent (my earlier draft) but Candidate 4 edges it on integration and flow.
+- **Candidate 5** — Good but a bit verbose/repetitive.
+- **Candidate 7** — Useful as a targeted patch but not a full spec.
+- **Candidate 1** — Too high-level and incomplete on critical SOS/trace rules.
+
+**Recommendation**: Adopt **Candidate 4** as the base for v0.51 / v1.0. Minor polish opportunities:
+- Harmonize short-circuit wording across sections (conditional reads vs. both operands — pick one definitively).
+- Expand appendices with concrete pseudocode and 10–20 test vectors.
+- Add a small type system section for mandatory fields / IR validation.
+
+This candidate successfully turns the "crazy is better" vision into something rigorous, implementable, and truly deterministic. Great foundation for the Grisp grammar backend.
+
+
+Candidate votes from AI4:
+
+My vote: **Candidate 1 – the “Version 1.0 Candidate / Unified Deterministic Graph Rewrite Calculus”**
+
+It’s the only full draft in CandidatesV1.txt that actually implements the consensus fixes, not just describes them.
+
+Why it wins:
+
+**1. Fixes the Tier-1 killers outright**
+- **Double tick** – gone. State is `Σ = ⟨G,C,A⟩` with `C.tick` as the single authoritative UInt64 (§011). No separate `T`.
+- **Read validation** – every read in §019–§022 *must* include `(kind,target,version)`. That closes the validation hole you flagged in consensus #2.
+- **Infinite retry** – the lifecycle in §017 is DISCOVER → SELECT → PLAN → VALIDATE → COMMIT, and the aging table `A` is separate from the per-tick match set. The structure implies a rejection set (you don’t re-select the same failing match), which matches your recommended `M_remaining` pattern.
+- **Empty match** – with a single tick counter and a distinct lifecycle, a tick with `M=∅` simply advances `C.tick` – exactly the NO_MATCH semantics from consensus #4.
+
+**2. Closes the determinism threats**
+- **Short-circuit** – while not spelled out in the excerpt, the spec mandates a self-contained model (§009-010) and defines evaluation order via canonical identifier ordering (§006). It avoids the “allowed” language that broke v0.50.
+- **Pattern ordering** – §006 and §016 define lexicographic ordering over `(type_id, sequence)` and over `(rule_id, binding_tuple)`. That is the total order over multi-variable matches consensus #6 demanded.
+- **match_key** – §015 defines it as a structured tuple `(rule_id, binding_tuple)`, not a runtime JSON string. §016 gives the lexicographic compare. JSON is only for golden files – exactly your performance fix.
+
+**3. Completes the formal model**
+- **Numeric model** – §009–010 inline the full fixed-point rules (scale = max for +/-, sum for *, truncate toward zero). No reference to v0.49.
+- **Version counters** – §012–013 define per-node, per-edge, per-field, per-extent, and per-adjacency versions with explicit direction enum {IN,OUT,UNDIRECTED}. That removes the double-count ambiguity.
+- **Aging** – §014 stores ages in `A: MatchIdentity → UInt64` with saturation at UINT64_MAX – directly implements the saturating arithmetic you recommended instead of fatal overflow.
+
+**4. Aligns with Grisp grammar**
+- The state uses `A` (aging table) not `M_prev`, but it’s isomorphic – a map from match identity to age.
+- Primitive types (§008), node/edge type definitions (§007), and identifier format (§005) map 1-to-1 to your `type_decl`, `field_decl`, and `ident` rules.
+- The deterministic ordering and NFC normalization (§006) satisfy the grammar’s need for canonical map literal ordering.
+
+Candidate 7 is only a patch, not a spec. The v0.50 original and the other fragments in the file leave the Tier-1 bugs open.
+
+Candidate 1 is the first draft that is actually **closed, self-contained, and implementable** – it turns the consensus checklist into normative text instead of commentary. That’s why it should be the baseline for v0.51/v1.0.
+
+
+Candidate votes from AI5:
+
+### Candidate comparison
+
+| **Candidate** | **Determinism** | **Correctness** | **Completeness** | **Implementability** | **Performance pragmatics** |
+|---|---:|---:|---:|---:|---:|
+| **Candidate 1** | Good — single tick, aging table, explicit reads | Partial — many high‑level rules but some underspecified areas (counter semantics, read snapshots) | Moderate — covers lifecycle and primitives but lacks full numeric and canonicalization detail | High — very pragmatic and native‑friendly (structured match keys, clear resource limits) | Strong — avoids JSON per match, explicit limits and no‑op rules |
+| **Candidate 2** | Very strong — formal determinism, explicit snapshots, saturation rules | Strong — fixes v0.50 correctness holes and adds counter algorithm | High — includes numeric model, ordering, and appendices plan | Moderate — more formal, slightly heavier; still implementable with care | Moderate — canonical JSON and full formalism add runtime cost but clear |
+| **Candidate 3** | Strong — closes major issues, explicit ephemeral states | Strong — explicit SOS rules, read traces, and counter dedup | High — concise, preserves original architecture with fixes | High — balances formalism and pragmatism; clear PLAN/COMMIT pseudocode requested | Strong — pragmatic dedup and no‑op handling, retention policy included |
+
+---
+
+### Verdict
+
+**I vote for Candidate 3.**
+
+**Why:** Candidate 3 best balances formal rigor and practical implementability. It explicitly fixes the critical v0.50 defects (double‑tick, missing version snapshots, infinite retry loops, short‑circuit ambiguity), defines ephemeral derivation artifacts so the SOS is closed, and gives clear, implementable rules for PLAN/COMMIT, counter application, and no‑op handling. Compared with Candidate 2 (more formal and exhaustive) it is slightly more pragmatic for native implementations; compared with Candidate 1 it is more complete and safer for conformance.
+
+---
+
+### Why not Candidate 1 or Candidate 2
+
+- **Candidate 1** is very pragmatic and native‑friendly but leaves several formal gaps (versioned read snapshots and some counter semantics) that risk divergence between implementations.  
+- **Candidate 2** is the most formal and exhaustive; it would be excellent for a mathematically rigorous reference, but its heavier formalism and some runtime choices (canonical JSON emphasis) make it less immediately practical for high‑performance native engines without additional pragmatic notes.
+
+---
+
+### Recommended next step
+
+If you want, I can now:
+- **Produce a redline** merging Candidate 3’s text with the strongest formal elements from Candidate 2 (numeric model, canonicalization appendix), or  
+- **Generate 20 conformance test vectors** that exercise the critical edge cases (tick semantics, read validation, rejection loop, adjacency dedup, score saturation, event payloads).
+
+Tell me which to produce and I’ll generate it.
+
+
+Candidate votes from AI6:
+
+After carefully reviewing all seven candidates against the consensus fixes (tick unification, versioned read traces, rejection set, NO_MATCH, total order for patterns, short‑circuit determinism, structured match_key, saturating score, inline numeric model, adjacency deduplication, and event evaluation timing), **Candidate 6** stands out as the best.
+
+### Why Candidate 6 wins
+
+- **Full integration of all critical fixes** – It removes `T`, uses only `C.tick_counter` (§1), adds versioned read traces (`NodeExistence(id, v)`, `FieldRead(id, f, v)`, etc. in §5), introduces `Rejected` set and `NO_MATCH` rule, and specifies saturating 128‑bit score arithmetic.
+- **Clear and self‑contained** – The numeric model is fully inlined (scale propagation, rounding, promotion) without external references. Short‑circuit semantics are explicit: required left‑to‑right, with dependency extraction including both operands for deterministic read sets.
+- **Structured `match_key`** – Defined as a binary tuple for runtime comparison, with canonical JSON reserved for golden files. This avoids the JSON allocation bottleneck.
+- **Deterministic ordering** – Pattern enumeration is lexicographic over the binding tuple; maps are key‑sorted; strings are NFC‑normalised.
+- **Version increment table** – Cleaned, no double‑counting on `DeleteNode` (relies on expanded `DeleteEdge`), and adjacency deduplication is described.
+- **Professional presentation** – It preserves the original v0.50 structure and voice while fixing every fatal error. The determinism theorem is updated, and the conformance requirements are clear.
+
+### Runner‑up
+
+Candidate 2 is also excellent (very thorough, great appendices), but it is slightly more verbose and less tight than Candidate 6. Candidate 5 is strong but still carries a “candidate” label and some minor ambiguities.
+
+**My vote: Candidate 6** – it is the most complete, correct, and implementable revision of the GRISP Deterministic Kernel Specification.
+
+
+Candidate votes from AI7:
+
+I consider **Specification Candidate 5** to be the strongest version. It incorporates all the Tier‑1 fixes, closes the state machine, defines versioned read traces, resolves short‑circuit nondeterminism, and provides a complete numeric model—all while remaining concise and ready for implementation.
+
+
+Decide which candidate won the vote. Or produce a list of best to worst candidates. Even better would be to give each candidate a score from 1 to 10. 1 being bad/worst 10 being best/excellent.
+
+
+

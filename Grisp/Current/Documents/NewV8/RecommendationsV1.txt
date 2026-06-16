@@ -1,0 +1,1318 @@
+After reviewing all analyses, there is strong convergence on a relatively small set of core defects. Many reviewers independently identified the same issues, which is a good signal that these are genuine specification problems rather than subjective preferences.
+
+# Consensus Findings
+
+The following issues appear repeatedly and should be considered defects until explicitly resolved.
+
+| Issue                                                     | Consensus   |
+| --------------------------------------------------------- | ----------- |
+| Double tick increment (`T`)                               | Very strong |
+| Missing version snapshot in read traces                   | Very strong |
+| Infinite re-selection loop                                | Very strong |
+| Short-circuit dependency ambiguity                        | Very strong |
+| Fixed-point arithmetic incompleteness                     | Strong      |
+| Incomplete state machine (DISCOVER/SELECT/PLAN artifacts) | Strong      |
+| Event evaluation ambiguity                                | Strong      |
+| Missing total ordering details                            | Strong      |
+| Duplicate DeleteEdge/DeleteNode semantics                 | Strong      |
+| Match aging semantics unclear                             | Moderate    |
+| Scalability concerns                                      | Moderate    |
+
+---
+
+# Recommended Fix Set (Kernel v0.51)
+
+I would recommend splitting fixes into:
+
+## Category A: Correctness Fixes
+
+These must be fixed before any implementation.
+
+## Category B: Formalization Fixes
+
+Needed to achieve a truly closed deterministic specification.
+
+## Category C: Quality Improvements
+
+Improve scalability and expressiveness but do not affect correctness.
+
+---
+
+# A1. Fix Tick Model
+
+Current:
+
+```text
+Rule 1:
+T -> T+1
+
+Rule 5:
+T -> T+1
+```
+
+This is almost certainly wrong.
+
+Recommendation:
+
+Remove `T` entirely.
+
+Use:
+
+```text
+tick_counter
+```
+
+as the single authoritative tick number.
+
+State becomes:
+
+```text
+Σ = ⟨G,C,M_prev⟩
+```
+
+where:
+
+```text
+C.tick_counter
+```
+
+is the tick.
+
+This removes an entire class of bugs.
+
+---
+
+# A2. Read Traces Must Store Versions
+
+Current:
+
+```text
+FieldRead(node, field)
+```
+
+Validation later requires:
+
+```text
+recorded version
+```
+
+but no version exists.
+
+Recommendation:
+
+Define:
+
+```text
+FieldRead(
+    element_id,
+    field_name,
+    field_version_snapshot
+)
+```
+
+Likewise:
+
+```text
+NodeExistence(
+    id,
+    existence_version_snapshot
+)
+
+ExtentRead(
+    type_name,
+    extent_version_snapshot
+)
+
+AdjacencyRead(
+    node_id,
+    edge_type,
+    dir,
+    adjacency_version_snapshot
+)
+```
+
+Then validation becomes mechanically defined.
+
+---
+
+# A3. Fix Infinite Retry Loop
+
+Current:
+
+```text
+Discard m*
+Reinvoke SELECT
+```
+
+Problem:
+
+SELECT returns same candidate again.
+
+Recommendation:
+
+Maintain:
+
+```text
+Rejected
+```
+
+set.
+
+Selection becomes:
+
+```text
+SELECT(M \ Rejected)
+```
+
+If:
+
+```text
+M \ Rejected = ∅
+```
+
+tick ends with:
+
+```text
+NO_COMMIT
+```
+
+---
+
+# A4. Define Empty Tick Rule
+
+Currently missing.
+
+Add:
+
+```text
+EMPTY:
+
+M = ∅
+
+────────────────
+
+EndTick
+```
+
+Result:
+
+```text
+M_prev' = {}
+```
+
+or
+
+```text
+M_prev' = previous
+```
+
+(depending on fairness design).
+
+Needs explicit choice.
+
+---
+
+# A5. Define Duplicate Deletion Semantics
+
+Current ambiguity:
+
+```text
+DeleteEdge(e)
+DeleteNode(n)
+```
+
+where e is incident to n.
+
+DeleteNode expansion creates another:
+
+```text
+DeleteEdge(e)
+```
+
+Recommendation:
+
+Compilation phase rejects duplicate primitive mutations.
+
+Example:
+
+```text
+DeleteEdge(e)
+DeleteEdge(e)
+```
+
+becomes:
+
+```text
+NON_FATAL_INVALID_PLAN
+```
+
+or
+
+```text
+INVALID_IR
+```
+
+Prefer:
+
+```text
+INVALID_IR
+```
+
+if statically detectable.
+
+---
+
+# A6. Fix Event Semantics
+
+Current contradiction:
+
+PLAN evaluates expressions.
+
+COMMIT says payloads evaluated pre-commit.
+
+Recommendation:
+
+EmitEvent compilation should produce:
+
+```text
+EmitEvent(
+    event_type,
+    evaluated_payload
+)
+```
+
+during PLAN.
+
+COMMIT merely emits.
+
+No further evaluation.
+
+Much simpler.
+
+---
+
+# A7. Define Constraint Revalidation
+
+Current:
+
+```text
+All constraints satisfied
+```
+
+during COMMIT.
+
+Against what state?
+
+Recommendation:
+
+Remove constraint re-evaluation entirely.
+
+Instead:
+
+Validation uses dependency versions.
+
+If versions match:
+
+constraints are assumed unchanged.
+
+This is what dependency tracking already guarantees.
+
+---
+
+# B1. Close the State Machine
+
+Current state:
+
+```text
+Σ = ⟨G,C,T,M_prev⟩
+```
+
+But transitions introduce:
+
+```text
+M
+m*
+α̂
+ℛ
+```
+
+Recommendation:
+
+Use extended machine states.
+
+Example:
+
+```text
+DISCOVER_STATE
+    = ⟨G,C,M_prev,M⟩
+
+SELECT_STATE
+    = ⟨G,C,M_prev,M,m*⟩
+
+PLAN_STATE
+    = ⟨G,C,M_prev,M,m*,α̂,ℛ⟩
+```
+
+Then theorem becomes correct.
+
+---
+
+# B2. Define Pattern Enumeration Precisely
+
+Current:
+
+```text
+ascending identifier order
+```
+
+insufficient.
+
+Need:
+
+For pattern:
+
+```text
+MatchNode(x,A)
+MatchNode(y,B)
+```
+
+enumeration order is:
+
+```text
+lexicographic(
+    id(x),
+    id(y)
+)
+```
+
+using ORDER_CANONICAL.
+
+This must be explicit.
+
+---
+
+# B3. Fix Short-Circuit Semantics
+
+Current:
+
+```text
+short-circuit allowed
+```
+
+This is dangerous.
+
+Recommendation:
+
+Make it mandatory.
+
+Example:
+
+```text
+false && X
+```
+
+must not evaluate X.
+
+Dependency extraction then follows evaluation.
+
+Alternative:
+
+Always evaluate both sides.
+
+Either is fine.
+
+"Allowed" is not.
+
+---
+
+# B4. Complete Numeric Model
+
+Must define:
+
+### Fixed-point addition
+
+### Fixed-point subtraction
+
+### Fixed-point multiplication
+
+### Fixed-point division
+
+### Scale propagation
+
+### Rounding
+
+Example recommendation:
+
+```text
+Addition/Subtraction:
+scale=max(lhs,rhs)
+
+Multiplication:
+scale=lhs_scale+rhs_scale
+
+Division:
+user-defined target scale
+round half-even
+```
+
+or similar.
+
+Just define it.
+
+---
+
+# B5. Remove v0.49 References
+
+Current spec claims:
+
+```text
+closed specification
+```
+
+but imports rules from:
+
+```text
+v0.49
+```
+
+This violates closure.
+
+Everything needed must appear inside the document.
+
+---
+
+# C1. Improve Match Aging
+
+Current:
+
+```text
+match_key = (rule_id, bindings)
+```
+
+Let values ignored.
+
+I actually think this is acceptable.
+
+Reason:
+
+Bindings determine identity.
+
+Let values are derived state.
+
+However this should be documented explicitly:
+
+```text
+Match identity depends solely on bindings.
+Derived values do not affect identity.
+```
+
+Otherwise reviewers will keep raising it.
+
+---
+
+# C2. Replace JSON Match Keys
+
+Current:
+
+```text
+canonical JSON serialization
+```
+
+This is expensive.
+
+For Object Pascal this is especially undesirable.
+
+Recommendation:
+
+Define:
+
+```text
+match_key =
+(rule_id, ordered binding tuple)
+```
+
+as an abstract ordered structure.
+
+JSON serialization only for golden files.
+
+This preserves determinism while improving performance.
+
+---
+
+# C3. Add Negative Application Conditions (NACs)
+
+Your grammar and kernel currently only support positive matches.
+
+Sooner or later you'll want:
+
+```text
+NOT EXISTS edge
+```
+
+patterns.
+
+Example:
+
+```text
+MatchNode(a,Person)
+
+NOT MatchEdge(e,Friend,a,b)
+```
+
+Without NACs many graph rewrite systems become awkward.
+
+I would add them early.
+
+---
+
+# C4. Add Explicit Type System
+
+The grammar you proposed:
+
+```text
+node Person
+begin
+    Name : String;
+    Age  : Integer;
+end
+```
+
+fits GRISP very naturally.
+
+However the kernel needs explicit typing rules:
+
+* field existence
+* field types
+* CreateNode completeness
+* CreateEdge endpoint legality
+* identifier types
+
+These are currently mostly absent.
+
+---
+
+# Suitability for Your Proposed Grammar
+
+The answer is:
+
+**Yes, the kernel architecture is very compatible with that grammar.**
+
+The grammar maps almost directly:
+
+| Grammar     | Kernel        |
+| ----------- | ------------- |
+| node type   | NodeType      |
+| edge type   | EdgeType      |
+| rule        | Rule          |
+| match block | Patterns      |
+| where       | Constraint    |
+| let         | Let bindings  |
+| actions     | Action block  |
+| init        | Initial graph |
+
+The largest missing pieces are:
+
+1. Type system.
+2. NACs.
+3. Complete expression semantics.
+4. Complete fixed-point semantics.
+
+Once those are added, the grammar becomes a very natural front-end language for GRISP.
+
+# Final Recommendation
+
+If I were editing the specification, I would prioritize these fixes in order:
+
+1. Remove double tick increment.
+2. Add version snapshots to read traces.
+3. Fix retry loop using a rejected set.
+4. Make short-circuit behavior mandatory.
+5. Complete numeric semantics.
+6. Formalize machine states.
+7. Define exact pattern enumeration order.
+8. Eliminate references to v0.49.
+9. Add type system.
+10. Add NACs.
+
+After those ten changes, the specification would move from "interesting but internally inconsistent" to something much closer to a genuinely implementable deterministic graph-rewrite kernel suitable as the backend for the GRISP grammar.
+
+
+This is a critical juncture for the GRISP kernel. The provided grammar (v0.01) is clean and perfectly maps to the intended structural operational semantics, but the underlying v0.50 kernel specification has severe contradictions that will make a native Delphi implementation unstable, non-deterministic, or prone to infinite loops.
+
+Based on the aggregated analysis, here is the consensus on the most critical flaws and the concrete recommendations to fix them so the kernel natively supports your grammar.
+
+---
+
+### 1. The Execution Loop: Livelocks and Time Drift
+
+The fundamental transition system driving the kernel has logical holes that will either crash the engine or trap it in an endless cycle.
+
+* 
+**The Double Tick Increment:** The specification currently increments the tick counter twice: once in the TICK rule and again in the COMMIT rule. This causes the logical time (`T`) to drift out of sync with the underlying tick counter.
+
+
+* **Recommendation:** Consolidate logical time. Drop `T` entirely and define `T ≡ C.tick_counter`. Ensure this counter is incremented exactly *once* per successful commit loop.
+
+
+
+
+* 
+**The Infinite Rejection Loop:** If a match fails a non-fatal validation (like a duplicate update or a missing target), the engine discards it and returns to the SELECT phase. However, because the candidate's score hasn't changed, SELECT will immediately pick the exact same failing match again.
+
+
+* **Recommendation:** Introduce a temporary `Rejected` set for the duration of the tick. If `m*` fails validation, execute `Rejected := Rejected ∪ {m*}` or mathematically remove it via `M := M \ {m*}` before re-invoking SELECT.
+
+
+
+
+* 
+**The "Empty Match" Void:** The specification lacks a transition rule for what happens when `M` is empty.
+
+
+* 
+**Recommendation:** Define an explicit SOS rule for an empty match set that gracefully ends the tick, advances the tick counter, and preserves the un-aged `M_prev` state.
+
+
+
+
+
+### 2. Version Validation and State Tracking
+
+The optimistic concurrency model relies on checking versions, but the data structures defined don't hold the necessary information.
+
+* 
+**Ghost Read Traces:** The `DISCOVER` phase requires building a read trace (`ℛ_m`) of accessed elements, and `COMMIT` requires validating these against "the version recorded". However, the specification never defines *how* to store those version numbers in the trace.
+
+
+* 
+**Recommendation:** When building the native record structures for the trace, `ℛ_m` must explicitly store tuples of `(ElementID, Property, VersionValue)`. Without the captured integer value, the `COMMIT` phase has nothing to validate against.
+
+
+
+
+* **Adjacency Double-Counting:** The version increment rules double-count edge deletions. If a node is deleted, the `PLAN` phase expands this into explicit `DeleteEdge(e)` commands for all incident edges, followed by `DeleteNode`. The table increments adjacency versions for *both* actions.
+
+
+* **Recommendation:** Remove the adjacency increment from the `DeleteNode` table row. The expanded `DeleteEdge` actions will safely and naturally handle the adjacency increments.
+
+
+* 
+**Unbounded Memory Growth:** The system indefinitely tracks the age of every match in `M_prev`.
+
+
+* 
+**Recommendation:** Implement an eviction policy (e.g., purging matches that haven't been seen in $N$ ticks) or establish a maximum capacity for the dictionary.
+
+
+
+
+
+### 3. Closing the Nondeterminism Gaps
+
+For all engines to produce identical golden files, ambiguities in evaluation order and mathematics must be eliminated.
+
+* 
+**Short-Circuiting Must Be Mandatory:** The specification states that short-circuiting for boolean operators (`&&`, `||`) and constraints is "allowed". This completely destroys determinism, as one engine might evaluate a right-hand operand (triggering a read trace addition) while another skips it.
+
+
+* 
+**Recommendation:** Explicitly mandate that short-circuiting is *strictly required*. The dependency extraction must immediately halt reading variables once a logical condition is met.
+
+
+
+
+* 
+**Fairness Score Overflows:** The scoring formula ($base \times scale + age \times fairness$) uses unbounded age. In a 64-bit system, a long-running instance will eventually throw a fatal `INTEGER_OVERFLOW` simply because a rule survived too long.
+
+
+* **Recommendation:** Use saturating arithmetic for the fairness score calculation. If the calculation hits `INT64_MAX`, it clamps to that value rather than killing the kernel.
+
+
+
+
+* 
+**Map and Tuple Ordering:** The sorting logic for internal maps and pattern cross-products is dangerously loose.
+
+
+* 
+**Recommendation:** For your proposed grammar's `map_literal`, enforce that all map keys must be strictly sorted by their UTF-8 byte values *before* evaluation or serialization.
+
+
+
+
+
+### 4. Aligning with the v0.01 Grammar
+
+Your proposed grammar introduces `let_block` and `where_block` sequentially.
+
+* 
+**The Let-Binding Trap:** The specification currently says that `let` bindings do *not* affect match identity. If your grammar's `let` block accesses graph state (e.g., `let x := node.field`), and two matches differ *only* by this evaluated value, they will collide in the `match_key`.
+
+
+* 
+**Recommendation:** If `let` blocks read graph state, those reads *must* be injected into the read trace `ℛ_m`. You must also clearly define if variables declared in a `let_block` are allowed to mutate or trigger side-effects within the `actions_block`.
+
+
+
+
+
+---
+
+If we strip out the unworkable parts, we are left with a strong core: a deterministic state machine driven by syntax-directed AST compilation.
+
+Before we tackle the data structures for the AST compilation, how do you want to handle the canonical serialization bottleneck? Should we replace the JSON-string `match_key` generation with a native binary hashing algorithm, or do you prefer to keep the JSON serialization for the sake of the golden files?
+
+
+**Consensus Summary on GRISP Kernel Specification Fixes**
+
+After reviewing the original spec + all the feedback in ProblemsV1.txt, there is **strong consensus** across analyses on the major problems. The core architecture (deterministic SOS, read traces + version validation, canonical ordering, aging for fairness, atomic commit with Canonical Action Trace) is **sound and worth preserving**. However, the document has **fatal bugs**, **critical underspecifications**, and **design weaknesses** that prevent deterministic implementation.
+
+### Must-Fix Critical Issues (Priority 1)
+
+These would break correctness or determinism:
+
+1. **Double Tick Increment (T vs tick_counter)**  
+   **Consensus**: Bug.  
+   **Fix**: Remove the separate `T` from the state model. Use only `tick_counter` (in `C`).  
+   - TICK rule increments only `tick_counter`.  
+   - COMMIT does **not** increment it again.  
+   - Golden file uses `tick_number: C.tick_counter`.  
+   - Idle ticks (empty `M`) still increment the counter.
+
+2. **Infinite Non-Fatal Rejection Loop**  
+   **Consensus**: Severe.  
+   **Fix**: During a tick, maintain a `rejected` set (or remove from `M`). After trying all candidates without success, end the tick with no commit. Add explicit SOS rule for "no successful commit".
+
+3. **Read Traces Lack Version Snapshots**  
+   **Consensus**: Makes validation impossible as written.  
+   **Fix**: Extend `ℛ_m` and `ℛ` to record **(read_kind, element, version_at_read)** tuples. Validation compares current versions against these snapshots.
+
+4. **Short-Circuit Evaluation**  
+   **Consensus**: "Allowed" is unacceptable for determinism.  
+   **Fix**: Change to **"mandatory left-to-right short-circuit"** (standard in most languages). Define dependency extraction to include *only* the actually-evaluated subexpressions (for `&&`/`||`). Document that expressions must be pure (no side effects).
+
+5. **Pattern Enumeration Order for Multi-Variable Patterns**  
+   **Consensus**: Underspecified → nondeterminism.  
+   **Fix**: Define total lexicographic order on the tuple of bound identifiers (in the order they appear in the inductive pattern). Use ORDER_CANONICAL component-wise.
+
+6. **State Model vs. Extended Transition States**  
+   **Fix**: Extend the formal configuration to `⟨G, C, tick_counter, M_prev, temp⟩` where `temp` holds `M`, `m*`, `α̂`, `ℛ`, `rejected` during the tick (cleared at end).
+
+### High-Priority Design & Completeness Fixes
+
+7. **Version Increment Table & DeleteNode Double-Counting**  
+   **Fix**: Clarify that increments are derived from the final primitive actions in `α̂` (after expansion). Remove double-counting for implicit `DeleteEdge`s. Make adjacency increments strictly per unique `(node, edge)` in the trace.
+
+8. **Match_key & Canonical Serialization**  
+   **Fix**: Provide a full, unambiguous algorithm (not just "JSON"). Prefer a structured tuple comparison over JSON strings for performance (as suggested in reviews). Fall back to canonical minified JSON only for golden files.
+
+9. **Fixed-Point & Numeric Model**  
+   **Fix**: Inline complete rules (no "see v0.49"). Define:
+   - Scale propagation: `max(scale1, scale2)` for `+`/`-`; `scale1 + scale2` for `*`; explicit for `/`.
+   - Rounding: truncation toward zero (or specify bankers/floor).
+   - Serialization: always exactly `scale` decimal digits, with point.
+
+10. **M_prev Growth & Score Overflow**  
+    **Fixes**:
+    - Ages: use saturating arithmetic (cap at `INT64_MAX`).
+    - Score: use 128-bit intermediates or saturating.
+    - Optional: add `M_prev` compaction (e.g., prune entries with age > some threshold, or per-rule history limits).
+
+### Other Important Recommendations
+
+- **Graph Model & IR**: Add a full type system section + concrete JSON schema for Canonical IR. Require all fields in `CreateNode`. Support Negative Application Conditions (NACs) for expressiveness (critical gap noted in reviews).
+
+- **Event Payloads**: Explicitly **pre-commit snapshot** evaluation (as written). Justify it.
+
+- **No-Op Writes**: Define precisely (value equality after canonical normalization). No-op updates still bump field versions? (Recommend **yes**, for simplicity.)
+
+- **DeleteNode Conflicts**: Explicit rule: implicit `DeleteEdge`s are inserted before user actions; duplicate `DeleteEdge` is a no-op (or non-fatal).
+
+- **Resource Limits**: Define soft limits triggering `RESOURCE_LIMIT_EXCEEDED`.
+
+- **Version Numbering**: Standardize on v0.51 or v1.0 consistently.
+
+### Proposed Concrete Fixes (Excerpts)
+
+**Revised State Model (§1)**:
+```
+Σ = ⟨G, C, M_prev⟩
+```
+(with `C.tick_counter` as the authoritative tick).
+
+**Revised TICK Rule**:
+```
+tick_counter < INT64_MAX
+────────────────────────────────────
+⟨Σ, IR⟩ → ⟨⟨G, C[tick_counter+1], M_prev⟩, IR⟩
+```
+
+**Revised COMMIT (simplified sketch)**:
+- Record versions in `ℛ`.
+- On non-fatal: `rejected := rejected ∪ {m*}`; if `M \ rejected` nonempty → re-SELECT; else end tick.
+- Update `M_prev'` from current `M` (ages from discovery).
+
+**Read Trace**:
+Each entry: `(kind, target, version_snapshot)` e.g. `(FieldRead, (node_id, field), ver)`.
+
+**Pattern Enumeration**:
+Matches are generated by nested loops in pattern order, with bindings sorted lexicographically by their identifier tuple using ORDER_CANONICAL.
+
+### Overall Verdict & Path Forward
+
+The spec is **salvageable and conceptually strong** (8/10 on determinism vision). After these fixes it can reach **formal completeness ~9/10** and **implementability ~8.5/10**.
+
+**Recommendations**:
+- Produce a **v0.51 cleaned edition** incorporating the above.
+- Add an appendix with full canonical serialization pseudocode + small test vectors.
+- For performance: consider optional incremental matching (while preserving deterministic fallback to full DISCOVER).
+- Keep the "crazy is better" rigor — total orders, explicit traces, golden files — but make it *implementable* without heroic effort.
+
+I can help draft the full revised sections (e.g., §1, §5 SOS rules, §6 increments, numeric model) or focus on specific parts like the IR schema, pattern matching details, or version tracking algorithm. 
+
+What would you like to tackle first?
+
+
+Your ProblemsV1.txt review and my earlier audit line up almost perfectly. You caught the same fatal bugs I did, plus you added the performance angle (JSON match_key, M_prev flapping, NACs). Let's consolidate into a single fix-list you can apply to the kernel before you wire it to the Grisp grammar you posted.
+
+I read your grammar:
+
+```
+<rule_decl> ::= "rule" <string> "priority" <int> "scale" <int> "fairness" <int>
+                "begin" <match_block> [where_block] [let_block] <actions_block> "end"
+```
+
+That maps 1-to-1 to the IR's `Rule(rule_id, base_priority, priority_scale, fairness_scale, P, φ, B, A)`. The grammar is fine – the kernel spec is not. Fix the kernel first, then the grammar needs only two small extensions.
+
+## Consensus – what must be fixed, and how
+
+### Tier 1 – correctness blockers (implementations will diverge)
+
+**1. Tick is incremented twice**
+- Problem: Rule 1 does `T+1` and `tick_counter+1`, Rule 5 COMMIT does `T+1` again. Your review shows T=0 → 1 → 2 in one tick.
+- Fix: Drop `T` from Σ entirely. Keep only `C.tick_counter`. Increment it **once**, in COMMIT, after successful validation. Rule 1 becomes a no-op (or just a guard for overflow). This matches your grammar where there is no explicit tick – time advances only on commit.
+
+**2. SOS states are not closed**
+- Problem: Σ = ⟨G,C,T,M_prev⟩ but DISCOVER adds M, SELECT adds m*, PLAN adds α̂, ℛ.
+- Fix: Define extended configuration explicitly:
+  ```
+  Σ0 = ⟨G,C,M_prev⟩
+  Σ1 = ⟨G,C,M_prev,M⟩
+  Σ2 = ⟨G,C,M_prev,M,m*⟩
+  Σ3 = ⟨G,C,M_prev,M,m*,α̂,ℛ⟩
+  ```
+  The determinism theorem then quantifies over Σ0→Σ0, not over hidden intermediates.
+
+**3. Infinite non-fatal rejection loop**
+- You flagged it, I flagged it. Current text says "discard m* and go back to SELECT" but never removes it from M.
+- Fix: After any non-fatal failure, set `M := M \ {m*}` before re-selecting. If M becomes empty, commit a no-op tick (still increment tick_counter, update M_prev to empty set). This guarantees termination.
+
+**4. Read-set validation has no versions**
+- DISCOVER records `ℛ_m` as bare reads, COMMIT compares to "version recorded during DISCOVER" – but no version is stored.
+- Fix: Store versions in the read trace:
+  ```
+  FieldRead(id,f, v) where v = field_version[id][f] at discovery
+  NodeExistence(id, v) where v = existence_version[id]
+  ```
+  PLAN must merge ℛ_m and ℛ (from action argument evaluation). Validation is then a simple equality check.
+
+**5. Short-circuit "allowed" breaks determinism**
+- Your point #6 is the biggest hidden issue. If `A || B` skips B on some engines, ℛ differs.
+- Fix: Change spec language from "allowed" to "required, left-to-right, with conditional dependencies":
+  - `e1 && e2`: evaluate e1, if false, ℛ = ℛ_e1, value = false
+  - if true, evaluate e2, ℛ = ℛ_e1 ∪ ℛ_e2
+  - Same for `||`. Document this in §2.1 and §4. This makes dependency extraction syntax-directed and deterministic.
+
+**6. match_key JSON bottleneck**
+- You asked: binary tuple or hash? Use binary tuple comparison, not hash.
+- Fix: Define `match_key = (rule_id, [ (var, type, seq)... ])` sorted by var name, compared lexicographically using ORDER_CANONICAL. No JSON allocation. Store it as a struct for tie-breaking. This preserves total order and avoids heap fragmentation in Object Pascal.
+
+### Tier 2 – semantic gaps that make the spec unimplementable
+
+**7. Version increments are global and double-count**
+- Current table does `+1 (all)` for every field on CreateNode, and double increments adjacency on DeleteNode.
+- Fix per your §6 observation:
+  - CreateNode: increment only `extent_version[type]`, `existence_version[new]`, and `field_version[new][f]` for each supplied field. Do **not** bump predicate_version for all fields.
+  - DeleteNode expansion: perform explicit DeleteEdge actions, and **only** those DeleteEdge actions bump adjacency and edge_type. Remove the "+1 per incident edge" line from DeleteNode row.
+  - UpdateField: bump only `field_version[id][f]` and `predicate_version[type][f]`. Drop ordering_dependency_version unless you actually use it for ordering queries (currently unused).
+
+**8. No-op writes undefined**
+- Spec says "No-Op writes do nothing" but doesn't define equality.
+- Fix: Define no-op as bitwise value equality after canonical serialization. For FixedPoint, compare scaled integer, not string. No-op writes skip version bumps and are removed from α̂ during PLAN.
+
+**9. Fairness overflow**
+- `score = base*scale + age*fairness` overflows int64.
+- Fix: Compute score in unsigned 128-bit, saturate at 2^63-1. Document that overflow is not fatal – it caps priority. This prevents a long-lived match from killing the kernel.
+
+**10. Event payload evaluation**
+- PLAN evaluates expressions, COMMIT says "evaluate at commit".
+- Fix: Choose your option B – PLAN evaluates all action arguments to values, α̂ stores values. EmitEvent payloads are therefore pre-computed against the discovery snapshot. Document this explicitly in §5.4.
+
+### Tier 3 – alignment with your Grisp grammar v0.01
+
+Your grammar is compatible, but the kernel spec currently contradicts it in three places:
+
+1. **where_block** allows any `<expr>` with `||`, but §2.3 constraints allow only `&&`. Update §2.3 to `φ ::= e` where e is boolean-typed, removing the artificial restriction.
+
+2. **let_block** is present in grammar but spec says let values do not affect match_key. That is fine, but you need to state that let expressions are evaluated during DISCOVER and their reads are added to ℛ_m. Otherwise a let that reads `account.balance` will not trigger stale-read detection.
+
+3. **CreateNode with map_literal** – grammar permits partial field lists, spec requires "all fields mandatory". Add a well-formedness rule: during PLAN, if any mandatory field is missing, treat as non-fatal validation failure (so rule is skipped, not fatal). This matches typical graph DB behavior.
+
+**Missing feature you flagged – NACs:** Your grammar has no negative patterns. For v0.01, leave it out, but reserve syntax:
+```
+pattern ::= <ident> ":" <type_name> ["!" ] ";"
+```
+The kernel can later implement NACs by adding a `MatchAbsent` pattern that contributes to ℛ_m as an extent read.
+
+## What to change in the document
+
+1. Rename to v0.51, remove all mentions of v1.0 and self-superseding.
+2. Replace §1 state with the extended Σ0-Σ3 definitions.
+3. Rewrite Rule 1 and Rule 5 to increment tick_counter once.
+4. Add §5.3a "Retry semantics: M := M \ {m*}".
+5. Redefine ℛ entries to carry versions, update validation pseudocode.
+6. Replace "short-circuit allowed" with "required" and give the conditional dependency rules.
+7. Replace match_key definition with binary tuple, delete JSON serialization requirement.
+8. Rewrite §6 version table per fixes above.
+9. Add FixedPoint scale propagation: result scale = max(scale1, scale2) for +/-, scale1+scale2 for *, scale1 for / with truncation toward zero. State rounding mode explicitly.
+10. Add UTF-8 normalization policy: require NFC on input, compare bytewise.
+
+## Overall assessment after fixes
+
+- **Conceptual design**: stays 8.5/10 – the DSOS idea is solid.
+- **Formal completeness**: rises to 9/10 once versions and retry are defined.
+- **Implementability in Object Pascal**: rises to 8.5/10 – no JSON per match, no global version churn, deterministic short-circuit.
+
+Your ProblemsV1 review already identified the six critical killers. If you apply the ten fixes above, the kernel will be implementable, will stay deterministic across engines, and will compile directly from your Grisp grammar without guessing.
+
+Want me to draft the corrected §5 (SOS rules) and §6 (version table) as a patch you can drop into the spec?
+
+
+### Analysis Summary
+
+The two documents together present a rigorous, well‑motivated deterministic SOS for a graph‑rewrite kernel. They also contain multiple **critical contradictions, underspecified artifacts, and practical scalability traps** that would prevent independent implementations from remaining deterministic or even terminating. Below I prioritize the most dangerous defects, explain why each breaks determinism or liveness, and give concrete, implementable fixes and a short patch plan you can apply to the spec quickly.
+
+---
+
+### Top Critical Issues (prioritized)
+
+| **Issue** | **Severity** | **Primary Impact** |
+|---|---:|---|
+| Tick incremented twice (T vs tick_counter) | Critical | Time drift; ambiguous golden files; inconsistent tick semantics |
+| DISCOVER/SELECT/PLAN introduce hidden state not in Σ | Critical | The SOS is not closed; determinism theorem is technically false |
+| Infinite reselection loop when all matches fail | Critical | Livelock; possible nontermination |
+| Read trace lacks recorded versions for validation | Critical | COMMIT validation impossible; stale-read detection broken |
+| Short-circuiting allowed but not specified for dependency extraction | High | Different dependency sets across engines; determinism broken |
+| Score arithmetic overflow (age × fairness_scale) | High | Long‑running systems can fatal on overflow; liveness loss |
+| Event payload evaluation timing ambiguous | High | Observable events differ between engines |
+| `match_key` canonicalization underspecified | High | Tie‑breaking divergence; selection nondeterminism |
+| Adjacency deduplication and counter application order unclear | High | Counter double‑counting; divergent post‑commit counters |
+| `M_prev` growth and resource exhaustion | Medium | Memory blowup; impractical for large graphs |
+
+---
+
+### Detailed issues and concrete fixes
+
+#### 1. Tick counter duplication and semantics
+**Problem:** `TICK` increments both `tick_counter` and `T`; `COMMIT` also returns `T+1`.  
+**Fix:** Choose one authoritative tick value. Recommended change:
+- Remove `T` from the state model and use `C.tick_counter` as the single canonical tick number.
+- Update all rules to increment `tick_counter` exactly once per successful commit. Make TICK only increment a pre‑commit counter if you need a pre‑discovery marker; otherwise remove the TICK rule or make it a no‑op that only increments `tick_counter` on commit.
+**Specification edit:** Replace all occurrences of `T` with `C.tick_counter` and change COMMIT transition to `→ ⟨G', C', M_prev'⟩` with `C'.tick_counter = C.tick_counter + 1`.
+
+#### 2. SOS closure and derivation artifacts
+**Problem:** DISCOVER/SELECT/PLAN produce `M`, `m*`, `α̂`, `ℛ` but Σ omits them; the determinism theorem claims a single successor for Σ.  
+**Fix:** Two options:
+- **Preferred:** Treat DISCOVER/SELECT/PLAN as *derivation judgments* (not stateful transitions) and keep Σ minimal. Explicitly state that `M`, `m*`, `α̂`, `ℛ` are ephemeral derivation artifacts and not part of Σ. Update the determinism theorem to quantify over derivations: for a given Σ and IR the next committed Σ' is unique.
+- **Alternative:** Extend Σ to include the intermediate artifacts and make transitions explicit.  
+**Specification edit:** Add a paragraph in §5 defining derivation artifacts and revise the determinism theorem accordingly.
+
+#### 3. Infinite reselection loop
+**Problem:** If every candidate repeatedly fails validation, SELECT will pick the same top candidate forever.  
+**Fix:** On non‑fatal rejection of `m*`, remove it from the current candidate set for the tick: `M := M \ {m*}` and record it in a per‑tick `Rejected` set. Re‑invoke SELECT on the reduced `M`. Ensure `M_prev` is not updated until COMMIT.  
+**Specification edit:** Add a rule in SELECT/COMMIT describing `Rejected` and the reselection semantics.
+
+#### 4. Read trace must record versions
+**Problem:** DISCOVER records read kinds but not the version values needed for COMMIT validation.  
+**Fix:** Define `ℛ_m` entries as tuples `(read_kind, element_id, recorded_version_value)` with a canonical serialization. For each read kind map to a specific counter/version field (e.g., `FieldRead(id,f)` → `field_version[id][f]`). Record the exact integer value observed during DISCOVER.  
+**Specification edit:** Add a `ReadTraceSchema` subsection listing read kinds and the exact counter/version to capture.
+
+#### 5. Short‑circuiting and dependency extraction
+**Problem:** Allowing short‑circuiting without specifying dependency semantics yields different read sets.  
+**Fix:** Make one of the following explicit:
+- **Deterministic evaluation policy A:** *Always evaluate both operands* for `&&` and `||` when used in constraints and pattern lets; dependency set is union of both. This preserves determinism and makes read traces stable.
+- **Policy B:** *Require short‑circuit evaluation* but mandate that dependency extraction must include reads from both operands regardless of runtime short‑circuit. This is less intuitive and more surprising.  
+**Recommendation:** Adopt Policy A (evaluate both) for constraints and let expressions used in DISCOVER. Document performance implications.  
+**Specification edit:** Replace “short‑circuit allowed” with “short‑circuit forbidden in DISCOVER; both operands evaluated for dependency extraction.”
+
+#### 6. Score arithmetic overflow and age semantics
+**Problem:** Age and score arithmetic can overflow and cause fatal errors.  
+**Fix:** Use saturating arithmetic for age and score computations or widen to 128‑bit intermediate arithmetic for scoring only. Additionally, provide an age compaction policy: cap `age` at a configurable `AGE_MAX` and treat larger ages as `AGE_MAX`. Document that overflow in score computation yields `INTEGER_OVERFLOW` only if intermediate exceeds a safe bound after widening.  
+**Specification edit:** Add numeric policy: scoring uses 128‑bit intermediates; ages saturate at `2^63-1` and do not cause fatal errors.
+
+#### 7. Event payload evaluation timing
+**Problem:** Ambiguity whether event payloads are evaluated during PLAN or at COMMIT against pre‑commit state.  
+**Fix:** Choose and document one:
+- **Option 1 (recommended):** Evaluate event payload expressions during PLAN and record their **values** in `α̂`. Emit those recorded values at COMMIT. This makes event emission deterministic and avoids surprising pre/post semantics.
+- If you must evaluate at COMMIT, explicitly state that payload expressions are evaluated against the pre‑commit snapshot and record the read versions induced by that evaluation in `ℛ`.  
+**Specification edit:** Make event payload evaluation policy explicit and add examples.
+
+#### 8. `match_key` canonicalization
+**Problem:** `match_key` canonical JSON rules are incomplete for nested maps/lists and identifier normalization.  
+**Fix:** Add a canonicalization appendix:
+- Unicode normalization form NFC for all strings.
+- Map keys sorted by ORDER_CANONICAL.
+- Identifiers serialized as `"type:seq"` with `seq` as decimal without leading zeros.
+- Exclude `let_values` explicitly.
+- Provide canonical examples and test vectors.  
+**Specification edit:** Add `MatchKeyCanonicalization` subsection and include 10 test vectors.
+
+#### 9. Adjacency deduplication and counter application order
+**Problem:** “Earliest occurrence in `α̂`” is ambiguous; counter application order unspecified leading to double increments.  
+**Fix:** Define a deterministic counter application algorithm:
+- Apply primitive actions in `α̂` left‑to‑right.
+- Maintain a deduplication map keyed by `(edge_id, endpoint)` to record the first index where adjacency increment should occur; only that first occurrence increments adjacency counters.
+- After applying all actions, compute counter increments by scanning `α̂` and applying per‑action increments immediately in order.  
+**Specification edit:** Add `CounterApplicationAlgorithm` with pseudocode and an example.
+
+#### 10. `M_prev` retention and resource limits
+**Problem:** `M_prev` can grow without bound.  
+**Fix:** Define retention policy:
+- Keep `M_prev` entries for at most `K` ticks (configurable), or
+- Compact `M_prev` by storing only a bounded LRU or hashed age bucket.  
+Add `RESOURCE_LIMIT_EXCEEDED` semantics when `M_prev` exceeds configured memory budget.  
+**Specification edit:** Add `M_prevRetentionPolicy` and recommended default `K` (e.g., 10,000).
+
+---
+
+### Quick patch plan (minimal edits to restore correctness)
+
+1. **One-line fixes**
+   - Replace `T` with `C.tick_counter` everywhere.
+   - Make DISCOVER/SELECT/PLAN derivation artifacts ephemeral in §5 and update theorem wording.
+
+2. **Add small schemas**
+   - `ReadTraceSchema` listing read tuple format.
+   - `MatchKeyCanonicalization` with NFC and JSON rules.
+
+3. **Behavioral clarifications**
+   - Prohibit short‑circuiting in DISCOVER; evaluate both operands.
+   - Decide event payload evaluation during PLAN and record values.
+
+4. **Safety and liveness**
+   - Add `Rejected` set semantics for SELECT.
+   - Add age saturation and widened scoring arithmetic.
+
+5. **Operational determinism**
+   - Add `CounterApplicationAlgorithm` pseudocode and adjacency dedup rules.
+
+6. **Tests**
+   - Add 20 conformance test vectors exercising tie‑breaking, short‑circuit, age overflow, adjacency dedup, event payloads, and non‑fatal rejection loops.
+
+Apply steps 1–4 as an urgent patch; steps 5–6 follow.
+
+---
+
+### Suggested edits to include in the next spec revision
+
+- **Appendix A:** Full JSON canonicalization and Unicode normalization rules.  
+- **Appendix B:** Read trace schema and validation algorithm with examples.  
+- **Appendix C:** Numeric model fully inlined (fixed‑point promotion, rounding modes, scale propagation).  
+- **Appendix D:** Pseudocode for DISCOVER, SELECT, PLAN, COMMIT including `Rejected` handling and counter application.  
+- **Appendix E:** Conformance test vectors and golden file examples for edge cases.
+
+---
+
+### Final recommendation and offer
+
+The core design is strong and salvageable. Fixing the ten items above will restore the formal determinism claim and make the spec implementable and testable. If you want, I can:
+
+- Produce a **concise patch diff** for §1, §5, and §6 implementing the critical fixes (tick unification, read trace schema, rejected set, and counter application algorithm).  
+- Or **rewrite the PLAN/COMMIT subsections** into precise pseudocode that implementers can follow verbatim.
+
+Tell me which you prefer and I will produce the patch immediately.
+
+
+## Consensus Recommendations for Fixing the GRISP Deterministic Kernel Specification
+
+Based on the detailed analysis of v0.50 (and the multiple review texts), the following critical problems must be resolved to make the specification implementable, deterministic, and compatible with the proposed grammar. The fixes are ordered by severity, with **fatal errors** first.
+
+---
+
+### 🔴 Fatal Errors (Must Fix)
+
+| # | Problem | Recommended Fix |
+|---|---------|----------------|
+| **F1** | **Double tick increment** – `TICK` increments `T` and `tick_counter`; `COMMIT` increments `T` again. | **Remove `T` entirely.** Use only `tick_counter` as the single tick number. Update `COMMIT` to produce `C'` with `tick_counter+1` and drop `T+1`. |
+| **F2** | **No transition for empty match set** – After `DISCOVER`, if `M = ∅` the system has no rule to advance. | Add a new rule **`NO_MATCH`**: when `M` empty, increment `tick_counter` (and optionally update `M_prev` to empty) and start a new tick without commit. |
+| **F3** | **Missing version snapshots in read traces** – Validation requires comparing current versions against “version recorded during DISCOVER”, but no versions are stored. | Extend read traces to capture the *actual version counter value* at read time. For example: `NodeExistence(id, v)` where `v` = current `existence_version[id]`. Define a canonical serialization of these versioned reads. |
+| **F4** | **No retry mechanism after non‑fatal error** – Discarding `m*` and going back to `SELECT` without removing it from `M` causes infinite loop. | Define `SELECT` to operate on a *remaining set* `M_remaining`. When a match fails validation, remove it from `M_remaining` and re‑select. If `M_remaining` becomes empty, the tick ends with no commit (→ `NO_MATCH`). |
+
+---
+
+### 🟠 Major Omissions & Determinism Breakers
+
+| # | Problem | Recommended Fix |
+|---|---------|----------------|
+| **O1** | **Pattern enumeration total order** – For multi‑element patterns, order of tuples is not defined. | Specify **lexicographic order** over the sequence of bound identifiers (in pattern order). Each identifier’s order is defined by `ORDER_CANONICAL` on the node/edge identifier. |
+| **O2** | **Short‑circuit “allowed” breaks determinism** – Different engines may evaluate different branches, changing read sets. | **Require short‑circuit evaluation** (left‑to‑right) and **mandate that read sets include dependencies of both branches** (i.e., always record reads from the unevaluated branch as if it were evaluated). Alternatively, forbid short‑circuit and always evaluate fully. |
+| **O3** | **Read trace construction for pattern matching** – No specification of how extent reads, adjacency traversals, etc., are recorded. | Define that for each type extent scan (e.g., all nodes of type `Person`), a read of `extent_version[type]` is recorded. For each adjacency test, record `adjacency_version[node][type][dir]`. |
+| **O4** | **Duplicate `UpdateField` detection** – Unclear when and how to detect. | Make it a **static fatal error** at IR load time (duplicate updates to same `(id, field)` in a single action block). For updates that become duplicates only after earlier creations (e.g., two updates to a newly created node), detect during `PLAN` by simulating side‑effects and reject the match non‑fatally. |
+| **O5** | **Fixed‑point arithmetic incompleteness** – Missing: rounding mode, scale propagation, promotion for `+`/`-`, division rounding. | Adopt **truncation toward zero** as rounding mode. Define **result scale** as `max(scale_left, scale_right)` for `+`, `-`, `*`; for `/`, result scale = `scale_left`. For mixed Integer+Fix, promote Integer to Fix with scale 0. Document all in the spec (no external references). |
+| **O6** | **Score overflow fatal** – `base_priority * priority_scale + age * fairness_scale` easily overflows 64‑bit. | Use **saturating arithmetic** clamped to `INT64_MAX` (or `INT64_MIN` for negative scores). Never fatal. Or use 128‑bit intermediate then clamp. |
+
+---
+
+### 🟡 Design Weaknesses & Scalability Concerns
+
+| # | Problem | Recommended Fix |
+|---|---------|----------------|
+| **D1** | **Unbounded `M_prev` growth** – Stores every match ever seen, leading to memory explosion. | Add a **pruning policy**: discard `match_key` entries whose age exceeds a configurable threshold (e.g., 1,000,000) or after they have not appeared for N ticks. Document that this preserves determinism because age can be bounded. |
+| **D2** | **Version counters per field and adjacency** – Huge state overhead. | While correct, add a **non‑normative note** that implementations may use a global “epoch” counter plus per‑element dirty bits as an optimisation, as long as the observable version increment semantics are preserved. |
+| **D3** | **Global rollback model not formally defined** – “Rollback‑able” but no mechanism. | Define that all mutations during `COMMIT` are applied to a **copy** `G_temp`. If validation passes, `G` is replaced by `G_temp` atomically. On fatal error, discard `G_temp`. |
+| **D4** | **Event payload evaluation ambiguity** – Pre‑commit vs. post‑commit. | **Explicitly choose pre‑commit** (as written). Add a note: “Payloads are evaluated using the graph state before any mutation in the current tick. This ensures event ordering is independent of action ordering.” |
+
+---
+
+### 🟢 Minor but Necessary Clarifications
+
+| # | Problem | Recommended Fix |
+|---|---------|----------------|
+| **M1** | **Identifier format `type:seq`** – Colon may appear in type names. | Restrict type names to `[A-Za-z_][A-Za-z0-9_]*` (no colon). |
+| **M2** | **UTF‑8 string ordering** – No normalization policy. | Require strings to be **NFC normalized** before comparison and hashing. |
+| **M3** | **Map literal iteration order** – Must match `ORDER_CANONICAL`. | Specify that map fields are processed in **lexicographic order of keys** (UTF‑8 bytewise). |
+| **M4** | **Fixed‑point canonical string format** – Scale 0 example `"42.0"` contradicts usual practice. | Keep `"42.0"` but justify: always show decimal point and exactly `scale` digits, even when scale=0. |
+| **M5** | **Error code `ADJACENCY_COUNTER_MISSING`** – Unused. | Either remove it or define when it triggers (e.g., missing entry in adjacency version map). |
+| **M6** | **Version number inconsistency in spec (v0.50 vs v1.0)** | Declare the document as **v1.0** and fix all headings. |
+
+---
+
+### 🔧 Specific Changes to the SOS Rules
+
+1. **Replace `T` with `tick_counter`**  
+   - State becomes `⟨G, C, M_prev⟩` (remove `T`).  
+   - `C` contains `tick_counter`.  
+   - `TICK` rule: increment `tick_counter`.  
+   - `COMMIT` rule: output `C'` with `tick_counter+1` (no separate increment).  
+   - Golden file `tick_number` equals `tick_counter`.
+
+2. **Add `NO_MATCH` rule**  
+   ```
+   M = ∅
+   ──────────────────────────────────────────────────────────────
+   ⟨⟨G, C, M_prev⟩, IR⟩ → ⟨⟨G, C[tick_counter+1], ∅⟩, IR⟩
+   ```
+
+3. **Extend read trace with versions**  
+   ```
+   ℛ_m ::= { Read(kind, id, version) }
+   ```
+   Example: `NodeExistence(id, v)` where `v = existence_version[id]` at discovery time.  
+   Validation: `current_version(id) == recorded_version`.
+
+4. **Modify `SELECT` to work on `M_remaining`**  
+   - After `DISCOVER`, set `M_remaining = M`.  
+   - `SELECT` picks highest‑scoring from `M_remaining`.  
+   - On non‑fatal failure, `M_remaining := M_remaining \ {m*}` and `SELECT` repeats.  
+   - If `M_remaining` empty, go to `NO_MATCH`.
+
+---
+
+### ✅ Compatibility with the Provided Grammar
+
+The grammar (Grisp Grammar v0.01) is a **concrete frontend syntax**. The kernel specification defines a **Canonical IR** (JSON). They can be mapped as follows:
+
+| Grammar construct | Kernel IR equivalent |
+|------------------|----------------------|
+| `match` block with multiple patterns | Sequence of `MatchNode` / `MatchEdge` in canonical order |
+| `where` expression | Constraint `φ` |
+| `let` block | Let bindings `B` |
+| `actions` block | Action block `A` |
+| `CreateNode` / `CreateEdge` with `with {...}` | `CreateNode` / `CreateEdge` with field map |
+| `init` block | Initial state `G` and counters `C` |
+
+**No conflicts.** However, the kernel spec must ensure that the grammar’s implicit ordering (e.g., pattern order) maps to the kernel’s canonical ordering. Recommendation: explicitly define that patterns in the source grammar are processed in the order they appear, and that this order determines the tuple lexicographic order.
+
+---
+
+### 📋 Summary of Required Spec Revisions
+
+1. **Fix tick semantics** – single counter, remove `T`, add `NO_MATCH`.
+2. **Add versioned read traces** – store counters, define validation.
+3. **Fix retry loop** – remove failing matches from candidate set.
+4. **Define total order for multi‑pattern matches** – lexicographic over bound identifiers.
+5. **Make short‑circuit deterministic** – required left‑to‑right with read sets from both branches.
+6. **Complete fixed‑point arithmetic** – rounding, scale, promotion.
+7. **Change score overflow to saturating** – never fatal.
+8. **Add `M_prev` pruning** – configurable age threshold.
+9. **Clarify event payload evaluation** – pre‑commit.
+10. **Remove version contradictions** – make it v1.0.
+
+After these changes, the specification will be **fatal‑error free**, **deterministic by construction**, and **compatible** with the proposed grammar. The conformance test suite must include edge cases for all fixed points (e.g., duplicate updates, empty match sets, overflow saturation).
+
+
+**Key problems in the current GRISP Deterministic Kernel spec**
+
+| # | Problem | Why it matters | Recommended fix |
+|---|----------|----------------|-----------------|
+| **1** | **Double tick increment** – `T` is increased in both Rule 1 (TICK) and Rule 5 (COMMIT). | Breaks the “one‑step‑per‑tick” invariant and makes the golden‑file tick count drift. | Choose a single authoritative tick counter (e.g., keep `tick_counter` only). Remove the `T+1` in COMMIT or make TICK update only `tick_counter` and let `T` be defined as `tick_counter`. |
+| **2** | **Missing transition for an empty match set** – the SOS never defines what happens when `M` is empty after DISCOVER. | The engine would get stuck; the spec claims “tick ends with no commit” but provides no rule. | Add an explicit rule `NO_MATCH` that consumes the current configuration, increments the tick counter (or leaves it unchanged if you keep a single counter) and clears the temporary match artefacts. |
+| **3** | **Read‑trace lacks version data** – `ℛ_m` records *what* was read, but validation requires the *version* that was observed. | Validation cannot be performed; implementations will diverge. | Extend `ℛ_m` to a set of tuples `<read_kind, element_id, version_at_read>`. Define a canonical way to capture the version (e.g., the exact counter field listed in §1). |
+| **4** | **Non‑fatal rejection loop** – after a validation failure the spec says “discard `m*` and go back to SELECT” without removing the match from `M`. | The same match can be selected repeatedly, leading to an infinite loop. | When a match is discarded, add it to a `rejected` set for the current tick and exclude it from subsequent SELECT steps. When `M` is exhausted, fall back to the `NO_MATCH` rule. |
+| **5** | **Ambiguous total order for pattern enumeration** – only a simple identifier order is described; multi‑element patterns have no defined ordering of the tuple of bindings. | Different engines could enumerate matches in different orders, breaking determinism. | Define a lexicographic order on the **entire binding tuple** `(id₁, id₂, …)` using `ORDER_CANONICAL` for each component. State this explicitly in the DISCOVER rule. |
+| **6** | **`match_key` canonicalization is underspecified** – JSON serialization must be deterministic, but whitespace, key order, and identifier formatting are not fully defined. | Two conformant engines could generate different keys, affecting tie‑breaking. | Provide a precise algorithm: (1) sort map keys by `ORDER_CANONICAL`, (2) emit no whitespace, (3) encode identifiers as `type:seq` with `seq` zero‑padded to a fixed width, (4) use UTF‑8 bytewise order for strings. |
+| **7** | **Short‑circuit semantics for `&&`/`||`** – the spec says “allowed”, which can change the read set. | A match that short‑circuits may have a smaller `ℛ_m` than one that evaluates both sides, leading to nondeterministic validation. | Change the wording to “short‑circuit required” and require that **both** operands are evaluated for the purpose of building the read trace, even if the logical result is already known. |
+| **8** | **Fixed‑point string representation** – scale‑0 numbers may be serialized as `"42"` or `"42.0"`; the spec mixes conventions. | Inconsistent golden‑file output. | Enforce a canonical format: always include a decimal point and exactly `scale` digits after it (e.g., `"42.0"` for scale 0, `"12.5000"` for scale 4). |
+| **9** | **Overflow in the scoring function** – `score = base_priority·scale + age·fairness` can overflow 64‑bit before the fatal check. | Long‑running systems may halt abruptly. | Compute the score in a wider integer type (e.g., 128‑bit) and then apply a deterministic overflow policy (e.g., saturate to `INT64_MAX` and treat as a non‑fatal “score‑overflow” that forces the match to be discarded). |
+| **10** | **Version‑increment table is incomplete / double‑counts** – adjacency counters are incremented both by `DeleteNode` expansion and by `DeleteEdge`. | Different engines may produce different adjacency versions. | Clarify that each adjacency counter is incremented **once per edge** regardless of how the edge is removed. Remove the “+1 per incident edge (after dedup)” entry for `DeleteNode` and rely on the explicit `DeleteEdge` actions. |
+| **11** | **`M_prev` unbounded growth** – the map stores an entry for every distinct match ever seen. | Memory blow‑up for long runs. | Introduce a retention policy: keep entries only for matches that appear in the *current* discovery set, or prune entries older than a configurable number of ticks. |
+| **12** | **Missing concrete type system / IR validation** – the spec references “type errors” but never defines the typing rules for node/edge definitions, field types, or expression typing. | Implementers cannot reliably reject malformed IR. | Add a formal typing section: (a) primitive types (Int, FixedPoint, Bool, String, Identifier), (b) field type declarations, (c) expression typing rules, (d) rule‑level well‑formedness checks (unique rule ids, no duplicate field names, all mandatory fields present). |
+| **13** | **Event payload evaluation timing** – the spec says “payloads evaluated against pre‑commit state” but also that actions are compiled into `α̂`. | Ambiguity for payloads that reference fields updated earlier in the same trace. | State explicitly that **all** expressions in an `EmitEvent` are evaluated **before** any state changes of the current tick (i.e., on the snapshot taken at DISCOVER). Document the rationale. |
+| **14** | **Unspecified direction enum for adjacency version** – `adjacency_version[node][type][dir]` has no defined enum (`in`, `out`, `both`). | Implementations may choose different conventions. | Define `dir ∈ {in, out, undirected}` and specify that for directed edges only `out` (source) and `in` (target) are used; for undirected edges both are updated. |
+| **15** | **Missing rule for “no‑op writes do nothing”** – the spec does not define when a field update is considered a no‑op (e.g., numeric equality vs. string representation). | Different engines may increment version counters for writes that leave the value unchanged. | Define a no‑op as “the new value is *identical* to the old value under the canonical serialization of the type”. If a write is a no‑op, it does not affect any version counters. |
+| **16** | **No explicit handling of `RESOURCE_LIMIT_EXCEEDED`** – the error code exists but no limits are defined. | Engines cannot know when to raise it. | Add a section “Resource limits” that defines (a) maximum size of `M`, (b) maximum depth of `M_prev`, (c) maximum length of `α̂`. Specify that exceeding any limit triggers `RESOURCE_LIMIT_EXCEEDED`. |
+| **17** | **Inconsistent version identifiers** – `extent_version`, `predicate_version`, `ordering_dependency_version` appear in the state model but never used in validation. | Unclear purpose, possible dead code. | Either remove them from the model or integrate them into the validation step (e.g., `extent_version` must be unchanged for any node‑type extent read during DISCOVER). |
+| **18** | **Missing rule for “tick counter overflow” handling** – the spec treats overflow as fatal but gives no recovery path. | Long‑running deployments will inevitably hit the limit. | Define a deterministic wrap‑around: when `tick_counter` would overflow, reset all version counters to zero and re‑hash the graph state, emitting a special `COUNTER_WRAP` event in the golden file. |
+
+---
+
+### Aligning the **Grisp Grammar (v0.01)** with the kernel
+
+| Grammar element | Kernel counterpart | Suggested adjustment |
+|-----------------|-------------------|----------------------|
+| `module_decl` | Not present in the kernel spec | Add an optional `module` field to the top‑level configuration; it can be ignored by the kernel but useful for namespacing. |
+| `type_decl` (node/edge) | `G` type definitions | Ensure each `type_decl` includes a **mandatory field list**; the kernel must reject a `CreateNode` that omits any mandatory field. |
+| `rule_decl` (priority, scale, fairness) | `Rule(rule_id, base_priority, priority_scale, fairness_scale, …)` | Rename `scale` → `priority_scale` and `fairness` → `fairness_scale` to match the spec. |
+| `match_block` → `pattern` | `P` (MatchNode/MatchEdge) | Extend the grammar to distinguish node vs. edge patterns, e.g., `MatchNode` and `MatchEdge` syntax, and enforce the `ascending identifier order` rule. |
+| `where_block` → `expr` | `φ` (constraints) | Require that the expression language used here follows the same short‑circuit semantics defined in the kernel (both operands evaluated for read‑trace). |
+| `let_block` → `let_stmt` | `B` (let bindings) | Explicitly state that let bindings do **not** affect `match_key`. If a let binding reads graph state, its read must be added to `ℛ_m`. |
+| `actions_block` → `action_stmt` | `A` (action sequence) | For each action, define the exact read‑set that it contributes (e.g., `CreateNode` reads the type’s extent version). |
+| `init_block` → `create node` | Initial graph construction | The grammar should enforce that every mandatory field is supplied; otherwise the kernel must raise a fatal `INVALID_IR`. |
+| `map_literal` / `list_expr` | Field initializations and event payloads | Ensure that map literals are serialized in a deterministic order (keys sorted) to match the kernel’s canonical JSON rules. |
+
+**Additional grammar recommendations**
+
+1. **Explicit identifier format** – restrict `<ident>` to `[A-Za-z_][A-Za-z0-9_]*` and forbid `:` to avoid ambiguity with the `type:seq` identifier used internally.  
+2. **Normalization rule** – require all string literals to be NFC‑normalized before being stored; this guarantees the same ordering across platforms.  
+3. **Typed literals** – add a syntax for fixed‑point literals that includes the scale, e.g., `12.5#4` meaning scale 4.  
+4. **Constraint syntax** – allow boolean operators `&&` and `||` but make their evaluation *eager* for the purpose of building the read set, while preserving short‑circuit semantics for the logical result.  
+5. **Version‑aware map literals** – when a map literal is used in `CreateNode` or `UpdateField`, the kernel should treat each key‑value pair as a separate read/write; the grammar can annotate this with a comment if needed.
+
+---
+
+### Recommended next steps
+
+1. **Produce a revised kernel specification** that incorporates the fixes above (especially the tick handling, empty‑match rule, version‑snapshot in `ℛ_m`, and deterministic ordering).  
+2. **Update the grammar** to reflect the clarified kernel constructs (explicit pattern types, deterministic map ordering, fixed‑point literal syntax).  
+3. **Create a minimal conformance test suite** (e.g., a handful of programs exercising empty matches, duplicate updates, overflow, and event payloads) to validate the revised spec.  
+4. **Add a formal proof sketch** that references the newly added deterministic ordering and version‑snapshot definitions, to close the determinism theorem gap.  
+
+---
+
+**Follow‑up question:**  
+Which of these recommendations would you like to prioritize for the next revision—fixing the core SOS inconsistencies (tick handling, empty‑match rule, version snapshot) or aligning the grammar with the deterministic semantics?
+
+
+The recommendations are in, try and come to a concensus.
+
+

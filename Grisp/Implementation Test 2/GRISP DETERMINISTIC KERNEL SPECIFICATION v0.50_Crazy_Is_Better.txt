@@ -1,0 +1,453 @@
+# GRISP DETERMINISTIC KERNEL SPECIFICATION – Version 0.50
+
+## Unified DSOS (Deterministic Structural Operational Semantics) Edition  
+
+---
+
+### Preamble
+
+This specification defines the GRISP Deterministic Kernel as a **closed, formally deterministic graph‑rewrite calculus**. It supersedes all previous versions (v0.49, v0.50, v0.51, v0.60) and resolves their architectural inconsistencies by unifying pattern matching, dependency tracking, action compilation, and commit into a **single structural operational semantics with trace projection**.
+
+For identical Canonical IR and identical initial state, all conformant engines MUST produce identical observable behavior:
+- Committed state transitions
+- Emitted events
+- Golden file output
+
+All normative rules are mandatory. No hidden nondeterminism, runtime inference, or dual semantic models are permitted.
+
+---
+
+## 0. Core Principles
+
+1. **Single semantic object** – State is a tuple `⟨G, C, T, M_prev⟩` with no hidden runtime artifacts.
+2. **Determinism by construction** – All choice points eliminated via total orders and structural recursion.
+3. **Read effects as derivation** – Dependencies are induced by syntax‑directed translation, not tracked by a separate subsystem.
+4. **Canonical Action Trace (CAT)** – The execution trace is a projection of the compilation derivation.
+5. **Atomic commit** – Validation, application, and counter update form a single, rollback‑able step.
+
+---
+
+## 1. State Model
+
+A configuration is:
+
+```
+Σ = ⟨G, C, T, M_prev⟩
+```
+
+- **G** – Typed property graph (nodes, edges, fields, identifiers). No nulls, all fields mandatory.
+- **C** – Counters (signed 64‑bit integers):
+  - `tick_counter` (starts at 0)
+  - Sequence counters per node/edge type (start at 0 or max+1 from initial state)
+  - Version counters:  
+    `extent_version[type]`,  
+    `predicate_version[type][field]`,  
+    `ordering_dependency_version[type][field]`,  
+    `edge_type_version[type]`,  
+    `edge_predicate_version[type][field]`,  
+    `edge_ordering_dependency_version[type][field]`,  
+    `adjacency_version[node][type][dir]`,  
+    `existence_version[node/edge]`,  
+    `field_version[element][field]`
+- **T** – Current tick number (non‑negative integer)
+- **M_prev** – Previous match set: a map from `match_key` to `age` (integer). Initialized empty.
+
+**Invariants** (checked after each commit):
+- No dangling edges (source/target exist)
+- No dangling identifier references (recursively through lists/maps)
+- All declared constraints satisfied
+- No cycles in identifier references (detected via visited set)
+
+---
+
+## 2. Canonical IR Syntax (Inductive)
+
+The IR is a deterministic, canonical JSON format. Below is its inductive definition.
+
+### 2.1 Expressions
+
+```
+e ::= k                           // literal (Integer, FixedPoint(s), Boolean, String, Identifier)
+    | x                           // variable (pattern binding or let)
+    | x.f                         // field access
+    | e1 ⊕ e2                     // binary operator
+    | len(e)                      // list length
+    | to_fixed(e, scale)          // conversion to FixedPoint
+    | to_integer(e)               // truncation to Integer
+
+⊕ ::= + | - | * | / | // | % | < | <= | > | >= | == | != | && | ||
+```
+
+All operations have checked semantics (overflow → fatal). Short‑circuit allowed for `&&` and `||`.
+
+### 2.2 Patterns
+
+```
+P ::= ∅
+    | MatchNode(x, type_name) · P
+    | MatchEdge(x, type_name, src, tgt) · P
+```
+
+Enumerated in **ascending identifier order** (type_name lexicographic, then sequence number).
+
+### 2.3 Constraints (where clause)
+
+```
+φ ::= True
+    | e1 == e2
+    | e1 < e2
+    | φ1 && φ2
+    | (φ)
+```
+
+Evaluated left‑to‑right, short‑circuit allowed.
+
+### 2.4 Let Bindings
+
+```
+B ::= ∅
+    | Let(x, e) · B
+```
+
+Evaluated during discovery; do **not** affect match identity or match_key.
+
+### 2.5 Actions
+
+```
+a ::= CreateNode(x, type_name, {f1: e1, ...})
+    | CreateEdge(x, type_name, src, tgt, {f1: e1, ...})
+    | UpdateField(target, field, e)
+    | DeleteEdge(e)
+    | DeleteNode(x)
+    | EmitEvent(event_type, [e1, ...])
+```
+
+### 2.6 Rule Definition
+
+```
+Rule ::= Rule(rule_id, base_priority, priority_scale, fairness_scale, P, φ, B, A)
+```
+
+- `rule_id` – string matching `[A-Za-z_][A-Za-z0-9_-]*`
+- Priorities: non‑negative integers
+- `A` – action block (sequence of actions)
+
+---
+
+## 3. Deterministic Ordering (ORDER_CANONICAL)
+
+For any two values `x` and `y`:
+
+- **Strings**: UTF‑8 bytewise lexicographic.
+- **Identifiers**: compare `(type_name, sequence_number)` lexicographically (type_name UTF‑8, then numeric).
+- **Lists**: element‑wise lexicographic.
+- **Maps**: compare keys in UTF‑8 order, then values.
+
+Used for:
+- Pattern enumeration (nodes by id, edges by id)
+- Sorting incident edges for implicit `DeleteNode` expansion
+- `match_key` ordering
+- Map literal iteration
+- Tie‑breaking for `min`/`max`/`sort`
+
+---
+
+## 4. Numeric Model
+
+- All integers: signed 64‑bit.
+- Fixed‑point: scaled integers, scale 0–18 inclusive, serialized as **strings** (e.g., `"12.50"`).
+- Arithmetic rules (v0.49):
+  - Mixed promotion: Integer → FixedPoint(0) when combined with FixedPoint in `*` or `/`.
+  - Overflow and division by zero → **fatal**.
+  - Fixed‑point division uses big‑integer intermediates, checked on final result.
+- Literal conversion rules from v0.49 apply.
+
+---
+
+## 5. Operational Semantics (Small‑Step SOS)
+
+The kernel executes via **five deterministic transition rules**:
+
+```
+⟨Σ, IR⟩ → ⟨Σ', IR⟩
+```
+
+### Rule 1: TICK
+
+```
+tick_counter < INT64_MAX
+──────────────────────────────────────────────────────────────
+⟨⟨G, C, T, M_prev⟩, IR⟩ → ⟨⟨G, C[tick_counter + 1], T+1, M_prev⟩, IR⟩
+```
+
+If overflow → fatal `COUNTER_OVERFLOW`.
+
+### Rule 2: DISCOVER
+
+Define `EvalPatterns(G, IR) = M` as the total set of matches obtained by:
+
+- Enumerating pattern bindings in ascending identifier order.
+- Evaluating constraints and let bindings in order.
+- Each match `m` contains:
+  - `match_key` = canonical JSON serialization of `(rule_id, bindings)`
+  - `bindings` (identifier bindings only)
+  - `let_values` (diagnostic only)
+  - **read trace** `ℛ_m` of all graph elements accessed (node existence, field reads, adjacency, extents, edge types).
+
+Age assignment:
+
+```
+age(m) = if match_key(m) ∈ M_prev then M_prev[match_key(m)] + 1 else 0
+```
+
+Overflow → fatal `COUNTER_OVERFLOW`.
+
+Transition:
+
+```
+⟨⟨G, C, T, M_prev⟩, IR⟩ → ⟨⟨G, C, T, M_prev, M⟩, IR⟩
+```
+
+### Rule 3: SELECT
+
+For each match `m ∈ M`:
+
+```
+score(m) = base_priority(m) × priority_scale(m) + age(m) × fairness_scale(m)
+```
+
+Checked arithmetic; overflow → fatal `INTEGER_OVERFLOW`.
+
+Total order:
+
+1. Higher score first.
+2. If tie, lexicographically smaller `match_key` (ORDER_CANONICAL).
+
+Let `m*` be the first match (if any). If `M` empty → tick ends with no commit.
+
+Transition:
+
+```
+⟨⟨G, C, T, M_prev, M⟩, IR⟩ → ⟨⟨G, C, T, M_prev, M, m*⟩, IR⟩
+```
+
+### Rule 4: PLAN (Syntax‑Directed Compilation)
+
+Define `Compile(IR, G, m*)` by **structural recursion** over the rule’s action block `A`. It produces a **Canonical Action Trace** `α̂` (primitive action sequence) and a **read set** `ℛ`.
+
+The judgment:
+
+```
+ℰ ⊢ ⟨A, G⟩ ⇓ ⟨α̂, ℛ⟩
+```
+
+where `ℰ` is the environment from `m*` bindings.
+
+**Base case (empty block):**
+
+```
+ℰ ⊢ ⟨∅, G⟩ ⇓ ⟨[], ∅⟩
+```
+
+**UpdateField:**
+
+```
+ℰ ⊢ ⟨e, G⟩ ⇓ ⟨v, ℛ_e⟩   x_id = ℰ(x)   ℰ ⊢ ⟨A_tail, G⟩ ⇓ ⟨α̂_tail, ℛ_tail⟩
+────────────────────────────────────────────────────────────────────────────
+ℰ ⊢ ⟨UpdateField(x, f, e) · A_tail, G⟩ ⇓ ⟨[UpdateField(x_id, f, v)] · α̂_tail,
+                                            ℛ_e ∪ {NodeExistence(x_id), FieldRead(x_id,f)} ∪ ℛ_tail⟩
+```
+
+**DeleteNode (with implicit edge deletion):**
+
+```
+x_id = ℰ(x)
+edges = GetIncidentEdgesSorted(x_id, G)   // ORDER_CANONICAL by edge identifier
+α̂_edges = [DeleteEdge(e) for e in edges]
+ℛ_edges = ⋃_{e∈edges} {Adjacency(x_id, e), EdgeExistence(e)}
+ℰ ⊢ ⟨A_tail, G⟩ ⇓ ⟨α̂_tail, ℛ_tail⟩
+──────────────────────────────────────────────────────────────────────────────
+ℰ ⊢ ⟨DeleteNode(x) · A_tail, G⟩ ⇓ ⟨α̂_edges · [DeleteNode(x_id)] · α̂_tail,
+                                    ℛ_edges ∪ {NodeExistence(x_id)} ∪ ℛ_tail⟩
+```
+
+**CreateNode, CreateEdge, EmitEvent** – similar structural rules, each recording appropriate reads (e.g., source/target existence for edge creation).
+
+**Context‑freeness invariant:** The evaluation of any subterm depends only on:
+- the subterm itself
+- the immutable environment `ℰ`
+- the fixed graph snapshot `G`
+
+**not** on traversal history or incidental ordering.
+
+If compilation encounters a non‑fatal validation error (duplicate field update, missing target), the candidate `m*` is discarded and SELECT is re‑invoked.
+
+Transition:
+
+```
+⟨⟨G, C, T, M_prev, M, m*⟩, IR⟩ → ⟨⟨G, C, T, M_prev, M, m*, α̂, ℛ⟩, IR⟩
+```
+
+### Rule 5: COMMIT
+
+**Premises:**
+
+1. **Version validation:** For every read `r ∈ ℛ`:
+   - `NodeExistence(id)` → node exists and its `existence_version` equals the version recorded during DISCOVER.
+   - `FieldRead(id,f)` → `field_version[id][f]` unchanged.
+   - `EdgeExistence`, `Adjacency`, `Extent`, etc. similarly.
+
+2. **Structural validation:**
+   - No duplicate `UpdateField` on same `(id, f)`.
+   - All targets exist (or are created earlier in `α̂`).
+   - No dangling identifiers after applying `α̂`.
+   - All constraints satisfied.
+
+3. **Counter overflow pre‑check:** For every counter that would be incremented (sequence counters, version counters, adjacency counters), ensure `post_value ≤ INT64_MAX`. If any overflow → fatal.
+
+If any validation fails (non‑fatal) → discard `m*` and go back to SELECT. Fatal errors halt and rollback.
+
+**Application:**
+
+- Apply each step in `α̂` in order to `G` → `G'`.
+- Update counters `C → C'` according to the version increment table (see §6).
+- Emit events in the order they appear in `α̂` (payloads evaluated against pre‑commit state).
+
+**Match history update:**
+
+```
+M_prev' = { match_key(m) → age(m) | m ∈ M }
+```
+
+(All matches from the discovery snapshot, not only the committed one.)
+
+Transition:
+
+```
+⟨⟨G, C, T, M_prev, M, m*, α̂, ℛ⟩, IR⟩ → ⟨⟨G', C', T+1, M_prev'⟩, IR⟩
+```
+
+---
+
+## 6. Version Increment Rules (Derived from Compile)
+
+The following table shows counter changes **only when a mutation actually occurs** (No‑Op writes do nothing). These are consequences of the structural compilation semantics.
+
+| Operation              | extent | pred(node) | order(node) | edge_pred | edge_order | edge_type | adjacency (source.out, target.in) | existence | field_vers |
+|------------------------|--------|------------|-------------|-----------|------------|-----------|-----------------------------------|-----------|------------|
+| CreateNode             | +1     | +1 (all)   | +1 (all)    | -         | -          | -         | -                                 | set to 1  | set to 1 each |
+| DeleteNode             | +1     | +1 (all)   | +1 (all)    | -         | -          | -         | +1 per incident edge (after dedup)| removed   | removed    |
+| CreateEdge             | -      | -          | -           | +1 (all)  | +1 (all)   | +1        | +1 source.out, target.in          | set to 1  | set to 1 each |
+| DeleteEdge             | -      | -          | -           | -         | -          | +1        | +1 source.out, target.in          | removed   | removed    |
+| UpdateField (node)     | -      | +1 (that)  | +1 (that)   | -         | -          | -         | -                                 | -         | +1 (that)  |
+| UpdateField (edge)     | -      | -          | -           | +1 (that) | +1 (that)  | -         | -                                 | -         | +1 (that)  |
+
+- `+1 (all)` – increment for every field of that type.
+- `+1 (that)` – increment only for the specific field.
+- Adjacency increments occur exactly once per edge per endpoint, deduplicated using the earliest occurrence in `α̂`.
+
+---
+
+## 7. Canonical Serialization (Golden File)
+
+Output is UTF‑8 JSON with lexicographically sorted keys, no extra whitespace.
+
+- **Integer** – JSON number, no leading zeros.
+- **FixedPoint** – JSON string with decimal point and exactly scale digits (e.g., `"42.0"` for scale 0).
+- **Boolean** – `true`/`false`.
+- **String** – double‑quoted, escaping `\`, `"`, `\n`, `\r`, `\t`, other controls as `\uXXXX`.
+- **Identifier** – string containing `type:seq` (e.g., `"Person:5"`).
+- **List** – `[e1,e2,...]`.
+- **Map** – `{"k1":v1,"k2":v2,...}` (keys sorted by ORDER_CANONICAL).
+
+### Top‑level golden file structure
+
+```json
+{
+  "ir_schema_version": "1.0",
+  "type_definitions_hash": "<hex>",
+  "initial_state": { ... },
+  "ticks": [ ... ],   // or "error" if fatal
+  "final_state": { ... }
+}
+```
+
+### Tick record
+
+```json
+{
+  "tick_number": 0,
+  "selected_match_key": { "rule_id": "...", "bindings": {...} } | null,
+  "committed_changes": [ ... ],
+  "events": [ { "rule_id": "...", "payload": ... } ]
+}
+```
+
+### Error object
+
+```json
+{
+  "code": "COUNTER_OVERFLOW",
+  "context": { "location": 0, "snapshot": [...] },
+  "state": { ... },
+  "tick": 0
+}
+```
+
+Allowed error codes:  
+`INTEGER_OVERFLOW`, `DIVISION_BY_ZERO`, `COUNTER_OVERFLOW`, `INDEX_OUT_OF_BOUNDS`, `MISSING_MAP_KEY`, `INVALID_IR`, `INVARIANT_VIOLATION`, `ADJACENCY_COUNTER_MISSING`, `RESOURCE_LIMIT_EXCEEDED`.
+
+---
+
+## 8. Determinism Theorem
+
+**Theorem:** For any configuration `⟨Σ, IR⟩`, there is at most one `⟨Σ', IR⟩` such that `⟨Σ, IR⟩ → ⟨Σ', IR⟩`. Consequently, for a given initial state and IR, all conformant engines produce identical observable behavior.
+
+**Proof sketch:**
+
+- `EvalPatterns` is a total function over `G` and `IR` – no choice.
+- `ComputeAge` is a pure lookup.
+- Selection (`SELECT`) is a total order (score descending, then `match_key` ascending).
+- `Compile` is defined by structural induction; each clause yields a unique `(α̂, ℛ)` due to canonical ordering and context‑freeness.
+- `COMMIT` validation and application are pure functions.
+- No other transition rules exist.
+
+Thus the transition relation is deterministic.
+
+---
+
+## 9. Error Model
+
+| Category | Example | Effect |
+|----------|---------|--------|
+| **Fatal** | counter overflow, division‑by‑zero, invariant breach, missing map key, index out of bounds | Immediate halt, rollback to pre‑tick state, emit error snapshot |
+| **Non‑fatal** | stale read, duplicate field update, missing target | Discard current match, retry selection with next candidate |
+
+Fatal errors use the codes in §7. Non‑fatal errors are not recorded in golden files.
+
+---
+
+## 10. Conformance
+
+A conformant engine **must**:
+
+- Implement the SOS rules exactly as defined.
+- Reject invalid IR (type errors, malformed identifiers, duplicate rule ids, etc.).
+- Enforce all deterministic ordering and overflow checks.
+- Produce identical golden files for identical IR and initial state.
+
+All normative content in this specification is mandatory.  
+The companion conformance test suite provides exact IR inputs and expected golden outputs.
+
+---
+
+## 11. Relationship to Previous Versions
+
+- **v0.49** – A complete, implementable specification whose dependency extraction and validation rules are preserved as a concrete implementation strategy.
+- **v0.50** – An architectural proposal whose Canonical Action Graph (CAG) corresponds to the trace `α̂` in this specification.
+- **v0.60/v0.51** – Intermediate synthesis steps.
+- **This v1.0 (Unified DSOS)** – The closed, formally deterministic kernel that resolves earlier contradictions and provides a single semantic foundation.
+
+---
+
+*End of GRISP Deterministic Kernel Specification v0.5*

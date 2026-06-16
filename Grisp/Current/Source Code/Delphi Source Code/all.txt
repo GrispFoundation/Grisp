@@ -1,0 +1,5786 @@
+unit unit_Builder_TGrispGraphBuilder_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.IOUtils,
+  unit_Parser_TGrispUnifiedParser_version_001,
+  unit_Graph_TGrispGraph_version_001,
+  unit_Debug_TGrispDebug_version_001;
+
+type
+  EGrispGraphBuilderError = class(Exception);
+
+  TGrispGraphBuilder = class
+  private
+    FSource: string;
+    FGraph: TGrispGraph;
+    FParser: TGrispUnifiedParser;
+    FFileName: string;
+    FDebugEnabled: Boolean;
+
+    procedure Debug(const Msg: string);
+    procedure DebugEnter(const Method: string);
+    procedure DebugExit(const Method: string);
+    procedure Initialize;
+    procedure Cleanup;
+  public
+    constructor Create(const ASource: string);
+    destructor Destroy; override;
+
+    procedure EnableDebug;
+    procedure DisableDebug;
+
+    function Build: TGrispGraph;
+    procedure Reload;
+
+    property Source: string read FSource write FSource;
+    property Graph: TGrispGraph read FGraph;
+    property FileName: string read FFileName;
+  end;
+
+// Simple function-based API
+function BuildGraphFromSource(const Source: string): TGrispGraph;
+function BuildGraphFromFile(const FileName: string): TGrispGraph;
+
+implementation
+
+function BuildGraphFromSource(const Source: string): TGrispGraph;
+var
+  Builder: TGrispGraphBuilder;
+begin
+  Builder := TGrispGraphBuilder.Create(Source);
+  try
+    Result := Builder.Build;
+  finally
+    Builder.Free;
+  end;
+end;
+
+function BuildGraphFromFile(const FileName: string): TGrispGraph;
+var
+  Source: string;
+begin
+  if not TFile.Exists(FileName) then
+    raise EGrispGraphBuilderError.CreateFmt('File not found: %s', [FileName]);
+
+  Source := TFile.ReadAllText(FileName);
+  Result := BuildGraphFromSource(Source);
+end;
+
+{ TGrispGraphBuilder }
+
+constructor TGrispGraphBuilder.Create(const ASource: string);
+begin
+  inherited Create;
+  FSource := ASource;
+  FFileName := '';
+  FDebugEnabled := False;
+  Initialize;
+  Debug('TGrispGraphBuilder created');
+end;
+
+destructor TGrispGraphBuilder.Destroy;
+begin
+  Debug('TGrispGraphBuilder destroyed');
+  Cleanup;
+  inherited Destroy;
+end;
+
+procedure TGrispGraphBuilder.EnableDebug;
+begin
+  FDebugEnabled := True;
+  TGrispDebug.Enable;
+  Debug('GraphBuilder debug enabled');
+  if Assigned(FParser) then
+    FParser.EnableDebug;
+end;
+
+procedure TGrispGraphBuilder.DisableDebug;
+begin
+  Debug('GraphBuilder debug disabled');
+  FDebugEnabled := False;
+  if Assigned(FParser) then
+    FParser.DisableDebug;
+end;
+
+procedure TGrispGraphBuilder.Debug(const Msg: string);
+begin
+  if FDebugEnabled then
+    TGrispDebug.Log('[GraphBuilder] ' + Msg);
+end;
+
+procedure TGrispGraphBuilder.DebugEnter(const Method: string);
+begin
+  if FDebugEnabled then
+	TGrispDebug.LogEnter('[GraphBuilder] ' + Method);
+end;
+
+procedure TGrispGraphBuilder.DebugExit(const Method: string);
+begin
+  if FDebugEnabled then
+    TGrispDebug.LogExit('[GraphBuilder] ' + Method);
+end;
+
+procedure TGrispGraphBuilder.Initialize;
+begin
+  DebugEnter('Initialize');
+  FGraph := TGrispGraph.Create;
+  Debug('Graph created');
+  FParser := TGrispUnifiedParser.Create(FSource, FGraph);
+  Debug('Parser created');
+  if FDebugEnabled then
+    FParser.EnableDebug;
+  DebugExit('Initialize');
+end;
+
+procedure TGrispGraphBuilder.Cleanup;
+begin
+  DebugEnter('Cleanup');
+  FreeAndNil(FParser);
+  Debug('Parser freed');
+  FreeAndNil(FGraph);
+  Debug('Graph freed');
+  DebugExit('Cleanup');
+end;
+
+function TGrispGraphBuilder.Build: TGrispGraph;
+begin
+  DebugEnter('Build');
+  Debug(Format('Source length: %d chars', [Length(FSource)]));
+
+  if FSource.IsEmpty then
+  begin
+    Debug('ERROR: Source is empty');
+    raise EGrispGraphBuilderError.Create('Source is empty');
+  end;
+
+  try
+    Debug('Calling FParser.ParseFile...');
+    FParser.ParseFile;
+    Debug('ParseFile completed successfully');
+
+    Debug('Calling FGraph.RegisterEdgesFromIdentifiers...');
+    FGraph.RegisterEdgesFromIdentifiers;
+    Debug('RegisterEdgesFromIdentifiers completed');
+
+    Debug(Format('Graph has %d nodes and %d edges', [FGraph.Nodes.Count, FGraph.Edges.Count]));
+
+    Result := FGraph;
+    FGraph := nil;  // Detach so it doesn't get freed with the builder
+    Debug('Graph detached from builder');
+
+    DebugExit('Build');
+  except
+    on E: Exception do
+    begin
+      Debug(Format('ERROR during build: %s', [E.Message]));
+      Cleanup;
+      raise;
+    end;
+  end;
+end;
+
+procedure TGrispGraphBuilder.Reload;
+begin
+  DebugEnter('Reload');
+  Cleanup;
+  if FFileName <> '' then
+  begin
+    Debug(Format('Reloading from file: %s', [FFileName]));
+    FSource := TFile.ReadAllText(FFileName);
+  end;
+  Initialize;
+  DebugExit('Reload');
+end;
+
+end.
+unit unit_Core_TGrispExpressionEvaluator_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.Math,
+  System.Generics.Collections,
+  unit_Core_TGrispValueBase_version_001,  // Changed: use Base unit directly
+  unit_Core_TGrispExpression_version_001;
+
+type
+  TGrispExpressionEvaluator = class
+  private
+    class function EvaluateLiteral(Expression: TGrispExpression): TGrispValue; static;
+    class function EvaluateVariable(Expression: TGrispExpression; Bindings: TDictionary<string, TGrispValue>): TGrispValue; static;
+    class function EvaluateUnary(Expression: TGrispExpression; Bindings: TDictionary<string, TGrispValue>): TGrispValue; static;
+    class function EvaluateBinary(Expression: TGrispExpression; Bindings: TDictionary<string, TGrispValue>): TGrispValue; static;
+    class function EvaluateCall(Expression: TGrispExpression; Bindings: TDictionary<string, TGrispValue>): TGrispValue; static;
+    class function RequireNumber(Value: TGrispValue; const Context: string): Double; static;
+    class function RequireBoolean(Value: TGrispValue; const Context: string): Boolean; static;
+    class procedure EnsureArgumentCount(Expression: TGrispExpression; Expected: Integer); static;
+  public
+    class function Evaluate(Expression: TGrispExpression; Bindings: TDictionary<string, TGrispValue>): TGrispValue;
+  end;
+
+implementation
+
+class function TGrispExpressionEvaluator.Evaluate(Expression: TGrispExpression; Bindings: TDictionary<string, TGrispValue>): TGrispValue;
+begin
+  if Expression = nil then Exit(nil);
+  case Expression.Kind of
+    gekLiteral: Result := EvaluateLiteral(Expression);
+    gekVariable: Result := EvaluateVariable(Expression, Bindings);
+    gekUnary: Result := EvaluateUnary(Expression, Bindings);
+    gekBinary: Result := EvaluateBinary(Expression, Bindings);
+    gekCall: Result := EvaluateCall(Expression, Bindings);
+  else
+    Result := nil;
+  end;
+end;
+
+class function TGrispExpressionEvaluator.EvaluateLiteral(Expression: TGrispExpression): TGrispValue;
+begin
+  if Assigned(Expression.Value) then
+    Result := TGrispValue(Expression.Value).Clone
+  else
+    Result := nil;
+end;
+
+class function TGrispExpressionEvaluator.EvaluateVariable(Expression: TGrispExpression; Bindings: TDictionary<string, TGrispValue>): TGrispValue;
+var BoundValue: TGrispValue;
+begin
+  if not Assigned(Bindings) then
+    raise Exception.Create('No variable bindings supplied');
+  if Bindings.TryGetValue(Expression.Name, BoundValue) then
+    Result := BoundValue.Clone
+  else
+    raise Exception.CreateFmt('Unbound variable "%s"', [Expression.Name]);
+end;
+
+class function TGrispExpressionEvaluator.EvaluateUnary(Expression: TGrispExpression; Bindings: TDictionary<string, TGrispValue>): TGrispValue;
+var Operand: TGrispValue;
+begin
+  Operand := Evaluate(Expression.Left, Bindings);
+  try
+    if SameText(Expression.OperatorSymbol, 'not') then
+    begin
+      Result := TGrispValue.Create(gvkBoolean);
+      Result.BoolValue := not RequireBoolean(Operand, 'not');
+      Exit;
+    end;
+    if Expression.OperatorSymbol = '-' then
+    begin
+      Result := TGrispValue.Create(gvkNumber);
+      Result.NumberValue := -RequireNumber(Operand, 'unary -');
+      Exit;
+    end;
+    raise Exception.CreateFmt('Unknown unary operator "%s"', [Expression.OperatorSymbol]);
+  finally
+    Operand.Free;
+  end;
+end;
+
+class function TGrispExpressionEvaluator.EvaluateBinary(Expression: TGrispExpression; Bindings: TDictionary<string, TGrispValue>): TGrispValue;
+var LeftValue, RightValue: TGrispValue; RightNumber: Double; LeftBool, RightBool: Boolean;
+begin
+  LeftValue := Evaluate(Expression.Left, Bindings);
+  RightValue := Evaluate(Expression.Right, Bindings);
+  try
+    if Expression.OperatorSymbol = '+' then
+    begin
+      Result := TGrispValue.Create(gvkNumber);
+      Result.NumberValue := RequireNumber(LeftValue, '+') + RequireNumber(RightValue, '+');
+      Exit;
+    end;
+    if Expression.OperatorSymbol = '-' then
+    begin
+      Result := TGrispValue.Create(gvkNumber);
+      Result.NumberValue := RequireNumber(LeftValue, '-') - RequireNumber(RightValue, '-');
+      Exit;
+    end;
+    if Expression.OperatorSymbol = '*' then
+    begin
+      Result := TGrispValue.Create(gvkNumber);
+      Result.NumberValue := RequireNumber(LeftValue, '*') * RequireNumber(RightValue, '*');
+      Exit;
+    end;
+    if Expression.OperatorSymbol = '/' then
+    begin
+      RightNumber := RequireNumber(RightValue, '/');
+	  if RightNumber = 0 then raise Exception.Create('Division by zero');
+      Result := TGrispValue.Create(gvkNumber);
+      Result.NumberValue := RequireNumber(LeftValue, '/') / RightNumber;
+      Exit;
+    end;
+    if SameText(Expression.OperatorSymbol, 'mod') then
+    begin
+      Result := TGrispValue.Create(gvkNumber);
+      Result.NumberValue := Trunc(RequireNumber(LeftValue, 'mod')) mod Trunc(RequireNumber(RightValue, 'mod'));
+      Exit;
+    end;
+    if Expression.OperatorSymbol = '=' then
+    begin
+      Result := TGrispValue.Create(gvkBoolean);
+      Result.BoolValue := RequireNumber(LeftValue, '=') = RequireNumber(RightValue, '=');
+      Exit;
+    end;
+    if Expression.OperatorSymbol = '<>' then
+    begin
+      Result := TGrispValue.Create(gvkBoolean);
+      Result.BoolValue := RequireNumber(LeftValue, '<>') <> RequireNumber(RightValue, '<>');
+      Exit;
+    end;
+    if Expression.OperatorSymbol = '<' then
+    begin
+      Result := TGrispValue.Create(gvkBoolean);
+      Result.BoolValue := RequireNumber(LeftValue, '<') < RequireNumber(RightValue, '<');
+      Exit;
+    end;
+    if Expression.OperatorSymbol = '>' then
+    begin
+      Result := TGrispValue.Create(gvkBoolean);
+      Result.BoolValue := RequireNumber(LeftValue, '>') > RequireNumber(RightValue, '>');
+      Exit;
+    end;
+    if Expression.OperatorSymbol = '<=' then
+    begin
+      Result := TGrispValue.Create(gvkBoolean);
+      Result.BoolValue := RequireNumber(LeftValue, '<=') <= RequireNumber(RightValue, '<=');
+      Exit;
+    end;
+    if Expression.OperatorSymbol = '>=' then
+    begin
+      Result := TGrispValue.Create(gvkBoolean);
+      Result.BoolValue := RequireNumber(LeftValue, '>=') >= RequireNumber(RightValue, '>=');
+      Exit;
+    end;
+    if SameText(Expression.OperatorSymbol, 'and') then
+    begin
+      LeftBool := RequireBoolean(LeftValue, 'and');
+      RightBool := RequireBoolean(RightValue, 'and');
+      Result := TGrispValue.Create(gvkBoolean);
+      Result.BoolValue := LeftBool and RightBool;
+      Exit;
+    end;
+    if SameText(Expression.OperatorSymbol, 'or') then
+    begin
+      LeftBool := RequireBoolean(LeftValue, 'or');
+      RightBool := RequireBoolean(RightValue, 'or');
+      Result := TGrispValue.Create(gvkBoolean);
+      Result.BoolValue := LeftBool or RightBool;
+      Exit;
+    end;
+    raise Exception.CreateFmt('Unknown binary operator "%s"', [Expression.OperatorSymbol]);
+  finally
+    LeftValue.Free;
+	RightValue.Free;
+  end;
+end;
+
+class function TGrispExpressionEvaluator.EvaluateCall(Expression: TGrispExpression; Bindings: TDictionary<string, TGrispValue>): TGrispValue;
+var Arg0, Arg1, Arg2: TGrispValue; N0, N1, N2: Double;
+begin
+  if SameText(Expression.Name, 'min') then
+  begin
+    EnsureArgumentCount(Expression, 2);
+    Arg0 := Evaluate(Expression.Arguments[0], Bindings);
+    Arg1 := Evaluate(Expression.Arguments[1], Bindings);
+    try
+      Result := TGrispValue.Create(gvkNumber);
+      Result.NumberValue := Min(RequireNumber(Arg0, 'min'), RequireNumber(Arg1, 'min'));
+    finally Arg0.Free; Arg1.Free; end;
+    Exit;
+  end;
+  if SameText(Expression.Name, 'max') then
+  begin
+    EnsureArgumentCount(Expression, 2);
+    Arg0 := Evaluate(Expression.Arguments[0], Bindings);
+    Arg1 := Evaluate(Expression.Arguments[1], Bindings);
+    try
+      Result := TGrispValue.Create(gvkNumber);
+      Result.NumberValue := Max(RequireNumber(Arg0, 'max'), RequireNumber(Arg1, 'max'));
+    finally Arg0.Free; Arg1.Free; end;
+    Exit;
+  end;
+  if SameText(Expression.Name, 'mid') then
+  begin
+    EnsureArgumentCount(Expression, 3);
+    Arg0 := Evaluate(Expression.Arguments[0], Bindings);
+    Arg1 := Evaluate(Expression.Arguments[1], Bindings);
+    Arg2 := Evaluate(Expression.Arguments[2], Bindings);
+    try
+      N0 := RequireNumber(Arg0, 'mid'); N1 := RequireNumber(Arg1, 'mid'); N2 := RequireNumber(Arg2, 'mid');
+      Result := TGrispValue.Create(gvkNumber);
+      Result.NumberValue := N0 + N1 + N2 - Min(Min(N0, N1), N2) - Max(Max(N0, N1), N2);
+    finally Arg0.Free; Arg1.Free; Arg2.Free; end;
+    Exit;
+  end;
+  raise Exception.CreateFmt('Unknown function "%s"', [Expression.Name]);
+end;
+
+class function TGrispExpressionEvaluator.RequireNumber(Value: TGrispValue; const Context: string): Double;
+begin
+  if not Assigned(Value) or (Value.Kind <> gvkNumber) then
+    raise Exception.CreateFmt('Operator "%s" requires number operands', [Context]);
+  Result := Value.NumberValue;
+end;
+
+class function TGrispExpressionEvaluator.RequireBoolean(Value: TGrispValue; const Context: string): Boolean;
+begin
+  if not Assigned(Value) or (Value.Kind <> gvkBoolean) then
+    raise Exception.CreateFmt('Operator "%s" requires boolean operands', [Context]);
+  Result := Value.BoolValue;
+end;
+
+class procedure TGrispExpressionEvaluator.EnsureArgumentCount(Expression: TGrispExpression; Expected: Integer);
+begin
+  if Expression.Arguments.Count <> Expected then
+    raise Exception.CreateFmt('Function "%s" expects %d arguments, got %d',
+      [Expression.Name, Expected, Expression.Arguments.Count]);
+end;
+
+end.
+unit unit_Core_TGrispExpression_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.Generics.Collections,
+  unit_Core_TGrispValueBase_version_001;  // Changed: use Base unit
+
+type
+  TGrispExpressionKind = (
+    gekLiteral,
+    gekVariable,
+    gekUnary,
+    gekBinary,
+    gekCall
+  );
+
+  TGrispExpression = class
+  public
+    Kind: TGrispExpressionKind;
+    Value: TObject; // TGrispValue
+    Name: string;
+    OperatorSymbol: string;
+    Left: TGrispExpression;
+    Right: TGrispExpression;
+    Arguments: TObjectList<TGrispExpression>;
+    constructor Create(AKind: TGrispExpressionKind);
+    destructor Destroy; override;
+    function Clone: TGrispExpression;
+  end;
+
+implementation
+
+constructor TGrispExpression.Create(AKind: TGrispExpressionKind);
+begin
+  inherited Create;
+  Kind := AKind;
+  Arguments := TObjectList<TGrispExpression>.Create(True);
+end;
+
+destructor TGrispExpression.Destroy;
+begin
+  Arguments.Free;
+  Left.Free;
+  Right.Free;
+  Value.Free;
+  inherited Destroy;
+end;
+
+function TGrispExpression.Clone: TGrispExpression;
+var Arg: TGrispExpression;
+begin
+  Result := TGrispExpression.Create(Kind);
+  Result.Name := Name;
+  Result.OperatorSymbol := OperatorSymbol;
+  if Assigned(Value) then
+    Result.Value := TGrispValue(Value).Clone;
+  if Assigned(Left) then
+    Result.Left := Left.Clone;
+  if Assigned(Right) then
+    Result.Right := Right.Clone;
+  for Arg in Arguments do
+    Result.Arguments.Add(Arg.Clone);
+end;
+
+end.
+unit unit_Core_TGrispType_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.Generics.Collections,
+  unit_Core_TGrispValueBase_version_001;  // Changed: use Base unit directly
+
+type
+  TGrispTypeKind = (
+    gtkNumber,
+    gtkString,
+    gtkBoolean,
+    gtkIdentifier,
+    gtkNode,
+    gtkArray,
+    gtkNil
+  );
+
+  TGrispType = class
+  public
+    Kind: TGrispTypeKind;
+    ElementType: TGrispType;
+    NodeTypeName: string;
+    constructor Create(AKind: TGrispTypeKind);
+    destructor Destroy; override;
+    function Matches(Value: TGrispValue): Boolean;
+    function ToString: string; override;
+  end;
+
+implementation
+
+constructor TGrispType.Create(AKind: TGrispTypeKind);
+begin
+  inherited Create;
+  Kind := AKind;
+  ElementType := nil;
+  NodeTypeName := '';
+end;
+
+destructor TGrispType.Destroy;
+begin
+  ElementType.Free;
+  inherited Destroy;
+end;
+
+function TGrispType.Matches(Value: TGrispValue): Boolean;
+var
+  NodeId: Integer;
+  NodeName: string;
+  E: TGrispValue;
+begin
+  Result := False;
+  if Value = nil then Exit;
+
+  case Kind of
+    gtkNumber: Result := Value.Kind = gvkNumber;
+    gtkString: Result := Value.Kind = gvkString;
+    gtkBoolean: Result := Value.Kind = gvkBoolean;
+    gtkIdentifier: Result := Value.Kind = gvkIdentifier;
+    gtkNil: Result := Value = nil;
+    gtkNode:
+      begin
+        if Value.Kind <> gvkNode then Exit;
+		Value.GetNodeReference(NodeId, NodeName);
+        Result := (NodeId >= 0) and ((NodeTypeName = '') or (NodeName = NodeTypeName));
+      end;
+    gtkArray:
+      begin
+        if Value.Kind <> gvkArray then Exit;
+        if ElementType = nil then
+          Result := True
+        else
+        begin
+          Result := True;
+          for E in Value.ArrayValue do
+            if not ElementType.Matches(E) then
+            begin
+              Result := False;
+              Break;
+            end;
+        end;
+      end;
+  end;
+end;
+
+function TGrispType.ToString: string;
+begin
+  case Kind of
+    gtkNumber: Result := 'number';
+    gtkString: Result := 'string';
+    gtkBoolean: Result := 'boolean';
+    gtkIdentifier: Result := 'identifier';
+    gtkNil: Result := 'nil';
+    gtkNode:
+      if NodeTypeName <> '' then
+        Result := 'node<' + NodeTypeName + '>'
+      else
+        Result := 'node';
+    gtkArray:
+      if ElementType <> nil then
+        Result := 'array<' + ElementType.ToString + '>'
+      else
+        Result := 'array';
+  end;
+end;
+
+end.
+unit unit_Core_TGrispValueBase_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.Generics.Collections;
+
+type
+  TGrispValueKind = (
+    gvkNumber,
+    gvkString,
+    gvkBoolean,
+    gvkIdentifier,
+    gvkArray,
+    gvkNode,
+    gvkExpression
+  );
+
+  TGrispValue = class
+  private
+    FNodeId: Integer;      // Store node ID instead of direct reference
+    FNodeName: string;     // Store node name instead of direct reference
+  public
+    Kind: TGrispValueKind;
+    NumberValue: Double;
+    StringValue: string;
+    BoolValue: Boolean;
+    IdentifierValue: string;
+    ArrayValue: TObjectList<TGrispValue>;
+    ExpressionValue: TObject;  // Will be TGrispExpression
+
+    // Node reference stored as ID/Name to avoid circular dependency
+    procedure SetNodeReference(AId: Integer; const AName: string);
+    procedure GetNodeReference(out AId: Integer; out AName: string);
+
+    constructor Create(AKind: TGrispValueKind);
+    destructor Destroy; override;
+    function Clone: TGrispValue;
+    function ToString: string; override;
+  end;
+
+implementation
+
+constructor TGrispValue.Create(AKind: TGrispValueKind);
+begin
+  inherited Create;
+  Kind := AKind;
+  if Kind = gvkArray then
+    ArrayValue := TObjectList<TGrispValue>.Create(True);
+  FNodeId := -1;
+  FNodeName := '';
+end;
+
+destructor TGrispValue.Destroy;
+begin
+  ArrayValue.Free;
+  ExpressionValue.Free;
+  inherited Destroy;
+end;
+
+procedure TGrispValue.SetNodeReference(AId: Integer; const AName: string);
+begin
+  FNodeId := AId;
+  FNodeName := AName;
+end;
+
+procedure TGrispValue.GetNodeReference(out AId: Integer; out AName: string);
+begin
+  AId := FNodeId;
+  AName := FNodeName;
+end;
+
+function TGrispValue.Clone: TGrispValue;
+var E: TGrispValue;
+begin
+  Result := TGrispValue.Create(Kind);
+  Result.NumberValue := NumberValue;
+  Result.StringValue := StringValue;
+  Result.BoolValue := BoolValue;
+  Result.IdentifierValue := IdentifierValue;
+  Result.FNodeId := FNodeId;
+  Result.FNodeName := FNodeName;
+  if Kind = gvkArray then
+    for E in ArrayValue do
+      Result.ArrayValue.Add(E.Clone);
+  if (Kind = gvkExpression) and (ExpressionValue <> nil) then
+    Result.ExpressionValue := ExpressionValue;
+end;
+
+function TGrispValue.ToString: string;
+begin
+  case Kind of
+    gvkNumber: Result := FloatToStr(NumberValue);
+    gvkString: Result := '"' + StringValue + '"';
+    gvkBoolean: Result := BoolToStr(BoolValue, True);
+    gvkIdentifier: Result := IdentifierValue;
+    gvkArray: Result := '[...]';
+    gvkNode:
+      if FNodeId >= 0 then
+        Result := Format('node(%d:%s)', [FNodeId, FNodeName])
+      else
+        Result := 'node(nil)';
+    gvkExpression: Result := '<expr>';
+  else
+    Result := 'nil';
+  end;
+end;
+
+end.
+unit unit_Debug_TGrispDebug_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.TypInfo,
+  unit_Token_TGrispTokenKind_version_001,
+  unit_Token_TGrispToken_version_001,
+  unit_Core_TGrispValueBase_version_001,
+  unit_Graph_TGrispEdge_TGrispNode_version_001;
+
+type
+  TGrispDebug = class
+  private
+    class var FEnabled: Boolean;
+    class var FIndentLevel: Integer;
+    class procedure WriteIndent;
+  public
+    class procedure Enable;
+    class procedure Disable;
+    class function IsEnabled: Boolean;
+    class procedure Log(const Msg: string);
+    class procedure LogEnter(const MethodName: string);
+    class procedure LogExit(const MethodName: string);
+    class procedure LogToken(const Prefix: string; const Token: TGrispToken);
+    class procedure LogValue(const Prefix: string; const Value: TGrispValue);
+    class procedure LogNode(const Prefix: string; const Node: TGrispNode);
+  end;
+
+implementation
+
+class procedure TGrispDebug.Enable;
+begin
+  FEnabled := True;
+end;
+
+class procedure TGrispDebug.Disable;
+begin
+  FEnabled := False;
+end;
+
+class function TGrispDebug.IsEnabled: Boolean;
+begin
+  Result := FEnabled;
+end;
+
+class procedure TGrispDebug.WriteIndent;
+var
+  i: Integer;
+begin
+  for i := 1 to FIndentLevel do
+    Write('  ');
+end;
+
+class procedure TGrispDebug.Log(const Msg: string);
+begin
+  if not FEnabled then Exit;
+  WriteIndent;
+  Writeln(Msg);
+end;
+
+class procedure TGrispDebug.LogEnter(const MethodName: string);
+begin
+  if not FEnabled then Exit;
+  WriteIndent;
+  Writeln('-> Enter: ', MethodName);
+  Inc(FIndentLevel);
+end;
+
+class procedure TGrispDebug.LogExit(const MethodName: string);
+begin
+  if not FEnabled then Exit;
+  Dec(FIndentLevel);
+  WriteIndent;
+  Writeln('<- Exit: ', MethodName);
+end;
+
+class procedure TGrispDebug.LogToken(const Prefix: string; const Token: TGrispToken);
+begin
+  if not FEnabled then Exit;
+  WriteIndent;
+  Writeln(Format('%s Token: Kind=%s, Lexeme="%s", Line=%d, Col=%d',
+    [Prefix, GetEnumName(TypeInfo(TGrispTokenKind), Ord(Token.Kind)),
+     Token.Lexeme, Token.Line, Token.Column]));
+end;
+
+class procedure TGrispDebug.LogValue(const Prefix: string; const Value: TGrispValue);
+begin
+  if not FEnabled or (Value = nil) then Exit;
+  WriteIndent;
+  Writeln(Format('%s Value: Kind=%s, Value=%s',
+    [Prefix, GetEnumName(TypeInfo(TGrispValueKind), Ord(Value.Kind)), Value.ToString]));
+end;
+
+class procedure TGrispDebug.LogNode(const Prefix: string; const Node: TGrispNode);
+begin
+  if not FEnabled or (Node = nil) then Exit;
+  WriteIndent;
+  Writeln(Format('%s Node: Id=%d, Name="%s", Type="%s"',
+    [Prefix, Node.Id, Node.Name, Node.NodeType]));
+end;
+
+initialization
+  TGrispDebug.FEnabled := False;
+  TGrispDebug.FIndentLevel := 0;
+end.
+unit unit_Graph_TGrispEdge_TGrispNode_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.Generics.Collections,
+  unit_Core_TGrispValueBase_version_001;
+
+type
+  TGrispNode = class;
+  TGrispEdge = class;
+
+  // Edge class - connects two nodes
+  TGrispEdge = class
+  public
+    LabelName: string;
+    EdgeType: string;
+    Source: TGrispNode;
+	Target: TGrispNode;
+    constructor Create(ASource: TGrispNode; ATarget: TGrispNode; const ALabel: string; const AEdgeType: string);
+  end;
+
+  // Node class - graph vertex with attributes and edges
+  TGrispNode = class
+  private
+    FAttributes: TObjectDictionary<string, TGrispValue>;
+    FOutgoing: TObjectList<TGrispEdge>;
+    FIncoming: TObjectList<TGrispEdge>;
+    FMarked: Boolean;
+    FId: Integer;
+    FName: string;
+    FNodeType: string;
+  public
+    constructor Create(AId: Integer; const AName: string; const ANodeType: string);
+    destructor Destroy; override;
+
+    // Properties
+    property Id: Integer read FId;
+    property Name: string read FName write FName;
+    property NodeType: string read FNodeType;
+    property Outgoing: TObjectList<TGrispEdge> read FOutgoing;
+    property Incoming: TObjectList<TGrispEdge> read FIncoming;
+    property Marked: Boolean read FMarked write FMarked;
+
+    // Attribute operations
+	function GetValueAttribute(const Key: string): TGrispValue;
+	procedure SetValueAttribute(const Key: string; AValue: TGrispValue);
+    procedure RemoveAttribute(const Key: string);
+    function HasAttribute(const Key: string): Boolean;
+    function GetNumber(const Key: string; Default: Double = 0): Double;
+    function GetIdentifier(const Key: string): string;
+    function GetAttributeKeys: TList<string>;
+
+    // Edge operations
+    procedure AddOutgoingEdge(Edge: TGrispEdge);
+    procedure AddIncomingEdge(Edge: TGrispEdge);
+    procedure RemoveOutgoingEdge(Edge: TGrispEdge);
+    procedure RemoveIncomingEdge(Edge: TGrispEdge);
+
+    function ToString: string; override;
+  end;
+
+implementation
+
+{ TGrispEdge }
+
+constructor TGrispEdge.Create(ASource: TGrispNode; ATarget: TGrispNode; const ALabel: string; const AEdgeType: string);
+begin
+  inherited Create;
+  Source := ASource;
+  Target := ATarget;
+  LabelName := ALabel;
+  EdgeType := AEdgeType;
+end;
+
+{ TGrispNode }
+
+constructor TGrispNode.Create(AId: Integer; const AName: string; const ANodeType: string);
+begin
+  inherited Create;
+  FId := AId;
+  FName := AName;
+  FNodeType := ANodeType;
+  FAttributes := TObjectDictionary<string, TGrispValue>.Create([doOwnsValues]);
+  FOutgoing := TObjectList<TGrispEdge>.Create(False);
+  FIncoming := TObjectList<TGrispEdge>.Create(False);
+  FMarked := False;
+end;
+
+destructor TGrispNode.Destroy;
+begin
+  FIncoming.Free;
+  FOutgoing.Free;
+  FAttributes.Free;
+  inherited Destroy;
+end;
+
+function TGrispNode.GetValueAttribute(const Key: string): TGrispValue;
+begin
+  if not FAttributes.TryGetValue(Key, Result) then Result := nil;
+end;
+
+procedure TGrispNode.SetValueAttribute(const Key: string; AValue: TGrispValue);
+begin
+  // Do NOT mutate the incoming value - it may be shared or already correct
+  // If we need to store a copy, clone it first
+  var ValueToStore := AValue;
+  if (AValue <> nil) and (AValue.Kind = gvkNode) then
+	ValueToStore := AValue.Clone;  // Store a clone to avoid mutation side effects
+
+  FAttributes.AddOrSetValue(Key, ValueToStore);
+end;
+
+procedure TGrispNode.RemoveAttribute(const Key: string);
+begin
+  FAttributes.Remove(Key);
+end;
+
+function TGrispNode.HasAttribute(const Key: string): Boolean;
+begin
+  Result := FAttributes.ContainsKey(Key);
+end;
+
+function TGrispNode.GetNumber(const Key: string; Default: Double): Double;
+var V: TGrispValue;
+begin
+  V := GetValueAttribute(Key);
+  if Assigned(V) and (V.Kind = gvkNumber) then Exit(V.NumberValue);
+  Result := Default;
+end;
+
+function TGrispNode.GetIdentifier(const Key: string): string;
+var V: TGrispValue;
+begin
+  V := GetValueAttribute(Key);
+  if Assigned(V) and (V.Kind = gvkIdentifier) then Exit(V.IdentifierValue);
+  Result := '';
+end;
+
+function TGrispNode.GetAttributeKeys: TList<string>;
+begin
+  Result := TList<string>.Create;
+  for var Key in FAttributes.Keys do
+    Result.Add(Key);
+end;
+
+procedure TGrispNode.AddOutgoingEdge(Edge: TGrispEdge);
+begin
+  FOutgoing.Add(Edge);
+end;
+
+procedure TGrispNode.AddIncomingEdge(Edge: TGrispEdge);
+begin
+  FIncoming.Add(Edge);
+end;
+
+procedure TGrispNode.RemoveOutgoingEdge(Edge: TGrispEdge);
+begin
+  FOutgoing.Remove(Edge);
+end;
+
+procedure TGrispNode.RemoveIncomingEdge(Edge: TGrispEdge);
+begin
+  FIncoming.Remove(Edge);
+end;
+
+function TGrispNode.ToString: string;
+begin
+  Result := Format('Node %d "%s" [%s]', [FId, FName, FNodeType]);
+end;
+
+end.
+unit unit_Graph_TGrispGraph_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.Generics.Collections,
+  unit_Core_TGrispValueBase_version_001,
+  unit_Core_TGrispExpression_version_001,
+  unit_Core_TGrispExpressionEvaluator_version_001,
+  unit_Core_TGrispType_version_001,
+  unit_Graph_TGrispEdge_TGrispNode_version_001,
+  unit_Strategy_TGrispStrategy_version_001;  // Added for TGrispStrategy
+
+type
+  TGrispGraph = class
+  private
+    FNextId: Integer;
+    FNodes: TObjectList<TGrispNode>;
+    FEdges: TObjectList<TGrispEdge>;
+    FNodeIndex: TObjectDictionary<string, TGrispNode>;
+    FRules: TObjectList<TGrispNode>;
+    FTypes: TObjectDictionary<string, TGrispType>;
+    FStrategies: TObjectDictionary<string, TGrispStrategy>;  // NEW: owns strategies
+    FModified: Boolean;
+
+    procedure MarkReachable(Node: TGrispNode);
+    procedure SweepUnmarked;
+  public
+    constructor Create;
+    destructor Destroy; override;
+
+    function AddNode(const AName: string; const ANodeType: string): TGrispNode;
+    function FindNode(const AName: string): TGrispNode;
+    procedure RemoveNode(Node: TGrispNode);
+    procedure RemoveNodeByName(const AName: string);
+
+    function AddEdge(ASource: TGrispNode; ATarget: TGrispNode; const ALabel: string; const AEdgeType: string = ''): TGrispEdge;
+    procedure RemoveEdge(Edge: TGrispEdge);
+    procedure RemoveEdgesBetween(Source, Target: TGrispNode; const ALabel: string = '');
+
+    procedure RegisterRule(ANode: TGrispNode);
+    property Rules: TObjectList<TGrispNode> read FRules;
+
+    procedure AddType(const Name: string; TypeObj: TGrispType);
+    function FindType(const Name: string): TGrispType;
+    property Types: TObjectDictionary<string, TGrispType> read FTypes;
+
+    // NEW: Strategy management
+    procedure AddStrategy(const Name: string; Strategy: TGrispStrategy);
+    function GetStrategy(const Name: string): TGrispStrategy;
+    property Strategies: TObjectDictionary<string, TGrispStrategy> read FStrategies;
+
+    property Nodes: TObjectList<TGrispNode> read FNodes;
+    property Edges: TObjectList<TGrispEdge> read FEdges;
+    property NodeIndex: TObjectDictionary<string, TGrispNode> read FNodeIndex;
+
+    procedure RegisterEdgesFromIdentifiers;
+    procedure GarbageCollect;
+    function GetNodesByType(const ANodeType: string): TArray<TGrispNode>;
+    function GetNodesByAttribute(const Key: string; Value: TGrispValue): TList<TGrispNode>;
+
+    function ToDOT: string;
+    function ToJSON: string;
+
+	property Modified: Boolean read FModified write FModified;
+  end;
+
+implementation
+
+constructor TGrispGraph.Create;
+begin
+  inherited Create;
+  FNodes := TObjectList<TGrispNode>.Create(True);
+  FEdges := TObjectList<TGrispEdge>.Create(True);
+  FNodeIndex := TObjectDictionary<string, TGrispNode>.Create;
+  FRules := TObjectList<TGrispNode>.Create(False);
+  FTypes := TObjectDictionary<string, TGrispType>.Create([doOwnsValues]);
+  FStrategies := TObjectDictionary<string, TGrispStrategy>.Create([doOwnsValues]);  // NEW: owns strategies
+  FNextId := 1;
+  FModified := False;
+end;
+
+destructor TGrispGraph.Destroy;
+begin
+  FStrategies.Free;  // NEW: free strategies
+  FRules.Free;
+  FTypes.Free;
+  FNodeIndex.Free;
+  FEdges.Free;
+  FNodes.Free;
+  inherited Destroy;
+end;
+
+function TGrispGraph.AddNode(const AName: string; const ANodeType: string): TGrispNode;
+begin
+  if (AName <> '') and FNodeIndex.ContainsKey(AName) then
+    raise Exception.CreateFmt('Duplicate node name "%s"', [AName]);
+  Result := TGrispNode.Create(FNextId, AName, ANodeType);
+  Inc(FNextId);
+  FNodes.Add(Result);
+  if AName <> '' then FNodeIndex.Add(AName, Result);
+  FModified := True;
+end;
+
+procedure TGrispGraph.RemoveNode(Node: TGrispNode);
+var
+  i: Integer;
+  Edge: TGrispEdge;
+begin
+  if Node = nil then Exit;
+
+  // Remove all outgoing edges (they will free themselves via RemoveEdge)
+  for i := Node.Outgoing.Count - 1 downto 0 do
+  begin
+    Edge := Node.Outgoing[i];
+	RemoveEdge(Edge);
+  end;
+
+  // Remove all incoming edges
+  for i := Node.Incoming.Count - 1 downto 0 do
+  begin
+    Edge := Node.Incoming[i];
+    RemoveEdge(Edge);
+  end;
+
+  if Node.Name <> '' then
+    FNodeIndex.Remove(Node.Name);
+  FRules.Remove(Node);
+  FNodes.Remove(Node);  // <- This frees Node
+  // NO Node.Free here!
+  FModified := True;
+end;
+
+procedure TGrispGraph.RemoveNodeByName(const AName: string);
+var
+  Node: TGrispNode;
+begin
+  Node := FindNode(AName);
+  if Node <> nil then
+    RemoveNode(Node);
+end;
+
+function TGrispGraph.FindNode(const AName: string): TGrispNode;
+begin
+  if not FNodeIndex.TryGetValue(AName, Result) then Result := nil;
+end;
+
+function TGrispGraph.AddEdge(ASource: TGrispNode; ATarget: TGrispNode; const ALabel: string; const AEdgeType: string): TGrispEdge;
+var
+  E: TGrispEdge;
+begin
+  for E in FEdges do
+    if (E.Source = ASource) and (E.Target = ATarget) and SameText(E.LabelName, ALabel) then
+      Exit(E);
+
+  Result := TGrispEdge.Create(ASource, ATarget, ALabel, AEdgeType);
+  FEdges.Add(Result);
+  if Assigned(ASource) then ASource.AddOutgoingEdge(Result);
+  if Assigned(ATarget) then ATarget.AddIncomingEdge(Result);
+  FModified := True;
+end;
+
+procedure TGrispGraph.RemoveEdge(Edge: TGrispEdge);
+begin
+  if Edge = nil then Exit;
+
+  if Assigned(Edge.Source) then
+    Edge.Source.RemoveOutgoingEdge(Edge);
+  if Assigned(Edge.Target) then
+    Edge.Target.RemoveIncomingEdge(Edge);
+
+  FEdges.Remove(Edge);  // <- This frees Edge (OwnsObjects = True)
+  // NO Edge.Free here!
+  FModified := True;
+end;
+
+procedure TGrispGraph.RemoveEdgesBetween(Source, Target: TGrispNode; const ALabel: string);
+var
+  Edge: TGrispEdge;
+  i: Integer;
+begin
+  for i := FEdges.Count - 1 downto 0 do
+  begin
+    Edge := FEdges[i];
+    if (Edge.Source = Source) and (Edge.Target = Target) then
+      if (ALabel = '') or SameText(Edge.LabelName, ALabel) then
+        RemoveEdge(Edge);
+  end;
+end;
+
+procedure TGrispGraph.RegisterRule(ANode: TGrispNode);
+begin
+  if FRules.IndexOf(ANode) < 0 then
+    FRules.Add(ANode);
+end;
+
+procedure TGrispGraph.AddType(const Name: string; TypeObj: TGrispType);
+begin
+  FTypes.AddOrSetValue(Name, TypeObj);
+end;
+
+function TGrispGraph.FindType(const Name: string): TGrispType;
+begin
+  if not FTypes.TryGetValue(Name, Result) then Result := nil;
+end;
+
+// NEW: Strategy management
+procedure TGrispGraph.AddStrategy(const Name: string; Strategy: TGrispStrategy);
+begin
+  FStrategies.AddOrSetValue(Name, Strategy);
+end;
+
+function TGrispGraph.GetStrategy(const Name: string): TGrispStrategy;
+begin
+  if not FStrategies.TryGetValue(Name, Result) then Result := nil;
+end;
+
+procedure TGrispGraph.RegisterEdgesFromIdentifiers;
+var N: TGrispNode; Key: string; Val: TGrispValue; Target: TGrispNode;
+begin
+  for N in FNodes do
+    for Key in N.GetAttributeKeys do
+    begin
+      Val := N.GetValueAttribute(Key);
+      if Assigned(Val) and (Val.Kind = gvkIdentifier) then
+      begin
+        Target := FindNode(Val.IdentifierValue);
+        if Assigned(Target) then
+          AddEdge(N, Target, Key, 'ref');
+      end;
+    end;
+  FModified := True;
+end;
+
+procedure TGrispGraph.MarkReachable(Node: TGrispNode);
+var
+  Edge: TGrispEdge;
+begin
+  if (Node = nil) or Node.Marked then Exit;
+
+  Node.Marked := True;
+  for Edge in Node.Outgoing do
+    if Edge.Target <> nil then
+      MarkReachable(Edge.Target);
+  for Edge in Node.Incoming do
+    if Edge.Source <> nil then
+      MarkReachable(Edge.Source);
+end;
+
+procedure TGrispGraph.SweepUnmarked;
+var
+  Node: TGrispNode;
+  i: Integer;
+begin
+  for i := FNodes.Count - 1 downto 0 do
+  begin
+    Node := FNodes[i];
+    if not Node.Marked then
+      RemoveNode(Node)
+    else
+      Node.Marked := False;
+  end;
+end;
+
+procedure TGrispGraph.GarbageCollect;
+var
+  Root: TGrispNode;
+  Key: string;
+  Val: TGrispValue;
+  Target: TGrispNode;
+begin
+  for Root in FRules do
+    MarkReachable(Root);
+
+  for Root in FRules do
+  begin
+    for Key in Root.GetAttributeKeys do
+    begin
+      Val := Root.GetValueAttribute(Key);
+      if (Val <> nil) and (Val.Kind = gvkIdentifier) then
+      begin
+        Target := FindNode(Val.IdentifierValue);
+        if Target <> nil then
+          MarkReachable(Target);
+      end;
+    end;
+  end;
+
+  SweepUnmarked;
+  FModified := True;
+end;
+
+function TGrispGraph.GetNodesByType(const ANodeType: string): TArray<TGrispNode>;
+var N: TGrispNode; List: TList<TGrispNode>;
+begin
+  List := TList<TGrispNode>.Create;
+  try
+    for N in FNodes do
+      if SameText(N.NodeType, ANodeType) then List.Add(N);
+    Result := List.ToArray;
+  finally
+    List.Free;
+  end;
+end;
+
+function TGrispGraph.GetNodesByAttribute(const Key: string; Value: TGrispValue): TList<TGrispNode>;
+var
+  Node: TGrispNode;
+  Attr: TGrispValue;
+begin
+  Result := TList<TGrispNode>.Create;
+  for Node in FNodes do
+  begin
+	Attr := Node.GetValueAttribute(Key);
+    if Attr <> nil then
+    begin
+      if Value = nil then
+        Result.Add(Node)
+      else if Attr.Kind = Value.Kind then
+      begin
+        case Attr.Kind of
+          gvkNumber:
+            if Attr.NumberValue = Value.NumberValue then Result.Add(Node);
+          gvkString:
+            if Attr.StringValue = Value.StringValue then Result.Add(Node);
+          gvkBoolean:
+            if Attr.BoolValue = Value.BoolValue then Result.Add(Node);
+          gvkIdentifier:
+            if Attr.IdentifierValue = Value.IdentifierValue then Result.Add(Node);
+        end;
+      end;
+    end;
+  end;
+end;
+
+function TGrispGraph.ToDOT: string;
+var N: TGrispNode; E: TGrispEdge;
+begin
+  Result := 'digraph G {' + sLineBreak;
+  for N in FNodes do
+    Result := Result + Format('  %d [label="%s"];', [N.Id, N.Name]) + sLineBreak;
+  for E in FEdges do
+    if Assigned(E.Source) and Assigned(E.Target) then
+      Result := Result + Format('  %d -> %d [label="%s"];', [E.Source.Id, E.Target.Id, E.LabelName]) + sLineBreak;
+  Result := Result + '}' + sLineBreak;
+end;
+
+function TGrispGraph.ToJSON: string;
+var
+  N: TGrispNode;
+  E: TGrispEdge;
+  First: Boolean;
+begin
+  Result := '{' + sLineBreak;
+  Result := Result + '  "nodes": [' + sLineBreak;
+
+  First := True;
+  for N in FNodes do
+  begin
+    if not First then Result := Result + ',' + sLineBreak;
+    First := False;
+    Result := Result + Format('    {"id": %d, "name": "%s", "type": "%s"}', [N.Id, N.Name, N.NodeType]);
+  end;
+
+  Result := Result + sLineBreak + '  ],' + sLineBreak;
+  Result := Result + '  "edges": [' + sLineBreak;
+
+  First := True;
+  for E in FEdges do
+  begin
+    if not First then Result := Result + ',' + sLineBreak;
+    First := False;
+    Result := Result + Format('    {"source": %d, "target": %d, "label": "%s"}', [E.Source.Id, E.Target.Id, E.LabelName]);
+  end;
+
+  Result := Result + sLineBreak + '  ]' + sLineBreak;
+  Result := Result + '}' + sLineBreak;
+end;
+
+end.
+unit unit_Lexer_TGrispLexer_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  unit_Token_TGrispTokenKind_version_001,
+  unit_Token_TGrispToken_version_001;
+
+type
+  EGrispLexerError = class(Exception);
+
+  TGrispLexer = class
+  private
+    FSource: string;
+    FPos: Integer;
+    FLine: Integer;
+    FCol: Integer;
+
+    procedure AdvanceChar;
+    function PeekChar(Offset: Integer = 0): Char;
+    procedure SkipWhitespaceAndComments;
+    function ReadString: TGrispToken;
+    function ReadNumber: TGrispToken;
+    function ReadIdentifier: TGrispToken;
+    function IsKeyword(const S: string): TGrispTokenKind;
+
+  public
+    constructor Create(const ASource: string);
+    function NextToken: TGrispToken;
+    procedure Reset;
+
+    property Source: string read FSource;
+    property Position: Integer read FPos;
+    property Line: Integer read FLine;
+    property Column: Integer read FCol;
+  end;
+
+implementation
+
+constructor TGrispLexer.Create(const ASource: string);
+begin
+  inherited Create;
+  FSource := ASource;
+  Reset;
+end;
+
+procedure TGrispLexer.Reset;
+begin
+  FPos := 1;
+  FLine := 1;
+  FCol := 1;
+end;
+
+procedure TGrispLexer.AdvanceChar;
+begin
+  if FPos <= Length(FSource) then
+  begin
+    if FSource[FPos] = #10 then
+    begin
+      Inc(FLine);
+      FCol := 1;
+    end
+    else if FSource[FPos] <> #13 then
+      Inc(FCol);
+	Inc(FPos);
+  end;
+end;
+
+function TGrispLexer.PeekChar(Offset: Integer): Char;
+begin
+  if FPos + Offset <= Length(FSource) then
+    Result := FSource[FPos + Offset]
+  else
+    Result := #0;
+end;
+
+procedure TGrispLexer.SkipWhitespaceAndComments;
+begin
+  while FPos <= Length(FSource) do
+  begin
+    // Skip whitespace
+    if CharInSet(FSource[FPos], [' ', #9, #13, #10]) then
+    begin
+      AdvanceChar;
+      Continue;
+    end;
+
+    // Skip line comments //
+    if (FSource[FPos] = '/') and (PeekChar(1) = '/') then
+    begin
+      AdvanceChar; AdvanceChar;
+      while (FPos <= Length(FSource)) and not CharInSet(FSource[FPos], [#10, #13]) do
+        AdvanceChar;
+      Continue;
+    end;
+
+    // Skip block comments /* */
+    if (FSource[FPos] = '/') and (PeekChar(1) = '*') then
+    begin
+      AdvanceChar; AdvanceChar;
+      while FPos <= Length(FSource) do
+      begin
+        if (FSource[FPos] = '*') and (PeekChar(1) = '/') then
+        begin
+          AdvanceChar; AdvanceChar;
+          Break;
+        end
+        else
+          AdvanceChar;
+      end;
+      Continue;
+    end;
+
+    Break;
+  end;
+end;
+
+function TGrispLexer.IsKeyword(const S: string): TGrispTokenKind;
+begin
+  if SameText(S, 'node') then Result := tkKeywordNode
+  else if SameText(S, 'array') then Result := tkKeywordArray
+  else if SameText(S, 'where') then Result := tkKeywordWhere
+  else if SameText(S, 'and') then Result := tkKeywordAnd
+  else if SameText(S, 'or') then Result := tkKeywordOr
+  else if SameText(S, 'not') then Result := tkKeywordNot
+  else if SameText(S, 'mod') then Result := tkKeywordMod
+  else if SameText(S, 'phase') then Result := tkKeywordPhase
+  else if SameText(S, 'temp') then Result := tkKeywordTemp
+  else if SameText(S, 'delete') then Result := tkKeywordDelete
+  else if SameText(S, 'remove') then Result := tkKeywordRemove
+  else if SameText(S, 'type') then Result := tkKeywordType
+  else if SameText(S, 'strategy') then Result := tkKeywordStrategy
+  else if SameText(S, 'repeat') then Result := tkKeywordRepeat
+  else if SameText(S, 'try') then Result := tkKeywordTry
+  else if SameText(S, 'choice') then Result := tkKeywordChoice
+  else if SameText(S, 'true') or SameText(S, 'false') then Result := tkBoolean
+  else Result := tkIdentifier;
+end;
+
+function TGrispLexer.ReadString: TGrispToken;
+var
+  Line, Col: Integer;
+  Quote: Char;
+  Esc: Boolean;
+  SB: TStringBuilder;
+begin
+  Line := FLine; Col := FCol;
+  Quote := FSource[FPos];
+  AdvanceChar;
+
+  SB := TStringBuilder.Create;
+  try
+    Esc := False;
+    while FPos <= Length(FSource) do
+    begin
+      if Esc then
+      begin
+        case FSource[FPos] of
+          'n': SB.Append(#10);
+          'r': SB.Append(#13);
+          't': SB.Append(#9);
+          else SB.Append(FSource[FPos]);
+        end;
+        Esc := False;
+        AdvanceChar;
+        Continue;
+      end;
+
+      if FSource[FPos] = '\' then
+      begin
+        Esc := True;
+        AdvanceChar;
+        Continue;
+      end;
+
+      if FSource[FPos] = Quote then
+      begin
+        AdvanceChar;
+        Break;
+      end;
+
+      SB.Append(FSource[FPos]);
+      AdvanceChar;
+    end;
+
+    Result.Kind := tkString;
+    Result.Lexeme := Quote + SB.ToString + Quote;
+    Result.Line := Line;
+    Result.Column := Col;
+  finally
+    SB.Free;
+  end;
+end;
+
+function TGrispLexer.ReadNumber: TGrispToken;
+var
+  Start, Line, Col: Integer;
+begin
+  Line := FLine; Col := FCol;
+  Start := FPos;
+
+  // Handle optional sign
+  if CharInSet(FSource[FPos], ['+', '-']) then
+    AdvanceChar;
+
+  // Read integer part
+  while (FPos <= Length(FSource)) and CharInSet(FSource[FPos], ['0'..'9']) do
+    AdvanceChar;
+
+  // Read fractional part
+  if (FSource[FPos] = '.') and CharInSet(PeekChar(1), ['0'..'9']) then
+  begin
+    AdvanceChar;
+    while (FPos <= Length(FSource)) and CharInSet(FSource[FPos], ['0'..'9']) do
+      AdvanceChar;
+  end;
+
+  // Read exponent
+  if CharInSet(FSource[FPos], ['e', 'E']) and CharInSet(PeekChar(1), ['0'..'9', '+', '-']) then
+  begin
+    AdvanceChar;
+    if CharInSet(FSource[FPos], ['+', '-']) then
+      AdvanceChar;
+    while (FPos <= Length(FSource)) and CharInSet(FSource[FPos], ['0'..'9']) do
+      AdvanceChar;
+  end;
+
+  Result.Kind := tkNumber;
+  Result.Lexeme := Copy(FSource, Start, FPos - Start);
+  Result.Line := Line;
+  Result.Column := Col;
+end;
+
+function TGrispLexer.ReadIdentifier: TGrispToken;
+var
+  Start, Line, Col: Integer;
+  S: string;
+begin
+  Line := FLine; Col := FCol;
+  Start := FPos;
+
+  // Read identifier (letters, digits, underscore, dot)
+  while (FPos <= Length(FSource)) and
+        CharInSet(FSource[FPos], ['a'..'z', 'A'..'Z', '0'..'9', '_', '.']) do
+    AdvanceChar;
+
+  S := Copy(FSource, Start, FPos - Start);
+
+  Result.Kind := IsKeyword(S);
+  Result.Lexeme := S;
+  Result.Line := Line;
+  Result.Column := Col;
+end;
+
+function TGrispLexer.NextToken: TGrispToken;
+var
+  C: Char;
+begin
+  SkipWhitespaceAndComments;
+
+  Result.Line := FLine;
+  Result.Column := FCol;
+
+  if FPos > Length(FSource) then
+  begin
+    Result.Kind := tkEOF;
+    Result.Lexeme := '';
+    Exit;
+  end;
+
+  C := FSource[FPos];
+
+  // Single character tokens
+  case C of
+    '{': begin Result.Kind := tkLBrace; Result.Lexeme := '{'; AdvanceChar; Exit; end;
+    '}': begin Result.Kind := tkRBrace; Result.Lexeme := '}'; AdvanceChar; Exit; end;
+    '[': begin Result.Kind := tkLBracket; Result.Lexeme := '['; AdvanceChar; Exit; end;
+    ']': begin Result.Kind := tkRBracket; Result.Lexeme := ']'; AdvanceChar; Exit; end;
+    '(': begin Result.Kind := tkLParen; Result.Lexeme := '('; AdvanceChar; Exit; end;
+    ')': begin Result.Kind := tkRParen; Result.Lexeme := ')'; AdvanceChar; Exit; end;
+    ':': begin Result.Kind := tkColon; Result.Lexeme := ':'; AdvanceChar; Exit; end;
+    '=': begin Result.Kind := tkEquals; Result.Lexeme := '='; AdvanceChar; Exit; end;
+    ',': begin Result.Kind := tkComma; Result.Lexeme := ','; AdvanceChar; Exit; end;
+    ';': begin Result.Kind := tkSemicolon; Result.Lexeme := ';'; AdvanceChar; Exit; end;
+
+    // Operators with possible arrow
+    '-':
+      begin
+        if PeekChar(1) = '>' then
+        begin
+          Result.Kind := tkArrow;
+          Result.Lexeme := '->';
+          AdvanceChar;
+          AdvanceChar;
+          Exit;
+        end
+        else if CharInSet(PeekChar(1), ['0'..'9']) then
+        begin
+          Result := ReadNumber;
+          Exit;
+        end
+        else
+        begin
+          Result.Kind := tkOperator;
+          Result.Lexeme := '-';
+          AdvanceChar;
+          Exit;
+        end;
+      end;
+
+    '+':
+      begin
+        if CharInSet(PeekChar(1), ['0'..'9']) then
+        begin
+          Result := ReadNumber;
+          Exit;
+        end
+        else
+        begin
+          Result.Kind := tkOperator;
+          Result.Lexeme := '+';
+          AdvanceChar;
+          Exit;
+        end;
+      end;
+
+    '*', '/':
+      begin
+        Result.Kind := tkOperator;
+        Result.Lexeme := C;
+        AdvanceChar;
+        Exit;
+      end;
+
+    '<':
+      begin
+        if PeekChar(1) = '=' then
+        begin
+		  Result.Kind := tkLessEqual;
+          Result.Lexeme := '<=';
+          AdvanceChar;
+          AdvanceChar;
+          Exit;
+        end
+        else if PeekChar(1) = '>' then
+        begin
+          Result.Kind := tkNotEqual;
+          Result.Lexeme := '<>';
+          AdvanceChar;
+          AdvanceChar;
+          Exit;
+        end
+        else
+        begin
+          Result.Kind := tkLess;
+          Result.Lexeme := '<';
+          AdvanceChar;
+          Exit;
+        end;
+      end;
+
+    '>':
+      begin
+        if PeekChar(1) = '=' then
+        begin
+          Result.Kind := tkGreaterEqual;
+          Result.Lexeme := '>=';
+          AdvanceChar;
+          AdvanceChar;
+          Exit;
+        end
+        else
+        begin
+          Result.Kind := tkGreater;
+          Result.Lexeme := '>';
+          AdvanceChar;
+          Exit;
+        end;
+      end;
+
+    '''', '"':
+      begin
+        Result := ReadString;
+        Exit;
+      end;
+  end;
+
+  // Numbers
+  if CharInSet(C, ['0'..'9']) then
+  begin
+    Result := ReadNumber;
+    Exit;
+  end;
+
+  // Identifiers and keywords
+  if CharInSet(C, ['a'..'z', 'A'..'Z', '_']) then
+  begin
+    Result := ReadIdentifier;
+    Exit;
+  end;
+
+  raise EGrispLexerError.CreateFmt('Invalid character "%s" at %d:%d', [C, FLine, FCol]);
+end;
+
+end.
+unit unit_Parser_TGrispUnifiedParser_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.StrUtils,
+  System.TypInfo,
+  System.Generics.Collections,
+  unit_Token_TGrispTokenKind_version_001,
+  unit_Token_TGrispToken_version_001,
+  unit_Lexer_TGrispLexer_version_001,
+  unit_Graph_TGrispGraph_version_001,
+  unit_Graph_TGrispEdge_TGrispNode_version_001,
+  unit_Core_TGrispValueBase_version_001,
+  unit_Core_TGrispExpression_version_001,
+  unit_Core_TGrispExpressionEvaluator_version_001,
+  unit_Core_TGrispType_version_001,
+  unit_Strategy_TGrispStrategyKind_version_001,
+  unit_Strategy_TGrispStrategy_version_001,
+  unit_Debug_TGrispDebug_version_001;  // Remove StrategyEngine from uses
+
+type
+  EGrispParseError = class(Exception);
+
+  TGrispUnifiedParser = class
+  private
+    FLexer: TGrispLexer;
+    FCurrent: TGrispToken;
+    FGraph: TGrispGraph;
+    FAnonId: Integer;
+    FDebugEnabled: Boolean;
+
+    procedure Debug(const Msg: string);
+    procedure DebugEnter(const Method: string);
+    procedure DebugExit(const Method: string);
+    procedure DebugToken(const Prefix: string);
+    procedure DebugValue(const Prefix: string; const Value: TGrispValue);
+    procedure DebugNode(const Prefix: string; const Node: TGrispNode);
+    procedure DebugAttribute(const Prefix: string; const Key: string; const Value: TGrispValue);
+
+    procedure Advance;
+    procedure Expect(AKind: TGrispTokenKind; const Msg: string);
+
+    function ParseTypeName: string;
+    function InnerArrayType(const ATypeName: string): string;
+    function ParseType: TGrispType;
+
+    function ParseValue(const ATypeName: string): TGrispValue;
+    procedure ParseNodeBody(ANode: TGrispNode);
+
+    function ParseExpr: TGrispExpression;
+    function ParseOrExpr: TGrispExpression;
+    function ParseAndExpr: TGrispExpression;
+	function ParseCompareExpr: TGrispExpression;
+    function ParseAddExpr: TGrispExpression;
+    function ParseMulExpr: TGrispExpression;
+    function ParseUnaryExpr: TGrispExpression;
+    function ParsePrimaryExpr: TGrispExpression;
+    function ExprToValue(Expr: TGrispExpression): TGrispValue;
+
+    function ParseStrategy: TGrispStrategy;
+
+    function EdgeExists(ASource, ATarget: TGrispNode; const ALabel: string): Boolean;
+    procedure RegisterEdgesForNode(ANode: TGrispNode);
+    procedure RegisterEdgesForAllNodes;
+
+  public
+    constructor Create(const ASource: string; AGraph: TGrispGraph);
+    destructor Destroy; override;
+
+    procedure EnableDebug;
+    procedure DisableDebug;
+
+    procedure ParseNodeDecl;
+    procedure ParseTypeDecl;
+    procedure ParseStrategyDecl;
+    procedure ParseFile;
+  end;
+
+implementation
+
+{ TGrispUnifiedParser }
+
+constructor TGrispUnifiedParser.Create(const ASource: string; AGraph: TGrispGraph);
+begin
+  inherited Create;
+  FDebugEnabled := False;
+  FLexer := TGrispLexer.Create(ASource);
+  FGraph := AGraph;
+  FAnonId := 0;
+  Advance;
+  Debug('Parser created');
+end;
+
+destructor TGrispUnifiedParser.Destroy;
+begin
+  Debug('Parser destroyed');
+  FLexer.Free;
+  inherited Destroy;
+end;
+
+procedure TGrispUnifiedParser.EnableDebug;
+begin
+  FDebugEnabled := True;
+  TGrispDebug.Enable;
+  Debug('Debug enabled');
+end;
+
+procedure TGrispUnifiedParser.DisableDebug;
+begin
+  Debug('Debug disabled');
+  FDebugEnabled := False;
+  TGrispDebug.Disable;
+end;
+
+procedure TGrispUnifiedParser.Debug(const Msg: string);
+begin
+  if FDebugEnabled then
+    TGrispDebug.Log(Msg);
+end;
+
+procedure TGrispUnifiedParser.DebugEnter(const Method: string);
+begin
+  if FDebugEnabled then
+    TGrispDebug.LogEnter(Method);
+end;
+
+procedure TGrispUnifiedParser.DebugExit(const Method: string);
+begin
+  if FDebugEnabled then
+    TGrispDebug.LogExit(Method);
+end;
+
+procedure TGrispUnifiedParser.DebugToken(const Prefix: string);
+begin
+  if FDebugEnabled then
+    TGrispDebug.LogToken(Prefix, FCurrent);
+end;
+
+procedure TGrispUnifiedParser.DebugValue(const Prefix: string; const Value: TGrispValue);
+begin
+  if FDebugEnabled then
+    TGrispDebug.LogValue(Prefix, Value);
+end;
+
+procedure TGrispUnifiedParser.DebugNode(const Prefix: string; const Node: TGrispNode);
+begin
+  if FDebugEnabled then
+    TGrispDebug.LogNode(Prefix, Node);
+end;
+
+procedure TGrispUnifiedParser.DebugAttribute(const Prefix: string; const Key: string; const Value: TGrispValue);
+begin
+  if not FDebugEnabled then Exit;
+  Debug(Format('%s Attribute: %s = %s', [Prefix, Key, Value.ToString]));
+end;
+
+procedure TGrispUnifiedParser.Advance;
+begin
+  DebugToken('Advance from');
+  FCurrent := FLexer.NextToken;
+  DebugToken('Advance to');
+end;
+
+procedure TGrispUnifiedParser.Expect(AKind: TGrispTokenKind; const Msg: string);
+begin
+  Debug(Format('Expect: %s, Current: %s',
+    [GetEnumName(TypeInfo(TGrispTokenKind), Ord(AKind)),
+     GetEnumName(TypeInfo(TGrispTokenKind), Ord(FCurrent.Kind))]));
+  if FCurrent.Kind <> AKind then
+    raise EGrispParseError.CreateFmt('%s at line %d col %d', [Msg, FCurrent.Line, FCurrent.Column]);
+  Advance;
+end;
+
+function TGrispUnifiedParser.ParseTypeName: string;
+var
+  Inner: string;
+begin
+  DebugEnter('ParseTypeName');
+  DebugToken('Start');
+  Result := FCurrent.Lexeme;
+  Debug('Type name: ' + Result);
+  Advance;
+  if SameText(Result, 'array') then
+  begin
+    Debug('Parsing array type');
+    Expect(tkLess, '"<" expected');
+    Inner := FCurrent.Lexeme;
+    Debug('Inner type: ' + Inner);
+    Advance;
+    Expect(tkGreater, '">" expected');
+    Result := 'array<' + Inner + '>';
+    Debug('Array type: ' + Result);
+  end;
+  DebugExit('ParseTypeName');
+end;
+
+function TGrispUnifiedParser.InnerArrayType(const ATypeName: string): string;
+begin
+  DebugEnter('InnerArrayType');
+  Debug('ATypeName: ' + ATypeName);
+  Result := Copy(ATypeName, 7, Length(ATypeName) - 7);
+  if (Length(Result) > 0) and (Result[Length(Result)] = '>') then
+    SetLength(Result, Length(Result) - 1);
+  Debug('Result: ' + Result);
+  DebugExit('InnerArrayType');
+end;
+
+function TGrispUnifiedParser.ParseType: TGrispType;
+var
+  InnerType: TGrispType;
+begin
+  DebugEnter('ParseType');
+  DebugToken('Start');
+
+  if SameText(FCurrent.Lexeme, 'number') then
+  begin
+    Debug('Type: number');
+    Result := TGrispType.Create(gtkNumber);
+    Advance;
+  end
+  else if SameText(FCurrent.Lexeme, 'string') then
+  begin
+    Debug('Type: string');
+    Result := TGrispType.Create(gtkString);
+    Advance;
+  end
+  else if SameText(FCurrent.Lexeme, 'boolean') then
+  begin
+    Debug('Type: boolean');
+    Result := TGrispType.Create(gtkBoolean);
+    Advance;
+  end
+  else if SameText(FCurrent.Lexeme, 'identifier') then
+  begin
+    Debug('Type: identifier');
+    Result := TGrispType.Create(gtkIdentifier);
+    Advance;
+  end
+  else if SameText(FCurrent.Lexeme, 'nil') then
+  begin
+    Debug('Type: nil');
+    Result := TGrispType.Create(gtkNil);
+    Advance;
+  end
+  else if SameText(FCurrent.Lexeme, 'array') then
+  begin
+    Debug('Type: array');
+    Advance;
+    Expect(tkLess, '"<" expected');
+    InnerType := ParseType;
+    Result := TGrispType.Create(gtkArray);
+    Result.ElementType := InnerType;
+    Expect(tkGreater, '">" expected');
+  end
+  else if FCurrent.Kind = tkIdentifier then
+  begin
+    Debug('Type: node<' + FCurrent.Lexeme + '>');
+    Result := TGrispType.Create(gtkNode);
+    Result.NodeTypeName := FCurrent.Lexeme;
+    Advance;
+  end
+  else
+    raise EGrispParseError.Create('Type expected');
+
+  DebugExit('ParseType');
+end;
+
+function TGrispUnifiedParser.ParseValue(const ATypeName: string): TGrispValue;
+var
+  S: string;
+  D: Double;
+  Node: TGrispNode;
+  InnerType: string;
+begin
+  DebugEnter('ParseValue');
+  Debug('ATypeName: ' + ATypeName);
+  DebugToken('Start');
+
+  // Pattern variable support: bare identifier for scalar types
+  if FCurrent.Kind = tkIdentifier then
+  begin
+    if not SameText(ATypeName, 'node') and not StartsText('array<', ATypeName) then
+    begin
+      Debug('Pattern variable: ' + FCurrent.Lexeme);
+      Result := TGrispValue.Create(gvkIdentifier);
+      Result.IdentifierValue := FCurrent.Lexeme;
+      Advance;
+      DebugValue('Created', Result);
+      DebugExit('ParseValue');
+      Exit;
+    end;
+  end;
+
+  if StartsText('array<', ATypeName) then
+  begin
+    Debug('Parsing array value');
+    InnerType := InnerArrayType(ATypeName);
+    Expect(tkLBracket, '"[" expected');
+    Result := TGrispValue.Create(gvkArray);
+    while (FCurrent.Kind <> tkRBracket) and (FCurrent.Kind <> tkEOF) do
+    begin
+      Debug('Adding array element');
+      Result.ArrayValue.Add(ParseValue(InnerType));
+      if FCurrent.Kind = tkComma then Advance else Break;
+    end;
+    Expect(tkRBracket, '"]" expected');
+    DebugValue('Created array', Result);
+    DebugExit('ParseValue');
+    Exit;
+  end;
+
+  if SameText(ATypeName, 'number') then
+  begin
+    Debug('Parsing number');
+    if FCurrent.Kind <> tkNumber then raise EGrispParseError.Create('number expected');
+    D := StrToFloat(FCurrent.Lexeme);
+    Advance;
+    Result := TGrispValue.Create(gvkNumber);
+    Result.NumberValue := D;
+    DebugValue('Created number', Result);
+    DebugExit('ParseValue');
+    Exit;
+  end;
+
+  if SameText(ATypeName, 'string') then
+  begin
+    Debug('Parsing string');
+    if FCurrent.Kind <> tkString then raise EGrispParseError.Create('string expected');
+    S := FCurrent.Lexeme;
+    Advance;
+    if (Length(S) >= 2) and CharInSet(S[1], ['''', '"']) then
+      S := Copy(S, 2, Length(S) - 2);
+    Result := TGrispValue.Create(gvkString);
+    Result.StringValue := S;
+    DebugValue('Created string', Result);
+    DebugExit('ParseValue');
+    Exit;
+  end;
+
+  if SameText(ATypeName, 'boolean') then
+  begin
+    Debug('Parsing boolean');
+    if FCurrent.Kind <> tkBoolean then raise EGrispParseError.Create('boolean expected');
+    Result := TGrispValue.Create(gvkBoolean);
+    Result.BoolValue := SameText(FCurrent.Lexeme, 'true');
+    Advance;
+    DebugValue('Created boolean', Result);
+    DebugExit('ParseValue');
+    Exit;
+  end;
+
+  if SameText(ATypeName, 'identifier') then
+  begin
+    Debug('Parsing identifier');
+    if not (FCurrent.Kind in [tkIdentifier, tkKeywordNode, tkKeywordArray]) then
+      raise EGrispParseError.Create('identifier expected');
+    Result := TGrispValue.Create(gvkIdentifier);
+    Result.IdentifierValue := FCurrent.Lexeme;
+    Advance;
+    DebugValue('Created identifier', Result);
+    DebugExit('ParseValue');
+    Exit;
+  end;
+
+  if SameText(ATypeName, 'node') then
+  begin
+    Debug('Parsing node value');
+
+    // Case 1: Inline node literal
+    if FCurrent.Kind = tkLBrace then
+    begin
+      Debug('Inline node literal');
+      Expect(tkLBrace, '"{" expected');
+      Inc(FAnonId);
+      Node := FGraph.AddNode('#' + IntToStr(FAnonId), 'pattern');
+      DebugNode('Created nested node', Node);
+      ParseNodeBody(Node);
+      Expect(tkRBrace, '"}" expected');
+      Result := TGrispValue.Create(gvkNode);
+      Result.SetNodeReference(Node.Id, Node.Name);
+      DebugValue('Created node reference', Result);
+      DebugExit('ParseValue');
+      Exit;
+    end;
+
+    // Case 2: Reference to existing node by identifier
+    if FCurrent.Kind = tkIdentifier then
+    begin
+      Debug('Node reference: ' + FCurrent.Lexeme);
+      Result := TGrispValue.Create(gvkIdentifier);
+      Result.IdentifierValue := FCurrent.Lexeme;
+      Advance;
+      DebugValue('Created node reference', Result);
+      DebugExit('ParseValue');
+      Exit;
+    end;
+
+    raise EGrispParseError.Create('"{" or identifier expected for node value');
+  end;
+
+  Debug('Unknown type: ' + ATypeName);
+  raise EGrispParseError.CreateFmt('Unknown type "%s"', [ATypeName]);
+end;
+
+procedure TGrispUnifiedParser.ParseNodeBody(ANode: TGrispNode);
+var
+  Key, TypeName: string;
+  Value: TGrispValue;
+  AttrCount: Integer;
+begin
+  DebugEnter('ParseNodeBody');
+  DebugNode('For node', ANode);
+  AttrCount := 0;
+
+  while (FCurrent.Kind <> tkRBrace) and (FCurrent.Kind <> tkEOF) and
+        (FCurrent.Kind <> tkKeywordWhere) do
+  begin
+    Debug('Parsing attribute #' + IntToStr(AttrCount + 1));
+    DebugToken('Attribute start');
+
+    if not (FCurrent.Kind in [tkIdentifier, tkKeywordNode, tkKeywordArray]) then
+      raise EGrispParseError.CreateFmt('Attribute name expected at %d:%d', [FCurrent.Line, FCurrent.Column]);
+
+    Key := FCurrent.Lexeme;
+    Debug('Key: ' + Key);
+    Advance;
+
+    Expect(tkColon, '":" expected');
+    TypeName := ParseTypeName;
+    Debug('TypeName: ' + TypeName);
+
+    Expect(tkEquals, '"=" expected');
+    Value := ParseValue(TypeName);
+
+    DebugAttribute('Setting', Key, Value);
+    ANode.SetValueAttribute(Key, Value);
+    Inc(AttrCount);
+
+    if FCurrent.Kind = tkSemicolon then
+    begin
+      Debug('Semicolon separator');
+      Advance;
+    end;
+  end;
+
+  Debug(Format('ParseNodeBody complete: %d attributes', [AttrCount]));
+  DebugExit('ParseNodeBody');
+end;
+
+function TGrispUnifiedParser.ExprToValue(Expr: TGrispExpression): TGrispValue;
+begin
+  DebugEnter('ExprToValue');
+  Result := TGrispValue.Create(gvkExpression);
+  Result.ExpressionValue := Expr;
+  DebugValue('Created', Result);
+  DebugExit('ExprToValue');
+end;
+
+function TGrispUnifiedParser.ParseExpr: TGrispExpression;
+begin
+  DebugEnter('ParseExpr');
+  Result := ParseOrExpr;
+  DebugExit('ParseExpr');
+end;
+
+function TGrispUnifiedParser.ParseOrExpr: TGrispExpression;
+var
+  Left, Right: TGrispExpression;
+begin
+  DebugEnter('ParseOrExpr');
+  Left := ParseAndExpr;
+  while FCurrent.Kind = tkKeywordOr do
+  begin
+    Debug('OR operator found');
+    Advance;
+    Right := ParseAndExpr;
+    Result := TGrispExpression.Create(gekBinary);
+    Result.OperatorSymbol := 'or';
+    Result.Left := Left;
+    Result.Right := Right;
+    Left := Result;
+  end;
+  Result := Left;
+  DebugExit('ParseOrExpr');
+end;
+
+function TGrispUnifiedParser.ParseAndExpr: TGrispExpression;
+var
+  Left, Right: TGrispExpression;
+begin
+  DebugEnter('ParseAndExpr');
+  Left := ParseCompareExpr;
+  while FCurrent.Kind = tkKeywordAnd do
+  begin
+    Debug('AND operator found');
+    Advance;
+    Right := ParseCompareExpr;
+    Result := TGrispExpression.Create(gekBinary);
+    Result.OperatorSymbol := 'and';
+    Result.Left := Left;
+    Result.Right := Right;
+    Left := Result;
+  end;
+  Result := Left;
+  DebugExit('ParseAndExpr');
+end;
+
+function TGrispUnifiedParser.ParseCompareExpr: TGrispExpression;
+var
+  Left, Right: TGrispExpression;
+  Op: string;
+begin
+  DebugEnter('ParseCompareExpr');
+  Left := ParseAddExpr;
+  while FCurrent.Kind in [tkEquals, tkNotEqual, tkLess, tkGreater, tkLessEqual, tkGreaterEqual] do
+  begin
+    Op := FCurrent.Lexeme;
+    Debug('Compare operator: ' + Op);
+    Advance;
+    Right := ParseAddExpr;
+    Result := TGrispExpression.Create(gekBinary);
+    Result.OperatorSymbol := Op;
+    Result.Left := Left;
+    Result.Right := Right;
+    Left := Result;
+  end;
+  Result := Left;
+  DebugExit('ParseCompareExpr');
+end;
+
+function TGrispUnifiedParser.ParseAddExpr: TGrispExpression;
+var
+  Left, Right: TGrispExpression;
+  Op: string;
+begin
+  DebugEnter('ParseAddExpr');
+  Left := ParseMulExpr;
+  while (FCurrent.Kind = tkOperator) and ((FCurrent.Lexeme = '+') or (FCurrent.Lexeme = '-')) do
+  begin
+    Op := FCurrent.Lexeme;
+    Debug('Add operator: ' + Op);
+    Advance;
+    Right := ParseMulExpr;
+    Result := TGrispExpression.Create(gekBinary);
+    Result.OperatorSymbol := Op;
+    Result.Left := Left;
+    Result.Right := Right;
+    Left := Result;
+  end;
+  Result := Left;
+  DebugExit('ParseAddExpr');
+end;
+
+function TGrispUnifiedParser.ParseMulExpr: TGrispExpression;
+var
+  Left, Right: TGrispExpression;
+  Op: string;
+begin
+  DebugEnter('ParseMulExpr');
+  Left := ParseUnaryExpr;
+  while ((FCurrent.Kind = tkOperator) and ((FCurrent.Lexeme = '*') or (FCurrent.Lexeme = '/'))) or
+        (FCurrent.Kind = tkKeywordMod) do
+  begin
+    Op := FCurrent.Lexeme;
+    Debug('Mul operator: ' + Op);
+    Advance;
+    Right := ParseUnaryExpr;
+    Result := TGrispExpression.Create(gekBinary);
+    Result.OperatorSymbol := Op;
+    Result.Left := Left;
+    Result.Right := Right;
+    Left := Result;
+  end;
+  Result := Left;
+  DebugExit('ParseMulExpr');
+end;
+
+function TGrispUnifiedParser.ParseUnaryExpr: TGrispExpression;
+begin
+  DebugEnter('ParseUnaryExpr');
+  if FCurrent.Kind = tkKeywordNot then
+  begin
+    Debug('NOT operator');
+    Advance;
+    Result := TGrispExpression.Create(gekUnary);
+    Result.OperatorSymbol := 'not';
+    Result.Left := ParseUnaryExpr;
+    DebugExit('ParseUnaryExpr');
+    Exit;
+  end;
+  if (FCurrent.Kind = tkOperator) and (FCurrent.Lexeme = '-') then
+  begin
+    Debug('Unary minus');
+    Advance;
+    Result := TGrispExpression.Create(gekUnary);
+    Result.OperatorSymbol := '-';
+    Result.Left := ParseUnaryExpr;
+    DebugExit('ParseUnaryExpr');
+    Exit;
+  end;
+  Result := ParsePrimaryExpr;
+  DebugExit('ParseUnaryExpr');
+end;
+
+function TGrispUnifiedParser.ParsePrimaryExpr: TGrispExpression;
+var
+  Name: string;
+begin
+  DebugEnter('ParsePrimaryExpr');
+  DebugToken('Start');
+
+  if FCurrent.Kind = tkNumber then
+  begin
+    Debug('Number literal');
+    Result := TGrispExpression.Create(gekLiteral);
+    Result.Value := TGrispValue.Create(gvkNumber);
+    TGrispValue(Result.Value).NumberValue := StrToFloat(FCurrent.Lexeme);
+    Advance;
+    DebugExit('ParsePrimaryExpr');
+    Exit;
+  end;
+
+  if FCurrent.Kind = tkBoolean then
+  begin
+    Debug('Boolean literal');
+    Result := TGrispExpression.Create(gekLiteral);
+    Result.Value := TGrispValue.Create(gvkBoolean);
+    TGrispValue(Result.Value).BoolValue := SameText(FCurrent.Lexeme, 'true');
+    Advance;
+    DebugExit('ParsePrimaryExpr');
+    Exit;
+  end;
+
+  if FCurrent.Kind = tkIdentifier then
+  begin
+    Name := FCurrent.Lexeme;
+    Debug('Identifier: ' + Name);
+    Advance;
+    if FCurrent.Kind = tkLParen then
+    begin
+      Debug('Function call: ' + Name);
+      Result := TGrispExpression.Create(gekCall);
+      Result.Name := Name;
+      Advance;
+      while (FCurrent.Kind <> tkRParen) and (FCurrent.Kind <> tkEOF) do
+      begin
+        Result.Arguments.Add(ParseExpr);
+        if FCurrent.Kind = tkComma then Advance else Break;
+      end;
+      Expect(tkRParen, '")" expected');
+      DebugExit('ParsePrimaryExpr');
+      Exit;
+    end
+    else
+    begin
+      Debug('Variable: ' + Name);
+      Result := TGrispExpression.Create(gekVariable);
+      Result.Name := Name;
+      DebugExit('ParsePrimaryExpr');
+      Exit;
+    end;
+  end;
+
+  if FCurrent.Kind = tkLParen then
+  begin
+    Debug('Parenthesized expression');
+    Advance;
+    Result := ParseExpr;
+    Expect(tkRParen, '")" expected');
+    DebugExit('ParsePrimaryExpr');
+    Exit;
+  end;
+
+  raise EGrispParseError.Create('Expression expected');
+end;
+
+function TGrispUnifiedParser.ParseStrategy: TGrispStrategy;
+begin
+  DebugEnter('ParseStrategy');
+  DebugToken('Start');
+
+  if FCurrent.Kind = tkKeywordRepeat then
+  begin
+    Debug('Strategy: repeat');
+    Advance;
+    Expect(tkLParen, '"(" expected');
+    Result := TGrispStrategy.Create(gskRepeat);
+    while FCurrent.Kind <> tkRParen do
+    begin
+      Result.Strategies.Add(ParseStrategy);
+      if FCurrent.Kind = tkComma then Advance;
+    end;
+    Expect(tkRParen, '")" expected');
+  end
+  else if FCurrent.Kind = tkKeywordTry then
+  begin
+    Debug('Strategy: try');
+    Advance;
+    Expect(tkLParen, '"(" expected');
+    Result := TGrispStrategy.Create(gskTry);
+    while FCurrent.Kind <> tkRParen do
+    begin
+      Result.Strategies.Add(ParseStrategy);
+      if FCurrent.Kind = tkComma then Advance;
+    end;
+    Expect(tkRParen, '")" expected');
+  end
+  else if FCurrent.Kind = tkKeywordChoice then
+  begin
+    Debug('Strategy: choice');
+    Advance;
+    Expect(tkLParen, '"(" expected');
+    Result := TGrispStrategy.Create(gskChoice);
+    while FCurrent.Kind <> tkRParen do
+    begin
+      Result.Strategies.Add(ParseStrategy);
+      if FCurrent.Kind = tkComma then Advance;
+    end;
+    Expect(tkRParen, '")" expected');
+  end
+  else if (FCurrent.Kind = tkKeywordPhase) or ((FCurrent.Kind = tkIdentifier) and SameText(FCurrent.Lexeme, 'phase')) then
+  begin
+    Debug('Strategy: phase');
+    if FCurrent.Kind = tkIdentifier then Advance;
+    Expect(tkLParen, '"(" expected');
+    Result := TGrispStrategy.Create(gskPhase);
+    if FCurrent.Kind = tkNumber then
+    begin
+      Result.Phase := Trunc(StrToFloat(FCurrent.Lexeme));
+      Debug('Phase number: ' + IntToStr(Result.Phase));
+      Advance;
+      // FIX: Consume comma if present
+      if FCurrent.Kind = tkComma then
+        Advance;
+    end;
+    while FCurrent.Kind <> tkRParen do
+    begin
+      Result.Strategies.Add(ParseStrategy);
+      if FCurrent.Kind = tkComma then Advance;
+    end;
+    Expect(tkRParen, '")" expected');
+  end
+  else if FCurrent.Kind = tkIdentifier then
+  begin
+    Debug('Strategy: rule - ' + FCurrent.Lexeme);
+    Result := TGrispStrategy.Create(gskRule);
+    Result.RuleName := FCurrent.Lexeme;
+    Advance;
+  end
+  else
+    raise EGrispParseError.Create('Strategy expected');
+
+  DebugExit('ParseStrategy');
+end;
+
+function TGrispUnifiedParser.EdgeExists(ASource, ATarget: TGrispNode; const ALabel: string): Boolean;
+var
+  E: TGrispEdge;
+begin
+  for E in FGraph.Edges do
+    if (E.Source = ASource) and (E.Target = ATarget) and SameText(E.LabelName, ALabel) then
+      Exit(True);
+  Result := False;
+end;
+
+procedure TGrispUnifiedParser.RegisterEdgesForNode(ANode: TGrispNode);
+var
+  Key: string;
+  Val: TGrispValue;
+  Target: TGrispNode;
+  Elem: TGrispValue;
+  NodeId: Integer;
+  NodeName: string;
+begin
+  DebugEnter('RegisterEdgesForNode');
+  DebugNode('For node', ANode);
+
+  for Key in ANode.GetAttributeKeys do
+  begin
+    Val := ANode.GetValueAttribute(Key);
+    if Val = nil then Continue;
+
+    Debug('Processing edge for key: ' + Key);
+
+    case Val.Kind of
+      gvkNode:
+        begin
+          Val.GetNodeReference(NodeId, NodeName);
+          // Find by ID first, then by name as fallback
+          Target := nil;
+          for var Node in FGraph.Nodes do
+            if Node.Id = NodeId then
+            begin
+              Target := Node;
+              Break;
+            end;
+          // Fallback to name lookup if ID not found
+          if Target = nil then
+            Target := FGraph.FindNode(NodeName);
+
+          if Assigned(Target) and not EdgeExists(ANode, Target, Key) then
+          begin
+            Debug(Format('Adding edge: %s -%s-> %s (ID: %d)', [ANode.Name, Key, Target.Name, Target.Id]));
+            FGraph.AddEdge(ANode, Target, Key, '');
+          end
+          else if Target = nil then
+            Debug(Format('Target node not found: ID=%d, Name=%s', [NodeId, NodeName]));
+        end;
+      gvkIdentifier:
+        begin
+          Target := FGraph.FindNode(Val.IdentifierValue);
+          if Assigned(Target) and not EdgeExists(ANode, Target, Key) then
+          begin
+            Debug(Format('Adding edge: %s -%s-> %s', [ANode.Name, Key, Target.Name]));
+            FGraph.AddEdge(ANode, Target, Key, '');
+          end;
+        end;
+      gvkArray:
+        for Elem in Val.ArrayValue do
+        begin
+          if Elem.Kind = gvkNode then
+          begin
+            Elem.GetNodeReference(NodeId, NodeName);
+            // Find by ID
+            Target := nil;
+            for var Node in FGraph.Nodes do
+              if Node.Id = NodeId then
+              begin
+                Target := Node;
+                Break;
+              end;
+            if Target = nil then
+              Target := FGraph.FindNode(NodeName);
+
+            if Assigned(Target) and not EdgeExists(ANode, Target, Key) then
+              FGraph.AddEdge(ANode, Target, Key, '');
+          end
+          else if Elem.Kind = gvkIdentifier then
+          begin
+            Target := FGraph.FindNode(Elem.IdentifierValue);
+            if Assigned(Target) and not EdgeExists(ANode, Target, Key) then
+              FGraph.AddEdge(ANode, Target, Key, '');
+          end;
+        end;
+    end;
+  end;
+
+  DebugExit('RegisterEdgesForNode');
+end;
+
+procedure TGrispUnifiedParser.RegisterEdgesForAllNodes;
+var
+  Node: TGrispNode;
+begin
+  DebugEnter('RegisterEdgesForAllNodes');
+  Debug('Total nodes: ' + IntToStr(FGraph.Nodes.Count));
+
+  for Node in FGraph.Nodes do
+    RegisterEdgesForNode(Node);
+
+  DebugExit('RegisterEdgesForAllNodes');
+end;
+
+procedure TGrispUnifiedParser.ParseNodeDecl;
+var
+  NodeName: string;
+  Node: TGrispNode;
+  WhereExpr: TGrispExpression;
+  TempExpr: TGrispExpression;
+  PhaseNum: Double;
+begin
+  DebugEnter('ParseNodeDecl');
+  DebugToken('Start');
+
+  Expect(tkKeywordNode, '"node" expected');
+  NodeName := FCurrent.Lexeme;
+  Debug('Node name: ' + NodeName);
+  Expect(tkIdentifier, 'name expected');
+  Node := FGraph.AddNode(NodeName, 'node');
+  DebugNode('Created node', Node);
+
+  if StartsText('rule.', NodeName) then
+  begin
+    Debug('Registering as rule');
+    FGraph.RegisterRule(Node);
+  end;
+
+  // Parse optional phase declaration
+  if (FCurrent.Kind = tkKeywordPhase) or ((FCurrent.Kind = tkIdentifier) and SameText(FCurrent.Lexeme, 'phase')) then
+  begin
+    Debug('Parsing phase declaration');
+    if FCurrent.Kind = tkIdentifier then Advance;
+    if FCurrent.Kind = tkNumber then
+    begin
+      PhaseNum := StrToFloat(FCurrent.Lexeme);
+      Debug('Phase number: ' + FloatToStr(PhaseNum));
+      Node.SetValueAttribute('phase', TGrispValue.Create(gvkNumber));
+      Node.GetValueAttribute('phase').NumberValue := PhaseNum;
+      Advance;
+    end;
+  end;
+
+  Expect(tkLBrace, '{ expected');
+  ParseNodeBody(Node);
+
+  // Parse optional temp section
+  if (FCurrent.Kind = tkKeywordTemp) or ((FCurrent.Kind = tkIdentifier) and SameText(FCurrent.Lexeme, 'temp')) then
+  begin
+    Debug('Parsing temp section');
+    if FCurrent.Kind = tkIdentifier then Advance;
+    Expect(tkEquals, '"=" expected');
+    TempExpr := ParseExpr;
+    Node.SetValueAttribute('temp', ExprToValue(TempExpr));
+  end;
+
+  if FCurrent.Kind = tkKeywordWhere then
+  begin
+    Debug('Parsing where clause');
+    Advance;
+    WhereExpr := ParseExpr;
+    Node.SetValueAttribute('where', ExprToValue(WhereExpr));
+  end;
+
+  DebugToken('Before closing brace');
+  Expect(tkRBrace, '} expected');
+  DebugToken('After closing brace');
+
+  DebugExit('ParseNodeDecl');
+end;
+
+procedure TGrispUnifiedParser.ParseTypeDecl;
+var
+  TypeName: string;
+  Typ: TGrispType;
+begin
+  DebugEnter('ParseTypeDecl');
+  DebugToken('Start');
+
+  Expect(tkKeywordType, '"type" expected');
+  TypeName := FCurrent.Lexeme;
+  Debug('Type name: ' + TypeName);
+  Expect(tkIdentifier, 'name expected');
+  Expect(tkEquals, '"=" expected');
+  Typ := ParseType;
+  FGraph.AddType(TypeName, Typ);
+  Debug('Type added to graph');
+
+  DebugExit('ParseTypeDecl');
+end;
+
+procedure TGrispUnifiedParser.ParseStrategyDecl;
+var
+  StrategyName: string;
+  Strat: TGrispStrategy;
+begin
+  DebugEnter('ParseStrategyDecl');
+  DebugToken('Start');
+
+  Expect(tkKeywordStrategy, '"strategy" expected');
+  StrategyName := FCurrent.Lexeme;
+  Debug('Strategy name: ' + StrategyName);
+  Expect(tkIdentifier, 'name expected');
+  Expect(tkEquals, '"=" expected');
+  Strat := ParseStrategy;
+  // Store strategy directly on the graph
+  FGraph.AddStrategy(StrategyName, Strat);
+  Debug('Strategy added to graph');
+
+  DebugExit('ParseStrategyDecl');
+end;
+
+procedure TGrispUnifiedParser.ParseFile;
+var
+  DeclCount: Integer;
+begin
+  DebugEnter('ParseFile');
+  Debug('Starting parse');
+  DeclCount := 0;
+
+  while FCurrent.Kind <> tkEOF do
+  begin
+    Debug(Format('Declaration #%d', [DeclCount + 1]));
+    DebugToken('Current token');
+
+    case FCurrent.Kind of
+      tkKeywordNode:
+        begin
+          Debug('Found node declaration');
+          ParseNodeDecl;
+          Inc(DeclCount);
+        end;
+      tkKeywordType:
+        begin
+          Debug('Found type declaration');
+          ParseTypeDecl;
+          Inc(DeclCount);
+        end;
+      tkKeywordStrategy:
+        begin
+          Debug('Found strategy declaration');
+          ParseStrategyDecl;
+          Inc(DeclCount);
+        end;
+      else
+        raise EGrispParseError.Create('Expected node, type, or strategy declaration');
+    end;
+  end;
+
+  Debug(Format('Parse complete: %d declarations', [DeclCount]));
+  RegisterEdgesForAllNodes;
+  DebugExit('ParseFile');
+end;
+
+end.
+unit unit_Pattern_TGrispMatchResult_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.Generics.Collections,
+  unit_Graph_TGrispEdge_TGrispNode_version_001,      // Changed: contains TGrispNode
+  unit_Core_TGrispValueBase_version_001,             // Changed: contains TGrispValue
+  unit_Pattern_TGrispNodeBinding_version_001,
+  unit_Pattern_TGrispValueBinding_version_001;
+
+type
+  TGrispMatchResult = class
+  public
+    Success: Boolean;
+    NodeBindings: TList<TGrispNodeBinding>;
+    ValueBindings: TList<TGrispValueBinding>;
+    constructor Create;
+    destructor Destroy; override;
+    procedure AddNodeBinding(const AName: string; ANode: TGrispNode);
+    procedure AddValueBinding(const AName: string; AValue: TGrispValue);
+    function TryGetNode(const AName: string; out ANode: TGrispNode): Boolean;
+    function TryGetValue(const AName: string; out AValue: TGrispValue): Boolean;
+  end;
+
+implementation
+
+constructor TGrispMatchResult.Create;
+begin
+  inherited Create;
+  NodeBindings := TList<TGrispNodeBinding>.Create;
+  ValueBindings := TList<TGrispValueBinding>.Create;
+  Success := False;
+end;
+
+destructor TGrispMatchResult.Destroy;
+begin
+  NodeBindings.Free;
+  ValueBindings.Free;
+  inherited Destroy;
+end;
+
+procedure TGrispMatchResult.AddNodeBinding(const AName: string; ANode: TGrispNode);
+var B: TGrispNodeBinding;
+begin
+  B.Name := AName;
+  B.Node := ANode;
+  NodeBindings.Add(B);
+end;
+
+procedure TGrispMatchResult.AddValueBinding(const AName: string; AValue: TGrispValue);
+var B: TGrispValueBinding;
+begin
+  B.Name := AName;
+  B.Value := AValue;
+  ValueBindings.Add(B);
+end;
+
+function TGrispMatchResult.TryGetNode(const AName: string; out ANode: TGrispNode): Boolean;
+var B: TGrispNodeBinding;
+begin
+  for B in NodeBindings do
+    if SameText(B.Name, AName) then
+    begin
+	  ANode := B.Node;
+      Exit(True);
+    end;
+  ANode := nil;
+  Result := False;
+end;
+
+function TGrispMatchResult.TryGetValue(const AName: string; out AValue: TGrispValue): Boolean;
+var B: TGrispValueBinding;
+begin
+  for B in ValueBindings do
+    if SameText(B.Name, AName) then
+    begin
+      AValue := B.Value;
+      Exit(True);
+    end;
+  AValue := nil;
+  Result := False;
+end;
+
+end.
+unit unit_Pattern_TGrispNodeBinding_version_001;
+
+interface
+
+uses
+  unit_Graph_TGrispEdge_TGrispNode_version_001;  // Changed: use combined core unit
+
+type
+  TGrispNodeBinding = record
+    Name: string;
+    Node: TGrispNode;
+  end;
+
+implementation
+
+end.
+unit unit_Pattern_TGrispNodeVarInfo_version_001;
+
+interface
+
+uses
+  unit_Graph_TGrispEdge_TGrispNode_version_001;  // Changed: contains TGrispNode
+
+type
+  TGrispNodeVarInfo = record
+    VarName: string;
+    PatternNode: TGrispNode;
+  end;
+
+implementation
+
+end.
+unit unit_Pattern_TGrispPatternMatcher_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.Generics.Collections,
+  unit_Graph_TGrispGraph_version_001,
+  unit_Graph_TGrispEdge_TGrispNode_version_001,
+  unit_Core_TGrispValueBase_version_001,
+  unit_Core_TGrispExpressionEvaluator_version_001,
+  unit_Core_TGrispExpression_version_001,
+  unit_Pattern_TGrispMatchResult_version_001,
+  unit_Pattern_TGrispNodeVarInfo_version_001,
+  unit_Pattern_TGrispNodeBinding_version_001,
+  unit_Pattern_TGrispValueBinding_version_001;
+
+type
+  TGrispPatternMatcher = class
+  private
+    FGraph: TGrispGraph;
+    FPatternVariables: THashSet<string>;
+    FNodeVars: TList<TGrispNodeVarInfo>;
+    FCurrentRule: TGrispNode;
+    FTraceEnabled: Boolean;
+    FCurrentPhase: Integer;
+    procedure Trace(const Msg: string; Depth: Integer);
+    function IsVariable(const AIdentifier: string): Boolean;
+    function ValuesEqual(Val1: TGrispValue; Val2: TGrispValue): Boolean;
+    function GetNodeAttrOrEdge(TargetNode: TGrispNode; const Key: string; out OutVal: TGrispValue): Boolean;
+    function MatchNodeConstraints(PatternNode: TGrispNode; TargetNode: TGrispNode; Match: TGrispMatchResult): Boolean;
+    function MatchValue(PatternValue: TGrispValue; TargetValue: TGrispValue; Match: TGrispMatchResult): Boolean;
+    function CheckPatternEdges(PatternNode: TGrispNode; TargetNode: TGrispNode; const PartialMatch: TGrispMatchResult): Boolean;
+    function Search(VarIndex: Integer; Match: TGrispMatchResult): Boolean;
+    function HasWhere: Boolean;
+    function EvalWhere(Match: TGrispMatchResult): Boolean;
+    procedure CollectVariables(Node: TGrispNode; IsTempPattern: Boolean = False);
+    function GetAttributeKeys(Node: TGrispNode): TList<string>;
+  public
+    constructor Create(AGraph: TGrispGraph);
+    destructor Destroy; override;
+    procedure SetCurrentRule(Rule: TGrispNode);
+    procedure SetPhase(Phase: Integer);
+    property TraceEnabled: Boolean read FTraceEnabled write FTraceEnabled;
+    property CurrentPhase: Integer read FCurrentPhase;
+    function MatchPattern(PatternRoot: TGrispNode): TGrispMatchResult;
+    function FindAllMatches(PatternRoot: TGrispNode): TList<TGrispMatchResult>;
+  end;
+
+implementation
+
+constructor TGrispPatternMatcher.Create(AGraph: TGrispGraph);
+begin
+  inherited Create;
+  FGraph := AGraph;
+  FPatternVariables := THashSet<string>.Create;
+  FNodeVars := TList<TGrispNodeVarInfo>.Create;
+  FCurrentPhase := 1;
+end;
+
+destructor TGrispPatternMatcher.Destroy;
+begin
+  FNodeVars.Free;
+  FPatternVariables.Free;
+  inherited Destroy;
+end;
+
+procedure TGrispPatternMatcher.SetCurrentRule(Rule: TGrispNode);
+begin
+  FCurrentRule := Rule;
+end;
+
+procedure TGrispPatternMatcher.SetPhase(Phase: Integer);
+begin
+  FCurrentPhase := Phase;
+end;
+
+procedure TGrispPatternMatcher.Trace(const Msg: string; Depth: Integer);
+begin
+  if not FTraceEnabled then Exit;
+  Writeln(StringOfChar(' ', Depth * 2) + Msg);
+end;
+
+function TGrispPatternMatcher.IsVariable(const AIdentifier: string): Boolean;
+begin
+  Result := (Length(AIdentifier) = 1) and CharInSet(AIdentifier[1], ['A'..'Z']) or
+            (Length(AIdentifier) >= 2) and (AIdentifier[1] = 'V') and CharInSet(AIdentifier[2], ['A'..'Z']);
+end;
+
+function TGrispPatternMatcher.GetAttributeKeys(Node: TGrispNode): TList<string>;
+begin
+  Result := TList<string>.Create;
+  if Node.HasAttribute('value') then Result.Add('value');
+  if Node.HasAttribute('next') then Result.Add('next');
+  if Node.HasAttribute('name') then Result.Add('name');
+  if Node.HasAttribute('mark') then Result.Add('mark');
+  if Node.HasAttribute('phase') then Result.Add('phase');
+  if Node.HasAttribute('temp') then Result.Add('temp');
+  if Node.HasAttribute('where') then Result.Add('where');
+  if Node.HasAttribute('match') then Result.Add('match');
+  if Node.HasAttribute('rewrite') then Result.Add('rewrite');
+  if Node.HasAttribute('minVal') then Result.Add('minVal');
+  if Node.HasAttribute('minNode') then Result.Add('minNode');
+  if Node.HasAttribute('scanPos') then Result.Add('scanPos');
+  if Node.HasAttribute('pass') then Result.Add('pass');
+  if Node.HasAttribute('currentMin') then Result.Add('currentMin');
+  if Node.HasAttribute('isMin') then Result.Add('isMin');
+  if Node.HasAttribute('X') then Result.Add('X');
+  if Node.HasAttribute('Y') then Result.Add('Y');
+  if Node.HasAttribute('Prev') then Result.Add('Prev');
+  if Node.HasAttribute('Head') then Result.Add('Head');
+  if Node.HasAttribute('State') then Result.Add('State');
+end;
+
+function TGrispPatternMatcher.ValuesEqual(Val1: TGrispValue; Val2: TGrispValue): Boolean;
+var
+  I: Integer;
+  Id1, Id2: Integer;
+  Name1, Name2: string;
+begin
+  if (Val1 = nil) or (Val2 = nil) then Exit((Val1 = nil) and (Val2 = nil));
+  if Val1.Kind <> Val2.Kind then Exit(False);
+  case Val1.Kind of
+    gvkNumber: Result := Val1.NumberValue = Val2.NumberValue;
+    gvkString: Result := Val1.StringValue = Val2.StringValue;
+    gvkBoolean: Result := Val1.BoolValue = Val2.BoolValue;
+    gvkIdentifier: Result := Val1.IdentifierValue = Val2.IdentifierValue;
+    gvkArray:
+      begin
+        if Val1.ArrayValue.Count <> Val2.ArrayValue.Count then Exit(False);
+        for I := 0 to Val1.ArrayValue.Count - 1 do
+          if not ValuesEqual(Val1.ArrayValue[I], Val2.ArrayValue[I]) then Exit(False);
+        Result := True;
+      end;
+    gvkNode:
+      begin
+        Val1.GetNodeReference(Id1, Name1);
+        Val2.GetNodeReference(Id2, Name2);
+        Result := (Id1 = Id2) and (Name1 = Name2);
+      end;
+  else
+    Result := False;
+  end;
+end;
+
+function TGrispPatternMatcher.GetNodeAttrOrEdge(TargetNode: TGrispNode; const Key: string; out OutVal: TGrispValue): Boolean;
+var
+  Edge: TGrispEdge;
+begin
+  OutVal := TargetNode.GetValueAttribute(Key);
+  if OutVal <> nil then Exit(True);
+  for Edge in TargetNode.Outgoing do
+    if SameText(Edge.LabelName, Key) then
+    begin
+      OutVal := TGrispValue.Create(gvkIdentifier);
+      OutVal.IdentifierValue := Edge.Target.Name;
+      Exit(True);
+    end;
+  OutVal := nil;
+  Result := False;
+end;
+
+function TGrispPatternMatcher.MatchNodeConstraints(PatternNode: TGrispNode; TargetNode: TGrispNode; Match: TGrispMatchResult): Boolean;
+var
+  Key: string;
+  PatternVal, TargetVal: TGrispValue;
+  NeedFree: Boolean;
+  Edge: TGrispEdge;
+  FoundEdge: Boolean;
+  Keys: TList<string>;
+begin
+  if (PatternNode = nil) or (TargetNode = nil) then Exit(False);
+
+  Keys := GetAttributeKeys(PatternNode);
+  try
+    for Key in Keys do
+    begin
+      PatternVal := PatternNode.GetValueAttribute(Key);
+      NeedFree := False;
+
+      if (Key = 'next') then
+      begin
+        FoundEdge := False;
+        for Edge in TargetNode.Outgoing do
+        begin
+          if SameText(Edge.LabelName, 'next') then
+          begin
+            TargetVal := TGrispValue.Create(gvkIdentifier);
+            TargetVal.IdentifierValue := Edge.Target.Name;
+            NeedFree := True;
+            FoundEdge := True;
+            Break;
+          end;
+        end;
+
+        if not FoundEdge then
+        begin
+          if not GetNodeAttrOrEdge(TargetNode, Key, TargetVal) then
+            Exit(False);
+          if TargetVal <> TargetNode.GetValueAttribute(Key) then
+            NeedFree := True;
+        end;
+      end
+      else
+      begin
+        if not GetNodeAttrOrEdge(TargetNode, Key, TargetVal) then
+          Exit(False);
+        if TargetVal <> TargetNode.GetValueAttribute(Key) then
+          NeedFree := True;
+      end;
+
+      if not MatchValue(PatternVal, TargetVal, Match) then
+      begin
+        if NeedFree then TargetVal.Free;
+        Exit(False);
+      end;
+
+      if NeedFree then TargetVal.Free;
+    end;
+  finally
+    Keys.Free;
+  end;
+
+  Result := True;
+end;
+
+function TGrispPatternMatcher.MatchValue(PatternValue: TGrispValue; TargetValue: TGrispValue; Match: TGrispMatchResult): Boolean;
+var
+  IdStr: string;
+  BoundNode: TGrispNode;
+  BoundValue: TGrispValue;
+  TargetNodeRef: TGrispNode;
+  I: Integer;
+  Node: TGrispNode;
+  PatNodeId, TarNodeId: Integer;
+  PatNodeName, TarNodeName: string;
+begin
+  if (PatternValue = nil) or (TargetValue = nil) then
+  begin
+    Result := (PatternValue = nil) and (TargetValue = nil);
+    Exit;
+  end;
+
+  if (PatternValue.Kind = gvkIdentifier) then
+  begin
+    IdStr := PatternValue.IdentifierValue;
+
+    if (Length(IdStr) = 1) and CharInSet(IdStr[1], ['A'..'Z']) then
+    begin
+      if TargetValue.Kind = gvkIdentifier then
+      begin
+        TargetNodeRef := FGraph.FindNode(TargetValue.IdentifierValue);
+        if TargetNodeRef = nil then
+        begin
+          Result := False;
+          Exit;
+        end;
+
+        if Match.TryGetNode(IdStr, BoundNode) then
+        begin
+          Result := (BoundNode = TargetNodeRef);
+          Exit;
+        end;
+
+        Match.AddNodeBinding(IdStr, TargetNodeRef);
+        Result := True;
+        Exit;
+      end
+      else if TargetValue.Kind = gvkNode then
+      begin
+        TargetValue.GetNodeReference(I, IdStr);
+        TargetNodeRef := nil;
+        for Node in FGraph.Nodes do
+          if Node.Id = I then
+          begin
+            TargetNodeRef := Node;
+            Break;
+          end;
+        if TargetNodeRef = nil then
+        begin
+          Result := False;
+          Exit;
+        end;
+
+        if Match.TryGetNode(IdStr, BoundNode) then
+        begin
+          Result := (BoundNode = TargetNodeRef);
+          Exit;
+        end;
+
+        Match.AddNodeBinding(IdStr, TargetNodeRef);
+        Result := True;
+        Exit;
+      end
+      else
+      begin
+        Result := False;
+        Exit;
+      end;
+    end
+
+    else if (Length(IdStr) >= 2) and (IdStr[1] = 'V') and CharInSet(IdStr[2], ['A'..'Z']) then
+    begin
+      if Match.TryGetValue(IdStr, BoundValue) then
+      begin
+        Result := ValuesEqual(BoundValue, TargetValue);
+        Exit;
+      end
+      else
+      begin
+        if (TargetValue.Kind = gvkNumber) or (TargetValue.Kind = gvkBoolean) then
+        begin
+          Match.AddValueBinding(IdStr, TargetValue.Clone);
+          Result := True;
+          Exit;
+        end
+        else
+        begin
+          Result := False;
+          Exit;
+        end;
+      end;
+    end
+
+    else
+    begin
+      if TargetValue.Kind = gvkIdentifier then
+        Result := (IdStr = TargetValue.IdentifierValue)
+      else
+        Result := False;
+      Exit;
+    end;
+  end
+
+  else if PatternValue.Kind <> TargetValue.Kind then
+  begin
+    Result := False;
+    Exit;
+  end
+
+  else
+  begin
+    case PatternValue.Kind of
+      gvkNumber:
+        Result := (PatternValue.NumberValue = TargetValue.NumberValue);
+
+      gvkString:
+        Result := (PatternValue.StringValue = TargetValue.StringValue);
+
+      gvkBoolean:
+        Result := (PatternValue.BoolValue = TargetValue.BoolValue);
+
+      gvkIdentifier:
+        Result := (PatternValue.IdentifierValue = TargetValue.IdentifierValue);
+
+      gvkArray:
+        begin
+          if PatternValue.ArrayValue.Count <> TargetValue.ArrayValue.Count then
+          begin
+            Result := False;
+            Exit;
+          end;
+
+          for I := 0 to PatternValue.ArrayValue.Count - 1 do
+          begin
+            if not MatchValue(PatternValue.ArrayValue[I], TargetValue.ArrayValue[I], Match) then
+            begin
+              Result := False;
+              Exit;
+            end;
+          end;
+          Result := True;
+        end;
+
+      gvkNode:
+        begin
+          PatternValue.GetNodeReference(PatNodeId, PatNodeName);
+          TargetValue.GetNodeReference(TarNodeId, TarNodeName);
+
+          // Find nodes by name
+          var PatNode := FGraph.FindNode(PatNodeName);
+          var TarNode := FGraph.FindNode(TarNodeName);
+
+          if (PatNode = nil) or (TarNode = nil) then
+            Result := False
+          else
+            Result := MatchNodeConstraints(PatNode, TarNode, Match);
+        end;
+    else
+      Result := False;
+    end;
+  end;
+end;
+
+function TGrispPatternMatcher.CheckPatternEdges(PatternNode: TGrispNode; TargetNode: TGrispNode; const PartialMatch: TGrispMatchResult): Boolean;
+var
+  Key: string;
+  PatVal: TGrispValue;
+  TargetVar: string;
+  TargetHN: TGrispNode;
+  Edge: TGrispEdge;
+  Found: Boolean;
+  Keys: TList<string>;
+begin
+  Result := True;
+  Keys := GetAttributeKeys(PatternNode);
+  try
+    for Key in Keys do
+    begin
+      PatVal := PatternNode.GetValueAttribute(Key);
+      if (PatVal = nil) or (PatVal.Kind <> gvkIdentifier) then Continue;
+      TargetVar := PatVal.IdentifierValue;
+      if not FPatternVariables.Contains(TargetVar) then Continue;
+      if not PartialMatch.TryGetNode(TargetVar, TargetHN) then Continue;
+      Found := False;
+      for Edge in TargetNode.Outgoing do
+        if SameText(Edge.LabelName, Key) and (Edge.Target = TargetHN) then
+        begin
+          Found := True;
+          Break;
+        end;
+      if not Found then
+      begin
+        Trace(Format('Missing edge %s --%s--> %s', [TargetNode.Name, Key, TargetHN.Name]), FNodeVars.Count);
+        Exit(False);
+      end;
+    end;
+  finally
+    Keys.Free;
+  end;
+end;
+
+function TGrispPatternMatcher.Search(VarIndex: Integer; Match: TGrispMatchResult): Boolean;
+var
+  VarInfo: TGrispNodeVarInfo;
+  Candidate: TGrispNode;
+  SavedNodeCount, SavedValueCount: Integer;
+  AlreadyBound: TGrispNode;
+  NodeBoundToOther: Boolean;
+  B: TGrispNodeBinding;
+begin
+  if VarIndex >= FNodeVars.Count then Exit(True);
+
+  VarInfo := FNodeVars[VarIndex];
+  Trace(Format('Search[%d] var=%s', [VarIndex, VarInfo.VarName]), VarIndex);
+
+  if (VarInfo.VarName <> '') and Match.TryGetNode(VarInfo.VarName, AlreadyBound) then
+  begin
+    SavedNodeCount := Match.NodeBindings.Count;
+    SavedValueCount := Match.ValueBindings.Count;
+    if MatchNodeConstraints(VarInfo.PatternNode, AlreadyBound, Match) and
+       CheckPatternEdges(VarInfo.PatternNode, AlreadyBound, Match) then
+    begin
+      if Search(VarIndex + 1, Match) then Exit(True);
+    end;
+    Match.NodeBindings.Count := SavedNodeCount;
+    Match.ValueBindings.Count := SavedValueCount;
+    Exit(False);
+  end;
+
+  for Candidate in FGraph.Nodes do
+  begin
+    NodeBoundToOther := False;
+    for B in Match.NodeBindings do
+      if B.Node = Candidate then begin NodeBoundToOther := True; Break; end;
+    if NodeBoundToOther then Continue;
+
+    SavedNodeCount := Match.NodeBindings.Count;
+    SavedValueCount := Match.ValueBindings.Count;
+
+    if VarInfo.VarName <> '' then Match.AddNodeBinding(VarInfo.VarName, Candidate);
+
+    Trace(Format('Try %s -> %s', [VarInfo.VarName, Candidate.Name]), VarIndex);
+
+    if MatchNodeConstraints(VarInfo.PatternNode, Candidate, Match) then
+    begin
+      Trace(' constraints ok', VarIndex);
+      if CheckPatternEdges(VarInfo.PatternNode, Candidate, Match) then
+      begin
+        Trace(' edges ok', VarIndex);
+        if Search(VarIndex + 1, Match) then Exit(True);
+      end
+      else Trace(' edges fail', VarIndex);
+    end
+    else Trace(' constraints fail', VarIndex);
+
+    Match.NodeBindings.Count := SavedNodeCount;
+    Match.ValueBindings.Count := SavedValueCount;
+  end;
+  Result := False;
+end;
+
+function TGrispPatternMatcher.HasWhere: Boolean;
+begin
+  Result := Assigned(FCurrentRule) and FCurrentRule.HasAttribute('where') and
+            (FCurrentRule.GetValueAttribute('where').Kind = gvkExpression);
+end;
+
+function TGrispPatternMatcher.EvalWhere(Match: TGrispMatchResult): Boolean;
+var
+  V: TGrispValue;
+  Expr: TGrispExpression;
+  Bindings: TDictionary<string, TGrispValue>;
+  Res: TGrispValue;
+  B: TGrispValueBinding;
+  BNode: TGrispNodeBinding;
+  Pair: TPair<string, TGrispValue>;
+begin
+  Result := True;
+  if not Assigned(FCurrentRule) then Exit;
+  if not FCurrentRule.HasAttribute('where') then Exit;
+
+  V := FCurrentRule.GetValueAttribute('where');
+  if (V = nil) or (V.Kind <> gvkExpression) then Exit;
+
+  // Cast ExpressionValue to TGrispExpression
+  if not (V.ExpressionValue is TGrispExpression) then
+    Exit(False);
+
+  Expr := TGrispExpression(V.ExpressionValue);
+
+  Bindings := TDictionary<string, TGrispValue>.Create;
+  try
+    for B in Match.ValueBindings do
+      Bindings.Add(B.Name, B.Value.Clone);
+
+    for BNode in Match.NodeBindings do
+    begin
+      if not Bindings.ContainsKey(BNode.Name) then
+      begin
+        var NodeVal := TGrispValue.Create(gvkIdentifier);
+        NodeVal.IdentifierValue := BNode.Node.Name;
+        Bindings.Add(BNode.Name, NodeVal);
+      end;
+    end;
+
+    Res := TGrispExpressionEvaluator.Evaluate(Expr, Bindings);
+
+    try
+      Result := Assigned(Res) and (Res.Kind = gvkBoolean) and Res.BoolValue;
+    finally
+      Res.Free;
+    end;
+  finally
+    for Pair in Bindings do
+      Pair.Value.Free;
+    Bindings.Free;
+  end;
+end;
+
+procedure TGrispPatternMatcher.CollectVariables(Node: TGrispNode; IsTempPattern: Boolean);
+var
+  K: string;
+  V: TGrispValue;
+  VarInfo: TGrispNodeVarInfo;
+  Keys: TList<string>;
+  PatNodeId: Integer;
+  PatNodeName: string;
+  PatNode: TGrispNode;
+begin
+  if Node = nil then Exit;
+
+  Keys := GetAttributeKeys(Node);
+  try
+    for K in Keys do
+    begin
+      V := Node.GetValueAttribute(K);
+      if (V <> nil) and (V.Kind = gvkNode) then
+      begin
+        if IsVariable(K) then
+        begin
+          V.GetNodeReference(PatNodeId, PatNodeName);
+          PatNode := FGraph.FindNode(PatNodeName);
+          VarInfo.VarName := K;
+          VarInfo.PatternNode := PatNode;
+          FNodeVars.Add(VarInfo);
+          if not IsTempPattern then
+            FPatternVariables.Add(K);
+        end;
+        // Recursively collect - but need to get the actual node from the value
+        if V.Kind = gvkNode then
+        begin
+          V.GetNodeReference(PatNodeId, PatNodeName);
+          PatNode := FGraph.FindNode(PatNodeName);
+          if PatNode <> nil then
+            CollectVariables(PatNode, IsTempPattern);
+        end;
+      end
+      else if (V <> nil) and (V.Kind = gvkIdentifier) then
+      begin
+        if IsVariable(V.IdentifierValue) then
+        begin
+          if not IsTempPattern then
+            FPatternVariables.Add(V.IdentifierValue);
+        end;
+      end;
+    end;
+  finally
+    Keys.Free;
+  end;
+end;
+
+function TGrispPatternMatcher.MatchPattern(PatternRoot: TGrispNode): TGrispMatchResult;
+var
+  VarInfo: TGrispNodeVarInfo;
+  TempPattern: TGrispNode;
+  TempValue: TGrispValue;
+  TempNodeId: Integer;
+  TempNodeName: string;
+begin
+  Result := TGrispMatchResult.Create;
+  FPatternVariables.Clear;
+  FNodeVars.Clear;
+
+  if PatternRoot = nil then
+  begin
+    Result.Success := False;
+    Exit;
+  end;
+
+  TempPattern := nil;
+  if (FCurrentRule <> nil) and FCurrentRule.HasAttribute('temp') then
+  begin
+    TempValue := FCurrentRule.GetValueAttribute('temp');
+    if (TempValue <> nil) and (TempValue.Kind = gvkNode) then
+    begin
+      TempValue.GetNodeReference(TempNodeId, TempNodeName);
+      TempPattern := FGraph.FindNode(TempNodeName);
+    end;
+  end;
+
+  CollectVariables(PatternRoot, False);
+
+  if TempPattern <> nil then
+    CollectVariables(TempPattern, True);
+
+  if FNodeVars.Count = 0 then
+  begin
+    VarInfo.VarName := '';
+    VarInfo.PatternNode := PatternRoot;
+    FNodeVars.Add(VarInfo);
+  end;
+
+  if Search(0, Result) then
+  begin
+    if HasWhere then
+      Result.Success := EvalWhere(Result)
+    else
+      Result.Success := True;
+  end
+  else
+    Result.Success := False;
+end;
+
+function TGrispPatternMatcher.FindAllMatches(PatternRoot: TGrispNode): TList<TGrispMatchResult>;
+var
+  ResultList: TList<TGrispMatchResult>;
+  TempMatch: TGrispMatchResult;
+  VarInfo: TGrispNodeVarInfo;
+  TempPattern: TGrispNode;
+  TempValue: TGrispValue;
+  TempNodeId: Integer;
+  TempNodeName: string;
+
+  procedure SearchAll(VarIndex: Integer; CurrentMatch: TGrispMatchResult);
+  var
+    VI: TGrispNodeVarInfo;
+    Candidate: TGrispNode;
+    SavedNodeCount, SavedValueCount: Integer;
+    NodeBoundToOther: Boolean;
+    BNode: TGrispNodeBinding;
+    BValue: TGrispValueBinding;
+    NewMatch: TGrispMatchResult;
+  begin
+    if VarIndex >= FNodeVars.Count then
+    begin
+      if HasWhere then
+      begin
+        if EvalWhere(CurrentMatch) then
+        begin
+          NewMatch := TGrispMatchResult.Create;
+          NewMatch.Success := True;
+          for BNode in CurrentMatch.NodeBindings do
+            NewMatch.AddNodeBinding(BNode.Name, BNode.Node);
+          for BValue in CurrentMatch.ValueBindings do
+            NewMatch.AddValueBinding(BValue.Name, BValue.Value.Clone);
+          ResultList.Add(NewMatch);
+        end;
+      end
+      else
+      begin
+        NewMatch := TGrispMatchResult.Create;
+        NewMatch.Success := True;
+        for BNode in CurrentMatch.NodeBindings do
+          NewMatch.AddNodeBinding(BNode.Name, BNode.Node);
+        for BValue in CurrentMatch.ValueBindings do
+          NewMatch.AddValueBinding(BValue.Name, BValue.Value.Clone);
+        ResultList.Add(NewMatch);
+      end;
+      Exit;
+    end;
+
+    VI := FNodeVars[VarIndex];
+
+    if (VI.VarName <> '') and CurrentMatch.TryGetNode(VI.VarName, Candidate) then
+    begin
+      SavedNodeCount := CurrentMatch.NodeBindings.Count;
+      SavedValueCount := CurrentMatch.ValueBindings.Count;
+      if MatchNodeConstraints(VI.PatternNode, Candidate, CurrentMatch) and
+         CheckPatternEdges(VI.PatternNode, Candidate, CurrentMatch) then
+      begin
+        SearchAll(VarIndex + 1, CurrentMatch);
+      end;
+      CurrentMatch.NodeBindings.Count := SavedNodeCount;
+      CurrentMatch.ValueBindings.Count := SavedValueCount;
+      Exit;
+    end;
+
+    for Candidate in FGraph.Nodes do
+    begin
+      NodeBoundToOther := False;
+      for BNode in CurrentMatch.NodeBindings do
+        if BNode.Node = Candidate then
+        begin
+          NodeBoundToOther := True;
+          Break;
+        end;
+      if NodeBoundToOther then Continue;
+
+      SavedNodeCount := CurrentMatch.NodeBindings.Count;
+      SavedValueCount := CurrentMatch.ValueBindings.Count;
+
+      if VI.VarName <> '' then
+        CurrentMatch.AddNodeBinding(VI.VarName, Candidate);
+
+      if MatchNodeConstraints(VI.PatternNode, Candidate, CurrentMatch) then
+      begin
+        if CheckPatternEdges(VI.PatternNode, Candidate, CurrentMatch) then
+        begin
+          SearchAll(VarIndex + 1, CurrentMatch);
+        end;
+      end;
+
+      CurrentMatch.NodeBindings.Count := SavedNodeCount;
+      CurrentMatch.ValueBindings.Count := SavedValueCount;
+    end;
+  end;
+
+begin
+  ResultList := TList<TGrispMatchResult>.Create;
+  Result := ResultList;
+
+  FPatternVariables.Clear;
+  FNodeVars.Clear;
+
+  if PatternRoot = nil then
+    Exit;
+
+  TempPattern := nil;
+  if (FCurrentRule <> nil) and FCurrentRule.HasAttribute('temp') then
+  begin
+    TempValue := FCurrentRule.GetValueAttribute('temp');
+    if (TempValue <> nil) and (TempValue.Kind = gvkNode) then
+    begin
+      TempValue.GetNodeReference(TempNodeId, TempNodeName);
+      TempPattern := FGraph.FindNode(TempNodeName);
+    end;
+  end;
+
+  CollectVariables(PatternRoot, False);
+
+  if TempPattern <> nil then
+    CollectVariables(TempPattern, True);
+
+  if FNodeVars.Count = 0 then
+  begin
+    VarInfo.VarName := '';
+    VarInfo.PatternNode := PatternRoot;
+    FNodeVars.Add(VarInfo);
+  end;
+
+  TempMatch := TGrispMatchResult.Create;
+  try
+    SearchAll(0, TempMatch);
+  finally
+    TempMatch.Free;
+  end;
+end;
+
+end.
+unit unit_Pattern_TGrispValueBinding_version_001;
+
+interface
+
+uses
+  unit_Core_TGrispValueBase_version_001;  // Changed: use Base unit which contains TGrispValue
+
+type
+  TGrispValueBinding = record
+    Name: string;
+    Value: TGrispValue;
+  end;
+
+implementation
+
+end.
+unit unit_Rewrite_TGrispRewriteOperation_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.Generics.Collections,
+  unit_Graph_TGrispEdge_TGrispNode_version_001,  // For TGrispNode and TGrispEdge
+  unit_Core_TGrispValueBase_version_001;          // For TGrispValue
+
+type
+  TGrispRewriteOperation = record
+    TargetNode: TGrispNode;
+    Attributes: TDictionary<string, TGrispValue>;
+    EdgesToAdd: TList<TPair<string, TGrispNode>>;
+    EdgesToRemove: TList<TPair<string, TGrispNode>>;
+    NodesToRemove: TList<TGrispNode>;
+
+    procedure Init;
+    procedure Free;
+    function HasChanges: Boolean;
+    procedure Clear;
+  end;
+
+implementation
+
+procedure TGrispRewriteOperation.Init;
+begin
+  Attributes := TDictionary<string, TGrispValue>.Create;
+  EdgesToAdd := TList<TPair<string, TGrispNode>>.Create;
+  EdgesToRemove := TList<TPair<string, TGrispNode>>.Create;
+  NodesToRemove := TList<TGrispNode>.Create;
+end;
+
+procedure TGrispRewriteOperation.Free;
+begin
+  Attributes.Free;
+  EdgesToAdd.Free;
+  EdgesToRemove.Free;
+  NodesToRemove.Free;
+end;
+
+function TGrispRewriteOperation.HasChanges: Boolean;
+begin
+  Result := (Attributes.Count > 0) or (EdgesToAdd.Count > 0) or
+            (EdgesToRemove.Count > 0) or (NodesToRemove.Count > 0);
+end;
+
+procedure TGrispRewriteOperation.Clear;
+begin
+  Attributes.Clear;
+  EdgesToAdd.Clear;
+  EdgesToRemove.Clear;
+  NodesToRemove.Clear;
+end;
+
+end.
+unit unit_Rewrite_TGrispRewriter_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.Classes,
+  System.Generics.Collections,
+  unit_Graph_TGrispGraph_version_001,
+  unit_Graph_TGrispEdge_TGrispNode_version_001,
+  unit_Core_TGrispValueBase_version_001,
+  unit_Pattern_TGrispMatchResult_version_001,
+  unit_Pattern_TGrispPatternMatcher_version_001,
+  unit_Pattern_TGrispNodeBinding_version_001,
+  unit_Rewrite_TGrispRewriteOperation_version_001;
+
+type
+  TGrispRewriter = class
+  private
+    FGraph: TGrispGraph;
+    FOperations: TList<TGrispRewriteOperation>;
+    FTrace: TStrings;
+
+    function GetMatchRoot(ARule: TGrispNode): TGrispNode;
+    function GetRewriteRoot(ARule: TGrispNode): TGrispNode;
+    function CloneValue(AValue: TGrispValue): TGrispValue;
+    function IsEdgeDeletionAttribute(const Key: string; out EdgeLabel: string): Boolean;
+    function EvaluateValue(
+      TemplateVal: TGrispValue;
+      Match: TGrispMatchResult;
+      NodeVarMap: TDictionary<string, TGrispNode>;
+      NewNodes: TList<TGrispNode>): TGrispValue;
+    procedure CollectRewriteOperations(
+      RewriteRoot: TGrispNode;
+      Match: TGrispMatchResult;
+      NewNodes: TList<TGrispNode>;
+      Operations: TList<TGrispRewriteOperation>);
+    procedure ApplyOperations(Operations: TList<TGrispRewriteOperation>);
+	procedure RemoveEdge(Source: TGrispNode; const LabelName: string; Target: TGrispNode);
+    procedure RemoveNode(Node: TGrispNode);
+    function SelectNonOverlappingMatches(Matches: TList<TGrispMatchResult>): TList<TGrispMatchResult>;
+
+  public
+    constructor Create(AGraph: TGrispGraph);
+    destructor Destroy; override;
+
+    function ApplyAllMatches(ARule: TGrispNode; Matcher: TGrispPatternMatcher; Trace: TStrings = nil): Integer;
+    function ApplyAllMatchesWithLimit(ARule: TGrispNode; Matcher: TGrispPatternMatcher;
+                                      MaxMatches: Integer; Trace: TStrings = nil): Integer;
+
+    property Trace: TStrings read FTrace write FTrace;
+  end;
+
+implementation
+
+constructor TGrispRewriter.Create(AGraph: TGrispGraph);
+begin
+  inherited Create;
+  FGraph := AGraph;
+  FOperations := TList<TGrispRewriteOperation>.Create;
+end;
+
+destructor TGrispRewriter.Destroy;
+var
+  Op: TGrispRewriteOperation;
+begin
+  for Op in FOperations do
+    Op.Free;
+  FOperations.Free;
+  inherited Destroy;
+end;
+
+function TGrispRewriter.GetMatchRoot(ARule: TGrispNode): TGrispNode;
+var
+  V: TGrispValue;
+  NodeId: Integer;
+  NodeName: string;
+begin
+  Result := nil;
+  V := ARule.GetValueAttribute('match');
+  if (V <> nil) and (V.Kind = gvkNode) then
+  begin
+    V.GetNodeReference(NodeId, NodeName);
+    Result := FGraph.FindNode(NodeName);
+  end;
+end;
+
+function TGrispRewriter.GetRewriteRoot(ARule: TGrispNode): TGrispNode;
+var
+  V: TGrispValue;
+  NodeId: Integer;
+  NodeName: string;
+begin
+  Result := nil;
+  V := ARule.GetValueAttribute('rewrite');
+  if (V <> nil) and (V.Kind = gvkNode) then
+  begin
+    V.GetNodeReference(NodeId, NodeName);
+    Result := FGraph.FindNode(NodeName);
+  end;
+end;
+
+function TGrispRewriter.CloneValue(AValue: TGrispValue): TGrispValue;
+var
+  Elem: TGrispValue;
+begin
+  if AValue = nil then Exit(nil);
+  Result := TGrispValue.Create(AValue.Kind);
+  case AValue.Kind of
+    gvkNumber:  Result.NumberValue := AValue.NumberValue;
+    gvkString:  Result.StringValue := AValue.StringValue;
+    gvkBoolean: Result.BoolValue := AValue.BoolValue;
+    gvkIdentifier: Result.IdentifierValue := AValue.IdentifierValue;
+    gvkArray:
+      for Elem in AValue.ArrayValue do
+        Result.ArrayValue.Add(CloneValue(Elem));
+    gvkNode:
+      begin
+        var Id: Integer;
+        var Name: string;
+        AValue.GetNodeReference(Id, Name);
+        Result.SetNodeReference(Id, Name);
+      end;
+    gvkExpression:
+      Result.ExpressionValue := AValue.ExpressionValue;
+  end;
+end;
+
+function TGrispRewriter.IsEdgeDeletionAttribute(const Key: string; out EdgeLabel: string): Boolean;
+begin
+  if (Length(Key) > 7) and (Copy(Key, 1, 7) = 'remove_') then
+  begin
+    EdgeLabel := Copy(Key, 8, Length(Key) - 7);
+    Result := True;
+  end
+  else
+  begin
+    EdgeLabel := '';
+    Result := False;
+  end;
+end;
+
+function TGrispRewriter.EvaluateValue(
+  TemplateVal: TGrispValue;
+  Match: TGrispMatchResult;
+  NodeVarMap: TDictionary<string, TGrispNode>;
+  NewNodes: TList<TGrispNode>): TGrispValue;
+var
+  BoundNode: TGrispNode;
+  BoundVal: TGrispValue;
+  Elem: TGrispValue;
+  NewInlineNode: TGrispNode;
+  AttrKey: string;
+  NodeId: Integer;
+  NodeName: string;
+  SourceNode: TGrispNode;
+  Keys: TList<string>;
+begin
+  if TemplateVal = nil then Exit(nil);
+
+  case TemplateVal.Kind of
+    gvkNumber:
+      begin
+        Result := TGrispValue.Create(gvkNumber);
+        Result.NumberValue := TemplateVal.NumberValue;
+      end;
+    gvkString:
+      begin
+        Result := TGrispValue.Create(gvkString);
+        Result.StringValue := TemplateVal.StringValue;
+      end;
+    gvkBoolean:
+      begin
+        Result := TGrispValue.Create(gvkBoolean);
+        Result.BoolValue := TemplateVal.BoolValue;
+      end;
+    gvkIdentifier:
+      begin
+        if Match.TryGetNode(TemplateVal.IdentifierValue, BoundNode) then
+        begin
+          Result := TGrispValue.Create(gvkIdentifier);
+          Result.IdentifierValue := BoundNode.Name;
+        end
+        else if NodeVarMap.TryGetValue(TemplateVal.IdentifierValue, BoundNode) then
+        begin
+          Result := TGrispValue.Create(gvkIdentifier);
+          Result.IdentifierValue := BoundNode.Name;
+        end
+        else if Match.TryGetValue(TemplateVal.IdentifierValue, BoundVal) then
+        begin
+          Result := CloneValue(BoundVal);
+        end
+        else
+        begin
+          Result := TGrispValue.Create(gvkIdentifier);
+          Result.IdentifierValue := TemplateVal.IdentifierValue;
+        end;
+      end;
+    gvkArray:
+      begin
+        Result := TGrispValue.Create(gvkArray);
+        for Elem in TemplateVal.ArrayValue do
+          Result.ArrayValue.Add(EvaluateValue(Elem, Match, NodeVarMap, NewNodes));
+      end;
+    gvkNode:
+      begin
+        NewInlineNode := FGraph.AddNode('', 'node');
+        NewNodes.Add(NewInlineNode);
+
+        // Get the source node from the template value
+        TemplateVal.GetNodeReference(NodeId, NodeName);
+        SourceNode := FGraph.FindNode(NodeName);
+
+        if SourceNode <> nil then
+        begin
+          Keys := SourceNode.GetAttributeKeys;
+          try
+            for AttrKey in Keys do
+              NewInlineNode.SetValueAttribute(
+                AttrKey,
+                EvaluateValue(SourceNode.GetValueAttribute(AttrKey), Match, NodeVarMap, NewNodes)
+              );
+          finally
+            Keys.Free;
+          end;
+        end;
+
+        Result := TGrispValue.Create(gvkNode);
+        // Store the node reference using SetNodeReference instead of NodeValue
+        Result.SetNodeReference(NewInlineNode.Id, NewInlineNode.Name);
+      end;
+  else
+    Result := nil;
+  end;
+end;
+
+procedure TGrispRewriter.RemoveEdge(Source: TGrispNode; const LabelName: string; Target: TGrispNode);
+var
+  i: Integer;
+  Edge: TGrispEdge;
+begin
+  if (Source = nil) or (Target = nil) then Exit;
+
+  for i := FGraph.Edges.Count - 1 downto 0 do
+  begin
+	Edge := FGraph.Edges[i];
+	if (Edge.Source = Source) and (Edge.Target = Target) and SameText(Edge.LabelName, LabelName) then
+	begin
+	  FGraph.RemoveEdge(Edge);  // <- Use graph's method, don't manually delete
+	  Break;
+	end;
+  end;
+end;
+
+procedure TGrispRewriter.RemoveNode(Node: TGrispNode);
+begin
+  if Node = nil then Exit;
+  FGraph.RemoveNode(Node);  // <- Use graph's method
+end;
+
+function TGrispRewriter.SelectNonOverlappingMatches(Matches: TList<TGrispMatchResult>): TList<TGrispMatchResult>;
+var
+  M: TGrispMatchResult;
+  BNode: TGrispNodeBinding;
+  UsedNodes: THashSet<TGrispNode>;
+  HasOverlap: Boolean;
+  i: Integer;
+begin
+  Result := TList<TGrispMatchResult>.Create;
+  UsedNodes := THashSet<TGrispNode>.Create;
+
+  try
+    for i := 0 to Matches.Count - 1 do
+    begin
+      M := Matches[i];
+      HasOverlap := False;
+      for BNode in M.NodeBindings do
+      begin
+        if UsedNodes.Contains(BNode.Node) then
+        begin
+          HasOverlap := True;
+          Break;
+        end;
+      end;
+
+      if not HasOverlap then
+      begin
+        Result.Add(M);
+        for BNode in M.NodeBindings do
+          UsedNodes.Add(BNode.Node);
+      end;
+    end;
+  finally
+    UsedNodes.Free;
+  end;
+end;
+
+procedure TGrispRewriter.CollectRewriteOperations(
+  RewriteRoot: TGrispNode;
+  Match: TGrispMatchResult;
+  NewNodes: TList<TGrispNode>;
+  Operations: TList<TGrispRewriteOperation>);
+var
+  NodeVarMap: TDictionary<string, TGrispNode>;
+  AttrKey, Key, EdgeLabel: string;
+  AttrVal: TGrispValue;
+  BoundNode, NewNode, TargetNode: TGrispNode;
+  InlineTemplate: TGrispNode;
+  EvaluatedVal: TGrispValue;
+  Op: TGrispRewriteOperation;
+  EdgePair: TPair<string, TGrispNode>;
+  IsDeletion: Boolean;
+  RewriteKeys: TList<string>;
+  InlineKeys: TList<string>;
+  NodeId: Integer;
+  NodeName: string;
+begin
+  NodeVarMap := TDictionary<string, TGrispNode>.Create;
+  try
+    RewriteKeys := RewriteRoot.GetAttributeKeys;
+    try
+      for AttrKey in RewriteKeys do
+      begin
+        AttrVal := RewriteRoot.GetValueAttribute(AttrKey);
+        if (AttrVal <> nil) and (AttrVal.Kind = gvkNode) then
+        begin
+          if Match.TryGetNode(AttrKey, BoundNode) then
+            NodeVarMap.Add(AttrKey, BoundNode)
+          else
+          begin
+            NewNode := FGraph.AddNode('', 'node');
+            NewNodes.Add(NewNode);
+            NodeVarMap.Add(AttrKey, NewNode);
+          end;
+        end;
+      end;
+    finally
+      RewriteKeys.Free;
+    end;
+
+    for AttrKey in NodeVarMap.Keys do
+    begin
+      BoundNode := NodeVarMap[AttrKey];
+      AttrVal := RewriteRoot.GetValueAttribute(AttrKey);
+      if (AttrVal <> nil) and (AttrVal.Kind = gvkNode) then
+      begin
+        AttrVal.GetNodeReference(NodeId, NodeName);
+        InlineTemplate := FGraph.FindNode(NodeName);
+
+        Op.Init;
+        Op.TargetNode := BoundNode;
+
+        if Assigned(InlineTemplate) then
+        begin
+          InlineKeys := InlineTemplate.GetAttributeKeys;
+          try
+            for Key in InlineKeys do
+            begin
+              IsDeletion := IsEdgeDeletionAttribute(Key, EdgeLabel);
+
+              if IsDeletion then
+              begin
+                EvaluatedVal := EvaluateValue(InlineTemplate.GetValueAttribute(Key), Match, NodeVarMap, NewNodes);
+                if (EvaluatedVal <> nil) and (EvaluatedVal.Kind = gvkIdentifier) then
+                begin
+                  TargetNode := FGraph.FindNode(EvaluatedVal.IdentifierValue);
+                  if Assigned(TargetNode) then
+                  begin
+                    EdgePair.Key := EdgeLabel;
+                    EdgePair.Value := TargetNode;
+                    Op.EdgesToRemove.Add(EdgePair);
+                  end;
+                end;
+                EvaluatedVal.Free;
+                Continue;
+              end;
+
+              EvaluatedVal := EvaluateValue(InlineTemplate.GetValueAttribute(Key), Match, NodeVarMap, NewNodes);
+
+              if (Key = 'delete') and (EvaluatedVal <> nil) and (EvaluatedVal.Kind = gvkBoolean) and EvaluatedVal.BoolValue then
+              begin
+                Op.NodesToRemove.Add(BoundNode);
+                EvaluatedVal.Free;
+                Continue;
+              end;
+
+              if (Key = 'next') and (EvaluatedVal <> nil) and (EvaluatedVal.Kind = gvkIdentifier) then
+              begin
+                NewNode := FGraph.FindNode(EvaluatedVal.IdentifierValue);
+                if Assigned(NewNode) and (NewNode = BoundNode) then
+                begin
+                  EvaluatedVal.Free;
+                  Continue;
+                end;
+              end;
+
+              if SameText(Key, 'name') and (EvaluatedVal <> nil) and (EvaluatedVal.Kind = gvkIdentifier) then
+              begin
+                Op.Attributes.AddOrSetValue(Key, EvaluatedVal);
+              end
+              else
+              begin
+                Op.Attributes.AddOrSetValue(Key, EvaluatedVal);
+
+                if Assigned(EvaluatedVal) then
+                begin
+                  if EvaluatedVal.Kind = gvkNode then
+                  begin
+                    EvaluatedVal.GetNodeReference(NodeId, NodeName);
+                    TargetNode := FGraph.FindNode(NodeName);
+                    if Assigned(TargetNode) then
+                    begin
+                      EdgePair.Key := Key;
+                      EdgePair.Value := TargetNode;
+                      Op.EdgesToAdd.Add(EdgePair);
+                    end;
+                  end
+                  else if EvaluatedVal.Kind = gvkIdentifier then
+                  begin
+                    NewNode := FGraph.FindNode(EvaluatedVal.IdentifierValue);
+                    if Assigned(NewNode) then
+                    begin
+                      EdgePair.Key := Key;
+                      EdgePair.Value := NewNode;
+                      Op.EdgesToAdd.Add(EdgePair);
+                    end;
+                  end;
+                end;
+              end;
+            end;
+          finally
+            InlineKeys.Free;
+          end;
+        end;
+
+        if Op.HasChanges then
+          Operations.Add(Op)
+        else
+          Op.Free;
+      end;
+    end;
+  finally
+    NodeVarMap.Free;
+  end;
+end;
+
+procedure TGrispRewriter.ApplyOperations(Operations: TList<TGrispRewriteOperation>);
+var
+  Op: TGrispRewriteOperation;
+  Pair: TPair<string, TGrispNode>;
+  AttrKey: string;
+  AttrVal: TGrispValue;
+  NodeToRemove: TGrispNode;
+begin
+  for Op in Operations do
+  begin
+    for Pair in Op.EdgesToRemove do
+      RemoveEdge(Op.TargetNode, Pair.Key, Pair.Value);
+
+    for AttrKey in Op.Attributes.Keys do
+    begin
+      AttrVal := Op.Attributes[AttrKey];
+
+      if SameText(AttrKey, 'name') and (AttrVal <> nil) and (AttrVal.Kind = gvkIdentifier) then
+      begin
+        if Op.TargetNode.Name <> '' then
+          FGraph.NodeIndex.Remove(Op.TargetNode.Name);
+        Op.TargetNode.Name := AttrVal.IdentifierValue;
+        if Op.TargetNode.Name <> '' then
+          FGraph.NodeIndex.AddOrSetValue(Op.TargetNode.Name, Op.TargetNode);
+      end
+      else
+      begin
+        Op.TargetNode.SetValueAttribute(AttrKey, AttrVal);
+      end;
+    end;
+
+    for Pair in Op.EdgesToAdd do
+      FGraph.AddEdge(Op.TargetNode, Pair.Value, Pair.Key);
+
+    for NodeToRemove in Op.NodesToRemove do
+      RemoveNode(NodeToRemove);
+  end;
+end;
+
+function TGrispRewriter.ApplyAllMatches(ARule: TGrispNode; Matcher: TGrispPatternMatcher; Trace: TStrings): Integer;
+begin
+  Result := ApplyAllMatchesWithLimit(ARule, Matcher, MaxInt, Trace);
+end;
+
+function TGrispRewriter.ApplyAllMatchesWithLimit(ARule: TGrispNode; Matcher: TGrispPatternMatcher;
+                                                MaxMatches: Integer; Trace: TStrings): Integer;
+var
+  MatchRoot, RewriteRoot: TGrispNode;
+  MatchResults: TList<TGrispMatchResult>;
+  NewNodes: TList<TGrispNode>;
+  AllOperations: TList<TGrispRewriteOperation>;
+  Op: TGrispRewriteOperation;
+  TotalApplied: Integer;
+  SelectedMatches: TList<TGrispMatchResult>;
+  M: TGrispMatchResult;
+  i: Integer;
+begin
+  Result := 0;
+  TotalApplied := 0;
+
+  MatchRoot := GetMatchRoot(ARule);
+  RewriteRoot := GetRewriteRoot(ARule);
+  if (MatchRoot = nil) or (RewriteRoot = nil) then
+    Exit;
+
+  repeat
+    MatchResults := Matcher.FindAllMatches(MatchRoot);
+    try
+      if MatchResults.Count = 0 then
+        Break;
+
+      if Assigned(Trace) then
+        Trace.Add(Format('Found %d matches for rule %s', [MatchResults.Count, ARule.Name]));
+
+      SelectedMatches := SelectNonOverlappingMatches(MatchResults);
+      try
+        if SelectedMatches.Count = 0 then
+          Break;
+
+        if Assigned(Trace) then
+          Trace.Add(Format('Selected %d non-overlapping matches', [SelectedMatches.Count]));
+
+        NewNodes := TList<TGrispNode>.Create;
+        AllOperations := TList<TGrispRewriteOperation>.Create;
+        try
+          for i := 0 to SelectedMatches.Count - 1 do
+          begin
+            if TotalApplied >= MaxMatches then Break;
+            M := SelectedMatches[i];
+            CollectRewriteOperations(RewriteRoot, M, NewNodes, AllOperations);
+          end;
+
+          if AllOperations.Count > 0 then
+          begin
+            ApplyOperations(AllOperations);
+            Inc(TotalApplied, AllOperations.Count);
+            if Assigned(Trace) then
+              Trace.Add(Format('Applied %d rewrites (total: %d)', [AllOperations.Count, TotalApplied]));
+          end;
+        finally
+          for Op in AllOperations do
+            Op.Free;
+          AllOperations.Free;
+          NewNodes.Free;
+        end;
+      finally
+        SelectedMatches.Free;
+      end;
+    finally
+      MatchResults.Free;
+    end;
+  until (TotalApplied >= MaxMatches);
+
+  Result := TotalApplied;
+end;
+
+end.
+unit unit_Runtime_TGrispRuntimeConfig_version_001;
+
+interface
+
+type
+  TGrispRuntimeConfig = record
+    MaxSteps: Integer;
+    MaxPhases: Integer;
+    MaxStepsPerPhase: Integer;
+    TraceEnabled: Boolean;
+    PhaseMode: Boolean;
+    AutoCleanup: Boolean;
+
+    procedure SetDefaults;
+  end;
+
+implementation
+
+procedure TGrispRuntimeConfig.SetDefaults;
+begin
+  MaxSteps := 1000;
+  MaxPhases := 10;
+  MaxStepsPerPhase := 100;
+  TraceEnabled := False;
+  PhaseMode := False;
+  AutoCleanup := True;
+end;
+
+end.
+unit unit_Runtime_TGrispRuntimeEngine_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.Classes,
+  System.Generics.Collections,
+  unit_Graph_TGrispGraph_version_001,
+  unit_Graph_TGrispEdge_TGrispNode_version_001,
+  unit_Core_TGrispValueBase_version_001,           // Added for TGrispValue
+  unit_Pattern_TGrispPatternMatcher_version_001,
+  unit_Rewrite_TGrispRewriter_version_001,
+  unit_Runtime_TGrispRuntimeConfig_version_001;
+
+type
+  TGrispRuntimeEngine = class
+  private
+    FGraph: TGrispGraph;
+    FMatcher: TGrispPatternMatcher;
+    FRewriter: TGrispRewriter;
+    FTrace: TStrings;
+    FConfig: TGrispRuntimeConfig;
+    FTotalSteps: Integer;
+
+    function GetRulePhase(Rule: TGrispNode): Integer;
+    procedure LogTrace(const Msg: string);
+    procedure EnsureMatcherRewriter;
+
+  public
+    constructor Create(Graph: TGrispGraph);
+    destructor Destroy; override;
+
+    function Run(MaxSteps: Integer = 0): Integer; overload;
+    function RunWithTrace(Trace: TStrings; MaxSteps: Integer = 0): Integer;
+    function RunWithPhases(MaxPhases: Integer = 0; MaxStepsPerPhase: Integer = 0): Integer;
+    function RunWithPhasesAndTrace(Trace: TStrings; MaxPhases: Integer = 0; MaxStepsPerPhase: Integer = 0): Integer;
+    function RunUntilStable(MaxSteps: Integer = 0): Integer;
+
+    procedure Reset;
+    procedure SetConfig(const Config: TGrispRuntimeConfig);
+
+    property TotalSteps: Integer read FTotalSteps;
+    property Config: TGrispRuntimeConfig read FConfig;
+  end;
+
+implementation
+
+constructor TGrispRuntimeEngine.Create(Graph: TGrispGraph);
+begin
+  inherited Create;
+  FGraph := Graph;
+  FConfig.SetDefaults;
+  FTotalSteps := 0;
+  FMatcher := nil;
+  FRewriter := nil;
+end;
+
+destructor TGrispRuntimeEngine.Destroy;
+begin
+  FreeAndNil(FRewriter);
+  FreeAndNil(FMatcher);
+  inherited Destroy;
+end;
+
+procedure TGrispRuntimeEngine.EnsureMatcherRewriter;
+begin
+  if FMatcher = nil then
+    FMatcher := TGrispPatternMatcher.Create(FGraph);
+  if FRewriter = nil then
+    FRewriter := TGrispRewriter.Create(FGraph);
+end;
+
+procedure TGrispRuntimeEngine.LogTrace(const Msg: string);
+begin
+  if FConfig.TraceEnabled and Assigned(FTrace) then
+    FTrace.Add(Msg);
+end;
+
+function TGrispRuntimeEngine.GetRulePhase(Rule: TGrispNode): Integer;
+var
+  PhaseAttr: TGrispValue;
+begin
+  Result := 0;
+  if Rule.HasAttribute('phase') then
+  begin
+    PhaseAttr := Rule.GetValueAttribute('phase');
+    if (PhaseAttr <> nil) and (PhaseAttr.Kind = gvkNumber) then
+      Result := Trunc(PhaseAttr.NumberValue);
+  end;
+end;
+
+procedure TGrispRuntimeEngine.Reset;
+begin
+  FTotalSteps := 0;
+  if FConfig.AutoCleanup then
+  begin
+    FreeAndNil(FRewriter);
+    FreeAndNil(FMatcher);
+  end;
+end;
+
+procedure TGrispRuntimeEngine.SetConfig(const Config: TGrispRuntimeConfig);
+begin
+  FConfig := Config;
+end;
+
+function TGrispRuntimeEngine.Run(MaxSteps: Integer): Integer;
+var
+  Steps: Integer;
+  ActualMaxSteps: Integer;
+begin
+  Result := 0;
+  if FGraph = nil then Exit;
+
+  ActualMaxSteps := MaxSteps;
+  if ActualMaxSteps = 0 then
+    ActualMaxSteps := FConfig.MaxSteps;
+
+  EnsureMatcherRewriter;
+
+  Steps := 0;
+  try
+    Result := RunWithTrace(nil, ActualMaxSteps);
+  finally
+    FTotalSteps := Steps;
+  end;
+end;
+
+function TGrispRuntimeEngine.RunWithTrace(Trace: TStrings; MaxSteps: Integer): Integer;
+var
+  Step: Integer;
+  Changed: Boolean;
+  Rule: TGrispNode;
+  Applied: Integer;
+  ActualMaxSteps: Integer;
+  i: Integer;
+begin
+  Result := 0;
+  if FGraph = nil then Exit;
+
+  FTrace := Trace;
+  ActualMaxSteps := MaxSteps;
+  if ActualMaxSteps = 0 then
+    ActualMaxSteps := FConfig.MaxSteps;
+
+  EnsureMatcherRewriter;
+
+  Step := 0;
+  try
+    repeat
+      Changed := False;
+
+      for i := 0 to FGraph.Rules.Count - 1 do
+      begin
+        Rule := FGraph.Rules[i];
+        FMatcher.SetCurrentRule(Rule);
+        Applied := FRewriter.ApplyAllMatches(Rule, FMatcher, FTrace);
+
+        if Applied > 0 then
+        begin
+          Inc(Step, Applied);
+          Changed := True;
+
+          LogTrace(Format('Step %d: applied %s (%d matches)', [Step, Rule.Name, Applied]));
+
+          if Step >= ActualMaxSteps then
+            Break;
+        end;
+      end;
+
+    until (not Changed) or (Step >= ActualMaxSteps);
+
+    Result := Step;
+  finally
+    FTrace := nil;
+    if FConfig.AutoCleanup then
+    begin
+      FreeAndNil(FRewriter);
+      FreeAndNil(FMatcher);
+    end;
+  end;
+end;
+
+function TGrispRuntimeEngine.RunWithPhases(MaxPhases: Integer; MaxStepsPerPhase: Integer): Integer;
+begin
+  Result := RunWithPhasesAndTrace(nil, MaxPhases, MaxStepsPerPhase);
+end;
+
+function TGrispRuntimeEngine.RunWithPhasesAndTrace(Trace: TStrings; MaxPhases: Integer; MaxStepsPerPhase: Integer): Integer;
+var
+  Phase: Integer;
+  PhaseSteps: Integer;
+  Changed: Boolean;
+  Rule: TGrispNode;
+  Applied: Integer;
+  RulePhase: Integer;
+  TotalSteps: Integer;
+  ActualMaxPhases: Integer;
+  ActualMaxStepsPerPhase: Integer;
+  i: Integer;
+begin
+  Result := 0;
+  TotalSteps := 0;
+
+  if FGraph = nil then Exit;
+
+  FTrace := Trace;
+  ActualMaxPhases := MaxPhases;
+  if ActualMaxPhases = 0 then
+    ActualMaxPhases := FConfig.MaxPhases;
+
+  ActualMaxStepsPerPhase := MaxStepsPerPhase;
+  if ActualMaxStepsPerPhase = 0 then
+	ActualMaxStepsPerPhase := FConfig.MaxStepsPerPhase;
+
+  EnsureMatcherRewriter;
+
+  try
+    for Phase := 1 to ActualMaxPhases do
+    begin
+      LogTrace(Format('========== PHASE %d ==========', [Phase]));
+      PhaseSteps := 0;
+
+      repeat
+        Changed := False;
+
+        for i := 0 to FGraph.Rules.Count - 1 do
+        begin
+          Rule := FGraph.Rules[i];
+          RulePhase := GetRulePhase(Rule);
+
+          if (RulePhase = 0) or (RulePhase = Phase) then
+          begin
+            FMatcher.SetCurrentRule(Rule);
+            Applied := FRewriter.ApplyAllMatches(Rule, FMatcher, FTrace);
+
+            if Applied > 0 then
+            begin
+              Inc(PhaseSteps, Applied);
+              Changed := True;
+
+              LogTrace(Format('  Phase %d, Step %d: %s (%d matches)',
+                       [Phase, PhaseSteps, Rule.Name, Applied]));
+
+              if PhaseSteps >= ActualMaxStepsPerPhase then
+                Break;
+            end;
+          end;
+        end;
+
+        if PhaseSteps >= ActualMaxStepsPerPhase then
+          Break;
+
+      until not Changed;
+
+      LogTrace(Format('Phase %d complete after %d steps', [Phase, PhaseSteps]));
+      Inc(TotalSteps, PhaseSteps);
+
+      if PhaseSteps = 0 then
+        Break;
+    end;
+
+    Result := TotalSteps;
+
+  finally
+    FTrace := nil;
+    if FConfig.AutoCleanup then
+    begin
+      FreeAndNil(FRewriter);
+      FreeAndNil(FMatcher);
+    end;
+  end;
+end;
+
+function TGrispRuntimeEngine.RunUntilStable(MaxSteps: Integer): Integer;
+begin
+  Result := Run(MaxSteps);
+end;
+
+end.
+unit unit_Runtime_TGrispRuntime_version_001;
+
+interface
+
+uses
+  System.Classes,
+  unit_Graph_TGrispGraph_version_001,
+  unit_Runtime_TGrispRuntimeConfig_version_001,
+  unit_Runtime_TGrispRuntimeEngine_version_001;
+
+type
+  // Public API facade
+  TGrispRuntime = class
+  private
+    class var FDefaultConfig: TGrispRuntimeConfig;
+    class var FDefaultEngine: TGrispRuntimeEngine;
+
+    class function GetEngine(Graph: TGrispGraph): TGrispRuntimeEngine;
+    class procedure ReleaseEngine(Engine: TGrispRuntimeEngine);
+  public
+    class procedure Initialize;
+    class procedure Configure(const Config: TGrispRuntimeConfig);
+    class function Run(Graph: TGrispGraph; MaxSteps: Integer = 0; Trace: TStrings = nil): Integer; overload;
+    class function RunWithPhases(Graph: TGrispGraph; MaxPhases: Integer = 0;
+                                 MaxStepsPerPhase: Integer = 0; Trace: TStrings = nil): Integer;
+    class function RunUntilStable(Graph: TGrispGraph; MaxSteps: Integer = 0; Trace: TStrings = nil): Integer;
+
+    class property DefaultConfig: TGrispRuntimeConfig read FDefaultConfig;
+  end;
+
+implementation
+
+class procedure TGrispRuntime.Initialize;
+begin
+  FDefaultConfig.SetDefaults;
+  FDefaultEngine := nil;
+end;
+
+class procedure TGrispRuntime.Configure(const Config: TGrispRuntimeConfig);
+begin
+  FDefaultConfig := Config;
+end;
+
+class function TGrispRuntime.GetEngine(Graph: TGrispGraph): TGrispRuntimeEngine;
+begin
+  if FDefaultEngine = nil then
+    FDefaultEngine := TGrispRuntimeEngine.Create(Graph);
+  Result := FDefaultEngine;
+  Result.SetConfig(FDefaultConfig);
+end;
+
+class procedure TGrispRuntime.ReleaseEngine(Engine: TGrispRuntimeEngine);
+begin
+  if Engine = FDefaultEngine then
+  begin
+    FDefaultEngine.Free;
+    FDefaultEngine := nil;
+  end
+  else
+    Engine.Free;
+end;
+
+class function TGrispRuntime.Run(Graph: TGrispGraph; MaxSteps: Integer; Trace: TStrings): Integer;
+var
+  Engine: TGrispRuntimeEngine;
+begin
+  Engine := GetEngine(Graph);
+  try
+    Result := Engine.RunWithTrace(Trace, MaxSteps);
+  finally
+    ReleaseEngine(Engine);
+  end;
+end;
+
+class function TGrispRuntime.RunWithPhases(Graph: TGrispGraph; MaxPhases, MaxStepsPerPhase: Integer;
+                                           Trace: TStrings): Integer;
+var
+  Engine: TGrispRuntimeEngine;
+begin
+  Engine := GetEngine(Graph);
+  try
+    Result := Engine.RunWithPhasesAndTrace(Trace, MaxPhases, MaxStepsPerPhase);
+  finally
+    ReleaseEngine(Engine);
+  end;
+end;
+
+class function TGrispRuntime.RunUntilStable(Graph: TGrispGraph; MaxSteps: Integer; Trace: TStrings): Integer;
+begin
+  Result := Run(Graph, MaxSteps, Trace);
+end;
+
+initialization
+  TGrispRuntime.Initialize;
+end.
+unit unit_Strategy_TGrispStrategyBuilder_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.Generics.Collections,
+  System.TypInfo,
+  unit_Strategy_TGrispStrategyKind_version_001,
+  unit_Strategy_TGrispStrategy_version_001,
+  unit_Debug_TGrispDebug_version_001;
+
+type
+  TGrispStrategyBuilder = class
+  private
+    FRoot: TGrispStrategy;
+    FCurrentParent: TGrispStrategy;
+    FScopeStack: TStack<TGrispStrategy>;
+    FDebugEnabled: Boolean;
+
+    procedure Debug(const Msg: string);
+    procedure DebugEnter(const Method: string);
+    procedure DebugExit(const Method: string);
+    procedure DumpStrategy(Strategy: TGrispStrategy; Indent: Integer = 0);
+    procedure DumpState(const Prefix: string);
+
+    procedure AddStrategy(Strategy: TGrispStrategy);
+	procedure WrapLastStrategy(Kind: TGrispStrategyKind; PhaseNum: Integer = 0);
+  public
+    constructor Create;
+    destructor Destroy; override;
+
+    procedure EnableDebug;
+    procedure DisableDebug;
+
+    function Rule(const RuleName: string): TGrispStrategyBuilder;
+    function Sequence: TGrispStrategyBuilder;
+    function EndScope: TGrispStrategyBuilder;
+    function RepeatStrategy: TGrispStrategyBuilder;
+    function TryStrategy: TGrispStrategyBuilder;
+    function Choice: TGrispStrategyBuilder;
+    function Phase(PhaseNum: Integer): TGrispStrategyBuilder;
+
+    function Build: TGrispStrategy;
+    procedure Clear;
+  end;
+
+implementation
+
+constructor TGrispStrategyBuilder.Create;
+begin
+  inherited Create;
+  FRoot := nil;
+  FCurrentParent := nil;
+  FScopeStack := TStack<TGrispStrategy>.Create;
+  FDebugEnabled := False;
+end;
+
+destructor TGrispStrategyBuilder.Destroy;
+begin
+  Clear;
+  FScopeStack.Free;
+  inherited Destroy;
+end;
+
+procedure TGrispStrategyBuilder.EnableDebug;
+begin
+  FDebugEnabled := True;
+  TGrispDebug.Enable;
+  Debug('=== Fixed StrategyBuilder DEBUG ENABLED ===');
+end;
+
+procedure TGrispStrategyBuilder.DisableDebug;
+begin
+  Debug('=== Fixed StrategyBuilder DEBUG DISABLED ===');
+  FDebugEnabled := False;
+end;
+
+procedure TGrispStrategyBuilder.Debug(const Msg: string);
+begin
+  if FDebugEnabled then
+    TGrispDebug.Log('[FixedBuilder] ' + Msg);
+end;
+
+procedure TGrispStrategyBuilder.DebugEnter(const Method: string);
+begin
+  if FDebugEnabled then
+    TGrispDebug.LogEnter('[FixedBuilder] ' + Method);
+end;
+
+procedure TGrispStrategyBuilder.DebugExit(const Method: string);
+begin
+  if FDebugEnabled then
+    TGrispDebug.LogExit('[FixedBuilder] ' + Method);
+end;
+
+procedure TGrispStrategyBuilder.DumpStrategy(Strategy: TGrispStrategy; Indent: Integer = 0);
+var
+  i: Integer;
+  IndentStr: string;
+begin
+  if not FDebugEnabled then Exit;
+
+  IndentStr := StringOfChar(' ', Indent * 2);
+  case Strategy.Kind of
+    gskRule:
+      Debug(Format('%sRule: %s', [IndentStr, Strategy.RuleName]));
+    gskSequence:
+      begin
+        Debug(Format('%sSequence (%d children)', [IndentStr, Strategy.Strategies.Count]));
+        for i := 0 to Strategy.Strategies.Count - 1 do
+          DumpStrategy(Strategy.Strategies[i], Indent + 1);
+      end;
+    gskRepeat:
+      begin
+        Debug(Format('%sRepeat (%d children)', [IndentStr, Strategy.Strategies.Count]));
+        for i := 0 to Strategy.Strategies.Count - 1 do
+          DumpStrategy(Strategy.Strategies[i], Indent + 1);
+      end;
+    gskTry:
+      begin
+        Debug(Format('%sTry (%d children)', [IndentStr, Strategy.Strategies.Count]));
+        for i := 0 to Strategy.Strategies.Count - 1 do
+          DumpStrategy(Strategy.Strategies[i], Indent + 1);
+      end;
+    gskChoice:
+      begin
+        Debug(Format('%sChoice (%d children)', [IndentStr, Strategy.Strategies.Count]));
+        for i := 0 to Strategy.Strategies.Count - 1 do
+          DumpStrategy(Strategy.Strategies[i], Indent + 1);
+      end;
+    gskPhase:
+      begin
+        Debug(Format('%sPhase %d (%d children)', [IndentStr, Strategy.Phase, Strategy.Strategies.Count]));
+        for i := 0 to Strategy.Strategies.Count - 1 do
+          DumpStrategy(Strategy.Strategies[i], Indent + 1);
+      end;
+  end;
+end;
+
+procedure TGrispStrategyBuilder.DumpState(const Prefix: string);
+begin
+  if not FDebugEnabled then Exit;
+  Debug(Format('%s Root: %s, CurrentParent: %s, ScopeStack depth: %d', [
+    Prefix,
+    BoolToStr(FRoot <> nil, True),
+    BoolToStr(FCurrentParent <> nil, True),
+    FScopeStack.Count
+  ]));
+  if FRoot <> nil then
+    DumpStrategy(FRoot, 1);
+end;
+
+procedure TGrispStrategyBuilder.Clear;
+begin
+  DebugEnter('Clear');
+  FRoot.Free;
+  FRoot := nil;
+  FCurrentParent := nil;
+  FScopeStack.Clear;
+  DumpState('After Clear');
+  DebugExit('Clear');
+end;
+
+procedure TGrispStrategyBuilder.AddStrategy(Strategy: TGrispStrategy);
+begin
+  if FRoot = nil then
+  begin
+    FRoot := Strategy;
+    FCurrentParent := Strategy;
+    Debug('Added as root');
+  end
+  else if (FRoot.Kind = gskRule) and (FCurrentParent = FRoot) then
+  begin
+    // Multiple root rules - wrap in sequence
+    Debug('Multiple root rules detected - wrapping in sequence');
+    var NewSequence := TGrispStrategy.Create(gskSequence);
+    NewSequence.Strategies.Add(FRoot);
+    NewSequence.Strategies.Add(Strategy);
+    FRoot := NewSequence;
+    FCurrentParent := NewSequence;
+    Debug('Created sequence with both rules');
+  end
+  else if FCurrentParent <> nil then
+  begin
+    FCurrentParent.Strategies.Add(Strategy);
+    Debug(Format('Added to parent %s', [GetEnumName(TypeInfo(TGrispStrategyKind), Ord(FCurrentParent.Kind))]));
+  end
+  else
+  begin
+    Debug('ERROR: No current parent for strategy');
+    Strategy.Free;
+    raise Exception.Create('No current parent for strategy');
+  end;
+end;
+
+procedure TGrispStrategyBuilder.WrapLastStrategy(Kind: TGrispStrategyKind; PhaseNum: Integer = 0);
+var
+  Last: TGrispStrategy;
+  Wrapper: TGrispStrategy;
+begin
+  Debug(Format('Wrapping last strategy with %s', [GetEnumName(TypeInfo(TGrispStrategyKind), Ord(Kind))]));
+
+  if FRoot = nil then
+  begin
+    case Kind of
+      gskRepeat:
+        raise Exception.Create('RepeatStrategy requires a preceding strategy');
+      gskTry:
+        raise Exception.Create('TryStrategy requires a preceding strategy');
+      gskChoice:
+        raise Exception.Create('Choice requires a preceding strategy');
+      gskPhase:
+        raise Exception.Create('Phase requires a preceding strategy');
+    else
+      raise Exception.Create('No strategy to wrap');
+    end;
+  end;
+
+  // If current parent has children, wrap the last child
+  if (FCurrentParent <> nil) and (FCurrentParent.Strategies.Count > 0) then
+  begin
+    Last := FCurrentParent.Strategies.Last;
+    Debug(Format('Wrapping child strategy: %s', [GetEnumName(TypeInfo(TGrispStrategyKind), Ord(Last.Kind))]));
+
+    Wrapper := TGrispStrategy.Create(Kind);
+    if Kind = gskPhase then
+      Wrapper.Phase := PhaseNum;
+    Wrapper.Strategies.Add(Last);
+
+    FCurrentParent.Strategies.Delete(FCurrentParent.Strategies.Count - 1);
+    FCurrentParent.Strategies.Add(Wrapper);
+    Debug('Created wrapper and replaced child');
+  end
+  // Otherwise, wrap the root itself
+  else if FRoot <> nil then
+  begin
+    Debug('Wrapping root strategy');
+    Last := FRoot;
+    Debug(Format('Root strategy: %s', [GetEnumName(TypeInfo(TGrispStrategyKind), Ord(Last.Kind))]));
+
+    Wrapper := TGrispStrategy.Create(Kind);
+    if Kind = gskPhase then
+      Wrapper.Phase := PhaseNum;
+    Wrapper.Strategies.Add(Last);
+
+    FRoot := Wrapper;
+    FCurrentParent := Wrapper;
+    Debug('Created wrapper and replaced root');
+  end
+  else
+  begin
+    // This case should never be reached because FRoot is checked above
+    raise Exception.Create('No strategy to wrap');
+  end;
+end;
+
+function TGrispStrategyBuilder.Rule(const RuleName: string): TGrispStrategyBuilder;
+var
+  Strategy: TGrispStrategy;
+begin
+  DebugEnter('Rule');
+  Debug(Format('Adding rule: %s', [RuleName]));
+  Strategy := TGrispStrategy.Create(gskRule);
+  Strategy.RuleName := RuleName;
+  AddStrategy(Strategy);
+  DumpState('After Rule');
+  DebugExit('Rule');
+  Result := Self;
+end;
+
+function TGrispStrategyBuilder.Sequence: TGrispStrategyBuilder;
+var
+  Strategy: TGrispStrategy;
+begin
+  DebugEnter('Sequence');
+  Debug('Adding sequence - opening new scope');
+
+  Strategy := TGrispStrategy.Create(gskSequence);
+
+  FScopeStack.Push(FCurrentParent);
+
+  if FRoot = nil then
+  begin
+    FRoot := Strategy;
+    FCurrentParent := Strategy;
+    Debug('Sequence is root');
+  end
+  else if FCurrentParent <> nil then
+  begin
+    FCurrentParent.Strategies.Add(Strategy);
+    FCurrentParent := Strategy;
+    Debug('Sequence added as child and becomes current parent');
+  end
+  else
+  begin
+    Debug('ERROR: Cannot add sequence - no context');
+    Strategy.Free;
+    raise Exception.Create('Cannot add sequence - no context');
+  end;
+
+  DumpState('After Sequence');
+  DebugExit('Sequence');
+  Result := Self;
+end;
+
+function TGrispStrategyBuilder.EndScope: TGrispStrategyBuilder;
+begin
+  DebugEnter('EndScope');
+
+  if FScopeStack.Count = 0 then
+  begin
+    Debug('ERROR: EndScope called with no open scope');
+    raise Exception.Create('EndScope called with no open scope');
+  end;
+
+  FCurrentParent := FScopeStack.Pop;
+  Debug('Closed scope');
+  DumpState('After EndScope');
+  DebugExit('EndScope');
+  Result := Self;
+end;
+
+function TGrispStrategyBuilder.RepeatStrategy: TGrispStrategyBuilder;
+begin
+  DebugEnter('RepeatStrategy');
+  WrapLastStrategy(gskRepeat);
+  DumpState('After RepeatStrategy');
+  DebugExit('RepeatStrategy');
+  Result := Self;
+end;
+
+function TGrispStrategyBuilder.TryStrategy: TGrispStrategyBuilder;
+begin
+  DebugEnter('TryStrategy');
+  WrapLastStrategy(gskTry);
+  DumpState('After TryStrategy');
+  DebugExit('TryStrategy');
+  Result := Self;
+end;
+
+function TGrispStrategyBuilder.Choice: TGrispStrategyBuilder;
+begin
+  DebugEnter('Choice');
+  WrapLastStrategy(gskChoice);
+  DumpState('After Choice');
+  DebugExit('Choice');
+  Result := Self;
+end;
+
+function TGrispStrategyBuilder.Phase(PhaseNum: Integer): TGrispStrategyBuilder;
+begin
+  DebugEnter('Phase');
+  Debug(Format('Phase number: %d', [PhaseNum]));
+  WrapLastStrategy(gskPhase, PhaseNum);
+  DumpState('After Phase');
+  DebugExit('Phase');
+  Result := Self;
+end;
+
+function TGrispStrategyBuilder.Build: TGrispStrategy;
+begin
+  DebugEnter('Build');
+  DumpState('Before Build');
+
+  if FRoot = nil then
+  begin
+	Debug('ERROR: No strategies to build');
+	raise Exception.Create('No strategies to build');
+  end;
+
+  if FScopeStack.Count > 0 then
+  begin
+    Debug('WARNING: Unclosed scopes exist');
+	while FScopeStack.Count > 0 do
+	  EndScope;
+  end;
+
+  Result := FRoot;
+  FRoot := nil;
+  FCurrentParent := nil;
+  FScopeStack.Clear;
+
+  Debug('Final strategy tree:');
+  DumpStrategy(Result, 1);
+
+  DebugExit('Build');
+end;
+
+end.
+unit unit_Strategy_TGrispStrategyEngine_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.Classes,
+  System.Generics.Collections,
+  unit_Graph_TGrispGraph_version_001,
+  unit_Graph_TGrispEdge_TGrispNode_version_001,
+  unit_Pattern_TGrispPatternMatcher_version_001,
+  unit_Rewrite_TGrispRewriter_version_001,
+  unit_Strategy_TGrispStrategyKind_version_001,
+  unit_Strategy_TGrispStrategy_version_001;
+
+type
+  TGrispStrategyEngine = class
+  private
+	FGraph: TGrispGraph;
+    FMatcher: TGrispPatternMatcher;
+    FRewriter: TGrispRewriter;
+    FStrategies: TDictionary<string, TGrispStrategy>;  // Non-owning reference
+    FTrace: TStrings;
+    FMaxSteps: Integer;
+    FCurrentSteps: Integer;
+
+    function ExecuteStrategy(Strategy: TGrispStrategy): Boolean;
+    function FindRule(const RuleName: string): TGrispNode;
+    procedure ResetSteps;
+  public
+    constructor Create(Graph: TGrispGraph);
+    destructor Destroy; override;
+
+    function Execute(const StrategyName: string; MaxSteps: Integer = 1000): Integer;
+    function ExecuteWithTrace(const StrategyName: string; Trace: TStrings; MaxSteps: Integer = 1000): Integer;
+
+    property Trace: TStrings read FTrace write FTrace;
+    property MaxSteps: Integer read FMaxSteps write FMaxSteps;
+  end;
+
+implementation
+
+constructor TGrispStrategyEngine.Create(Graph: TGrispGraph);
+var
+  Pair: TPair<string, TGrispStrategy>;
+begin
+  inherited Create;
+  FGraph := Graph;
+  FMatcher := TGrispPatternMatcher.Create(Graph);
+  FRewriter := TGrispRewriter.Create(Graph);
+  FStrategies := TDictionary<string, TGrispStrategy>.Create;
+
+  // Load strategies from the graph (non-owning references)
+  for Pair in Graph.Strategies do
+    FStrategies.Add(Pair.Key, Pair.Value);
+
+  FMaxSteps := 1000;
+  FCurrentSteps := 0;
+end;
+
+destructor TGrispStrategyEngine.Destroy;
+begin
+  // Do NOT free the strategies - they are owned by the graph
+  FStrategies.Free;
+  FRewriter.Free;
+  FMatcher.Free;
+  inherited Destroy;
+end;
+
+function TGrispStrategyEngine.FindRule(const RuleName: string): TGrispNode;
+var
+  Node: TGrispNode;
+  i: Integer;
+begin
+  Result := nil;
+  for i := 0 to FGraph.Rules.Count - 1 do
+  begin
+    Node := FGraph.Rules[i];
+    if SameText(Node.Name, RuleName) then
+      Exit(Node);
+  end;
+end;
+
+procedure TGrispStrategyEngine.ResetSteps;
+begin
+  FCurrentSteps := 0;
+end;
+
+function TGrispStrategyEngine.ExecuteStrategy(Strategy: TGrispStrategy): Boolean;
+var
+  SubStrategy: TGrispStrategy;
+  Rule: TGrispNode;
+  Applied: Integer;
+  Changed: Boolean;
+  OldPhase: Integer;
+  i: Integer;
+begin
+  Result := False;
+
+  if FCurrentSteps >= FMaxSteps then
+    Exit;
+
+  case Strategy.Kind of
+    gskRule:
+      begin
+        Rule := FindRule(Strategy.RuleName);
+        if Assigned(Rule) then
+        begin
+          FMatcher.SetCurrentRule(Rule);
+          Applied := FRewriter.ApplyAllMatches(Rule, FMatcher, FTrace);
+          if Applied > 0 then
+          begin
+            Inc(FCurrentSteps, Applied);
+            Result := True;
+          end;
+        end;
+      end;
+
+    gskRepeat:
+      begin
+        repeat
+          Changed := False;
+          for i := 0 to Strategy.Strategies.Count - 1 do
+          begin
+            SubStrategy := Strategy.Strategies[i];
+            if ExecuteStrategy(SubStrategy) then
+              Changed := True;
+            if FCurrentSteps >= FMaxSteps then
+              Break;
+          end;
+        until (not Changed) or (FCurrentSteps >= FMaxSteps);
+        Result := Changed;
+      end;
+
+    gskSequence:
+      begin
+        for i := 0 to Strategy.Strategies.Count - 1 do
+        begin
+          SubStrategy := Strategy.Strategies[i];
+          if ExecuteStrategy(SubStrategy) then
+            Result := True;
+          if FCurrentSteps >= FMaxSteps then
+            Break;
+        end;
+      end;
+
+    gskTry:
+      begin
+        for i := 0 to Strategy.Strategies.Count - 1 do
+        begin
+		  SubStrategy := Strategy.Strategies[i];
+          if ExecuteStrategy(SubStrategy) then
+          begin
+            Result := True;
+            Break;
+          end;
+        end;
+      end;
+
+    gskChoice:
+      begin
+        for i := 0 to Strategy.Strategies.Count - 1 do
+        begin
+          SubStrategy := Strategy.Strategies[i];
+          if ExecuteStrategy(SubStrategy) then
+            Result := True;
+          if FCurrentSteps >= FMaxSteps then
+            Break;
+        end;
+      end;
+
+    gskPhase:
+      begin
+        OldPhase := FMatcher.CurrentPhase;
+        try
+          FMatcher.SetPhase(Strategy.Phase);
+          for i := 0 to Strategy.Strategies.Count - 1 do
+          begin
+            SubStrategy := Strategy.Strategies[i];
+            if ExecuteStrategy(SubStrategy) then
+              Result := True;
+            if FCurrentSteps >= FMaxSteps then
+              Break;
+          end;
+        finally
+          FMatcher.SetPhase(OldPhase);
+        end;
+      end;
+  end;
+end;
+
+function TGrispStrategyEngine.Execute(const StrategyName: string; MaxSteps: Integer): Integer;
+var
+  Strategy: TGrispStrategy;
+begin
+  Result := 0;
+  FMaxSteps := MaxSteps;
+  ResetSteps;
+
+  if not FStrategies.TryGetValue(StrategyName, Strategy) then
+    Exit;
+
+  ExecuteStrategy(Strategy);
+  Result := FCurrentSteps;
+end;
+
+function TGrispStrategyEngine.ExecuteWithTrace(const StrategyName: string; Trace: TStrings; MaxSteps: Integer): Integer;
+begin
+  FTrace := Trace;
+  try
+    Result := Execute(StrategyName, MaxSteps);
+  finally
+    FTrace := nil;
+  end;
+end;
+
+end.
+unit unit_Strategy_TGrispStrategyKind_version_001;
+
+interface
+
+type
+  TGrispStrategyKind = (
+    gskRule,
+    gskSequence,
+    gskRepeat,
+    gskTry,
+    gskChoice,
+    gskPhase
+  );
+
+implementation
+
+end.
+unit unit_Strategy_TGrispStrategy_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.Generics.Collections,
+  unit_Strategy_TGrispStrategyKind_version_001;
+
+type
+  TGrispStrategy = class
+  public
+    Kind: TGrispStrategyKind;
+    RuleName: string;
+    Phase: Integer;
+    Strategies: TList<TGrispStrategy>;
+    constructor Create(AKind: TGrispStrategyKind);
+    destructor Destroy; override;
+    function Clone: TGrispStrategy;
+  end;
+
+implementation
+
+constructor TGrispStrategy.Create(AKind: TGrispStrategyKind);
+begin
+  inherited Create;
+  Kind := AKind;
+  Strategies := TList<TGrispStrategy>.Create;
+  Phase := 0;
+end;
+
+destructor TGrispStrategy.Destroy;
+begin
+  Strategies.Free;
+  inherited Destroy;
+end;
+
+function TGrispStrategy.Clone: TGrispStrategy;
+var
+  SubStrategy: TGrispStrategy;
+begin
+  Result := TGrispStrategy.Create(Kind);
+  Result.RuleName := RuleName;
+  Result.Phase := Phase;
+  for SubStrategy in Strategies do
+    Result.Strategies.Add(SubStrategy.Clone);
+end;
+
+end.
+unit unit_Token_TGrispTokenHelper_version_001;
+
+interface
+
+uses
+  System.SysUtils,                              // Added for SameText
+  unit_Token_TGrispTokenKind_version_001,
+  unit_Token_TGrispToken_version_001;
+
+type
+  TGrispTokenHelper = record
+  private
+    FToken: TGrispToken;
+  public
+    constructor Create(const AToken: TGrispToken);
+
+    function IsEOF: Boolean;
+    function IsIdentifier: Boolean;
+    function IsNumber: Boolean;
+    function IsString: Boolean;
+    function IsBoolean: Boolean;
+    function IsKeyword(const Keyword: string): Boolean;
+    function IsKeywordNode: Boolean;
+    function IsKeywordArray: Boolean;
+    function IsKeywordWhere: Boolean;
+    function IsKeywordAnd: Boolean;
+    function IsKeywordOr: Boolean;
+    function IsKeywordNot: Boolean;
+    function IsKeywordMod: Boolean;
+    function IsKeywordPhase: Boolean;
+    function IsKeywordTemp: Boolean;
+    function IsKeywordDelete: Boolean;
+    function IsKeywordRemove: Boolean;
+    function IsKeywordType: Boolean;
+    function IsKeywordStrategy: Boolean;
+    function IsKeywordRepeat: Boolean;
+    function IsKeywordTry: Boolean;
+    function IsKeywordChoice: Boolean;
+    function IsLBrace: Boolean;
+    function IsRBrace: Boolean;
+    function IsLBracket: Boolean;
+    function IsRBracket: Boolean;
+    function IsLParen: Boolean;
+    function IsRParen: Boolean;
+    function IsColon: Boolean;
+    function IsEquals: Boolean;
+    function IsComma: Boolean;
+    function IsSemicolon: Boolean;
+    function IsArrow: Boolean;
+
+    property Token: TGrispToken read FToken;
+  end;
+
+implementation
+
+constructor TGrispTokenHelper.Create(const AToken: TGrispToken);
+begin
+  FToken := AToken;
+end;
+
+function TGrispTokenHelper.IsEOF: Boolean;
+begin
+  Result := FToken.Kind = tkEOF;
+end;
+
+function TGrispTokenHelper.IsIdentifier: Boolean;
+begin
+  Result := FToken.Kind = tkIdentifier;
+end;
+
+function TGrispTokenHelper.IsNumber: Boolean;
+begin
+  Result := FToken.Kind = tkNumber;
+end;
+
+function TGrispTokenHelper.IsString: Boolean;
+begin
+  Result := FToken.Kind = tkString;
+end;
+
+function TGrispTokenHelper.IsBoolean: Boolean;
+begin
+  Result := FToken.Kind = tkBoolean;
+end;
+
+function TGrispTokenHelper.IsKeyword(const Keyword: string): Boolean;
+begin
+  Result := FToken.IsKeyword and SameText(FToken.Lexeme, Keyword);
+end;
+
+function TGrispTokenHelper.IsKeywordNode: Boolean;
+begin
+  Result := FToken.Kind = tkKeywordNode;
+end;
+
+function TGrispTokenHelper.IsKeywordArray: Boolean;
+begin
+  Result := FToken.Kind = tkKeywordArray;
+end;
+
+function TGrispTokenHelper.IsKeywordWhere: Boolean;
+begin
+  Result := FToken.Kind = tkKeywordWhere;
+end;
+
+function TGrispTokenHelper.IsKeywordAnd: Boolean;
+begin
+  Result := FToken.Kind = tkKeywordAnd;
+end;
+
+function TGrispTokenHelper.IsKeywordOr: Boolean;
+begin
+  Result := FToken.Kind = tkKeywordOr;
+end;
+
+function TGrispTokenHelper.IsKeywordNot: Boolean;
+begin
+  Result := FToken.Kind = tkKeywordNot;
+end;
+
+function TGrispTokenHelper.IsKeywordMod: Boolean;
+begin
+  Result := FToken.Kind = tkKeywordMod;
+end;
+
+function TGrispTokenHelper.IsKeywordPhase: Boolean;
+begin
+  Result := FToken.Kind = tkKeywordPhase;
+end;
+
+function TGrispTokenHelper.IsKeywordTemp: Boolean;
+begin
+  Result := FToken.Kind = tkKeywordTemp;
+end;
+
+function TGrispTokenHelper.IsKeywordDelete: Boolean;
+begin
+  Result := FToken.Kind = tkKeywordDelete;
+end;
+
+function TGrispTokenHelper.IsKeywordRemove: Boolean;
+begin
+  Result := FToken.Kind = tkKeywordRemove;
+end;
+
+function TGrispTokenHelper.IsKeywordType: Boolean;
+begin
+  Result := FToken.Kind = tkKeywordType;
+end;
+
+function TGrispTokenHelper.IsKeywordStrategy: Boolean;
+begin
+  Result := FToken.Kind = tkKeywordStrategy;
+end;
+
+function TGrispTokenHelper.IsKeywordRepeat: Boolean;
+begin
+  Result := FToken.Kind = tkKeywordRepeat;
+end;
+
+function TGrispTokenHelper.IsKeywordTry: Boolean;
+begin
+  Result := FToken.Kind = tkKeywordTry;
+end;
+
+function TGrispTokenHelper.IsKeywordChoice: Boolean;
+begin
+  Result := FToken.Kind = tkKeywordChoice;
+end;
+
+function TGrispTokenHelper.IsLBrace: Boolean;
+begin
+  Result := FToken.Kind = tkLBrace;
+end;
+
+function TGrispTokenHelper.IsRBrace: Boolean;
+begin
+  Result := FToken.Kind = tkRBrace;
+end;
+
+function TGrispTokenHelper.IsLBracket: Boolean;
+begin
+  Result := FToken.Kind = tkLBracket;
+end;
+
+function TGrispTokenHelper.IsRBracket: Boolean;
+begin
+  Result := FToken.Kind = tkRBracket;
+end;
+
+function TGrispTokenHelper.IsLParen: Boolean;
+begin
+  Result := FToken.Kind = tkLParen;
+end;
+
+function TGrispTokenHelper.IsRParen: Boolean;
+begin
+  Result := FToken.Kind = tkRParen;
+end;
+
+function TGrispTokenHelper.IsColon: Boolean;
+begin
+  Result := FToken.Kind = tkColon;
+end;
+
+function TGrispTokenHelper.IsEquals: Boolean;
+begin
+  Result := FToken.Kind = tkEquals;
+end;
+
+function TGrispTokenHelper.IsComma: Boolean;
+begin
+  Result := FToken.Kind = tkComma;
+end;
+
+function TGrispTokenHelper.IsSemicolon: Boolean;
+begin
+  Result := FToken.Kind = tkSemicolon;
+end;
+
+function TGrispTokenHelper.IsArrow: Boolean;
+begin
+  Result := FToken.Kind = tkArrow;
+end;
+
+end.
+unit unit_Token_TGrispTokenKind_version_001;
+
+interface
+
+type
+  TGrispTokenKind = (
+    tkEOF,
+    tkIdentifier,
+    tkNumber,
+    tkString,
+    tkBoolean,
+    tkKeywordNode,
+    tkKeywordArray,
+    tkKeywordWhere,
+    tkKeywordAnd,
+    tkKeywordOr,
+    tkKeywordNot,
+    tkKeywordMod,
+    tkKeywordPhase,
+    tkKeywordTemp,
+    tkKeywordDelete,
+    tkKeywordRemove,
+    tkKeywordType,
+    tkKeywordStrategy,
+    tkKeywordRepeat,
+    tkKeywordTry,
+    tkKeywordChoice,
+    tkLBrace,
+    tkRBrace,
+    tkLBracket,
+    tkRBracket,
+    tkLParen,
+    tkRParen,
+    tkLess,
+    tkGreater,
+    tkLessEqual,
+    tkGreaterEqual,
+    tkNotEqual,
+    tkColon,
+    tkEquals,
+    tkComma,
+    tkSemicolon,
+    tkOperator,
+    tkArrow
+  );
+
+implementation
+
+end.
+unit unit_Token_TGrispToken_version_001;
+
+interface
+
+uses
+  System.SysUtils,
+  System.TypInfo,
+  unit_Token_TGrispTokenKind_version_001;
+
+type
+  TGrispToken = record
+    Kind: TGrispTokenKind;
+    Lexeme: string;
+    Line: Integer;
+    Column: Integer;
+
+    function IsKeyword: Boolean;
+    function IsOperator: Boolean;
+    function IsLiteral: Boolean;
+    function ToString: string;
+  end;
+
+implementation
+
+function TGrispToken.IsKeyword: Boolean;
+begin
+  Result := Kind in [
+    tkKeywordNode,
+    tkKeywordArray,
+    tkKeywordWhere,
+    tkKeywordAnd,
+    tkKeywordOr,
+    tkKeywordNot,
+    tkKeywordMod,
+    tkKeywordPhase,
+    tkKeywordTemp,
+    tkKeywordDelete,
+    tkKeywordRemove,
+    tkKeywordType,
+    tkKeywordStrategy,
+    tkKeywordRepeat,
+    tkKeywordTry,
+    tkKeywordChoice
+  ];
+end;
+
+function TGrispToken.IsOperator: Boolean;
+begin
+  Result := Kind in [
+    tkOperator,
+    tkLess,
+    tkGreater,
+    tkLessEqual,
+    tkGreaterEqual,
+    tkNotEqual,
+    tkEquals,
+    tkArrow
+  ];
+end;
+
+function TGrispToken.IsLiteral: Boolean;
+begin
+  Result := Kind in [
+    tkNumber,
+    tkString,
+    tkBoolean,
+    tkIdentifier
+  ];
+end;
+
+function TGrispToken.ToString: string;
+begin
+  Result := Format('Token(%s, "%s", %d:%d)',
+    [GetEnumName(TypeInfo(TGrispTokenKind), Ord(Kind)),
+     Lexeme, Line, Column]);
+end;
+
+end.
