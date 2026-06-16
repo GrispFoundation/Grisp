@@ -1,0 +1,1294 @@
+Fixes/Recommendation by AI1:
+
+Below is a **consolidated correction design** that directly targets the *shared failure modes across all AIs* and turns them into a **closed, implementable deterministic kernel contract**.
+
+I’m not rewriting the whole spec—this is a **minimal set of structural upgrades** that eliminates the divergence points.
+
+---
+
+# 🧠 GRISP v0.52 — Determinism Closure Fix Plan
+
+## 🟥 1. ELIMINATE ALL “IMPLEMENTATION-DEFINED” BEHAVIOR
+
+### ❌ Problem (consensus)
+
+Anything optional or “either A or B” breaks determinism:
+
+* `M_prev' keep vs clear`
+* optional constraint re-check
+* optional validation steps
+
+### ✅ Fix: Determinism Lock Principle
+
+> **Rule: The specification MUST define exactly one behavior for every semantic state transition. No alternatives allowed.**
+
+### 🔧 Concrete patch
+
+#### NO_MATCH rule becomes:
+
+```
+If no match is selected:
+    M_prev' := M_prev
+    age increment applies to all entries in M_prev
+```
+
+✔ No branch
+✔ No choice
+✔ No implementation freedom
+
+---
+
+#### COMMIT constraint evaluation:
+
+```
+Constraint evaluation is MANDATORY at COMMIT.
+All constraints are re-evaluated against DISCOVER snapshot G.
+```
+
+✔ remove “optional” entirely
+
+---
+
+# 🟥 2. CANONICAL IDENTIFIER SYSTEM (ROOT CAUSE OF DIVERGENCE)
+
+## ❌ Problem
+
+* node/edge IDs undefined
+* “0 or max+1”
+* no allocation order
+
+## ✅ Fix: Global Deterministic Sequence System
+
+### 🔧 Rule: Typed global counters
+
+Each type has:
+
+```
+C[type] : integer counter
+```
+
+Initialization:
+
+```
+If initial state contains no objects of type T:
+    C[T] = 0
+else:
+    C[T] = max(existing_ids_of_T) + 1
+```
+
+---
+
+### 🔧 Allocation rule (STRICT ORDER)
+
+During **PLAN → COMMIT only**:
+
+```
+new_id = T + ":" + C[T]
+C[T] := C[T] + 1
+```
+
+✔ deterministic
+✔ monotonic
+✔ cross-engine identical
+
+---
+
+### 🔧 Critical addition:
+
+Record in trace:
+
+```
+SequenceCounterRead(T, old_value)
+SequenceCounterWrite(T, new_value)
+```
+
+✔ ensures replay determinism
+
+---
+
+# 🟥 3. TOTAL ORDER FOR MATCH ENUMERATION (MAJOR SOURCE OF DIVERGENCE)
+
+## ❌ Problem
+
+“pattern enumeration” undefined → different M sets
+
+## ✅ Fix: Canonical Nested Iteration Model
+
+### 🔧 Rule: FIXED traversal pipeline
+
+```
+FOR each Node n in ORDER_CANONICAL(NodeIDs):
+    FOR each Rule r in ORDER_CANONICAL(Rules):
+        FOR each MatchBinding b in CanonicalBindings(n, r):
+            emit candidate match
+```
+
+---
+
+### 🔧 Edge traversal rule:
+
+```
+Edges are iterated by:
+    ORDER_CANONICAL(edge_id)
+```
+
+---
+
+### 🔧 Binding ordering rule:
+
+All bindings sorted by:
+
+1. variable name (lexicographic)
+2. then value using ORDER_CANONICAL
+3. then structural depth
+
+---
+
+✔ eliminates all combinatorial ordering divergence
+✔ guarantees identical M set across engines
+
+---
+
+# 🟥 4. MATCH_KEY BECOMES PURE FUNCTION
+
+## ❌ Problem
+
+“sorted_binding_list” undefined
+
+## ✅ Fix
+
+### 🔧 Definition:
+
+```
+match_key = hash(
+    rule_id +
+    CanonicalSerialize(binding_list)
+)
+```
+
+### Binding list serialization:
+
+```
+binding_list :=
+    sort(bindings by (var_name, value_canonical))
+```
+
+### Value canonicalization:
+
+* primitives → lexicographic
+* nodes/edges → ID string
+* lists → lexicographically sorted element-wise
+* maps → sorted keys recursively
+
+✔ removes ALL ambiguity
+
+---
+
+# 🟥 5. VERSION SYSTEM SIMPLIFICATION (CRITICAL DESIGN FIX)
+
+## ❌ Problem
+
+Too many overlapping counters (predicate, field, adjacency, extent...)
+
+## ✅ Fix: UNIFIED VERSION MODEL
+
+### 🔧 Replace with 3 counters only:
+
+```
+V_node[node_id]
+V_edge[edge_id]
+V_field[node_id, field_name]
+```
+
+### Derived views:
+
+* adjacency_version = function(V_edge)
+* predicate_version = function(V_field + V_edge)
+* extent_version = derived only
+
+---
+
+### 🔧 Update rules:
+
+Every mutation MUST explicitly state:
+
+```
+increment(V_* targets)
+```
+
+No implicit updates allowed.
+
+---
+
+✔ eliminates counter explosion
+✔ removes divergence from partial updates
+
+---
+
+# 🟥 6. SNAPSHOT MODEL MUST BE HARD FIXED
+
+## ❌ Problem
+
+PLAN vs DISCOVER ambiguity
+
+## ✅ Fix
+
+### 🔧 Rule:
+
+> DISCOVER produces immutable snapshot G₀
+> PLAN executes ONLY on G₀
+> COMMIT validates ONLY against G₀
+
+No mutation visibility anywhere else.
+
+---
+
+### 🔧 Expression evaluation rule:
+
+```
+All expressions evaluate ONLY against G₀
+No intermediate state access allowed
+```
+
+---
+
+✔ removes read/write drift
+✔ removes dependency mismatch bugs
+
+---
+
+# 🟥 7. FIXED-POINT ARITHMETIC MUST BE CLOSED
+
+## ❌ Problem
+
+overflow + rounding ambiguity
+
+## ✅ Fix
+
+### 🔧 Scale rule:
+
+```
+scale ∈ [0, 18]
+```
+
+### Overflow rule (mandatory):
+
+```
+If operation produces scale > 18:
+    ERROR(FIXED_POINT_SCALE_OVERFLOW)
+```
+
+### Division rule:
+
+```
+truncate toward zero
+```
+
+### Comparison rule:
+
+```
+always compare normalized scale = max(scaleA, scaleB)
+```
+
+---
+
+✔ removes numeric divergence completely
+
+---
+
+# 🟥 8. ADJACENCY MODEL MUST BE UNIQUE KEY BASED
+
+## ❌ Problem
+
+(node, edge) vs (node, type, dir)
+
+## ✅ Fix
+
+### 🔧 Canonical adjacency key:
+
+```
+AdjKey = (source_node_id, edge_id, direction)
+```
+
+Direction ∈ {IN, OUT}
+
+---
+
+✔ removes ambiguity in versioning + deduplication
+
+---
+
+# 🟥 9. GOLDEN FILE FORMAT MUST BE STRICT SERIALIZATION
+
+## ❌ Problem
+
+no canonical output format
+
+## ✅ Fix
+
+### 🔧 Hard spec:
+
+Nodes:
+
+```
+sorted by ORDER_CANONICAL(node_id)
+```
+
+Edges:
+
+```
+sorted by ORDER_CANONICAL(edge_id)
+```
+
+Fields:
+
+```
+sorted lexicographically
+```
+
+### Output:
+
+```
+{
+  nodes: [...],
+  edges: [...],
+  versions: {...}
+}
+```
+
+✔ identical byte-for-byte output required
+
+---
+
+# 🟥 10. RESOURCE MODEL MUST BE DEFINED OR REMOVED
+
+## Fix options:
+
+### Option A (recommended):
+
+Define deterministic limits:
+
+```
+MAX_MATCHES_PER_TICK = N
+MAX_RETRY = M
+MAX_GRAPH_SIZE = K
+```
+
+### Option B:
+
+Remove error entirely from core spec
+
+---
+
+# 🧩 SYSTEM-WIDE DESIGN IMPROVEMENTS
+
+## 🔷 1. “Determinism Closure Principle”
+
+Add to preamble:
+
+> Every observable output MUST be a pure function of:
+>
+> * Canonical IR
+> * Initial state
+> * Deterministic rules in this specification
+
+No hidden state allowed.
+
+---
+
+## 🔷 2. “No implicit state mutation”
+
+All state changes MUST be:
+
+```
+explicitly listed in PLAN → COMMIT transition table
+```
+
+---
+
+## 🔷 3. “Single Source of Truth Rule”
+
+For every concept:
+
+> There MUST be exactly one definition in the spec.
+
+No duplicates across sections.
+
+---
+
+## 🔷 4. “Total Ordering Requirement”
+
+Any iteration over:
+
+* nodes
+* edges
+* matches
+* bindings
+
+MUST define:
+
+> a total deterministic order using ORDER_CANONICAL
+
+---
+
+# 🚀 RESULT AFTER APPLYING FIXES
+
+After applying this patch set:
+
+### ✔ Guaranteed properties:
+
+* Cross-engine identical execution
+* Bitwise identical golden files
+* Deterministic match discovery
+* No hidden ordering bugs
+* No counter drift
+* No numeric divergence
+* No read/write ambiguity
+
+---
+
+# 🧠 Summary
+
+The root cause across all AIs is NOT complexity.
+
+It is:
+
+> ❌ Missing total ordering + missing identity rules + optional semantics
+
+This fix set closes all three.
+
+---
+
+If you want next step, I can:
+
+### 🔧 OPTION A
+
+Rewrite the full spec as a **fully closed v0.52 deterministic formal system**
+
+### 🔧 OPTION B
+
+Extract a **minimal “core kernel axioms page” (1–2 pages)** that proves determinism mathematically
+
+### 🔧 OPTION C
+
+Convert this into a **formal SOS rule system (inference-rule notation)**
+
+
+Fixes/Recommendation by AI2:
+
+The current specification for the GRISP Deterministic Kernel contains critical ambiguities that allow for divergent implementations. To transform this from a draft into a robust, cross-engine standard, you must move from "implementation-defined" logic to "normative constraints."
+
+Below are the architectural overhauls required to seal the determinism leaks identified in the consensus report.
+
+### 1. Eliminating Determinism Breakers
+
+These changes are mandatory to ensure that identical input always produces identical output.
+
+* **Mandatory M_prev Lifecycle:**
+* **The Problem:** Allowing implementations to choose between keeping or clearing `M_prev` after `NO_MATCH` creates divergent scoring histories.
+* **The Fix:** Redefine the `NO_MATCH` rule. `M_prev` must be cleared at the end of every tick where no commit occurs. This ensures that every tick begins with a pristine candidate history, preventing the "memory" of previous ticks from affecting future scheduling decisions.
+
+
+* **Forced Constraint Validation:**
+* **The Problem:** The specification currently marks constraint re-evaluation as "optional" during commit.
+* **The Fix:** Remove the "optional" qualifier. Constraint re-evaluation must be a mandatory, atomic step in the `COMMIT` phase. If a constraint is violated, the transition must fail and trigger an `INVARIANT_VIOLATION` error. This guarantees that no engine commits an invalid state.
+
+
+* **Bounded Retry Loops:**
+* **The Problem:** There is no hard limit on `SELECT` retries when validation fails, creating a risk of infinite livelock.
+* **The Fix:** Introduce `MAX_RETRIES` per tick, defined as `|M_initial|` (the count of candidate matches discovered at the start of the tick). Once `Rejected.size() == |M_initial|`, the tick must terminate with a `NO_MATCH` or a failure code. This guarantees termination.
+
+
+
+### 2. Architectural Overhauls
+
+To support scaling and cross-engine interoperability, the state model requires formalization.
+
+* **Explicit Identifier Allocation:**
+* **The Problem:** The specification lacks a canonical rule for how sequence counters (the numeric part of an ID) are generated.
+* **The Fix:** Add an `id_generator_state` object to the core configuration `<G, C, M_prev, ID_State>`. The `ID_State` must contain a monotonic counter for every node and edge type. `CreateNode(type)` must increment the specific counter for that `type` and use the resulting integer for the ID.
+
+
+* **Schema Definition Language (SDL):**
+* **The Problem:** The "No Nulls" requirement forces mandatory fields, but there is no mechanism to handle schema evolution or default values.
+* **The Fix:** Introduce a JSON-based schema object that is stored in the initial state. This schema must define mandatory fields, default values, and versioning for each node/edge type. When an engine encounters a node update, it validates against the schema version current at that `tick_counter`.
+
+
+
+### 3. Numeric & Semantic Hardening
+
+These fixes resolve the "math" inconsistencies.
+
+* **Standardized Rounding & Saturation:**
+* **The Problem:** Truncation toward zero and unconstrained saturation of scores can mask differences in priority.
+* **The Fix:**
+* **Rounding:** Mandate `Half-to-Even` (Banker's rounding) for all fixed-point operations to prevent cumulative bias in iterative calculations.
+* **Saturation:** Score saturation must trigger a `SCORE_SATURATION_WARNING` in the trace if the `base_priority` is high enough to cause it. This allows for debugging while maintaining a fixed fallback order (lexicographic `match_key`).
+
+
+
+
+* **Defining Resource Limits:**
+* **The Problem:** `RESOURCE_LIMIT_EXCEEDED` is a listed error, but what constitutes a limit is implementation-defined, making it non-portable.
+* **The Fix:** Define "Conformance Profiles" (e.g., Level 1: 100k nodes/tick, Level 2: 1M nodes/tick). Implementations must declare their profile in the golden file header. Any input triggering a limit above the declared profile triggers `RESOURCE_LIMIT_EXCEEDED`.
+
+
+
+### Summary of Priority Actions
+
+To reach a v0.52 (Implementation-Ready) state, prioritize the fixes in this specific order:
+
+1. **Remove Optionality:** Delete all "optional" or "implementation-defined" phrasing from the SOS rules.
+2. **Define Identifier State:** Add the monotonic counter mapping to the global configuration.
+3. **Formalize Constraints:** Explicitly mandate constraint re-evaluation in the `COMMIT` loop.
+
+Would you like the detailed pseudo-code for the `COMMIT` loop with these mandatory validation checks included?
+
+
+Fixes/Recommendation by AI3:
+
+**Recommended Fixes, Improvements, and Design Overhauls for GRISP Deterministic Kernel v0.51 → v0.52+**
+
+The consensus across all reviews is clear: the core architecture (phased SOS with versioned reads, canonical traces, and ORDER_CANONICAL) is strong and worth preserving. However, the spec needs **tighter closure** — removing all implementation-defined/optional elements, fully specifying primitives (IDs, enumeration, counters), and adding missing definitions (schema, serialization, numeric edge cases).
+
+Below are **prioritized, concrete suggestions**. I group them by consensus tiers and include exact wording patches, new subsections, tables, and design rationale where relevant. These changes would make the determinism theorem hold rigorously and enable reliable conformance testing.
+
+### 🔴 Tier 0: Determinism Breakers (Fix These First)
+
+**1. NO_MATCH M_prev' (Rule 5)**
+- **Problem**: Implementation-defined (keep or clear).
+- **Fix**: Mandate a single rule. **Recommendation**: Always preserve `M_prev` (best for fairness across idle ticks). Add explicit garbage collection to bound growth.
+- **Proposed Wording** (replace Rule 5):
+  ```
+  Rule 5: NO_MATCH (Empty Match Set)
+
+  M_remaining \ Rejected = empty
+  --------------------------------------------------------------
+  <<G, C, M_prev, M>, IR> -> <<G, C[tick_counter+1], M_prev'>, IR>
+
+  M_prev' is computed as follows (deterministic):
+  - For every match_key in M_prev or M: age' = age if match_key still structurally valid in new G (via existence check), else remove.
+  - Prune entries older than K ticks (recommended K=1000 or configurable via IR; must be fixed per engine for conformance).
+  - Ages always saturate at INT64_MAX with explicit saturation arithmetic.
+  ```
+- **Rationale**: Preserves fairness intent while bounding memory. Update determinism proof accordingly.
+
+**2. Optional/Implementation-Defined Semantics**
+- **Fix**: Eliminate all "optional", "implementation-defined", "recommended".
+  - Constraint re-evaluation in COMMIT: **Make mandatory** (re-evaluate against post-application G_temp using snapshot values where possible) or explicitly remove it (rely solely on version + structural validation).
+  - Preamble: Remove self-supersession ("v0.51").
+- **Design Note**: Version validation + structural simulation should suffice for invariants in the single-threaded model.
+
+### 🟠 Tier 1: Core Semantic Gaps (Graph Model, Counters, Schema)
+
+**3. Identifier Model & Sequence Counters (Critical)**
+- **Overhaul**: Add a new subsection **2.7 Element Identifiers**.
+  ```
+  Identifiers are strings "type:seq" where seq is a signed 64-bit integer.
+  - Nodes and edges share a global per-type sequence counter (separate namespaces ok if type prefixed).
+  - Edges: globally unique; may optionally encode (src, tgt, seq) internally but comparison uses full ORDER_CANONICAL.
+  - Creation (in PLAN/COMMIT):
+    - Read current sequence counter for type (record SequenceCounterRead(type, current_value) in R).
+    - New id = type : (current + 1); increment counter.
+    - Initial load: seq starts at max(existing for type) + 1 or 0 if none.
+  ```
+- **Update Rule 3 (PLAN)** and version table: Explicitly include sequence counter reads/increments for CreateNode/CreateEdge.
+- **Rationale**: Eliminates the "0 or max+1" ambiguity. Makes ID generation fully deterministic and traceable via read sets.
+
+**4. Schema / Type System**
+- **Add new section 2.8 Type Definitions** (normative JSON schema language).
+  - Define node/edge types, fields (name, type: Integer/FixedPoint/Boolean/String/Identifier/List/Map), mandatory flag, defaults (for evolution).
+  - `type_definitions_hash`: SHA-256 of canonical JSON serialization of the schema.
+  - Support schema evolution: new optional fields with defaults; mandatory fields must be present or defaulted on load.
+- **Rationale**: Addresses "No Nulls" rigidity and enables `type_definitions_hash` + IR validation. "All fields mandatory" becomes "per schema declaration."
+
+**5. Golden File & Graph Serialization**
+- **Add subsection 7.1 Canonical Graph Serialization**.
+  - Top-level: nodes and edges as arrays, each sorted by identifier using ORDER_CANONICAL.
+  - Example structure:
+    ```json
+    {
+      "nodes": [ { "id": "...", "type": "...", "fields": {sorted map} }, ... ],
+      "edges": [ { "id": "...", "type": "...", "src": "...", "tgt": "...", "fields": {...} }, ... ]
+    }
+    ```
+  - committed_changes: array of applied primitive actions from α̂ (with evaluated values).
+- **Rationale**: Ensures identical golden files.
+
+### 🟡 Tier 2: Read/Write, Pattern Matching, Versioning
+
+**6. Pattern Enumeration & match_key (Determinism Core)**
+- **New subsection 2.2.1 Pattern Matching Algorithm**:
+  - Nested iteration in fixed order: nodes sorted by ID → for each MatchNode, edges via adjacency (sorted by ID) for MatchEdge.
+  - Early pruning with constraints/lets.
+  - `match_key = (rule_id, sorted_binding_list)` where bindings sorted by variable name (UTF-8 lex), then by value (ORDER_CANONICAL recursive, with visited set for cycles — error if cycle).
+- **Rationale**: Closes the major enumeration gap. Makes EvalPatterns a total, deterministic function.
+
+**7. Versioning & Read Traces**
+- **Overhaul Section 6 Version Increment Rules**: Provide a complete, exhaustive table (one row per primitive action, columns for every counter type).
+  - Fix adjacency deduplication key: **(node_id, edge_type, dir)**.
+  - Explicitly define R for every action in Rule 3 (PLAN), including Creates, Deletes, and implicit expansions (use DISCOVER snapshot G).
+  - DeleteNode: Record adjacency reads for both endpoints; increment accordingly.
+  - Add missing increments (e.g., edge_type_version on DeleteEdge, predicate on relevant deletes).
+- **COMMIT Validation**: Explicitly list every read type that must be checked. Order: version validation first on snapshot, then structural simulation on G_temp.
+
+**8. Expression Evaluation & PLAN Snapshot**
+- **Clarify**:
+  - All evaluation (expressions, lets, constraints, payloads) uses the **immutable DISCOVER snapshot G**.
+  - Short-circuit: runtime left-to-right; dependency trace: union of both sides (document as conservative safety; may cause extra retries — acceptable tradeoff or make exact-match optional in future).
+  - Extend grammar: add `!e`, full relations in φ (`!=`, `<=`, `>=`, `>` , `||`), list/map literals `[...]`, `{"k":e,...}`, indexing `e1[e2]`.
+- **Rationale**: Prevents leakage and livelock surprises.
+
+### Tier 3: Numeric, Progress, Resources, Design Improvements
+
+**9. Numeric Model Fixes**
+- FixedPoint: Scale overflow (>18) → fatal `FIXED_POINT_SCALE_OVERFLOW`.
+- Serialization: Scale 0 = integer string without decimal (e.g., "42"); update example.
+- Complete operator semantics (promotion, //, %, all comparisons) with examples in a new appendix.
+- **Design Note**: Consider allowing user-specified rounding mode in future, but keep truncation for v0.52 determinism.
+
+**10. Progress & Resource Guarantees**
+- Bound SELECT retries: max = |M| (or 2*|M|).
+- Define minimal resource limits (e.g., max nodes/edges per graph, max actions per α̂, recursion depth) in conformance section; exceed → fatal.
+- M_prev: As above, with pruning.
+
+**11. Broader Design Improvements / Overhauls (Optional but Recommended)**
+- **Simplify Versioning**: Audit for redundancy (predicate_version vs field_version). Consider collapsing some if they serve identical purposes in single-threaded model (future concurrency justification needed).
+- **Canonical Action Trace (α̂)**: Define concrete JSON array format for debugging/golden files.
+- **Debug Mode**: Optional (but deterministic) extended golden file with rejected match reasons (non-normative for conformance).
+- **Performance Notes** (non-normative section): Acknowledge ORDER_CANONICAL cost; suggest indexes for production engines.
+- **Concurrency**: Explicitly state "This spec defines single-threaded sequential semantics. Future versions may extend with explicit parallelism under stronger isolation."
+
+### Implementation Path & Validation
+- **v0.52 Patch Strategy**: Focus on Tier 0+1 first (determinism + IDs + schema + serialization). This alone would make most engines converge.
+- **Reference Interpreter**: Build a minimal executable reference (e.g., in Python or Lean) alongside the spec to validate rules.
+- **Conformance Suite**: Expand with tests covering ID creation, idle ticks, scale overflow, pattern ordering edge cases.
+- **Proof Strengthening**: Add lemmas for pattern enumeration totality and read-trace completeness.
+
+These changes keep the spec's spirit (formal, closed, reproducible) while making it **implementable without divergence**. The result would be a much tighter, production-viable deterministic kernel.
+
+If you want me to draft **full revised sections** (e.g., complete new 2.7 Identifiers, updated Rule 5, full version table, or a complete v0.52 diff), provide targeted text, or generate a conformance test outline, let me know!
+
+Fixes/Recommendation by AI4:
+
+Here is a concrete fix-plan built directly on the consensus you pasted (AI1–AI7). I grouped it by the tiers the reviews agreed on, but instead of restating problems I give you the design changes that close each hole.
+
+---
+
+## Tier 0 — the determinism blockers (fix these first)
+
+### 1. Kill all "implementation-defined" and "optional"
+**Change:**
+- Rule 5 NO_MATCH: replace the two options with one mandatory rule:
+  > `M_prev' = M_prev` (preserve ages). Tick counter still increments. No clearing.
+- COMMIT validation L240: delete "optional". Make it mandatory:
+  > "All constraints MUST be re-evaluated against G_temp after applying α̂. Failure = fatal CONSTRAINT_VIOLATION."
+
+This alone makes the determinism theorem provable again.
+
+### 2. Define a canonical ID allocator
+**New section 2.4 — Identity:**
+- Node ID = `type_name + ":" + decimal(seq)` where seq is per-type 64-bit counter in C.
+- Edge ID = same scheme, independent namespace (`edge_type:seq`). Do NOT embed src/tgt in the ID.
+- On initial load: `seq = max(existing seq for type) + 1`, or 0 if none. No "or".
+- During PLAN: `CreateNode` reads `SequenceCounter(type)` → records `SequenceCounterRead` in R → COMMIT increments counter → assigns ID. Same for `CreateEdge`.
+
+This fixes the AI1/AI6 complaint that IDs diverge.
+
+### 3. Close pattern enumeration
+**New Rule 1.1:**
+> DISCOVER enumerates matches by nested loops in this total order:
+> 1. nodes sorted by ID using ORDER_CANONICAL
+> 2. edges sorted by ID
+> 3. for each MatchEdge, iterate adjacency list of source node sorted by edge ID
+> Constraints are tested left-to-right, short-circuiting.
+
+**match_key:** define `sorted_binding_list` = list of (binding_name, binding_value) pairs sorted by binding_name (UTF-8), then by binding_value using ORDER_CANONICAL recursively. For lists/maps, ORDER_CANONICAL already gives a total order.
+
+This is the missing lemma every reviewer asked for.
+
+### 4. Pin counter initialization
+Add to state definition:
+- All version counters initialize to 0 at genesis.
+- On load, if a counter is missing, treat as 0.
+
+---
+
+## Tier 1 — cross-engine compatibility
+
+### 5. Unify the version model (major simplification)
+Current design has 6 overlapping counters. Replace with 3:
+- `element_version[id]` — increments on any field change, create, or delete
+- `type_extent_version[type]` — increments on create/delete of that type
+- `adjacency_version[node][type][dir]` — as now
+
+Delete `predicate_version`, `field_version`, `edge_predicate_version`, `existence_version`. They are redundant because `element_version` already changes on field writes and existence is captured by type_extent.
+
+Update the version table to list exactly which of the 3 counters each action touches. This answers AI2/AI5 "over-engineered" complaint and removes the inconsistency.
+
+### 6. Complete the read-trace
+Write out R for every action (no "similar rules"):
+
+- `CreateNode(t, fields)`: R = { TypeExtentRead(t), SequenceCounterRead(t) }
+- `CreateEdge(t, src, tgt, fields)`: R = { TypeExtentRead(t), SequenceCounterRead(t), NodeExistence(src), NodeExistence(tgt), AdjacencyRead(src,t,out), AdjacencyRead(tgt,t,in) }
+- `DeleteNode(x)`: R = { NodeExistence(x), TypeExtentRead(type(x)), plus for each incident edge e (sorted): EdgeExistence(e), AdjacencyRead(src), AdjacencyRead(tgt) }
+- `UpdateField(x,f)`: R = { NodeExistence or EdgeExistence, FieldRead(x,f) }
+
+Then make COMMIT validation check *every* type in R. No missing EdgeExistence.
+
+### 7. Fix the numeric model
+- Scale 0 serialization: no decimal point. `"42"` not `"42.0"`.
+- Multiplication: if `scale_left + scale_right > 18` → fatal `FIXED_POINT_SCALE_OVERFLOW`.
+- Division: result_scale = scale_left. Define explicitly: convert to rational, truncate toward zero, then check scale.
+- Add missing operators to grammar: `!=`, `<=`, `>=`, `>`, `||`, `!`. Define promotion: align scales to max(scale_left, scale_right) before compare.
+
+### 8. Define snapshot semantics
+Add to Rule 3:
+> "PLAN evaluates all expressions against the immutable DISCOVER snapshot G. α̂ is built from values, not references. Payloads for EmitEvent are precomputed. No expression may observe effects of earlier actions in the same α̂."
+
+This resolves the short-circuit vs dependency mismatch — you keep recording both sides (safe), but you guarantee they read the same snapshot.
+
+### 9. Schema and golden files
+**New Section 3 — Schema:**
+- Minimal JSON schema: `{ types: { Person: { fields: { name: "string", age: "int" }, mandatory: ["name"] } } }`
+- `type_definitions_hash = SHA256(canonical JSON of schema sorted by ORDER_CANONICAL)`
+
+**Golden file graph:**
+```
+"graph": {
+  "nodes": [ {"id":"Person:1","type":"Person","fields":{...},"v":5} ... ] sorted by id,
+  "edges": [ {"id":"Knows:1","type":"Knows","src":"Person:1","tgt":"Person:2","fields":{...},"v":2} ... ] sorted by id
+}
+```
+
+**CAT format:** JSON array of `{op, target, ...}` in α̂ order.
+
+---
+
+## Tier 2 — correctness and stability
+
+### 10. Bound the retry loop
+Add to Rule 2:
+> "SELECT retries at most |M| times per tick. If all matches are rejected, transition to NO_MATCH."
+
+Prevents the livelock AI1 flagged.
+
+### 11. Fix fairness and memory
+Replace cumulative age with last-seen:
+- Store `M_prev[match_key] = last_tick_seen`
+- age(m) = current_tick - last_tick_seen (saturating at INT64_MAX)
+- On COMMIT: update only the selected match's last_tick. On DISCOVER: for every m in M, set last_tick = current_tick.
+
+Add GC: "Entries with last_tick < current_tick - 1_000_000 MAY be dropped deterministically."
+
+This eliminates ghost dominance and unbounded growth (AI1 §1.2, AI4).
+
+### 12. Adjacency deduplication
+Change text to match table:
+> "Deduplicate by (node, edge_type, dir). Scan α̂ left-to-right, increment adjacency_version once per unique key."
+
+### 13. Delete semantics
+- Add to validation: "No duplicate DeleteNode on same id."
+- On DeleteEdge: increment `type_extent_version[edge_type]` and `element_version[edge]` before removal (so version check works).
+
+---
+
+## Tier 3 — design improvements (worth doing now)
+
+1. **Single-thread contract:** Add preamble: "Kernel is defined as single-threaded sequential SOS. Parallel implementations MUST produce identical trace as sequential reference." This answers AI5/AI7.
+
+2. **Resource model:** Define minimum limits every engine must support (e.g., 1M nodes, 10M edges, 10k matches per tick). `RESOURCE_LIMIT_EXCEEDED` triggers only when exceeding those. Makes the error portable.
+
+3. **ORDER_CANONICAL caching:** Recommend implementations memoize canonical forms of IDs and small maps to avoid repeated UTF-8 sorts — does not change semantics, just performance note AI2 wanted.
+
+4. **Diagnostic mode:** Add optional `"rejected_matches": [...]` to golden file with reason codes. Not required for conformance, but solves debuggability complaint.
+
+---
+
+### What this gives you
+
+- **Determinism theorem becomes true**: no options, IDs are canonical, enumeration is total, counters are unified.
+- **Implementable**: every read, every increment, every serialization is spelled out.
+- **Simpler**: you drop 3 redundant version counters, replace age accumulation with last-seen, and bound retries.
+- **Evolvable**: schema hash and mandatory fields give you a path for migrations without breaking "no nulls."
+
+If you want, I can draft the exact v0.52 text for:
+1. the new Identity and Counter sections,
+2. the complete version-increment table, and
+3. the mandatory NO_MATCH and constraint rules
+
+— those three edits alone close 80% of the consensus issues.
+
+
+Fixes/Recommendation by AI5:
+
+### Summary
+
+The consensus is clear: the spec is close but **not closed**. Fixing a small set of underspecified primitives will restore the determinism theorem and make the kernel implementable and testable. Below are **concrete, prioritized fixes**, precise algorithms or canonical rules to add, and a compact patch checklist you can drop into v0.52.
+
+---
+
+### Priority fixes at a glance
+
+| **Fix** | **Priority** | **Impact** |
+|---|---:|---|
+| **Canonical NO_MATCH / M_prev policy** | Critical | Restores determinism across idle ticks and ages |
+| **Deterministic id allocation for nodes/edges** | Critical | Stabilizes ORDER_CANONICAL, match_keys, serialization |
+| **Canonical pattern enumeration and match_key construction** | Critical | Ensures identical match discovery across engines |
+| **Complete counter/version semantics and adjacency deduplication** | High | Makes validation and counter updates reproducible |
+| **PLAN snapshot semantics and dependency rules** | High | Eliminates spurious stale reads and livelock |
+| **Numeric model completion (fixed-point rules)** | High | Prevents scale overflow and serialization mismatches |
+
+---
+
+### Concrete fixes and canonical algorithms
+
+#### 1. Canonical NO_MATCH and M_prev lifecycle (exact wording to add)
+**Specification change (mandatory):**
+- Replace the current NO_MATCH paragraph with:
+  - **Deterministic idle-tick policy:** On any tick where `M_remaining \ Rejected = ∅`, set  
+    `M_prev' = M_prev` (preserve previous match history).  
+    Additionally, **garbage-collect** `M_prev` entries deterministically by keeping only entries whose `last_seen_tick >= C.tick_counter - GC_WINDOW`, where `GC_WINDOW` is a fixed integer constant (recommended default: 1024). Engines must expose `GC_WINDOW` as a configuration parameter but the conformance suite will use the canonical default.
+  - **Rejected reset:** The per-tick `Rejected` set is cleared at the start of each tick.
+  - **Retry bound:** Limit SELECT retries per tick to `RETRY_LIMIT = max( |M|, 1024 )`. If the retry limit is reached, the tick ends as NO_MATCH and `M_prev` is preserved.
+**Rationale:** single canonical policy, bounded retries, deterministic GC.
+
+#### 2. Deterministic id allocation algorithm
+**Specification change (mandatory):**
+- **Identifier format:** `Identifier := type_name ":" sequence_number` where `sequence_number` is a non-negative integer.
+- **Initial counters:** For each type `T`, `SequenceCounter[T]` is initialized to `max_seq_in_initial_state(T) + 1`. If no instances exist, start at `0`.
+- **Allocation rule:** During COMMIT, when applying `CreateNode` or `CreateEdge`, allocate ids by reading and incrementing `SequenceCounter[type]` in left-to-right order of α̂. The allocation is part of the atomic commit and recorded in the golden file.
+- **Temporary ids in PLAN:** During PLAN, use **stable temporary tokens** derived from `(rule_id, match_key, local_binding_name)`; map them to final ids only during COMMIT using the allocation rule above. The read-trace must record that temporary tokens are placeholders and are resolved deterministically in COMMIT.
+**Rationale:** deterministic id generation, stable mapping from PLAN to COMMIT.
+
+#### 3. Pattern enumeration and match_key canonicalization
+**Specification change (mandatory):**
+- **Graph traversal order for DISCOVER:**  
+  1. Enumerate node candidates in ORDER_CANONICAL of their **Identifier**.  
+  2. For each node, enumerate incident edges in ORDER_CANONICAL of **edge Identifier**.  
+  3. For multi-pattern rules, use nested loops in pattern order (first pattern component outermost).  
+- **Binding sort for match_key:** `sorted_binding_list` = list of `(binding_name, binding_value)` pairs sorted first by `binding_name` (UTF-8 lexicographic), then by `binding_value` using ORDER_CANONICAL. For complex values (lists/maps), ORDER_CANONICAL is applied recursively; cycles are impossible because bindings are graph identifiers or literals only (enforce this restriction).
+- **Match generation determinism:** If a pattern can bind the same identifier multiple ways, enumerate matches in the nested loop order above; do not deduplicate by value during discovery (deduplication only affects match_key equality).
+**Rationale:** fixes generation order and tie-breaking for match_keys.
+
+#### 4. Complete counter/version semantics and adjacency deduplication
+**Specification change (mandatory):**
+- **Canonical initial values:** All counters start at `0` unless otherwise specified in initial state. `existence_version` for existing elements is their stored value; missing counters are treated as `0`.
+- **Complete increment table:** Provide a full table mapping each primitive action to exact counter changes (include CreateNode, CreateEdge, DeleteNode, DeleteEdge, UpdateField, EmitEvent). Example row:
+  - `CreateNode(type, fields)` → `extent_version[type] += 1; existence_version[new_id] = 1; field_version[new_id][f] = 1 for each supplied f; SequenceCounter[type] += 1`.
+- **Adjacency deduplication key:** Use `(node_id, edge_id, endpoint_role)` where `endpoint_role` ∈ {`out`, `in`}. Deduplicate by earliest occurrence in α̂ (left-to-right). Sorting for DeleteNode expansion uses the DISCOVER snapshot edge identifiers.
+- **Atomic counter update order:** During COMMIT, apply α̂ left-to-right to `G_temp`, record the set of counter increments in the same left-to-right order, then apply counter updates in that recorded order. If multiple increments target the same counter, sum them deterministically.
+**Rationale:** removes ambiguity about which counters change and when.
+
+#### 5. PLAN snapshot semantics and dependency extraction
+**Specification change (mandatory):**
+- **Immutable PLAN snapshot:** DISCOVER produces a read-only snapshot `G_snap` used for all expression evaluation and for `GetIncidentEdgesSorted`. PLAN must evaluate expressions and produce α̂ using `G_snap` only. No action in α̂ may be visible to other parts of PLAN.
+- **Dependency extraction rule:** For each expression, record the union of reads that would be performed by a **conservative static evaluator** on `G_snap`. For `&&`/`||`, record reads from both operands (as current spec requires) but **all reads are resolved against `G_snap`**.
+- **Payload evaluation:** EmitEvent payloads and Create field expressions are evaluated during PLAN against `G_snap` and stored in α̂ as concrete values.
+**Rationale:** eliminates mismatch between evaluation and validation and prevents PLAN from observing intermediate α̂ effects.
+
+#### 6. Numeric model completion and fixed-point rules
+**Specification change (mandatory):**
+- **Scale enforcement:** All fixed-point results must have scale ∈ [0,18]. If an operation would produce a scale > 18, the operation is **fatal** with code `FIXED_POINT_SCALE_OVERFLOW`.
+- **Serialization rule:** For scale 0, serialize as an integer JSON number (no decimal point). For scale > 0, serialize as a JSON string with exactly `scale` fractional digits.
+- **Operator semantics:** Provide a complete table for `+ - * / // %` on Integer and FixedPoint, including promotion rules, intermediate precision, and overflow behavior. Example: `*` result_scale = scale_left + scale_right; if result_scale > 18 → `FIXED_POINT_SCALE_OVERFLOW`.
+- **Division intermediate bounds:** Require big-integer intermediates but mandate a **pre-check**: if numerator or denominator magnitude would produce an intermediate with bit-length > 4096, raise `RESOURCE_LIMIT_EXCEEDED` (deterministic).
+**Rationale:** prevents silent, non-deterministic numeric differences.
+
+---
+
+### Additional design improvements and tooling for conformance
+
+- **Mandatory constraint re-evaluation policy:** Make constraint re-evaluation at COMMIT **mandatory** (recompute φ on `G_temp` after applying α̂). If it fails, treat as non-fatal rejection. This removes optionality.
+- **Deterministic resource model:** Define canonical resource limits (e.g., max matches per DISCOVER = 1,000,000; max α̂ length = 1,000,000 actions; max intermediate big-int bits = 4096). Engines may choose higher limits but must support the canonical defaults for conformance tests.
+- **Diagnostic mode:** Add an optional `debug` flag that, when enabled, records rejected-match reasons and the read-trace for each rejected match into a companion debug log (not part of the golden file by default). Conformance tests may enable debug mode.
+- **Canonical golden-file extensions:** Add exact schemas for `initial_state`, `committed_changes`, and `final_state`. Require node/edge arrays sorted by Identifier and include `type_definitions_hash` algorithm (e.g., SHA-256 of canonical JSON of type definitions using ORDER_CANONICAL).
+- **Reference micro-specs:** For each complex area (id allocation, match enumeration, counter table, numeric model), add a one-page micro-spec with examples and a minimal reference implementation pseudocode snippet.
+
+---
+
+### Patch checklist for v0.52 (line-level actions)
+
+1. **Replace NO_MATCH paragraph** with the canonical policy and retry bound.
+2. **Insert Identifier section** with allocation algorithm and temporary-id mapping.
+3. **Add Graph Traversal subsection** under DISCOVER describing node/edge iteration order and binding sort algorithm.
+4. **Replace the counter increment table** with a complete table covering all actions and initial values.
+5. **Add PLAN snapshot clause** and explicit dependency extraction algorithm.
+6. **Complete numeric model**: scale overflow rule, serialization examples, operator table.
+7. **Mandate constraint re-evaluation** at COMMIT and clarify fatal vs non-fatal errors.
+8. **Add resource limits** defaults and `RESOURCE_LIMIT_EXCEEDED` deterministic behavior.
+9. **Add golden-file schema appendix** and `type_definitions_hash` algorithm.
+10. **Add debug logging option** and format for rejected-match diagnostics.
+
+---
+
+### Quick implementation notes for engineers
+
+- **Reference implementation strategy:** implement DISCOVER → build `G_snap` → PLAN using `G_snap` → produce α̂ with temporary tokens → SELECT/score using ages from preserved `M_prev` → COMMIT resolves temporary tokens to canonical ids and applies α̂ to `G_temp` then updates counters.
+- **Testing:** add conformance tests that vary only one of the previously-underspecified primitives (e.g., two engines with different id-allocation rules must fail) to ensure the new rules are enforced.
+- **Performance:** to avoid ORDER_CANONICAL cost explosion, recommend caching canonical sort keys and using stable incremental indices; document complexity expectations.
+
+---
+
+### Final recommendation and next step
+
+Adopt the **Tier 0 and Tier 1** fixes immediately (NO_MATCH/M_prev, id allocation, match enumeration, counter table, PLAN snapshot, numeric model). I can convert the patch checklist into **exact wording edits** for each affected paragraph and produce the complete replacement text for v0.52 (including the full counter table, operator table, and example traces). Tell me which section you want drafted first and I will produce the exact spec text ready to paste into v0.52.
+
+Fixes/Recommendation by AI6:
+
+## Suggested Fixes & Design Improvements for GRISP v0.51
+
+Based on the consensus across all seven independent analyses, the specification is **80% sound** but has critical determinism leaks and omissions. Below are **concrete fixes and design improvements** that address the top consensus problems.
+
+---
+
+### 🔴 Tier 1 – Fatal Determinism Breakers (Must Fix)
+
+#### 1. NO_MATCH `M_prev'` ambiguity
+**Problem:** `M_prev'` can be “unchanged or cleared” – implementation-defined.
+
+**Fix:** Mandate **preserve `M_prev` unchanged** (ages persist across idle ticks). Remove the “or cleared” option. Add explicit rule:
+> `M_prev' = M_prev` (no change) when `M_remaining \ Rejected = ∅`.
+
+**Rationale:** Preserving ages maintains fairness continuity; clearing resets all waiting matches, which can cause starvation. This is the simplest deterministic rule.
+
+---
+
+#### 2. Optional constraint re‑evaluation in COMMIT
+**Problem:** “optional but deterministic” is contradictory.
+
+**Fix:** Make constraint re‑evaluation **mandatory** after applying α̂ to `G_temp`. If any constraint fails, treat as **fatal** (not non‑fatal) because the rule’s own conditions are violated. However, the consensus prefers making it **mandatory and part of validation**:
+> All constraints (from the rule’s `φ`) are re‑evaluated on the post‑action snapshot `G_temp`. If any constraint evaluates to false, the commit fails and the match is added to `Rejected` (non‑fatal retry). This is required, not optional.
+
+Alternatively, rely solely on version validation and **forbid** re‑evaluation – but that requires complete version coverage of all constraints, which is complex. Mandatory re‑evaluation is simpler and deterministic.
+
+---
+
+#### 3. Pattern enumeration and `match_key` sorting underspecified
+**Problem:** No canonical traversal order for generating matches; `sorted_binding_list` sorting unspecified.
+
+**Fix – Pattern Enumeration:** Define a **nested iteration over the graph** using fixed total orders:
+
+```
+For each node n in G, sorted by node identifier (ORDER_CANONICAL):
+    For each pattern element in order (e.g., MatchNode first, then MatchEdge):
+        For each edge e in adjacency list of n for the required edge type and direction,
+        sorted by edge identifier (ORDER_CANONICAL):
+            Bind variables, evaluate constraints left-to-right.
+```
+
+For patterns with multiple `MatchNode`s without an edge connecting them, use a **cartesian product** over nodes sorted by identifier. The order of pattern elements in the sequence determines nesting depth.
+
+**Fix – `match_key` construction:** 
+- `sorted_binding_list` is a list of `(identifier_name, value)` pairs, sorted **lexicographically by identifier_name** (UTF-8 bytewise).  
+- For values that are identifiers, lists, or maps, compare recursively using `ORDER_CANONICAL`.  
+- Example: `[(x, node1), (y, node2)]` not `[(y, node2), (x, node1)]`.
+
+---
+
+#### 4. Sequence counters for node/edge creation – undefined generation
+**Problem:** No read/increment of sequence counters; identifier generation unspecified.
+
+**Fix – Identifier Allocation Algorithm:**
+- Node IDs: `"<type_name>:<seq>"` where `<seq>` is the current value of the **type-specific sequence counter** (stored in `C`).  
+- Edge IDs: `"<edge_type>:<seq>"` (globally unique, independent of source/target).  
+- At `CreateNode` / `CreateEdge` during **PLAN**:  
+  1. Read the current sequence counter for the type → record `SequenceCounterRead(type, value)` in `R`.  
+  2. Increment the counter by 1 (post‑increment).  
+  3. The new identifier is `type:value` (using the **pre‑increment** value).  
+- Initialisation: When loading an initial state, sequence counters for each type are set to `max( existing_identifier_sequence ) + 1`, or `0` if no existing identifiers of that type. No “or” ambiguity.
+
+Add to version increment table:
+| Operation | Sequence Counter |
+|-----------|------------------|
+| CreateNode | +1 for that node type |
+| CreateEdge | +1 for that edge type |
+
+And add `SequenceCounterRead(type, version)` to the read set.
+
+---
+
+### 🟠 Tier 2 – Critical Omissions (Implementation-Breaking)
+
+#### 5. No type definition schema
+**Problem:** `type_definitions_hash` appears but no schema language.
+
+**Fix – Minimal Schema Definition:** Add a normative section “Type Definitions” with JSON syntax:
+
+```json
+{
+  "node_types": {
+    "Person": {
+      "fields": {
+        "name": { "type": "string", "mandatory": true },
+        "age": { "type": "integer", "mandatory": false, "default": 0 }
+      },
+      "constraints": []   // optional, future
+    }
+  },
+  "edge_types": {
+    "Knows": {
+      "fields": { "since": { "type": "fixedpoint(0)", "mandatory": true } }
+    }
+  }
+}
+```
+
+The `type_definitions_hash` is a SHA‑256 of the canonical JSON (keys sorted, no whitespace). The kernel rejects IR that references undefined types or violates mandatory fields.
+
+---
+
+#### 6. Canonical serialisation of graph state (golden file)
+**Problem:** No JSON mapping for `G` (nodes, edges, fields).
+
+**Fix:** Define `initial_state` and `final_state` as:
+
+```json
+{
+  "nodes": [
+    { "id": "Person:1", "type": "Person", "fields": { "name": "Alice", "age": 42 } }
+  ],
+  "edges": [
+    { "id": "Knows:5", "type": "Knows", "source": "Person:1", "target": "Person:2",
+      "fields": { "since": "2020.0" } }
+  ]
+}
+```
+
+- Nodes sorted by `id` (`ORDER_CANONICAL`).  
+- Edges sorted by `id`.  
+- Fields within a node/edge: keys sorted lexicographically.  
+- Lists/maps inside fields follow `ORDER_CANONICAL` for keys/elements.
+
+---
+
+#### 7. Edge identity model missing
+**Problem:** How are edges uniquely identified? Sorting, adjacency versioning depend on it.
+
+**Fix:** Use same identifier scheme as nodes: `"<edge_type>:<seq>"`. Sequence counters for edge types are separate from node types. Edge identifiers are **stable** after creation; deletion does not reuse the sequence number (monotonic). This ensures `ORDER_CANONICAL` on edge IDs is total and stable.
+
+For `GetIncidentEdgesSorted(x_id, G)`, sort by edge identifier. No dependency on source/target for ordering.
+
+---
+
+### 🟡 Tier 3 – Ambiguities That Cause Divergence
+
+#### 8. Fixed‑point multiplication scale overflow
+**Problem:** `scale_left + scale_right` can exceed 18.
+
+**Fix:** Define **fatal error** `FIXED_POINT_SCALE_OVERFLOW` if the result scale > 18. This prevents silent truncation and keeps determinism. Alternatively, saturate scale to 18 with rounding – but that loses precision inconsistently. Fatal is cleaner.
+
+Add to error code list.
+
+---
+
+#### 9. Adjacency version deduplication key mismatch
+**Problem:** Text says `(node, edge)` but table implies `(node, edge_type, dir)`.
+
+**Fix:** Unify to `(node, edge_type, direction)` where direction ∈ {`out`, `in`}. For `CreateEdge`, record both `(source, edge_type, out)` and `(target, edge_type, in)`. For `DeleteEdge`, same. Deduplication scans α̂ left‑to‑right and increments each unique key **once** per commit.
+
+Update the increment table accordingly.
+
+---
+
+#### 10. Initial counter values ambiguous
+**Problem:** “0 or max+1” allows divergence.
+
+**Fix:** **Always initialise sequence counters to `max(seq_of_existing_identifiers_of_type) + 1`**, or `0` if no existing identifiers of that type. This is deterministic given the initial state. Specify that sequence counters are **not** reset on deletion (monotonic).
+
+---
+
+#### 11. Read set completeness for creation/deletion actions
+**Problem:** Missing `ExtentRead`, `AdjacencyRead`, `EdgeExistence`, etc.
+
+**Fix – Complete Read Sets (normative table):**
+
+| Action | Read set additions (recorded in `R`) |
+|--------|--------------------------------------|
+| `CreateNode(type, fields)` | `ExtentRead(type)`, `SequenceCounterRead(type)`; for each field: `PredicateVersionRead(type, field)` |
+| `CreateEdge(type, src, tgt, fields)` | `NodeExistence(src)`, `NodeExistence(tgt)`, `AdjacencyRead(src, type, out)`, `AdjacencyRead(tgt, type, in)`, `ExtentRead(edge_type)`, `SequenceCounterRead(edge_type)`, and predicate versions for fields |
+| `DeleteNode(x)` | `NodeExistence(x)`, `ExtentRead(type_of_x)`, `AdjacencyRead(x, *, out)` and `in` for every edge type that exists, plus `EdgeExistence` for each incident edge (as expanded) |
+| `UpdateField(target, f, e)` | `FieldRead(target, f)` (the old value version) plus predicate version of the type if applicable |
+| `EmitEvent` | reads from payload expressions only |
+
+This ensures version validation can check all counters that will be incremented.
+
+---
+
+### 🔧 Design Improvements / Overhauls (Recommended)
+
+#### A. Simplify versioning model
+**Problem:** Too many overlapping counters (`predicate_version`, `field_version`, `extent_version`, `edge_predicate_version`). In a single‑threaded deterministic kernel, version validation is **never triggered** because the snapshot never changes within a tick.
+
+**Improvement:** Either:
+- **Remove version validation entirely** (declare it reserved for future concurrent extensions) – simplifies implementation drastically while preserving determinism.  
+- Or **keep only `extent_version` and `adjacency_version`** as the minimal set to detect concurrent modifications in a hypothetical multi‑tick parallel system. Document that in the current spec, version checks always pass.
+
+Given the consensus that versioning is over‑engineered, I recommend **removing all version counters and validation** from the kernel specification, and instead rely on the fact that the kernel is sequential. This would cut specification complexity by ~30% and eliminate a whole class of bugs. However, that is a major design change – if the goal is to keep the spec as a foundation for future concurrency, then keep it but fix the gaps.
+
+---
+
+#### B. `M_prev` fairness model – prevent unbounded growth and ghost dominance
+**Problem:** `M_prev` stores ages for **all** discovered matches each tick, leading to unbounded memory and “ghost” matches that never disappear.
+
+**Improvement – Change to last‑seen tick model:**
+Instead of storing cumulative age, store `last_seen_tick` for each `match_key`. Then `age(m) = current_tick - last_seen_tick` (capped). This automatically forgets matches that haven’t been seen recently. The match set `M` from discovery gives the current matches; `M_prev` can be pruned to only those `match_key`s that have been seen in the last `N` ticks (e.g., N = 1000, configurable but deterministic). This bounds memory and avoids age saturation dominance.
+
+Alternatively, keep cumulative age but add a **decay factor** or reset age when a match is selected. The consensus leans toward last‑seen tick for simplicity and fairness.
+
+---
+
+#### C. Resource limits – define minimal deterministic behaviour
+**Problem:** `RESOURCE_LIMIT_EXCEEDED` is undefined.
+
+**Improvement:** Specify that a conformant engine **must** support at least:
+- `MAX_NODES = 2^31 - 1` (signed 32-bit for safety)  
+- `MAX_EDGES = 2^31 - 1`  
+- `MAX_MATCHES_PER_TICK = 10^6` (or engine-defined but documented)  
+- `MAX_ACTION_COUNT_PER_COMMIT = 10^6`
+
+If any limit is exceeded, the engine **must** raise `RESOURCE_LIMIT_EXCEEDED` and halt (fatal). The exact limit values are implementation-defined, but the error must be raised at some consistent point. For full determinism, engines must document their limits; conformance test suites would use small graphs that stay within reasonable bounds.
+
+Better: Define **default limits** in the spec (e.g., 10^6 nodes) and allow engines to increase them, but any two engines with the same limit configuration produce identical behaviour. This is acceptable as long as the golden file includes the limit configuration.
+
+---
+
+#### D. Short‑circuit vs dependency extraction mismatch
+**Problem:** Recording reads from unevaluated branches causes spurious rejections.
+
+**Improvement – Two options:**
+1. **Change dependency extraction to match runtime evaluation** – only record reads from the evaluated branch. This is more intuitive but requires careful deterministic ordering of side effects (none exist, so it’s safe).  
+2. **Keep conservative recording but document the livelock risk** and state that it is intentional to simplify the dependency model.
+
+The consensus leans toward **option 1** (record only evaluated reads) because it avoids unnecessary retries and still yields determinism (the evaluation order is fixed left‑to‑right). However, this changes the read set – implementers must be careful. I recommend **option 1** for practical systems.
+
+---
+
+#### E. Golden file and diagnostic output for rejected matches
+**Improvement:** Add an **optional debug mode** that records, for each tick, the list of rejected matches and the reason (e.g., “stale read”, “duplicate update”, “constraint failed”). This does not affect the canonical golden file but allows conformance test debugging. The spec can state: “Engines may provide a separate diagnostic log; the golden file itself must not include this information.”
+
+---
+
+### 📋 Summary – Priority Fix List for v0.52
+
+| Order | Fix | Type |
+|-------|-----|------|
+| 1 | NO_MATCH: `M_prev'` unchanged (mandatory) | Determinism |
+| 2 | Constraint re‑evaluation mandatory | Determinism |
+| 3 | Pattern enumeration order + `match_key` sorting defined | Determinism |
+| 4 | Sequence counter read/increment + identifier allocation | Completeness |
+| 5 | Type schema language | Completeness |
+| 6 | Graph state JSON serialisation | Completeness |
+| 7 | Edge identity model | Completeness |
+| 8 | Fixed‑point scale overflow fatal | Numeric |
+| 9 | Adjacency dedup key unified | Versioning |
+| 10 | Read set completeness table | Versioning |
+| 11 | M_prev last‑seen‑tick model (optional but recommended) | Design |
+
+Once these are implemented, the specification can be considered **closed and deterministic** for conformance testing. The design improvements (simplified versioning, resource limits) can be addressed in v1.0.
+
+---
+
+If you would like, I can produce a **draft v0.52 patch** with exact line changes for the first five items.
+
+Fixes/Recommendation by AI7:
+
+**Consensus‑driven redesign plan for GRISP v0.51 → v0.52**
+
+Below is a concrete, step‑by‑step set of changes that directly address every high‑severity problem identified by the seven audits.  The list is ordered by the *determinism‑breakers* first (must be fixed before any conformance claim can hold) and then by the remaining critical gaps that impede a portable implementation.
+
+---
+
+## 1️⃣ Fix the deterministic‑theorem violations  
+
+| # | Change | How it eliminates the nondeterminism |
+|---|--------|--------------------------------------|
+| **1‑A** | **NO_MATCH rule** – replace the “implementation‑defined but deterministic” clause with a single, mandatory policy: *M‑prev is always retained unchanged* (ages continue to increase). Add a small note that implementations may optionally prune entries that have not been seen for **K** ticks, but the pruning rule must be **identical** for all engines (e.g. `K = 0` → never prune). | Guarantees that the age map evolves identically on every engine, so scores and tie‑breaks stay the same. |
+| **1‑B** | **Constraint re‑evaluation** – make it **mandatory** at COMMIT. The rule now reads “All constraints must be re‑evaluated against the post‑commit state; if any fails, the match is rejected and added to `Rejected`.” Remove any “optional” wording. | Removes the possibility that one engine skips the check while another does not, eliminating divergent commit decisions. |
+| **1‑C** | **Per‑tick retry bound** – add a deterministic limit `MAX_RETRIES = |M|` (the size of the discovery set). If after `MAX_RETRIES` attempts no match can be committed, the tick ends with NO_MATCH. | Guarantees termination of the SELECT‑retry loop and makes the behaviour reproducible. |
+
+---
+
+## 2️⃣ Canonical identifier & counter model  
+
+| # | Change | Rationale |
+|---|--------|-----------|
+| **2‑A** | **Identifier format** – every graph element (node or edge) receives an identifier of the form `type:seq`, where `seq` is a **64‑bit signed integer** taken from a *type‑local sequence counter* stored in `C`. The counter is **initialised to `max(initial_seq)+1`** for that type (or to 0 if the type is brand‑new). |
+| **2‑B** | **Sequence‑counter read** – `CreateNode` and `CreateEdge` must **read** the current counter (`SequenceCounterRead(type)`) and **increment** it atomically during the COMMIT phase. The read is recorded in the read‑trace `R`. |
+| **2‑C** | **Edge‑id generation** – edges are treated exactly like nodes: `edge_type:seq`. The source and target identifiers are stored as fields of the edge; they are not encoded in the identifier itself. |
+| **2‑D** | **Initial‑counter rule** – the “0 or max+1” wording is removed and replaced by the rule in 2‑A. | All engines now generate the same identifiers for the same creation, making `match_key` and ordering stable. |
+
+---
+
+## 3️⃣ Deterministic pattern enumeration & match‑key construction  
+
+| # | Change | Detail |
+|---|--------|--------|
+| **3‑A** | **Global traversal order** – DISCOVER iterates over graph elements in a *total order* defined by `ORDER_CANONICAL` on identifiers. The algorithm is: <br>1. Enumerate all nodes of a given `type` in increasing identifier order. <br>2. For each node, enumerate incident edges of each `edge_type` in increasing identifier order. <br>3. For each edge, enumerate its fields in lexicographic key order. |
+| **3‑B** | **Binding‑list sorting** – after a match is found, the list of bindings is turned into a **sorted list** by identifier name (UTF‑8 bytewise) and then by the bound value using `ORDER_CANONICAL`. The resulting tuple is the *binding list* component of `match_key`. |
+| **3‑C** | **match_key definition** – `match_key = (rule_id, sorted_binding_list)`. The ordering of the tuple is the lexicographic order of its components, each compared with `ORDER_CANONICAL`. |
+| **3‑D** | **Explicit example** – include a small IR example in the spec that shows a rule with two bindings, the resulting `match_key`, and the order of two matches that differ only in the second binding. | Guarantees that every implementation follows the same enumeration and key‑generation algorithm, eliminating nondeterministic match sets. |
+
+---
+
+## 4️⃣ Complete version‑counter semantics  
+
+| # | Change | What is added |
+|---|--------|---------------|
+| **4‑A** | **Full counter‑increment table** – a single authoritative table that lists, for each primitive action, **exactly which counters are read, which are incremented, and which are unchanged**. The table covers: <br>• `CreateNode` (extent_version, field_version for each created field, existence_version, sequence_counter) <br>• `CreateEdge` (edge_type_version, edge_predicate_version for each field, existence_version, adjacency_version for source.out and target.in, sequence_counter) <br>• `DeleteNode` (extent_version, field_version for each field, existence_version, adjacency_version for all incident edges) <br>• `DeleteEdge` (edge_type_version, adjacency_version for source.out and target.in, existence_version) <br>• `UpdateField` (field_version or predicate_version, existence_version unchanged) |
+| **4‑B** | **Adjacency‑deduplication key** – the key used for deduplication is `(node_id, edge_type, direction)`. The spec’s text is updated everywhere to use this exact tuple. |
+| **4‑C** | **Read‑trace completeness** – every action’s compilation rule now explicitly lists all reads that must be added to `R`. For example, `CreateEdge` adds `ExtentRead(edge_type)`, `NodeExistence(src)`, `NodeExistence(tgt)`, `AdjacencyRead(src, edge_type, out)`, `AdjacencyRead(tgt, edge_type, in)`, and `SequenceCounterRead(edge_type)`. |
+| **4‑D** | **Validation rule extension** – COMMIT validation now checks **all** read‑trace entries, including `EdgeExistence`, `PredicateVersion`, and `AdjacencyVersion` for both directions. | With a single, unambiguous table and matching read‑trace, every engine will compute the same version snapshots and accept/reject the same matches. |
+
+---
+
+## 5️⃣ Schema language & golden‑file serialization  
+
+| # | Change | Effect |
+|---|--------|--------|
+| **5‑A** | **Minimal JSON schema DSL** – introduce a `type_definitions` object in the IR that maps each `type_name` to a list of fields, each field having a name, a primitive type (`int`, `fixed`, `bool`, `string`, `identifier`), and a `mandatory` flag. Example: <br>`"type_definitions": {"Person": [{"name":"age","type":"int","mandatory":true}, {"name":"name","type":"string","mandatory":true}]}` |
+| **5‑B** | **`type_definitions_hash`** – defined as the SHA‑256 hash of the canonical JSON representation of `type_definitions` (keys sorted, no whitespace). |
+| **5‑C** | **Graph serialization** – `initial_state` and `final_state` are JSON objects with two top‑level arrays: `"nodes"` and `"edges"`. Each node/edge object contains: <br>• `"id"` (canonical identifier) <br>• `"type"` (type name) <br>• `"fields"` (object with keys sorted lexicographically) <br>All arrays are sorted by identifier using `ORDER_CANONICAL`. |
+| **5‑D** | **Golden‑file format** – the top‑level JSON now includes `"ir_schema_version": "1.0"` and a `"state"` object that contains `"nodes"` and `"edges"` as described. The `"ticks"` array records each tick exactly as before, but `committed_changes` now stores actions in the same canonical JSON format. | Guarantees that two engines with identical internal state produce byte‑identical golden files. |
+
+---
+
+## 6️⃣ Numeric model & expression language fixes  
+
+| # | Change | Detail |
+|---|--------|--------|
+| **6‑A** | **Scale‑overflow rule** – any operation that would produce a scale > 18 results in a fatal error `FIXED_POINT_SCALE_OVERFLOW`. |
+| **6‑B** | **Fixed‑point serialization** – for `scale = 0` the string has **no decimal point** (e.g. `"42"`). For `scale > 0` the string contains exactly `scale` digits after the decimal point (e.g. `"12.5000"` for scale 4). |
+| **6‑C** | **Complete operator set** – add `!=`, `<=`, `>=`, `||` to the constraint grammar, and a unary `!` for boolean negation. |
+| **6‑D** | **List / map literals & indexing** – extend the expression grammar with `[e₁,…,eₙ]` and `{"k₁":e₁,…}` and with `e₁[e₂]` for list or map lookup (out‑of‑bounds ⇒ fatal). |
+| **6‑E** | **Short‑circuit dependency rule** – keep the current “record both operands” policy (deterministic read‑trace) but add a note that it is intentional and that the extra reads are harmless because version validation will succeed only if the underlying data has not changed. |
+| **6‑F** | **Integer division operator** – `/` on integers yields a `FixedPoint(0)` result (promotion rule) and truncates toward zero; `//` is defined as *floor division* for signed integers (result is integer). Both are fatal on division‑by‑zero. | Removes ambiguities and makes the arithmetic model fully specified. |
+
+---
+
+## 7️⃣ Resource limits, diagnostics & auxiliary formats  
+
+| # | Change | Reason |
+|---|--------|--------|
+| **7‑A** | **Define `RESOURCE_LIMIT_EXCEEDED`** – a minimal set of limits that every engine must enforce: <br>• `MAX_NODES = 2³¹‑1` <br>• `MAX_EDGES = 2³¹‑1` <br>• `MAX_MATCHES_PER_TICK = 2⁶⁴‑1` <br>All limits are configurable, but the default values above are mandatory. |
+| **7‑B** | **Canonical Action Trace (CAT) format** – JSON array of objects, each object containing `op`, `target`, and any additional fields (`type`, `src`, `tgt`, `field`, `value`). Example: `{"op":"CreateNode","target":"Person:7","type":"Person","fields":{"age":30,"name":"Alice"}}`. |
+| **7‑C** | **Debug‑mode rejection log** – optional field `"rejected_matches"` in the tick record that lists `match_key` and a short reason (e.g., `"stale_read"`). This field is omitted in production golden files but may be emitted when a `debug` flag is set. |
+| **7‑D** | **Garbage‑collection policy for `M_prev`** – after each tick, entries whose `match_key` has not appeared in the last `K = 2³²` ticks may be removed. The rule is deterministic because `K` is a constant. | Prevents unbounded memory growth while preserving fairness for recent matches. |
+
+---
+
+## 8️⃣ Summary of the patch order  
+
+1. **Determinism‑breaker fixes** (1‑A, 1‑B, 1‑C).  
+2. **Identifier & counter model** (2‑A–2‑D).  
+3. **Pattern enumeration & match‑key** (3‑A–3‑D).  
+4. **Version‑counter table & read‑trace** (4‑A–4‑D).  
+5. **Schema & golden‑file serialization** (5‑A–5‑D).  
+6. **Numeric & expression extensions** (6‑A–6‑F).  
+7. **Resource limits, CAT format, diagnostics** (7‑A–7‑D).  
+
+Implementing the changes in this order guarantees that the most fundamental determinism violations are eliminated before any higher‑level features are touched.
+
+---
+
+**Next step:** Which of the high‑severity clusters (1‑A/1‑B, 2‑A/2‑B, or 3‑A/3‑B) would you like a concrete “diff‑style” patch for first?
