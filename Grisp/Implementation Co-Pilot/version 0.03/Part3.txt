@@ -1,0 +1,164 @@
+⟦PART:id=grisp-delphi-001;part=3;total=3;sha256=;type=BUNDLE⟧
+⟦FILE:Grisp.Compiler.pas;encoding=utf8⟧
+unit Grisp.Compiler;
+
+interface
+uses Grisp.Types, Grisp.Match, System.Generics.Collections;
+
+type
+  TPrimitive = record
+    Kind: string;
+    Params: TDictionary<string, string>;
+  end;
+
+  TAlpha = TList<TPrimitive>;
+
+function CompilePlan(const G: TGraph; const M: TMatch; out Alpha: TAlpha; out ReadSet: TList<TReadEntry>): Boolean;
+
+implementation
+
+function CompilePlan(const G: TGraph; const M: TMatch; out Alpha: TAlpha; out ReadSet: TList<TReadEntry>): Boolean;
+begin
+  // Placeholder: structural compilation must:
+  // - Evaluate action expressions against DISCOVER snapshot G
+  // - Expand DeleteNode into DeleteEdge actions deterministically (edges sorted by ORDER_CANONICAL)
+  // - Record reads per action (TypeExtentRead, SequenceCounterRead, NodeExistence, FieldRead, AdjacencyRead, EdgeExistence)
+  // - Freeze alpha and assign monotonic handles left-to-right
+  Alpha := TAlpha.Create;
+  ReadSet := TList<TReadEntry>.Create;
+  Result := False; // return False until full implementation provided
+end;
+
+end.
+⟦/FILE⟧
+⟦FILE:Grisp.Engine.pas;encoding=utf8⟧
+unit Grisp.Engine;
+
+interface
+uses
+  Grisp.Types, Grisp.Counters, Grisp.Match, System.Generics.Collections;
+
+type
+  TConfig = record
+    G: TGraph;
+    C: TCounters;
+    MPrev: TDictionary<string, Int64>;
+    Rejected: TDictionary<string, Boolean>;
+  end;
+
+procedure InitConfig(var CFG: TConfig);
+procedure FreeConfig(var CFG: TConfig);
+procedure Delta(var CFG: TConfig; const IR: TArray<string>);
+
+implementation
+uses
+  Grisp.Graph, Grisp.Compiler, System.SysUtils;
+
+procedure InitConfig(var CFG: TConfig);
+begin
+  InitGraph(CFG.G);
+  InitCounters(CFG.C);
+  CFG.MPrev := TDictionary<string, Int64>.Create;
+  CFG.Rejected := TDictionary<string, Boolean>.Create;
+end;
+
+procedure FreeConfig(var CFG: TConfig);
+begin
+  FreeGraph(CFG.G);
+  FreeCounters(CFG.C);
+  CFG.MPrev.Free;
+  CFG.Rejected.Free;
+end;
+
+procedure Delta(var CFG: TConfig; const IR: TArray<string>);
+var
+  Matches: TList<TMatch>;
+  Selected: TMatch;
+  Alpha: TAlpha;
+  ReadSet: TList<TReadEntry>;
+begin
+  // DISCOVER: EvalPatterns must enumerate matches deterministically
+  Matches := TList<TMatch>.Create;
+  try
+    // If no matches, NO_MATCH: advance tick counter
+    if Matches.Count = 0 then
+    begin
+      CFG.C.TickCounter := CFG.C.TickCounter + 1;
+      Exit;
+    end;
+
+    // SELECT: choose highest score then lexicographic match_key; skip Rejected
+    // PLAN: compile selected match into Alpha and ReadSet
+    if not CompilePlan(CFG.G, Selected, Alpha, ReadSet) then
+    begin
+      // Non-fatal compile error: add to Rejected and retry (loop omitted)
+      Exit;
+    end;
+
+    // COMMIT: validate reads against counters, simulate alpha on copy, structural checks,
+    // reevaluate constraints on simulated graph, resource checks, then apply atomically.
+    // Update counters and versions per deterministic table, emit events, update MPrev.
+    // Full commit logic must be implemented per spec.
+  finally
+    Matches.Free;
+  end;
+end;
+
+end.
+⟦/FILE⟧
+⟦FILE:Grisp.Serialise.pas;encoding=utf8⟧
+unit Grisp.Serialise;
+
+interface
+uses System.SysUtils, System.JSON, Grisp.Types, Grisp.Counters;
+
+function SerialiseStateToJSON(const G: TGraph; const C: TCounters): string;
+
+implementation
+
+function SerialiseStateToJSON(const G: TGraph; const C: TCounters): string;
+var
+  Root: TJSONObject;
+begin
+  Root := TJSONObject.Create;
+  try
+    Root.AddPair('ir_schema_version', '1.0');
+    Root.AddPair('type_definitions_hash', '');
+    Root.AddPair('initial_state', TJSONObject.Create);
+    Root.AddPair('final_state', TJSONObject.Create);
+    Result := Root.ToString;
+  finally
+    Root.Free;
+  end;
+end;
+
+end.
+⟦/FILE⟧
+⟦FILE:Grisp.Main.dpr;encoding=utf8⟧
+program GrispMain;
+
+{$APPTYPE CONSOLE}
+
+uses
+  System.SysUtils,
+  Grisp.Engine;
+
+var
+  CFG: TConfig;
+begin
+  try
+    InitConfig(CFG);
+    try
+      // TODO: load canonical IR JSON and initial state here
+      Delta(CFG, []);
+      Writeln('GRISP tick done. Tick counter: ', CFG.C.TickCounter);
+    finally
+      FreeConfig(CFG);
+    end;
+  except
+    on E: Exception do
+      Writeln('Fatal: ', E.ClassName, ': ', E.Message);
+  end;
+end.
+⟦/FILE⟧
+⟦/PART⟧

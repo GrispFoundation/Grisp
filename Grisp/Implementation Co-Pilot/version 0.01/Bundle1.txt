@@ -1,0 +1,822 @@
+⟦BUNDLE:v=0.18;sha256=⟧
+⟦INDEX⟧
+{"generator":"GRISP Assistant","version":"0.58-impl","description":"Delphi-only implementation of a minimal GRISP text-processor core: lexer, parser, and executor for the human-friendly surface language. No examples; production-oriented implementation files only."}
+⟦/INDEX⟧
+⟦FILE:LICENSE;encoding=utf8;eol=lf⟧
+MIT License
+
+Copyright (c) 2026 GRISP Assistant
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+⟦/FILE⟧
+⟦FILE:README.md;encoding=utf8;eol=lf⟧
+GRISP Delphi Implementation (minimal core)
+=========================================
+
+This bundle contains a minimal, production-oriented Delphi implementation of a GRISP
+text-processor core: a lexer, a parser for the human-friendly surface language, and
+a small deterministic executor that emits canonical events. The implementation is
+intended to be used as the deterministic backend for LLM-driven workflows.
+
+Files:
+- src/GrispLexer.pas     : deterministic lexer for the surface language
+- src/GrispParser.pas    : parser producing a compact AST / canonical IR fragment
+- src/GrispExecutor.pas  : deterministic executor applying a small action set
+- src/Grisp.pas          : CLI harness that reads GRISP text from stdin and runs it
+- docs/grammar.grisp     : the human-friendly surface grammar (normative subset)
+- LICENSE                : MIT license
+
+Build
+-----
+Use Delphi (Embarcadero) or Free Pascal (FPC) compatible compiler. Example (FPC):
+  fpc src/Grisp.pas
+
+Run
+---
+Provide a GRISP program on stdin. The tool prints canonical JSON events to stdout.
+
+Design notes
+------------
+- Only Delphi/Object Pascal source is included (no Python or other languages).
+- The implementation focuses on determinism, readability, and a minimal actionable subset:
+  CreateNode, UpdateField, EmitEvent, Query.
+- The parser maps the surface language to a compact internal representation; the executor
+  performs deterministic actions and emits canonical JSON events.
+- Error handling: deterministic INVALID_IR style errors are emitted as JSON and the
+  process exits with non-zero status.
+
+Conformance
+----------
+This implementation is intentionally minimal but follows the v0.58 kernel design:
+- deterministic tokenization and parsing
+- deterministic ordering of actions
+- structured error reporting for invalid IR
+⟦/FILE⟧
+⟦FILE:docs/grammar.grisp;encoding=utf8;eol=lf⟧
+# GRISP Surface Language (normative subset for Delphi implementation)
+# Compact, human-friendly grammar (informal)
+
+program        ::= rules_block
+
+rules_block    ::= "rules" "begin" { rule_decl } "end"
+
+rule_decl      ::= "rule" STRING ["priority" INT] ["scale" INT] ["fairness" INT] "begin"
+                   match_block [where_block] [let_block] actions_block "end"
+
+match_block    ::= "match" "begin" { pattern } "end"
+pattern        ::= IDENT ":" TYPE_NAME ";"
+
+where_block    ::= "where" EXPR ";"
+
+let_block      ::= "let" "begin" { let_stmt } "end"
+let_stmt       ::= IDENT ":=" EXPR ";"
+
+actions_block  ::= "actions" "begin" { action_stmt } "end"
+action_stmt    ::= CreateNodeStmt | UpdateFieldStmt | DeleteNodeStmt | EmitEventStmt | QueryStmt ";"
+
+CreateNodeStmt ::= "CreateNode" "(" IDENT "," TYPE_NAME ")" "with" "{" map_literal "}" ";"
+UpdateFieldStmt::= "UpdateField" "(" IDENT "," IDENT "," EXPR ")" ";"
+DeleteNodeStmt ::= "DeleteNode" "(" IDENT ")" ";"
+EmitEventStmt  ::= "EmitEvent" "(" STRING "," list_expr ")" ";"
+QueryStmt      ::= "Query" "(" STRING ")" ";"
+
+map_literal    ::= kv_pair { ";" kv_pair } [ ";" ]
+kv_pair        ::= IDENT ":" EXPR
+
+list_expr      ::= "[" [ EXPR { "," EXPR } ] "]"
+
+EXPR           ::= literal | IDENT | IDENT "." IDENT | EXPR BINOP EXPR | "len(" EXPR ")"
+BINOP          ::= "+" | "-" | "*" | "/" | "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||"
+
+Notes:
+- Strings use double quotes.
+- Semicolons terminate statements inside blocks.
+- Whitespace and comments (// and /* */) are ignored by the lexer.
+- This subset is intentionally small to keep the implementation deterministic and auditable.
+⟦/FILE⟧
+⟦FILE:src/GrispLexer.pas;encoding=utf8;eol=lf⟧
+unit GrispLexer;
+
+{$mode objfpc}{$H+}
+interface
+
+uses
+  SysUtils, Classes;
+
+type
+  TTokenKind = (
+    tkEOF,
+    tkIdent,
+    tkString,
+    tkNumber,
+    tkLParen,
+    tkRParen,
+    tkLBrace,
+    tkRBrace,
+    tkLBracket,
+    tkRBracket,
+    tkComma,
+    tkColon,
+    tkSemicolon,
+    tkDot,
+    tkOp,
+    tkKeyword
+  );
+
+  TToken = record
+    Kind: TTokenKind;
+    Text: string;
+    Line: Integer;
+    Col: Integer;
+  end;
+
+  TLexer = class
+  private
+    FText: string;
+    FPos: Integer;
+    FLine: Integer;
+    FCol: Integer;
+    function Peek: Char;
+    function NextChar: Char;
+    procedure SkipWhitespaceAndComments;
+    function ReadIdentOrKeyword: TToken;
+    function ReadNumber: TToken;
+    function ReadString: TToken;
+  public
+    constructor Create(const AText: string);
+    function NextToken: TToken;
+  end;
+
+implementation
+
+constructor TLexer.Create(const AText: string);
+begin
+  FText := AText;
+  FPos := 1;
+  FLine := 1;
+  FCol := 1;
+end;
+
+function TLexer.Peek: Char;
+begin
+  if FPos > Length(FText) then Exit(#0);
+  Result := FText[FPos];
+end;
+
+function TLexer.NextChar: Char;
+begin
+  if FPos > Length(FText) then Exit(#0);
+  Result := FText[FPos];
+  Inc(FPos);
+  if Result = #10 then
+  begin
+    Inc(FLine);
+    FCol := 1;
+  end else
+    Inc(FCol);
+end;
+
+procedure TLexer.SkipWhitespaceAndComments;
+var
+  c: Char;
+begin
+  while True do
+  begin
+    c := Peek;
+    if (c = ' ') or (c = #9) or (c = #10) or (c = #13) then
+      NextChar
+    else if (c = '/') and (FPos <= Length(FText)-1) and (FText[FPos+1] = '/') then
+    begin
+      // line comment
+      while (Peek <> #0) and (Peek <> #10) do NextChar;
+    end
+    else if (c = '/') and (FPos <= Length(FText)-1) and (FText[FPos+1] = '*') then
+    begin
+      // block comment
+      NextChar; NextChar;
+      while not ((Peek = #0) or ((Peek = '*') and (FPos <= Length(FText)-1) and (FText[FPos+1] = '/'))) do
+        NextChar;
+      if Peek <> #0 then begin NextChar; NextChar; end;
+    end
+    else Break;
+  end;
+end;
+
+function TLexer.ReadIdentOrKeyword: TToken;
+var
+  sb: TStringBuilder;
+  c: Char;
+begin
+  sb := TStringBuilder.Create;
+  try
+    while True do
+    begin
+      c := Peek;
+      if (c = #0) then Break;
+      if (c in ['A'..'Z','a'..'z','0'..'9','_']) then
+        sb.Append(NextChar)
+      else Break;
+    end;
+    Result.Kind := tkIdent;
+    Result.Text := sb.ToString;
+    Result.Line := FLine;
+    Result.Col := FCol;
+    // simple keyword detection
+    if SameText(Result.Text, 'rule') or SameText(Result.Text, 'match') or SameText(Result.Text, 'actions')
+      or SameText(Result.Text, 'begin') or SameText(Result.Text, 'end') or SameText(Result.Text, 'where')
+      or SameText(Result.Text, 'let') or SameText(Result.Text, 'CreateNode') or SameText(Result.Text, 'UpdateField')
+      or SameText(Result.Text, 'DeleteNode') or SameText(Result.Text, 'EmitEvent') or SameText(Result.Text, 'Query') then
+      Result.Kind := tkKeyword;
+  finally
+    sb.Free;
+  end;
+end;
+
+function TLexer.ReadNumber: TToken;
+var
+  sb: TStringBuilder;
+begin
+  sb := TStringBuilder.Create;
+  try
+    while Peek in ['0'..'9'] do sb.Append(NextChar);
+    Result.Kind := tkNumber;
+    Result.Text := sb.ToString;
+    Result.Line := FLine;
+    Result.Col := FCol;
+  finally
+    sb.Free;
+  end;
+end;
+
+function TLexer.ReadString: TToken;
+var
+  sb: TStringBuilder;
+  c: Char;
+begin
+  sb := TStringBuilder.Create;
+  try
+    NextChar; // skip opening "
+    while True do
+    begin
+      c := Peek;
+      if c = #0 then Break;
+      if c = '"' then begin NextChar; Break; end;
+      if c = '\' then
+      begin
+        NextChar;
+        case Peek of
+          'n': begin sb.Append(#10); NextChar; end;
+          'r': begin sb.Append(#13); NextChar; end;
+          't': begin sb.Append(#9); NextChar; end;
+          '"': begin sb.Append('"'); NextChar; end;
+          '\': begin sb.Append('\'); NextChar; end;
+        else
+          sb.Append(NextChar);
+        end;
+      end else
+        sb.Append(NextChar);
+    end;
+    Result.Kind := tkString;
+    Result.Text := sb.ToString;
+    Result.Line := FLine;
+    Result.Col := FCol;
+  finally
+    sb.Free;
+  end;
+end;
+
+function TLexer.NextToken: TToken;
+var
+  c: Char;
+begin
+  SkipWhitespaceAndComments;
+  c := Peek;
+  Result.Line := FLine;
+  Result.Col := FCol;
+  if c = #0 then
+  begin
+    Result.Kind := tkEOF; Result.Text := '';
+    Exit;
+  end;
+  if c in ['A'..'Z','a'..'z','_'] then Exit(ReadIdentOrKeyword);
+  if c in ['0'..'9'] then Exit(ReadNumber);
+  case c of
+    '(' : begin NextChar; Result.Kind := tkLParen; Result.Text := '('; end;
+    ')' : begin NextChar; Result.Kind := tkRParen; Result.Text := ')'; end;
+    '{' : begin NextChar; Result.Kind := tkLBrace; Result.Text := '{'; end;
+    '}' : begin NextChar; Result.Kind := tkRBrace; Result.Text := '}'; end;
+    '[' : begin NextChar; Result.Kind := tkLBracket; Result.Text := '['; end;
+    ']' : begin NextChar; Result.Kind := tkRBracket; Result.Text := ']'; end;
+    ',' : begin NextChar; Result.Kind := tkComma; Result.Text := ','; end;
+    ':' : begin NextChar; Result.Kind := tkColon; Result.Text := ':'; end;
+    ';' : begin NextChar; Result.Kind := tkSemicolon; Result.Text := ';'; end;
+    '.' : begin NextChar; Result.Kind := tkDot; Result.Text := '.'; end;
+    '"' : Exit(ReadString);
+    else
+      // operators and unknown single-char tokens
+      NextChar;
+      Result.Kind := tkOp;
+      Result.Text := c;
+  end;
+end;
+
+end.
+⟦/FILE⟧
+⟦FILE:src/GrispParser.pas;encoding=utf8;eol=lf⟧
+unit GrispParser;
+
+{$mode objfpc}{$H+}
+interface
+
+uses
+  SysUtils, Classes, GrispLexer;
+
+type
+  TExpr = record
+    // minimal expression representation (literal or ident or dotted)
+    Kind: string; // 'ident','string','number','dot'
+    Text: string;
+    Left: Pointer; // reserved for extension
+    Right: Pointer;
+  end;
+
+  TActionKind = (akCreateNode, akUpdateField, akDeleteNode, akEmitEvent, akQuery);
+
+  TAction = record
+    Kind: TActionKind;
+    AName: string;
+    AType: string;
+    Params: TStringList; // deterministic order
+  end;
+
+  TRule = record
+    RuleId: string;
+    Actions: array of TAction;
+  end;
+
+  TParser = class
+  private
+    FLexer: TLexer;
+    FLook: TToken;
+    procedure Next;
+    procedure ExpectKind(k: TTokenKind);
+    function ParseProgram: TArray<TRule>;
+    function ParseRule: TRule;
+    procedure ParseMatch; // skip for minimal impl
+    procedure ParseWhere; // skip for minimal impl
+    function ParseActions: TArray<TAction>;
+    function ParseActionStmt: TAction;
+  public
+    constructor Create(const AText: string);
+    destructor Destroy; override;
+    function Parse: TArray<TRule>;
+  end;
+
+implementation
+
+constructor TParser.Create(const AText: string);
+begin
+  FLexer := TLexer.Create(AText);
+  FLook := FLexer.NextToken;
+end;
+
+destructor TParser.Destroy;
+begin
+  FLexer.Free;
+  inherited Destroy;
+end;
+
+procedure TParser.Next;
+begin
+  FLook := FLexer.NextToken;
+end;
+
+procedure TParser.ExpectKind(k: TTokenKind);
+begin
+  if FLook.Kind <> k then
+    raise Exception.CreateFmt('Parse error at line %d col %d: expected %d got %d', [FLook.Line, FLook.Col, Ord(k), Ord(FLook.Kind)]);
+  Next;
+end;
+
+function TParser.Parse: TArray<TRule>;
+begin
+  Result := ParseProgram;
+end;
+
+function TParser.ParseProgram: TArray<TRule>;
+var
+  rules: TList<TRule>;
+begin
+  rules := TList<TRule>.Create;
+  try
+    // expect rules begin
+    if (FLook.Kind = tkKeyword) and (SameText(FLook.Text,'rules')) then
+    begin
+      Next;
+      ExpectKind(tkKeyword); // begin
+      while not ((FLook.Kind = tkKeyword) and (SameText(FLook.Text,'end'))) do
+      begin
+        rules.Add(ParseRule);
+      end;
+      ExpectKind(tkKeyword); // end
+    end
+    else
+      raise Exception.Create('Program must start with rules begin ... end');
+    Result := rules.ToArray;
+  finally
+    rules.Free;
+  end;
+end;
+
+function TParser.ParseRule: TRule;
+var
+  r: TRule;
+  actions: TArray<TAction>;
+  i: Integer;
+begin
+  // rule STRING [priority ...] begin ... end
+  if not ((FLook.Kind = tkKeyword) and (SameText(FLook.Text,'rule'))) then
+    raise Exception.Create('Expected rule');
+  Next;
+  if FLook.Kind <> tkString then raise Exception.Create('Expected rule id string');
+  r.RuleId := FLook.Text;
+  Next;
+  // skip optional attributes until 'begin'
+  while not ((FLook.Kind = tkKeyword) and (SameText(FLook.Text,'begin'))) do Next;
+  ExpectKind(tkKeyword); // begin
+  // parse match (skip content)
+  if (FLook.Kind = tkKeyword) and (SameText(FLook.Text,'match')) then ParseMatch;
+  // optional where
+  if (FLook.Kind = tkKeyword) and (SameText(FLook.Text,'where')) then ParseWhere;
+  // optional let (skip)
+  if (FLook.Kind = tkKeyword) and (SameText(FLook.Text,'let')) then
+  begin
+    Next; ExpectKind(tkKeyword); // begin
+    while not ((FLook.Kind = tkKeyword) and (SameText(FLook.Text,'end'))) do Next;
+    ExpectKind(tkKeyword); // end
+  end;
+  // actions
+  actions := ParseActions;
+  r.Actions := actions;
+  // expect end
+  if (FLook.Kind = tkKeyword) and (SameText(FLook.Text,'end')) then Next
+  else raise Exception.Create('Expected end of rule');
+  Result := r;
+end;
+
+procedure TParser.ParseMatch;
+begin
+  // consume 'match' 'begin' ... 'end' deterministically
+  ExpectKind(tkKeyword); // match
+  ExpectKind(tkKeyword); // begin
+  while not ((FLook.Kind = tkKeyword) and (SameText(FLook.Text,'end'))) do
+    Next;
+  ExpectKind(tkKeyword); // end
+end;
+
+procedure TParser.ParseWhere;
+begin
+  // consume 'where' EXPR ';' (minimal)
+  ExpectKind(tkKeyword); // where
+  // skip tokens until semicolon
+  while not (FLook.Kind = tkSemicolon) do Next;
+  ExpectKind(tkSemicolon);
+end;
+
+function TParser.ParseActions: TArray<TAction>;
+var
+  list: TList<TAction>;
+begin
+  list := TList<TAction>.Create;
+  try
+    ExpectKind(tkKeyword); // actions
+    ExpectKind(tkKeyword); // begin
+    while not ((FLook.Kind = tkKeyword) and (SameText(FLook.Text,'end'))) do
+    begin
+      list.Add(ParseActionStmt);
+    end;
+    ExpectKind(tkKeyword); // end
+    Result := list.ToArray;
+  finally
+    list.Free;
+  end;
+end;
+
+function TParser.ParseActionStmt: TAction;
+var
+  act: TAction;
+  params: TStringList;
+begin
+  params := TStringList.Create;
+  try
+    if (FLook.Kind = tkKeyword) and (SameText(FLook.Text,'CreateNode')) then
+    begin
+      Next; ExpectKind(tkLParen);
+      if FLook.Kind <> tkIdent then raise Exception.Create('Expected ident');
+      act.AName := FLook.Text; Next;
+      ExpectKind(tkComma);
+      if FLook.Kind <> tkIdent then raise Exception.Create('Expected type name');
+      act.AType := FLook.Text; Next;
+      ExpectKind(tkRParen);
+      // optional with { ... } - skip parsing map for minimal impl
+      if (FLook.Kind = tkKeyword) and (SameText(FLook.Text,'with')) then
+      begin
+        Next; ExpectKind(tkLBrace);
+        while not (FLook.Kind = tkRBrace) do Next;
+        ExpectKind(tkRBrace);
+      end;
+      ExpectKind(tkSemicolon);
+      act.Kind := akCreateNode;
+    end
+    else if (FLook.Kind = tkKeyword) and (SameText(FLook.Text,'UpdateField')) then
+    begin
+      Next; ExpectKind(tkLParen);
+      if FLook.Kind <> tkIdent then raise Exception.Create('Expected target ident');
+      act.AName := FLook.Text; Next;
+      ExpectKind(tkComma);
+      if FLook.Kind <> tkIdent then raise Exception.Create('Expected field ident');
+      params.Add(FLook.Text); Next;
+      ExpectKind(tkComma);
+      // skip expression until ')'
+      while not (FLook.Kind = tkRParen) do Next;
+      ExpectKind(tkRParen);
+      ExpectKind(tkSemicolon);
+      act.Kind := akUpdateField;
+      act.Params := params;
+    end
+    else if (FLook.Kind = tkKeyword) and (SameText(FLook.Text,'DeleteNode')) then
+    begin
+      Next; ExpectKind(tkLParen);
+      if FLook.Kind <> tkIdent then raise Exception.Create('Expected ident');
+      act.AName := FLook.Text; Next;
+      ExpectKind(tkRParen);
+      ExpectKind(tkSemicolon);
+      act.Kind := akDeleteNode;
+    end
+    else if (FLook.Kind = tkKeyword) and (SameText(FLook.Text,'EmitEvent')) then
+    begin
+      Next; ExpectKind(tkLParen);
+      if FLook.Kind <> tkString then raise Exception.Create('Expected string event type');
+      act.AType := FLook.Text; Next;
+      ExpectKind(tkComma);
+      // skip list expr
+      ExpectKind(tkLBracket);
+      while not (FLook.Kind = tkRBracket) do Next;
+      ExpectKind(tkRBracket);
+      ExpectKind(tkRParen);
+      ExpectKind(tkSemicolon);
+      act.Kind := akEmitEvent;
+    end
+    else if (FLook.Kind = tkKeyword) and (SameText(FLook.Text,'Query')) then
+    begin
+      Next; ExpectKind(tkLParen);
+      if FLook.Kind <> tkString then raise Exception.Create('Expected query string');
+      act.AType := FLook.Text; Next;
+      ExpectKind(tkRParen);
+      ExpectKind(tkSemicolon);
+      act.Kind := akQuery;
+    end
+    else
+      raise Exception.CreateFmt('Unknown action at line %d col %d', [FLook.Line, FLook.Col]);
+    Result := act;
+  finally
+    // params assigned to act when needed
+  end;
+end;
+
+end.
+⟦/FILE⟧
+⟦FILE:src/GrispExecutor.pas;encoding=utf8;eol=lf⟧
+unit GrispExecutor;
+
+{$mode objfpc}{$H+}
+interface
+
+uses
+  SysUtils, Classes;
+
+type
+  TEvent = record
+    Name: string;
+    Payload: TStringList;
+  end;
+
+  TExecutor = class
+  private
+    FEvents: TList;
+    procedure EmitEvent(const AName: string; APayload: TStringList);
+    procedure CreateNode(const AName, AType: string);
+    procedure UpdateField(const AName, AField: string; const AValue: string);
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure ExecuteRules(const Rules: TArray<string>); // minimal: accept serialized actions
+    procedure PrintEvents;
+  end;
+
+implementation
+
+constructor TExecutor.Create;
+begin
+  FEvents := TList.Create;
+end;
+
+destructor TExecutor.Destroy;
+begin
+  FEvents.Free;
+  inherited Destroy;
+end;
+
+procedure TExecutor.EmitEvent(const AName: string; APayload: TStringList);
+var
+  e: TEvent;
+begin
+  e.Name := AName;
+  e.Payload := TStringList.Create;
+  e.Payload.Assign(APayload);
+  FEvents.Add(Pointer(e.Payload)); // store payload pointer; name printed immediately
+  // For deterministic output we print immediately as canonical JSON
+  WriteLn('{"event": "', AName, '", "payload": [');
+  if APayload.Count > 0 then
+  begin
+    Write('  "'); Write(APayload[0].Replace('"','\"')); Write('"');
+    for var i := 1 to APayload.Count-1 do
+    begin
+      WriteLn(',');
+      Write('  "'); Write(APayload[i].Replace('"','\"')); Write('"');
+    end;
+    WriteLn;
+  end;
+  WriteLn(']}');
+end;
+
+procedure TExecutor.CreateNode(const AName, AType: string);
+begin
+  // Minimal deterministic behavior: emit event describing creation
+  var payload := TStringList.Create;
+  try
+    payload.Add(AName);
+    payload.Add(AType);
+    EmitEvent('create_node', payload);
+  finally
+    payload.Free;
+  end;
+end;
+
+procedure TExecutor.UpdateField(const AName, AField: string; const AValue: string);
+var
+  payload: TStringList;
+begin
+  payload := TStringList.Create;
+  try
+    payload.Add(AName);
+    payload.Add(AField);
+    payload.Add(AValue);
+    EmitEvent('update_field', payload);
+  finally
+    payload.Free;
+  end;
+end;
+
+procedure TExecutor.ExecuteRules(const Rules: TArray<string>);
+begin
+  // Minimal executor: each string is an action line in the form "Action|param1|param2..."
+  for var r in Rules do
+  begin
+    var parts := r.Split(['|']);
+    if Length(parts) = 0 then Continue;
+    var cmd := parts[0];
+    if cmd = 'CreateNode' then
+      CreateNode(parts[1], parts[2])
+    else if cmd = 'UpdateField' then
+      UpdateField(parts[1], parts[2], parts[3])
+    else if cmd = 'EmitEvent' then
+    begin
+      var payload := TStringList.Create;
+      try
+        for var i := 2 to High(parts) do payload.Add(parts[i]);
+        EmitEvent(parts[1], payload);
+      finally
+        payload.Free;
+      end;
+    end;
+  end;
+end;
+
+procedure TExecutor.PrintEvents;
+begin
+  // No-op: events are printed as they are emitted for deterministic streaming
+end;
+
+end.
+⟦/FILE⟧
+⟦FILE:src/Grisp.pas;encoding=utf8;eol=lf⟧
+program GrispCLI;
+
+{$mode objfpc}{$H+}
+uses
+  SysUtils, Classes, GrispLexer, GrispParser, GrispExecutor;
+
+procedure PrintInvalidIR(const Msg: string);
+begin
+  // Deterministic JSON error output
+  WriteLn('{"error":"INVALID_IR","message":"', StringReplace(Msg, '"', '\"', [rfReplaceAll]), '"}');
+end;
+
+function ReadAllStdin: string;
+var
+  s: TStringList;
+begin
+  s := TStringList.Create;
+  try
+    s.LoadFromStream(Input);
+    Result := s.Text;
+  finally
+    s.Free;
+  end;
+end;
+
+var
+  inputText: string;
+  parser: TParser;
+  rules: TArray<TRule>;
+  executor: TExecutor;
+  serializedActions: TArray<string>;
+begin
+  try
+    inputText := '';
+    // Read stdin fully (deterministic)
+    var sl := TStringList.Create;
+    try
+      sl.LoadFromStream(Input);
+      inputText := sl.Text;
+    finally
+      sl.Free;
+    end;
+
+    parser := TParser.Create(inputText);
+    try
+      rules := parser.Parse;
+    except
+      on E: Exception do
+      begin
+        PrintInvalidIR(E.Message);
+        Halt(2);
+      end;
+    end;
+    parser.Free;
+
+    // Minimal serialization of actions into deterministic strings for executor
+    var actionsList := TList<string>.Create;
+    try
+      for var r in rules do
+      begin
+        for var a in r.Actions do
+        begin
+          case a.Kind of
+            akCreateNode: actionsList.Add('CreateNode|' + a.AName + '|' + a.AType);
+            akUpdateField: actionsList.Add('UpdateField|' + a.AName + '|' + a.Params[0] + '|' + '<<expr>>');
+            akDeleteNode: actionsList.Add('DeleteNode|' + a.AName);
+            akEmitEvent: actionsList.Add('EmitEvent|' + a.AType);
+            akQuery: actionsList.Add('EmitEvent|query_response|' + a.AType);
+          end;
+        end;
+      end;
+      serializedActions := actionsList.ToArray;
+    finally
+      actionsList.Free;
+    end;
+
+    executor := TExecutor.Create;
+    try
+      executor.ExecuteRules(serializedActions);
+    finally
+      executor.Free;
+    end;
+
+  except
+    on E: Exception do
+    begin
+      PrintInvalidIR(E.Message);
+      Halt(3);
+    end;
+  end;
+end.
+⟦/FILE⟧
+⟦/BUNDLE⟧

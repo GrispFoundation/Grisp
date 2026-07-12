@@ -1,0 +1,458 @@
+⟦BUNDLE:v=0.18;sha256=⟧
+⟦INDEX⟧
+{"generator":"AI LSBP Helper","project":"GRISP-Delphi-Project","version":"0.01"}
+⟦/INDEX⟧
+⟦FILE:Grisp.Types.pas;encoding=utf8⟧
+unit Grisp.Types;
+
+interface
+uses
+  System.SysUtils, System.Generics.Collections;
+
+type
+  // Identifier type: TypeName and sequence number
+  TID = record
+    TypeName: string;
+    SeqNum: Int64;
+  end;
+
+  // Value kinds follow the GRISP canonical order tags
+  TValueKind = (vkInt, vkFixed, vkBool, vkString, vkIdent, vkList, vkMap);
+
+  // Fixed point representation
+  TFixed = record
+    Scale: Integer;
+    Scaled: Int64; // scaled integer representation
+  end;
+
+  // Canonical value representation (compact)
+  TValue = record
+    Kind: TValueKind;
+    IntVal: Int64;
+    FixedVal: TFixed;
+    BoolVal: Boolean;
+    StrVal: string;
+    IdentVal: TID;
+    ListVal: TArray<TValue>;
+    MapVal: TDictionary<TValue, TValue>;
+  end;
+
+  // Field map for nodes/edges
+  TFieldMap = TDictionary<string, TValue>;
+
+  // Node record
+  TNode = record
+    Id: TID;
+    TypeName: string;
+    Fields: TFieldMap;
+  end;
+
+  // Edge record
+  TEdge = record
+    Id: TID;
+    TypeName: string;
+    Source, Target: TID;
+    Fields: TFieldMap;
+  end;
+
+  // Graph container
+  TGraph = record
+    Nodes: TDictionary<TID, TNode>;
+    Edges: TDictionary<TID, TEdge>;
+  end;
+
+implementation
+
+end.
+⟦/FILE⟧
+⟦FILE:Grisp.Order.pas;encoding=utf8⟧
+unit Grisp.Order;
+
+interface
+uses
+  System.SysUtils, System.Generics.Collections, Grisp.Types;
+
+type
+  // Compare result: -1,0,1
+  TCompareResult = -1..1;
+
+function CompareTID(const A, B: TID): Integer;
+function CompareValue(const A, B: TValue): Integer;
+
+implementation
+
+function CompareTID(const A, B: TID): Integer;
+begin
+  Result := CompareText(A.TypeName, B.TypeName);
+  if Result = 0 then
+  begin
+    if A.SeqNum < B.SeqNum then Exit(-1);
+    if A.SeqNum > B.SeqNum then Exit(1);
+    Exit(0);
+  end;
+  if Result < 0 then Exit(-1) else Exit(1);
+end;
+
+function CompareValue(const A, B: TValue): Integer;
+var
+  i, n: Integer;
+  ka, kb: Integer;
+begin
+  // Type tag order: Integer < FixedPoint < Boolean < String < Identifier < List < Map
+  ka := Ord(A.Kind); kb := Ord(B.Kind);
+  if ka < kb then Exit(-1);
+  if ka > kb then Exit(1);
+
+  case A.Kind of
+    vkInt:
+      if A.IntVal < B.IntVal then Exit(-1) else if A.IntVal > B.IntVal then Exit(1) else Exit(0);
+    vkFixed:
+      begin
+        if A.FixedVal.Scale < B.FixedVal.Scale then Exit(-1)
+        else if A.FixedVal.Scale > B.FixedVal.Scale then Exit(1)
+        else if A.FixedVal.Scaled < B.FixedVal.Scaled then Exit(-1)
+        else if A.FixedVal.Scaled > B.FixedVal.Scaled then Exit(1)
+        else Exit(0);
+      end;
+    vkBool:
+      if A.BoolVal = B.BoolVal then Exit(0) else if not A.BoolVal and B.BoolVal then Exit(-1) else Exit(1);
+    vkString:
+      begin
+        if A.StrVal < B.StrVal then Exit(-1) else if A.StrVal > B.StrVal then Exit(1) else Exit(0);
+      end;
+    vkIdent:
+      Exit(CompareTID(A.IdentVal, B.IdentVal));
+    vkList:
+      begin
+        n := Min(Length(A.ListVal), Length(B.ListVal));
+        for i := 0 to n - 1 do
+        begin
+          Result := CompareValue(A.ListVal[i], B.ListVal[i]);
+          if Result <> 0 then Exit;
+        end;
+        if Length(A.ListVal) < Length(B.ListVal) then Exit(-1)
+        else if Length(A.ListVal) > Length(B.ListVal) then Exit(1)
+        else Exit(0);
+      end;
+    vkMap:
+      begin
+        // Map comparison must follow ORDER_CANONICAL: compare tuples of (order_key(k), order_key(v))
+        // This implementation provides a deterministic placeholder: compare counts then stringified keys.
+        if A.MapVal.Count < B.MapVal.Count then Exit(-1)
+        else if A.MapVal.Count > B.MapVal.Count then Exit(1);
+        var keysA := TList<string>.Create;
+        try
+          for var kv in A.MapVal.Keys do keysA.Add(kv.StrVal);
+          keysA.Sort;
+          var keysB := TList<string>.Create;
+          try
+            for var kv in B.MapVal.Keys do keysB.Add(kv.StrVal);
+            keysB.Sort;
+            for i := 0 to keysA.Count - 1 do
+            begin
+              if keysA[i] < keysB[i] then Exit(-1) else if keysA[i] > keysB[i] then Exit(1);
+              // Value comparison by key is omitted here for brevity; full implementation must compare order_key(v)
+            end;
+          finally keysB.Free; end;
+        finally keysA.Free; end;
+        Exit(0);
+      end;
+  else
+    Exit(0);
+  end;
+end;
+
+end.
+⟦/FILE⟧
+⟦FILE:Grisp.Graph.pas;encoding=utf8⟧
+unit Grisp.Graph;
+
+interface
+uses
+  System.SysUtils, System.Generics.Collections, Grisp.Types, Grisp.Order;
+
+procedure InitGraph(var G: TGraph);
+procedure FreeGraph(var G: TGraph);
+function NodeExists(const G: TGraph; const Id: TID): Boolean;
+function EdgeExists(const G: TGraph; const Id: TID): Boolean;
+
+implementation
+
+procedure InitGraph(var G: TGraph);
+begin
+  G.Nodes := TDictionary<TID, TNode>.Create;
+  G.Edges := TDictionary<TID, TEdge>.Create;
+end;
+
+procedure FreeGraph(var G: TGraph);
+begin
+  G.Nodes.Free;
+  G.Edges.Free;
+end;
+
+function NodeExists(const G: TGraph; const Id: TID): Boolean;
+begin
+  Result := G.Nodes.ContainsKey(Id);
+end;
+
+function EdgeExists(const G: TGraph; const Id: TID): Boolean;
+begin
+  Result := G.Edges.ContainsKey(Id);
+end;
+
+end.
+⟦/FILE⟧
+⟦FILE:Grisp.Counters.pas;encoding=utf8⟧
+unit Grisp.Counters;
+
+interface
+uses System.Generics.Collections, Grisp.Types;
+
+type
+  TCounters = record
+    TickCounter: Int64;
+    SeqCounter: TDictionary<string, Int64>;
+    TypeExtentVersion: TDictionary<string, Int64>;
+    ElementVersion: TDictionary<TID, Int64>;
+    AdjacencyVersion: TDictionary<string, Int64>; // key: node|type|dir string
+  end;
+
+procedure InitCounters(var C: TCounters);
+procedure FreeCounters(var C: TCounters);
+
+implementation
+
+procedure InitCounters(var C: TCounters);
+begin
+  C.TickCounter := 0;
+  C.SeqCounter := TDictionary<string, Int64>.Create;
+  C.TypeExtentVersion := TDictionary<string, Int64>.Create;
+  C.ElementVersion := TDictionary<TID, Int64>.Create;
+  C.AdjacencyVersion := TDictionary<string, Int64>.Create;
+end;
+
+procedure FreeCounters(var C: TCounters);
+begin
+  C.SeqCounter.Free;
+  C.TypeExtentVersion.Free;
+  C.ElementVersion.Free;
+  C.AdjacencyVersion.Free;
+end;
+
+end.
+⟦/FILE⟧
+⟦FILE:Grisp.Match.pas;encoding=utf8⟧
+unit Grisp.Match;
+
+interface
+uses System.Generics.Collections, Grisp.Types;
+
+type
+  TReadKind = (rkNodeExistence, rkFieldRead, rkTypeExtent, rkAdjacency, rkEdgeExistence, rkSeqCounter);
+
+  TReadEntry = record
+    Kind: TReadKind;
+    Key: string; // canonical string describing the read (e.g., "Node:Person:5", "Field:Person:5:name")
+    Version: Int64;
+  end;
+
+  TMatch = record
+    RuleId: string;
+    Bindings: TDictionary<string, TValue>;
+    ReadSet: TList<TReadEntry>;
+    Age: Int64;
+  end;
+
+procedure InitMatch(var M: TMatch);
+procedure FreeMatch(var M: TMatch);
+
+implementation
+
+procedure InitMatch(var M: TMatch);
+begin
+  M.Bindings := TDictionary<string, TValue>.Create;
+  M.ReadSet := TList<TReadEntry>.Create;
+  M.Age := 0;
+end;
+
+procedure FreeMatch(var M: TMatch);
+begin
+  M.Bindings.Free;
+  M.ReadSet.Free;
+end;
+
+end.
+⟦/FILE⟧
+⟦FILE:Grisp.Compiler.pas;encoding=utf8⟧
+unit Grisp.Compiler;
+
+interface
+uses Grisp.Types, Grisp.Match, System.Generics.Collections;
+
+type
+  TPrimitive = record
+    // union of CreateNode/CreateEdge/UpdateField/DeleteEdge/DeleteNode/EmitEvent
+    Kind: string;
+    Params: TDictionary<string, string>; // simplified
+  end;
+
+  TAlpha = TList<TPrimitive>;
+
+function CompilePlan(const G: TGraph; const M: TMatch; out Alpha: TAlpha; out ReadSet: TList<TReadEntry>): Boolean;
+
+implementation
+
+function CompilePlan(const G: TGraph; const M: TMatch; out Alpha: TAlpha; out ReadSet: TList<TReadEntry>): Boolean;
+begin
+  // TODO: implement structural recursion over rule actions, evaluate expressions against snapshot G,
+  // expand DeleteNode into DeleteEdge actions, assign temporary handles (monotonic) after freeze.
+  Alpha := TAlpha.Create;
+  ReadSet := TList<TReadEntry>.Create;
+  // For now return false to indicate non-fatal compile error if rule incomplete.
+  Result := False;
+end;
+
+end.
+⟦/FILE⟧
+⟦FILE:Grisp.Engine.pas;encoding=utf8⟧
+unit Grisp.Engine;
+
+interface
+uses
+  Grisp.Types, Grisp.Counters, Grisp.Match, System.Generics.Collections;
+
+type
+  TConfig = record
+    G: TGraph;
+    C: TCounters;
+    MPrev: TDictionary<string, Int64>; // match_key -> last_tick_seen (stringified key)
+    Rejected: TDictionary<string, Boolean>;
+  end;
+
+procedure InitConfig(var CFG: TConfig);
+procedure FreeConfig(var CFG: TConfig);
+procedure Delta(var CFG: TConfig; const IR: TArray<string>); // IR is placeholder
+
+implementation
+uses
+  Grisp.Graph, Grisp.Compiler, System.SysUtils;
+
+procedure InitConfig(var CFG: TConfig);
+begin
+  InitGraph(CFG.G);
+  InitCounters(CFG.C);
+  CFG.MPrev := TDictionary<string, Int64>.Create;
+  CFG.Rejected := TDictionary<string, Boolean>.Create;
+end;
+
+procedure FreeConfig(var CFG: TConfig);
+begin
+  FreeGraph(CFG.G);
+  FreeCounters(CFG.C);
+  CFG.MPrev.Free;
+  CFG.Rejected.Free;
+end;
+
+procedure Delta(var CFG: TConfig; const IR: TArray<string>);
+var
+  Matches: TList<TMatch>;
+  i: Integer;
+  Selected: TMatch;
+  Alpha: TAlpha;
+  ReadSet: TList<TReadEntry>;
+  CommitOk: Boolean;
+begin
+  // DISCOVER: EvalPatterns (placeholder)
+  Matches := TList<TMatch>.Create;
+  try
+    // TODO: implement EvalPatterns deterministically (node type order, node id order, pattern order)
+    // SELECT: sort by score (priority*scale + age*fairness), tie-break by match_key lexicographic
+    // For now, if no matches -> NO_MATCH
+    if Matches.Count = 0 then
+    begin
+      // NO_MATCH: advance tick counter
+      CFG.C.TickCounter := CFG.C.TickCounter + 1;
+      Exit;
+    end;
+
+    // SELECT first non-rejected match deterministically
+    // PLAN
+    if not CompilePlan(CFG.G, Selected, Alpha, ReadSet) then
+    begin
+      // add to Rejected and retry (loop omitted for brevity)
+      Exit;
+    end;
+
+    // COMMIT: validate reads, structural checks, reevaluate constraints, resource checks
+    // apply alpha atomically, update counters, emit events, update MPrev
+    // For brevity, we assume commit succeeds
+  finally
+    Matches.Free;
+  end;
+end;
+
+end.
+⟦/FILE⟧
+⟦FILE:Grisp.Serialise.pas;encoding=utf8⟧
+unit Grisp.Serialise;
+
+interface
+uses System.SysUtils, System.JSON, Grisp.Types, Grisp.Counters;
+
+function SerialiseStateToJSON(const G: TGraph; const C: TCounters): string;
+
+implementation
+
+function SerialiseStateToJSON(const G: TGraph; const C: TCounters): string;
+var
+  Root, Initial, FinalState: TJSONObject;
+  NodesArr, EdgesArr: TJSONArray;
+begin
+  Root := TJSONObject.Create;
+  try
+    Root.AddPair('ir_schema_version', '1.0');
+    Root.AddPair('type_definitions_hash', ''); // fill in
+    NodesArr := TJSONArray.Create;
+    EdgesArr := TJSONArray.Create;
+    // Serialize nodes sorted by ORDER_CANONICAL (by id)
+    // For brevity we append in insertion order; production must sort by ORDER_CANONICAL.
+    Root.AddPair('initial_state', TJSONObject.Create);
+    Root.AddPair('final_state', TJSONObject.Create);
+    Result := Root.ToString;
+  finally
+    Root.Free;
+  end;
+end;
+
+end.
+⟦/FILE⟧
+⟦FILE:Grisp.Main.dpr;encoding=utf8⟧
+program GrispMain;
+
+{$APPTYPE CONSOLE}
+
+uses
+  System.SysUtils,
+  Grisp.Engine;
+
+var
+  CFG: TConfig;
+begin
+  try
+    InitConfig(CFG);
+    try
+      // Load IR (parse canonical JSON IR) and initial state (omitted)
+      // Run a single delta step as example:
+      Delta(CFG, []);
+      // Serialize final state
+      Writeln('GRISP tick done. Tick counter: ', CFG.C.TickCounter);
+    finally
+      FreeConfig(CFG);
+    end;
+  except
+    on E: Exception do
+      Writeln('Fatal: ', E.ClassName, ': ', E.Message);
+  end;
+end.
+⟦/FILE⟧
+⟦/BUNDLE⟧
