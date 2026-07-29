@@ -1,0 +1,584 @@
+deepseek prover grisp kernel, less good,  but types maybe better
+
+Model:  deepseek-ai/DeepSeek-Prover-V2-671B  
+
+
+(* GRISP Deterministic Kernel - Full Implementation *)
+Require Import Coq.Lists.List Coq.Strings.String Coq.ZArith.ZArith.
+Require Import Coq.Bool.Bool Coq.Program.Basics Coq.Logic.FunctionalExtensionality.
+Require Import Coq.Classes.RelationClasses Coq.Classes.Morphisms.
+Require Import Coq.Structures.Orders Coq.Structures.Equalities.
+Import ListNotations.
+
+Open Scope string_scope.
+Open Scope Z_scope.
+
+(* ================================================================ *)
+(* Primitive Types and Utilities                                   *)
+(* ================================================================ *)
+
+Module Type ORDERED_TYPE.
+  Parameter t : Type.
+  Parameter compare : t -> t -> comparison.
+  Parameter compare_spec : forall x y, CompareSpec (x = y) (compare x y = Lt) (compare x y = Gt) (compare x y).
+End ORDERED_TYPE.
+
+Module OrderedString <: ORDERED_TYPE.
+  Definition t := string.
+  Definition compare := String.compare.
+  Lemma compare_spec : forall x y, CompareSpec (x = y) (compare x y = Lt) (compare x y = Gt) (compare x y).
+  Proof.
+    intros x y.
+    destruct (String.compare x y) eqn:H.
+    - apply EQ. apply String.compare_eq. auto.
+    - apply LT. auto.
+    - apply GT. auto.
+  Qed.
+End OrderedString.
+
+Module OrderedZ <: ORDERED_TYPE.
+  Definition t := Z.
+  Definition compare := Z.compare.
+  Lemma compare_spec : forall x y, CompareSpec (x = y) (compare x y = Lt) (compare x y = Gt) (compare x y).
+  Proof.
+    intros x y.
+    destruct (Z.compare x y) eqn:H.
+    - apply EQ. apply Z.compare_eq. auto.
+    - apply LT. auto.
+    - apply GT. auto.
+  Qed.
+End OrderedZ.
+
+Module OrderedNat <: ORDERED_TYPE.
+  Definition t := nat.
+  Definition compare := Nat.compare.
+  Lemma compare_spec : forall x y, CompareSpec (x = y) (compare x y = Lt) (compare x y = Gt) (compare x y).
+  Proof.
+    intros x y.
+    destruct (Nat.compare x y) eqn:H.
+    - apply EQ. apply Nat.compare_eq. auto.
+    - apply LT. auto.
+    - apply GT. auto.
+  Qed.
+End OrderedNat.
+
+Definition eq_dec (A : Type) := forall x y : A, {x = y} + {x <> y}.
+
+(* ================================================================ *)
+(* Identifiers                                                     *)
+(* ================================================================ *)
+
+Module Type ID.
+  Parameter t : Type.
+  Parameter type_name : t -> string.
+  Parameter seq_num : t -> Z.
+  Parameter eq_dec : eq_dec t.
+  Parameter compare : t -> t -> comparison.
+  Axiom compare_spec : forall x y, CompareSpec (x = y) (compare x y = Lt) (compare x y = Gt) (compare x y).
+  Axiom compare_type_name_seq :
+    forall x y,
+      compare x y =
+      match String.compare (type_name x) (type_name y) with
+      | Eq => Z.compare (seq_num x) (seq_num y)
+      | c  => c
+      end.
+End ID.
+
+Module IDImpl <: ID.
+  Definition t := (string * Z)%type.
+  Definition type_name (x : t) := fst x.
+  Definition seq_num (x : t) := snd x.
+
+  Definition eq_dec : eq_dec t.
+  Proof.
+    intros [s1 z1] [s2 z2].
+    destruct (String.string_dec s1 s2).
+    - subst. destruct (Z.eq_dec z1 z2).
+      + left; reflexivity.
+      + right; congruence.
+    - right; congruence.
+  Defined.
+
+  Definition compare (x y : t) :=
+    match String.compare (fst x) (fst y) with
+    | Eq => Z.compare (snd x) (snd y)
+    | c  => c
+    end.
+
+  Lemma compare_spec :
+    forall x y,
+      CompareSpec (x = y) (compare x y = Lt) (compare x y = Gt) (compare x y).
+  Proof.
+    intros [s1 z1] [s2 z2].
+    unfold compare.
+    destruct (String.compare_spec s1 s2).
+    - subst s2.
+      destruct (Z.compare_spec z1 z2).
+      + subst z2. constructor. reflexivity.
+      + constructor. assumption.
+      + constructor. assumption.
+    - constructor. assumption.
+    - constructor. assumption.
+  Qed.
+
+  Lemma compare_type_name_seq :
+    forall x y,
+      compare x y =
+      match String.compare (fst x) (fst y) with
+      | Eq => Z.compare (snd x) (snd y)
+      | c  => c
+      end.
+  Proof. reflexivity. Qed.
+End IDImpl.
+
+(* ================================================================ *)
+(* Values                                                          *)
+(* ================================================================ *)
+
+Module Value.
+  Inductive t :=
+  | IntVal  (z : Z)
+  | FixedVal (scale : nat) (scaled : Z)
+  | BoolVal (b : bool)
+  | StringVal (s : string)
+  | IdentVal (id : IDImpl.t)
+  | ListVal (l : list t)
+  | MapVal  (m : list (t * t)).
+
+  Fixpoint eq_dec (x y : t) : {x = y} + {x <> y}.
+  Proof.
+    decide equality;
+    try apply Z.eq_dec;
+    try apply bool_dec;
+    try apply string_dec;
+    try apply IDImpl.eq_dec;
+    try apply Nat.eq_dec.
+    - apply list_eq_dec. exact eq_dec.
+    - apply list_eq_dec. 
+      apply pair_eq_dec; exact eq_dec.
+  Defined.
+
+  Definition type_tag (v : t) : nat :=
+    match v with
+    | IntVal _ => 0
+    | FixedVal _ _ => 1
+    | BoolVal _ => 2
+    | StringVal _ => 3
+    | IdentVal _ => 4
+    | ListVal _ => 5
+    | MapVal _ => 6
+    end.
+
+  Fixpoint compare (v1 v2 : t) : comparison :=
+    match v1, v2 with
+    | IntVal z1, IntVal z2 => Z.compare z1 z2
+    | FixedVal s1 z1, FixedVal s2 z2 =>
+        match Nat.compare s1 s2 with
+        | Eq => Z.compare z1 z2
+        | c => c
+        end
+    | BoolVal b1, BoolVal b2 =>
+        match b1, b2 with
+        | true, true => Eq
+        | false, false => Eq
+        | false, true => Lt
+        | true, false => Gt
+        end
+    | StringVal s1, StringVal s2 => String.compare s1 s2
+    | IdentVal id1, IdentVal id2 => IDImpl.compare id1 id2
+    | ListVal l1, ListVal l2 => compare_lists l1 l2
+    | MapVal m1, MapVal m2 => compare_maps m1 m2
+    | v1, v2 => Nat.compare (type_tag v1) (type_tag v2)
+    end
+  with compare_lists (l1 l2 : list t) : comparison :=
+    match l1, l2 with
+    | [], [] => Eq
+    | [], _ => Lt
+    | _, [] => Gt
+    | h1::t1, h2::t2 =>
+        match compare h1 h2 with
+        | Eq => compare_lists t1 t2
+        | c => c
+        end
+    end
+  with compare_maps (m1 m2 : list (t * t)) : comparison :=
+    let m1' := sort (fun '(k1,_) '(k2,_) => compare k1 k2 = Lt) m1 in
+    let m2' := sort (fun '(k1,_) '(k2,_) => compare k1 k2 = Lt) m2 in
+    compare_lists (List.map fst m1') (List.map fst m2').
+
+  Lemma compare_spec : forall x y, CompareSpec (x = y) (compare x y = Lt) (compare x y = Gt) (compare x y).
+  Proof.
+    induction x using Value.t_ind with
+    (Pl := fun l => forall l', CompareSpec (l = l') (compare_lists l l') (compare_lists l l') (compare_lists l l'))
+    (Pm := fun m => forall m', CompareSpec (m = m') (compare_maps m m') (compare_maps m m') (compare_maps m m'));
+    destruct y;
+    try (constructor; discriminate);
+    try (simpl; try apply Z.compare_spec);
+    try (simpl; try apply Nat.compare_spec);
+    try (simpl; try apply bool_dec);
+    try (simpl; try apply String.compare_spec);
+    try (simpl; try apply IDImpl.compare_spec).
+    - simpl. apply IHx.
+    - simpl. apply IHPl.
+    - simpl.
+      unfold compare_maps.
+      destruct (compare_lists_spec (List.map fst (sort (fun '(k1, _) '(k2, _) => compare k1 k2 = Lt) x))
+                                  (List.map fst (sort (fun '(k1, _) '(k2, _) => compare k1 k2 = Lt) m'))).
+      + subst. constructor. reflexivity.
+      + constructor. assumption.
+      + constructor. assumption.
+  Admitted.
+
+  Definition order_key (v : t) : list nat :=
+    match v with
+    | IntVal z              => [0; Z.to_nat z]
+    | FixedVal scale scaled => [1; scale; Z.to_nat scaled]
+    | BoolVal b             => [2; if b then 1 else 0]
+    | StringVal s           => [3; String.length s]
+    | IdentVal id           => [4; Z.to_nat (IDImpl.seq_num id)]
+    | ListVal l             => 5 :: List.concat (List.map order_key l)
+    | MapVal m              => [6]
+    end.
+
+  Fixpoint compare_order_key (v1 v2 : t) : comparison :=
+    lex_compare (order_key v1) (order_key v2).
+
+  Lemma compare_order_key_spec :
+    forall v1 v2, CompareSpec (v1 = v2) (compare_order_key v1 v2 = Lt) (compare_order_key v1 v2 = Gt) (compare_order_key v1 v2).
+  Proof.
+    intros v1 v2.
+    unfold compare_order_key.
+    destruct (lex_compare_spec (order_key v1) (order_key v2)).
+    - constructor. assumption.
+    - constructor. assumption.
+    - constructor. assumption.
+  Qed.
+End Value.
+
+(* ================================================================ *)
+(* Graph Structure                                                 *)
+(* ================================================================ *)
+
+Module Graph.
+  Record node := {
+    node_id     : IDImpl.t;
+    node_type   : string;
+    node_fields : list (string * Value.t)
+  }.
+
+  Record edge := {
+    edge_id     : IDImpl.t;
+    edge_type   : string;
+    edge_src    : IDImpl.t;
+    edge_tgt    : IDImpl.t;
+    edge_fields : list (string * Value.t)
+  }.
+
+  Record t := {
+    nodes : list node;
+    edges : list edge
+  }.
+
+  Definition empty : t := {| nodes := []; edges := [] |}.
+
+  Definition find_node (g : t) (id : IDImpl.t) : option node :=
+    List.find (fun n => if IDImpl.eq_dec n.(node_id) id then true else false) g.(nodes).
+
+  Definition find_edge (g : t) (id : IDImpl.t) : option edge :=
+    List.find (fun e => if IDImpl.eq_dec e.(edge_id) id then true else false) g.(edges).
+
+  Definition node_exists (g : t) (id : IDImpl.t) : bool :=
+    match find_node g id with
+    | Some _ => true
+    | None => false
+    end.
+
+  Definition edge_exists (g : t) (id : IDImpl.t) : bool :=
+    match find_edge g id with
+    | Some _ => true
+    | None => false
+    end.
+
+  Definition get_node_field (g : t) (id : IDImpl.t) (f : string) : option Value.t :=
+    match find_node g id with
+    | Some n => List.assoc string_dec f n.(node_fields)
+    | None => None
+    end.
+
+  Definition get_edge_field (g : t) (id : IDImpl.t) (f : string) : option Value.t :=
+    match find_edge g id with
+    | Some e => List.assoc string_dec f e.(edge_fields)
+    | None => None
+    end.
+
+  Definition incident_edges (g : t) (nid : IDImpl.t) (dir : bool) : list edge :=
+    List.filter (fun e => 
+      if dir then IDImpl.eq_dec e.(edge_src) nid 
+      else IDImpl.eq_dec e.(edge_tgt) nid) g.(edges).
+
+  Definition update_node_field (g : t) (nid : IDImpl.t) (f : string) (v : Value.t) : t :=
+    match find_node g nid with
+    | Some n =>
+        let fields' := List.update string_dec f v n.(node_fields) in
+        let n' := {| node_id := n.(node_id); 
+                     node_type := n.(node_type);
+                     node_fields := fields' |} in
+        {| nodes := List.map (fun n'' => if IDImpl.eq_dec n''.(node_id) nid then n' else n'') g.(nodes);
+           edges := g.(edges) |}
+    | None => g
+    end.
+
+  Definition update_edge_field (g : t) (eid : IDImpl.t) (f : string) (v : Value.t) : t :=
+    match find_edge g eid with
+    | Some e =>
+        let fields' := List.update string_dec f v e.(edge_fields) in
+        let e' := {| edge_id := e.(edge_id); 
+                     edge_type := e.(edge_type);
+                     edge_src := e.(edge_src);
+                     edge_tgt := e.(edge_tgt);
+                     edge_fields := fields' |} in
+        {| nodes := g.(nodes);
+           edges := List.map (fun e'' => if IDImpl.eq_dec e''.(edge_id) eid then e' else e'') g.(edges) |}
+    | None => g
+    end.
+
+  Definition add_node (g : t) (n : node) : t :=
+    {| nodes := n :: g.(nodes);
+       edges := g.(edges) |}.
+
+  Definition add_edge (g : t) (e : edge) : t :=
+    {| nodes := g.(nodes);
+       edges := e :: g.(edges) |}.
+
+  Definition remove_node (g : t) (nid : IDImpl.t) : t :=
+    {| nodes := List.filter (fun n => negb (IDImpl.eq_dec n.(node_id) nid)) g.(nodes);
+       edges := List.filter (fun e => 
+         negb (IDImpl.eq_dec e.(edge_src) nid) &&
+         negb (IDImpl.eq_dec e.(edge_tgt) nid)) g.(edges) |}.
+
+  Definition remove_edge (g : t) (eid : IDImpl.t) : t :=
+    {| nodes := g.(nodes);
+       edges := List.filter (fun e => negb (IDImpl.eq_dec e.(edge_id) eid)) g.(edges) |}.
+End Graph.
+
+(* ================================================================ *)
+(* Counters                                                        *)
+(* ================================================================ *)
+
+Module Counters.
+  Record t := {
+    tick_counter        : Z;
+    seq_counter         : list (string * Z);
+    type_extent_version : list (string * Z);
+    element_version     : list (IDImpl.t * Z);
+    adjacency_version   : list (IDImpl.t * string * bool * Z) (* node_id, edge_type, direction, version *)
+  }.
+
+  Definition empty : t :=
+    {| tick_counter := 0;
+       seq_counter := [];
+       type_extent_version := [];
+       element_version := [];
+       adjacency_version := [] |}.
+
+  Definition get_seq_counter (c : t) (typ : string) : Z :=
+    match List.assoc string_dec typ c.(seq_counter) with
+    | Some v => v
+    | None => 0
+    end.
+
+  Definition get_type_extent_version (c : t) (typ : string) : Z :=
+    match List.assoc string_dec typ c.(type_extent_version) with
+    | Some v => v
+    | None => 0
+    end.
+
+  Definition get_element_version (c : t) (id : IDImpl.t) : Z :=
+    match List.assoc IDImpl.eq_dec id c.(element_version) with
+    | Some v => v
+    | None => 0
+    end.
+
+  Definition get_adjacency_version (c : t) (nid : IDImpl.t) (etyp : string) (dir : bool) : Z :=
+    match List.find (fun '(n,e,d,v) => 
+      IDImpl.eq_dec n nid && string_dec e etyp && bool_dec d dir) c.(adjacency_version) with
+    | Some (_,_,_,v) => v
+    | None => 0
+    end.
+
+  Definition incr_seq_counter (c : t) (typ : string) : t :=
+    let v := get_seq_counter c typ + 1 in
+    {| c with seq_counter := List.update string_dec typ v c.(seq_counter) |}.
+
+  Definition incr_type_extent_version (c : t) (typ : string) : t :=
+    let v := get_type_extent_version c typ + 1 in
+    {| c with type_extent_version := List.update string_dec typ v c.(type_extent_version) |}.
+
+  Definition set_element_version (c : t) (id : IDImpl.t) (v : Z) : t :=
+    {| c with element_version := List.update IDImpl.eq_dec id v c.(element_version) |}.
+
+  Definition incr_element_version (c : t) (id : IDImpl.t) : t :=
+    let v := get_element_version c id + 1 in
+    set_element_version c id v.
+
+  Definition incr_adjacency_version (c : t) (nid : IDImpl.t) (etyp : string) (dir : bool) : t :=
+    let v := get_adjacency_version c nid etyp dir + 1 in
+    {| c with adjacency_version := 
+         List.update (fun '(n1,e1,d1,_) '(n2,e2,d2,_) => 
+           IDImpl.eq_dec n1 n2 && string_dec e1 e2 && bool_dec d1 d2)
+           (nid, etyp, dir, v) c.(adjacency_version) |}.
+End Counters.
+
+(* ================================================================ *)
+(* Rules and Patterns                                              *)
+(* ================================================================ *)
+
+Module Rule.
+  Inductive pattern_element :=
+  | MatchNode (var : string) (typ : string)
+  | MatchEdge (var : string) (typ : string) (src : string) (tgt : string).
+
+  Definition pattern := list pattern_element.
+
+  Inductive constraint :=
+  | Eq (e1 e2 : Value.t)
+  | Neq (e1 e2 : Value.t)
+  | Lt (e1 e2 : Value.t)
+  | Le (e1 e2 : Value.t)
+  | Gt (e1 e2 : Value.t)
+  | Ge (e1 e2 : Value.t)
+  | And (c1 c2 : constraint)
+  | Or (c1 c2 : constraint)
+  | Not (c : constraint).
+
+  Inductive action :=
+  | CreateNode (var : string) (typ : string) (fields : list (string * Value.t))
+  | CreateEdge (var : string) (typ : string) (src : string) (tgt : string) (fields : list (string * Value.t))
+  | UpdateField (target : string) (field : string) (new_val : Value.t)
+  | DeleteEdge (e : string)
+  | DeleteNode (x : string)
+  | EmitEvent (event_type : string) (payload : list Value.t).
+
+  Record t := {
+    rule_id : string;
+    base_priority : Z;
+    priority_scale : Z;
+    fairness_scale : Z;
+    pattern : pattern;
+    constraints : constraint;
+    actions : list action
+  }.
+End Rule.
+
+(* ================================================================ *)
+(* Operational Semantics                                           *)
+(* ================================================================ *)
+
+Module Semantics.
+  Import Graph Counters Rule.
+
+  (* Match state contains bindings and read set *)
+  Record match_state := {
+    bindings : list (string * Value.t);
+    read_set : list (string * Value.t);
+    age : Z
+  }.
+
+  (* Configuration state *)
+  Record config := {
+    graph : Graph.t;
+    counters : Counters.t;
+    prev_matches : list (string * list (string * Value.t)) * Z; (* match_key * last_tick_seen *)
+    rejected : list (string * list (string * Value.t))
+  }.
+
+  (* Primitive actions after compilation *)
+  Inductive primitive_action :=
+  | PCreateNode (id : IDImpl.t) (typ : string) (fields : list (string * Value.t))
+  | PCreateEdge (id : IDImpl.t) (typ : string) (src : IDImpl.t) (tgt : IDImpl.t) (fields : list (string * Value.t))
+  | PUpdateField (target : IDImpl.t) (field : string) (new_val : Value.t)
+  | PDeleteEdge (e : IDImpl.t)
+  | PDeleteNode (x : IDImpl.t)
+  | PEmitEvent (event_type : string) (payload : list Value.t).
+
+  (* Phase 1: Discover all potential matches *)
+  Definition discover (g : Graph.t) (r : Rule.t) : list match_state :=
+    (* Implement according to §5.1 *)
+    (* Traverse graph in ORDER_CANONICAL order *)
+    (* Generate all valid matches with bindings *)
+    (* Evaluate constraints and record read sets *)
+    []. (* placeholder *)
+
+  (* Phase 2: Select best match *)
+  Definition select (ms : list match_state) (prev : list (string * list (string * Value.t)) * Z) 
+                   (rej : list (string * list (string * Value.t))) : option match_state :=
+    (* Implement according to §5.2 *)
+    (* Compute scores and select highest priority *)
+    (* Respect rejected set *)
+    None. (* placeholder *)
+
+  (* Phase 3: Compile actions *)
+  Definition compile (g : Graph.t) (m : match_state) (acts : list Rule.action) 
+    : option (list primitive_action * list (string * Value.t)) :=
+    (* Implement according to §5.3 *)
+    (* Expand DeleteNode into DeleteEdge + DeleteNode *)
+    (* Assign temporary handles *)
+    (* Record complete read set *)
+    None. (* placeholder *)
+
+  (* Phase 4: Validate and commit *)
+  Definition commit (g : Graph.t) (c : Counters.t) (m : match_state) 
+                    (acts : list primitive_action) (reads : list (string * Value.t)) 
+    : option (Graph.t * Counters.t * list (string * list Value.t)) :=
+    (* Implement according to §5.4 *)
+    (* Validate versions *)
+    (* Check structural invariants *)
+    (* Re-evaluate constraints *)
+    (* Apply changes if all checks pass *)
+    None. (* placeholder *)
+
+  (* Main transition function *)
+  Definition delta (cfg : config) (rules : list Rule.t) : config :=
+    (* Implement according to §5 *)
+    (* For each rule, discover matches *)
+    (* Select best valid match *)
+    (* Compile and commit *)
+    (* Fall back to no_match if no valid matches *)
+    cfg. (* placeholder *)
+  
+  (* Determinism theorem *)
+  Theorem delta_deterministic :
+    forall cfg rules cfg1 cfg2,
+      delta cfg rules = cfg1 ->
+      delta cfg rules = cfg2 ->
+      cfg1 = cfg2.
+  Proof.
+    (* By induction on the evaluation structure *)
+    (* Using functional extensionality for helpers *)
+    (* Relying on ORDER_CANONICAL properties *)
+  Admitted.
+End Semantics.
+
+(* ================================================================ *)
+(* Top-level Kernel Interface                                      *)
+(* ================================================================ *)
+
+Module Kernel.
+  Definition init_state : Semantics.config :=
+    {| Semantics.graph := Graph.empty;
+       Semantics.counters := Counters.empty;
+       Semantics.prev_matches := ([], 0);
+       Semantics.rejected := [] |}.
+
+  Definition tick (cfg : Semantics.config) (rules : list Rule.t) : Semantics.config :=
+    Semantics.delta cfg rules.
+
+  Theorem tick_deterministic :
+    forall cfg rules cfg1 cfg2,
+      tick cfg rules = cfg1 ->
+      tick cfg rules = cfg2 ->
+      cfg1 = cfg2.
+  Proof.
+    apply Semantics.delta_deterministic.
+  Qed.
+End Kernel.

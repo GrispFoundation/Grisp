@@ -1,0 +1,196 @@
+From Coq Require Import List String ZArith Bool.
+From Coq.Structures Require Import OrderedType.
+Import ListNotations.
+Open Scope string_scope.
+
+(* ---------- maps ---------- *)
+Definition map (K V:Type) := list (K*V).
+Definition empty {K V} : map K V := [].
+Definition add {K V} (k:K) (v:V) (m:map K V) : map K V := (k,v)::m.
+Definition mem {K V} (eqd:forall x y:K,{x=y}+{x<>y}) (k:K) (m:map K V) : bool :=
+  existsb (fun p => if eqd (fst p) k then true else false) m.
+Definition map_map {K V1 V2} (f:V1->V2) (m:map K V1) : map K V2 :=
+  map (fun p => (fst p, f (snd p))) m.
+Definition find {K V} (eqd:forall x y:K,{x=y}+{x<>y}) (k:K) (m:map K V) : option V :=
+  match filter (fun p => if eqd (fst p) k then true else false) m with
+  | [] => None | (_,v)::_ => Some v end.
+
+(* ---------- ID ---------- *)
+Module Type ID.
+  Parameter t:Type.
+  Parameter type_name:t->string.
+  Parameter seq_num:t->Z.
+  Parameter eq_dec:forall x y:t,{x=y}+{x<>y}.
+  Parameter compare:t->t->comparison.
+  Axiom compare_spec:forall x y, CompareSpec (x=y) (compare x y=Lt) (compare x y=Gt) (compare x y).
+  Axiom compare_type_name_seq:forall x y,
+    compare x y = match String.compare (type_name x) (type_name y) with
+                  | Eq => Z.compare (seq_num x) (seq_num y) | c => c end.
+End ID.
+
+Lemma String_compare_refl:forall s,String.compare s s=Eq. Proof. Admitted.
+
+Module IDImpl<:ID.
+  Definition t:=(string*Z)%type.
+  Definition type_name:=fst. Definition seq_num:=snd.
+  Definition eq_dec(x y:t):{x=y}+{x<>y}. decide equality; apply string_dec || apply Z.eq_dec. Defined.
+  Definition compare x y:=
+    match String.compare (fst x) (fst y) with Eq=>Z.compare (snd x) (snd y) | c=>c end.
+  Lemma compare_spec:forall x y,CompareSpec (x=y) (compare x y=Lt) (compare x y=Gt) (compare x y).
+  Proof. Admitted.
+  Lemma compare_type_name_seq:forall x y,
+    compare x y = match String.compare (fst x) (fst y) with Eq=>Z.compare (snd x) (snd y) | c=>c end.
+  Proof. reflexivity. Qed.
+End IDImpl.
+
+(* ---------- Value ---------- *)
+Module Value.
+  Inductive value:=
+  | IntVal(z:Z) | FixedVal(s:nat)(v:Z) | BoolVal(b:bool)
+  | StringVal(s:string) | IdentVal(id:IDImpl.t)
+  | ListVal(l:list value) | MapVal(m:list (value*value)).
+  Parameter value_eq_dec:forall x y:value,{x=y}+{x<>y}.
+End Value.
+
+(* ---------- Field ---------- *)
+Module Field<:OrderedType.
+  Definition t:=string. Definition eq:=@eq string. Definition eq_dec:=string_dec.
+  Definition lt x y:=String.compare x y=Lt. Definition compare:=String.compare.
+  Lemma eq_refl:forall x,eq x x. Proof. reflexivity. Qed.
+  Lemma eq_sym:forall x y,eq x y->eq y x. Proof. intros x y H; destruct H; reflexivity. Qed.
+  Lemma eq_trans:forall x y z,eq x y->eq y z->eq x z. Proof. intros x y z H1 H2; destruct H1; destruct H2; reflexivity. Qed.
+  Lemma lt_trans:forall x y z,lt x y->lt y z->lt x z. Proof. Admitted.
+  Lemma lt_not_eq:forall x y,lt x y->~eq x y. Proof. Admitted.
+  Lemma compare_spec:forall x y,CompareSpec (eq x y) (lt x y) (lt y x) (compare x y). Proof. Admitted.
+End Field.
+
+Inductive dir:=InDir|OutDir.
+
+(* ---------- GRAPH ---------- *)
+Module Type GRAPH.
+  Record node:={node_id:IDImpl.t; node_type:string; node_fields:map Field.t Value.value}.
+  Record edge:={edge_id:IDImpl.t; edge_type:string; edge_src:IDImpl.t; edge_tgt:IDImpl.t; edge_fields:map Field.t Value.value}.
+  Record t:={nodes:map IDImpl.t node; edges:map IDImpl.t edge}. End GRAPH.
+Module Graph<:GRAPH. Include GRAPH. End Graph.
+
+(* ---------- COUNTERS ---------- *)
+Module Type COUNTERS.
+  Record t:={tick_counter:Z; seq_counter:map string Z; type_extent_version:map string Z;
+             element_version:map IDImpl.t Z; adjacency_version:map (IDImpl.t*string*dir) Z}. End COUNTERS.
+Module Counters<:COUNTERS. Include COUNTERS. End Counters.
+
+(* ---------- MATCH ---------- *)
+Module Type MATCH.
+  Record t:={key:(string*list (string*Value.value)); bindings:map string Value.value;
+             read_set:list (string*Value.value); age:Z}. End MATCH.
+Module Match<:MATCH. Include MATCH. End Match.
+
+Definition match_key:=(string*list (string*Value.value))%type.
+Fixpoint list_pair_value_eq_dec l1 l2:{l1=l2}+{l1<>l2}.
+Proof. destruct l1 as [|[s1 v1] t1]; destruct l2 as [|[s2 v2] t2]; try (right; discriminate); auto.
+  destruct (string_dec s1 s2);[subst|right;congruence].
+  destruct (Value.value_eq_dec v1 v2);[subst|right;congruence].
+  destruct (list_pair_value_eq_dec t1 t2);[subst;left|right;congruence]. Defined.
+Definition match_key_eq_dec k1 k2:{k1=k2}+{k1<>k2}.
+Proof. destruct k1 as [a b],k2 as [c d]; destruct (string_dec a c);[subst|right;congruence].
+  destruct (list_pair_value_eq_dec b d);[subst;left|right;congruence]. Defined.
+
+(* ---------- ACTION ---------- *)
+Module Type ACTION.
+  Inductive primitive:=
+  | CreateNode(x:IDImpl.t)(typ:string)(fields:map Field.t Value.value)
+  | CreateEdge(x:IDImpl.t)(typ:string)(src tgt:IDImpl.t)(fields:map Field.t Value.value)
+  | UpdateField(target:IDImpl.t)(field:string)(new_val:Value.value)
+  | DeleteEdge(e:IDImpl.t) | DeleteNode(x:IDImpl.t)
+  | EmitEvent(event_type:string)(payload:list Value.value).
+  Definition alpha:=list primitive. Definition handle:=nat.
+End ACTION. Module Action<:ACTION. Include ACTION. End Action.
+
+(* ---------- CONFIG ---------- *)
+Module Type CONFIG.
+  Record t:={G:Graph.t; C:Counters.t; M_prev:map match_key Z; Rejected:map match_key unit}. End CONFIG.
+Module Config<:CONFIG. Include CONFIG. End Config.
+
+(* ---------- IR ---------- *)
+Module Type IR.
+  Record rule:={rule_id:string; base_priority:Z; priority_scale:Z; fairness_scale:Z;
+                pattern:list (string*string); constraints:list (string*Value.value);
+                let_bindings:list (string*Value.value); actions:list Action.primitive}.
+  Definition t:=list rule. End IR. Module IRImpl<:IR. Include IR. End IRImpl.
+
+(* ---------- Canonical ordering ---------- *)
+Module OrderCanonical.
+  Import Value IDImpl.
+  Parameter compare_order_key_list:forall A, list A -> list A -> comparison.
+  Fixpoint order_key v:=match v with
+    | IntVal z=>[0;Z.to_nat z] | FixedVal s sc=>[1;s;Z.to_nat sc]
+    | BoolVal b=>[2;if b then 1 else 0] | StringVal s=>[3;String.length s]
+    | IdentVal id=>[4;Z.to_nat (seq_num id)] | ListVal l=>5::concat (map order_key l)
+    | MapVal _=>[6] end.
+  Definition compare_order_key v1 v2:=compare_order_key_list _ (order_key v1) (order_key v2).
+  Axiom order_key_inj:forall v1 v2,order_key v1=order_key v2->v1=v2.
+  Theorem total_order:forall v1 v2,compare_order_key v1 v2=Eq\/compare_order_key v1 v2=Lt\/compare_order_key v1 v2=Gt. Proof. Admitted.
+  Theorem antisym:forall v1 v2,compare_order_key v1 v2=Eq->v1=v2. Proof. Admitted.
+  Theorem transitive:forall v1 v2 v3,compare_order_key v1 v2=Lt->compare_order_key v2 v3=Lt->compare_order_key v1 v3=Lt. Proof. Admitted.
+End OrderCanonical.
+
+Definition compare_binding '(s1,v1) '(s2,v2):=
+  match String.compare s1 s2 with Eq=>OrderCanonical.compare_order_key v1 v2 | c=>c end.
+Fixpoint compare_binding_list l1 l2:=match l1,l2 with
+  |[],[]=>Eq |[],_=>Lt |_,[]=>Gt |b1::t1,b2::t2=>match compare_binding b1 b2 with Eq=>compare_binding_list t1 t2|c=>c end end.
+Definition compare_match_key m1 m2:=
+  match String.compare (fst m1.(Match.key)) (fst m2.(Match.key)) with
+  |Eq=>compare_binding_list (snd m1.(Match.key)) (snd m2.(Match.key))|c=>c end.
+Definition default_match:Match.t:={|Match.key:=("",[]);Match.bindings:=[];Match.read_set:=[];Match.age:=0|}.
+
+(* ---------- Helpers ---------- *)
+Module Helpers.
+  Import Graph Counters Match Action Config IRImpl.
+  Parameter eval_patterns:Graph.t->IRImpl.t->list Match.t.
+  Axiom eval_patterns_total:forall G IR,exists M,eval_patterns G IR=M.
+  Definition score m bp ps fs:=(bp*ps + m.(Match.age)*fs)%Z.
+  Parameter compile:Graph.t->Match.t->option (Action.alpha*list (string*Value.value)).
+  Parameter simulate:Graph.t->Action.alpha->Graph.t.
+  Parameter validate_reads:Counters.t->list (string*Value.value)->bool.
+  Parameter structural_checks:Graph.t->Action.alpha->bool.
+  Parameter reevaluate_constraints:Graph.t->Match.t->bool.
+  Parameter resource_checks:Graph.t->Counters.t->option string.
+  Parameter apply_alpha:Graph.t->Action.alpha->Counters.t->(Graph.t*Counters.t*list (string*list Value.value)).
+End Helpers.
+
+(* ---------- SOS ---------- *)
+Module SOS.
+  Import Helpers.
+  Definition discover cfg ir:=(cfg, eval_patterns cfg.(Config.G) ir).
+  Inductive select_result:=Selected(m:Match.t)|NoMatch.
+  Definition match_lt_bool m1 m2:=match Z.compare (score m1 0 1 1) (score m2 0 1 1) with
+    |Lt=>true|Eq=>match compare_match_key m1 m2 with Lt=>true|_=>false end|Gt=>false end.
+  Fixpoint insert_match m l:=match l with []=>[m]|h::t=>if match_lt_bool m h then m::l else h::insert_match m t end.
+  Fixpoint sort_matches l:=match l with []=>[]|h::t=>insert_match h (sort_matches t) end.
+  Definition select cfg M:=let M':=filter (fun m=>negb (mem match_key_eq_dec m.(Match.key) cfg.(Config.Rejected))) M in
+    match M' with []=>NoMatch|_=>Selected (hd default_match (sort_matches M')) end.
+  Definition plan:=compile.
+  Inductive commit_result:=CommitSuccess(cfg':Config.t)(ev:list (string*list Value.value))|CommitReject|CommitFatal(e:string).
+  Definition commit cfg m a R:=if negb (validate_reads cfg.(Config.C) R) then CommitReject else
+    let G':=simulate cfg.(Config.G) a in if negb (structural_checks G' a) then CommitReject else
+    if negb (reevaluate_constraints G' m) then CommitReject else
+    match resource_checks G' cfg.(Config.C) with Some e=>CommitFatal e|None=>
+      let '(Gn,Cn,ev):=apply_alpha cfg.(Config.G) a cfg.(Config.C) in
+      CommitSuccess {|Config.G:=Gn;Config.C:=Cn;Config.M_prev:=map_map (fun _=>cfg.(Config.C).(Counters.tick_counter)) cfg.(Config.M_prev);Config.Rejected:=empty|} ev end.
+  Definition no_match cfg:=let c:=cfg.(Config.C) in
+    {|Config.G:=cfg.(Config.G);Config.C:={|Counters.tick_counter:=c.(Counters.tick_counter)+1;Counters.seq_counter:=c.(Counters.seq_counter);
+      Counters.type_extent_version:=c.(Counters.type_extent_version);Counters.element_version:=c.(Counters.element_version);
+      Counters.adjacency_version:=c.(Counters.adjacency_version)|};Config.M_prev:=cfg.(Config.M_prev);Config.Rejected:=empty|}.
+  Definition delta cfg ir:=let '(c,M):=discover cfg ir in
+    let fix loop n cur rej:=match n with O=>no_match cur|S n'=>
+      match select {|Config.G:=cur.(Config.G);Config.C:=cur.(Config.C);Config.M_prev:=cur.(Config.M_prev);Config.Rejected:=rej|} M with
+      |NoMatch=>no_match cur|Selected m=>match plan cur.(Config.G) m with None=>loop n' cur (add m.(Match.key) tt rej)
+        |Some (a,R)=>match commit cur m a R with CommitReject=>loop n' cur (add m.(Match.key) tt rej)
+          |CommitFatal _=>cur|CommitSuccess c' _=>c' end end end in loop (length M) c empty.
+End SOS.
+
+(* ---------- Determinism ---------- *)
+Module DeterminismProofs.
+  Import SOS.
+  Theorem unique_execution:forall cfg ir,exists! cfg',SOS.delta cfg ir=cfg'. Proof. Admitted.
+End DeterminismProofs.
