@@ -32,6 +32,8 @@ type
     destructor Destroy; override;
 
     class function NormalizePath(const RawPath: string): string; static;
+    class function GetMimeFromExtension(const Filename: string): string; static;
+    function ResolveSafe(const VirtualPath: string; out RealPath, Reason: string): Boolean;
     function ResolveToPhysical(const VirtualPath: string): string;
 
     function WriteFile(const VirtualPath, Content, Mime: string; const Cap: IGrispCapability; out Reason: string): Boolean; overload;
@@ -130,6 +132,27 @@ begin
   end;
 end;
 
+class function TGrispVfs.GetMimeFromExtension(const Filename: string): string;
+var
+  Ext: string;
+begin
+  Ext := LowerCase(TPath.GetExtension(Filename));
+  if (Ext = '.txt') or (Ext = '.log') or (Ext = '.grisp') then
+    Result := 'text/plain'
+  else if (Ext = '.c') or (Ext = '.h') then
+    Result := 'text/x-c'
+  else if (Ext = '.pas') or (Ext = '.dpr') or (Ext = '.pp') then
+    Result := 'text/x-pascal'
+  else if (Ext = '.py') then
+    Result := 'text/x-python'
+  else if (Ext = '.json') then
+    Result := 'application/json'
+  else if (Ext = '.exe') or (Ext = '.dll') or (Ext = '.bin') then
+    Result := 'application/octet-stream'
+  else
+    Result := 'text/plain';
+end;
+
 constructor TGrispVfs.Create(const ASandboxPhysicalRoot: string; AUseDiskBacking: Boolean);
 begin
   inherited Create;
@@ -157,48 +180,92 @@ begin
     TDirectory.CreateDirectory(PhysicalDir);
 end;
 
-function TGrispVfs.ResolveToPhysical(const VirtualPath: string): string;
+function TGrispVfs.ResolveSafe(const VirtualPath: string; out RealPath, Reason: string): Boolean;
 var
   Canon: string;
   Relative: string;
+  Phys: string;
 begin
-  Canon := NormalizePath(VirtualPath);
+  Canon := VirtualPath.Trim;
+  // Strictly reject drive letter injection
+  if Pos(':', Canon) > 0 then
+  begin
+    Reason := Format('Drive letters are not permitted in virtual path: "%s"', [VirtualPath]);
+    Exit(False);
+  end;
+
+  // Normalize path
+  Canon := NormalizePath(Canon);
+
   if Canon.StartsWith('/') then
     Relative := Copy(Canon, 2, Length(Canon) - 1)
   else
     Relative := Canon;
 
   Relative := StringReplace(Relative, '/', PathDelim, [rfReplaceAll]);
-  Result := TPath.Combine(FSandboxPhysicalRoot, Relative);
+  Phys := TPath.GetFullPath(TPath.Combine(FSandboxPhysicalRoot, Relative));
+
+  // Strict physical prefix check to guarantee sandbox containment
+  if not Phys.StartsWith(FSandboxPhysicalRoot) then
+  begin
+    Reason := Format('Path "%s" attempts to escape physical sandbox boundary', [VirtualPath]);
+    Exit(False);
+  end;
+
+  RealPath := Phys;
+  Reason := '';
+  Result := True;
+end;
+
+function TGrispVfs.ResolveToPhysical(const VirtualPath: string): string;
+var
+  RealPath, Reason: string;
+begin
+  if ResolveSafe(VirtualPath, RealPath, Reason) then
+    Result := RealPath
+  else
+    Result := TPath.Combine(FSandboxPhysicalRoot, 'rejected_path');
 end;
 
 function TGrispVfs.WriteFile(const VirtualPath, Content, Mime: string; const Cap: IGrispCapability; out Reason: string): Boolean;
 var
   Canon: string;
   Size: Int64;
+  EffectiveMime: string;
 begin
   Canon := NormalizePath(VirtualPath);
   Size := Length(TEncoding.UTF8.GetBytes(Content));
 
+  if Mime <> '' then
+    EffectiveMime := Mime
+  else
+    EffectiveMime := GetMimeFromExtension(Canon);
+
   if Assigned(Cap) then
   begin
-    if not Cap.ValidateWrite(Canon, Mime, Size, Reason) then
+    if not Cap.ValidateWrite(Canon, EffectiveMime, Size, Reason) then
       Exit(False);
   end;
 
-  Result := WriteFile(Canon, Content, Mime);
+  Result := WriteFile(Canon, Content, EffectiveMime);
   Reason := '';
 end;
 
 function TGrispVfs.WriteFile(const VirtualPath, Content, Mime: string): Boolean;
 var
-  Canon, Phys, PhysDir: string;
+  Canon, Phys, PhysDir, Reason: string;
   Entry: TGrispVfsEntry;
+  EffectiveMime: string;
 begin
   Canon := NormalizePath(VirtualPath);
 
+  if Mime <> '' then
+    EffectiveMime := Mime
+  else
+    EffectiveMime := GetMimeFromExtension(Canon);
+
   Entry.VirtualPath := Canon;
-  Entry.MimeType := Mime;
+  Entry.MimeType := EffectiveMime;
   Entry.Content := Content;
   Entry.SizeBytes := Length(TEncoding.UTF8.GetBytes(Content));
   Entry.ModifiedUtc := Now;
@@ -208,13 +275,15 @@ begin
 
   if FUseDiskBacking then
   begin
-    try
-      Phys := ResolveToPhysical(Canon);
-      PhysDir := TPath.GetDirectoryName(Phys);
-      EnsurePhysicalDir(PhysDir);
-      TFile.WriteAllText(Phys, Content, TEncoding.UTF8);
-    except
-      // In-memory record is still preserved
+    if ResolveSafe(Canon, Phys, Reason) then
+    begin
+      try
+        PhysDir := TPath.GetDirectoryName(Phys);
+        EnsurePhysicalDir(PhysDir);
+        TFile.WriteAllText(Phys, Content, TEncoding.UTF8);
+      except
+        // In-memory record remains safe
+      end;
     end;
   end;
 
@@ -254,7 +323,7 @@ end;
 
 function TGrispVfs.ReadFile(const VirtualPath: string; out Content: string): Boolean;
 var
-  Canon, Phys: string;
+  Canon, Phys, Reason: string;
   Entry: TGrispVfsEntry;
 begin
   Canon := NormalizePath(VirtualPath);
@@ -265,15 +334,13 @@ begin
     Exit(True);
   end;
 
-  if FUseDiskBacking then
+  if FUseDiskBacking and ResolveSafe(Canon, Phys, Reason) then
   begin
-    Phys := ResolveToPhysical(Canon);
     if TFile.Exists(Phys) then
     begin
       Content := TFile.ReadAllText(Phys, TEncoding.UTF8);
-      // Cache in entries
       Entry.VirtualPath := Canon;
-      Entry.MimeType := 'text/plain';
+      Entry.MimeType := GetMimeFromExtension(Canon);
       Entry.Content := Content;
       Entry.SizeBytes := Length(TEncoding.UTF8.GetBytes(Content));
       Entry.ModifiedUtc := Now;
@@ -314,14 +381,13 @@ end;
 
 function TGrispVfs.DeleteFile(const VirtualPath: string): Boolean;
 var
-  Canon, Phys: string;
+  Canon, Phys, Reason: string;
 begin
   Canon := NormalizePath(VirtualPath);
   FEntries.Remove(Canon);
 
-  if FUseDiskBacking then
+  if FUseDiskBacking and ResolveSafe(Canon, Phys, Reason) then
   begin
-    Phys := ResolveToPhysical(Canon);
     if TFile.Exists(Phys) then
       TFile.Delete(Phys);
   end;
@@ -383,17 +449,14 @@ end;
 
 function TGrispVfs.FileExists(const VirtualPath: string): Boolean;
 var
-  Canon, Phys: string;
+  Canon, Phys, Reason: string;
 begin
   Canon := NormalizePath(VirtualPath);
   if FEntries.ContainsKey(Canon) then
     Exit(True);
 
-  if FUseDiskBacking then
-  begin
-    Phys := ResolveToPhysical(Canon);
+  if FUseDiskBacking and ResolveSafe(Canon, Phys, Reason) then
     Exit(TFile.Exists(Phys));
-  end;
 
   Result := False;
 end;
@@ -417,7 +480,7 @@ begin
   Canon := NormalizePath(VirtualPath);
   if FEntries.TryGetValue(Canon, Entry) then
     Exit(Entry.MimeType);
-  Result := 'application/octet-stream';
+  Result := GetMimeFromExtension(Canon);
 end;
 
 procedure TGrispVfs.Clear;

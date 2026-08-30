@@ -1,0 +1,84 @@
+Implementation Plan - Hardening & Firefox Web AI Integration
+Overview
+This implementation plan addresses the feedback in 
+Implementation Feedback.txt
+ and integrates the Firefox Web AI automation communication layer from 
+FireFoxWithChatAI
+ and 
+AIConsoleTool.dpr
+.
+
+Key Objectives
+FireFoxWithChatAI TCP Peer Integration:
+
+Implement TFirefoxChatAIPeer (in MLCRD_FirefoxPeer.pas & MLCRD_Peers.pas) using Indy TIdTCPClient.
+Connect to Firefox on localhost:9999 (configurable).
+Support all 8 AI sites: deepseek (default), gemini, claude, chatgpt, copilot, grok, perplexity, inception.
+Implement multi-stage prompt formatting and response extraction (candidates, critiques, cross-repairs, capability requests, test programs, scores).
+Add tab querying and tab session reuse.
+Graceful connection error handling and fallback.
+GRISP VFS & Capability Hardening (from Implementation Feedback):
+
+ResolveSafe in TGrispVfs: reject drive letters, reject .., normalize paths, compute TPath.GetFullPath, and strictly verify that physical path starts with FSandboxPhysicalRoot.
+Content- and extension-based MIME validation: map extensions (.c, .pas, .py, .json, .txt, .bin) to trusted MIME types and validate in TGrispCapability.
+Structured TValidationResult record for plan validation: Accepted: Boolean, FailedOps: TArray<string>, Diagnostics: string.
+Comprehensive error checks and return value validation across all VFS and engine methods.
+CLI Expansion:
+
+Add --firefox and --sites <list> (e.g. --sites deepseek,gemini,claude) to GrispAgentCLI.dpr.
+Add --list-tabs and --open-tab <url> options.
+Add automated test cases in GrispAgentTests.dpr.
+Proposed Changes
+GRISP Core Layer (Source Code/Core/)
+[MODIFY] 
+GrispVfs.pas
+Implement ResolveSafe(const VirtualPath: string; out RealPath, Reason: string): Boolean with physical prefix verification.
+Add extension-to-MIME deduction.
+Validate all return codes.
+[MODIFY] 
+GrispCapabilities.pas
+Integrate extension and content-type validation in ValidateWrite.
+[MODIFY] 
+GrispCore.pas
+Add structured TValidationResult for plan validation.
+MLCRD Agent Layer (Source Code/Agent/)
+[NEW] 
+MLCRD_FirefoxPeer.pas
+TFirefoxClient: Indy TIdTCPClient wrapper connecting to Firefox on port 9999.
+SendCommand(const Cmd: TJSONObject): TJSONObject
+Prompt(const Site, Text: string; TabId: Integer = -1; out ResponseText, ErrorMsg: string): Boolean
+GetTabs(out TabsJSON: string): Boolean
+OpenTab(const Url: string): Boolean
+CloseTab(const TabId: string): Boolean
+TFirefoxChatAIPeer: Implements IWebLLMPeer for a specific site (deepseek, gemini, claude, etc.).
+Implements candidate generation, critiques, repairs, capability requests, test program generation, and scoring via the Firefox TCP automation service.
+Extracts code blocks and structured answers from the web AI response.
+[MODIFY] 
+MLCRD_Peers.pas
+Register TFirefoxChatAIPeer and factory function CreateFirefoxPeers(const Sites: TArray<string>; Port: Integer = 9999).
+Applications & Tests (Projects/, Source Code/Tests/)
+[MODIFY] 
+Projects/GrispAgent/GrispAgentCLI.dpr
+Support --firefox, --port <port>, --sites <deepseek,gemini,claude,...>, --list-tabs, --open-tab.
+[MODIFY] 
+Source Code/Tests/TestGrispCore.pas
+Add tests for ResolveSafe, physical sandbox containment, and MIME deduction.
+[MODIFY] 
+Source Code/Tests/TestMLCRD.pas
+Add tests for Firefox JSON command generation, response parsing, and peer integration.
+Verification Plan
+Automated Tests
+Compile test runner and CLI with dcc64:
+powershell
+
+dcc64 "Projects\GrispAgentTests\GrispAgentTests.dpr" -E"EXE Output" -N"DCU Output" -U"Source Code\Core;Source Code\Agent;Source Code\Tests;C:\Tools\RAD Studio\37.0\lib\win64\release" -I"C:\Tools\RAD Studio\37.0\lib\win64\release" -NS"System;System.Win;Winapi;Data"
+dcc64 "Projects\GrispAgent\GrispAgentCLI.dpr" -E"EXE Output" -N"DCU Output" -U"Source Code\Core;Source Code\Agent;C:\Tools\RAD Studio\37.0\lib\win64\release" -I"C:\Tools\RAD Studio\37.0\lib\win64\release" -NS"System;System.Win;Winapi;Data"
+Run automated tests:
+powershell
+
+& ".\EXE Output\GrispAgentTests.exe"
+Test CLI commands:
+powershell
+
+& ".\EXE Output\GrispAgentCLI.exe" --help
+& ".\EXE Output\GrispAgentCLI.exe" -t "Implement safe integer division" --sites deepseek,gemini

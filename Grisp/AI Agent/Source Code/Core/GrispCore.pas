@@ -111,6 +111,16 @@ type
     Tick: Int64;
   end;
 
+  TGrispValidationResult = record
+    Accepted: Boolean;
+    FailedOps: TArray<string>;
+    Diagnostics: string;
+    RuleCount: Integer;
+
+    class function MakeAccepted(const ADiag: string; ARuleCount: Integer = 0): TGrispValidationResult; static;
+    class function MakeRejected(const ADiag: string; const AFailedOps: TArray<string> = nil): TGrispValidationResult; static;
+  end;
+
   TGrispEngine = class
   private
     FGraph: TGrispGraph;
@@ -122,6 +132,7 @@ type
     constructor Create(AGraph: TGrispGraph; AVfs: TGrispVfs; ACapabilities: TGrispCapabilitySet);
     destructor Destroy; override;
 
+    function ValidatePlan(const Rules: TArray<TGrispRule>; const CapName: string): TGrispValidationResult;
     function ExecuteAction(const Action: TGrispAction; const CapName: string; out Reason: string): Boolean;
     function ExecuteRule(const Rule: TGrispRule; const CapName: string; out Reason: string): Boolean;
     function ExecutePlan(const Rules: TArray<TGrispRule>; const CapName: string; out Reason: string): Boolean;
