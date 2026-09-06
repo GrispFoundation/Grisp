@@ -1,0 +1,117 @@
+Walkthrough - Hardening & Firefox Web AI Integration
+We have completed the hardening of the GRISP VFS, capabilities, and kernel engine, and integrated the Firefox Web AI automation communication layer via Indy TCP client.
+
+Key Achievements
+1. Firefox Web AI Automation TCP Peer Integration
+MLCRD_FirefoxPeer.pas
+:
+TFirefoxClient: Indy TIdTCPClient wrapper connecting to Firefox on port 9999. Features MaxLineLength := 0 (preventing line length truncation on large LLM outputs), robust connection and read timeouts, and clean error translation.
+Implements SendCommand, Prompt, GetTabs, OpenTab, CloseTab, and DuplicateTab.
+TFirefoxChatAIPeer: Implements IWebLLMPeer for all 8 supported AI sites: deepseek (default), gemini, claude, chatgpt, copilot, grok, perplexity, inception.
+Implements multi-stage prompt formatting and response extraction:
+Code block extraction (stripping markdown fences like c ...).
+Critique extraction (parsing bullet lists -, *, 1.).
+Repair candidate extraction.
+Sandboxed capability requests (compile, run, test_execute, debug).
+Test program proposals with assertions.
+Score extraction from textual evaluations.
+Graceful Offline Fallback: When Firefox is offline, peers seamlessly fallback to heuristic/stub peers without throwing unhandled exceptions.
+MLCRD_Peers.pas
+:
+Added factory function CreateFirefoxPeers(const Sites: TArray<string>; Port: Integer; const Host: string).
+2. GRISP VFS & Capability Security Hardening
+GrispVfs.pas
+:
+ResolveSafe Security Enforcement:
+Strictly rejects : (Windows drive letters, protocol schemes).
+Strictly rejects .. (directory traversal escapes).
+Enforces canonical normalization via NormalizePath.
+Enforces boundary containment by strictly checking that physical path starts with FSandboxPhysicalRoot + PathDelim.
+Extension-to-MIME Mapping: Added comprehensive mappings for .c, .pas, .py, .json, .txt, .bin, .exe.
+Disk Backing Error Handling: Added proper return value checks and exception safety across WriteFile and DeleteFile.
+GrispCapabilities.pas
+:
+Added TGrispCapability.DeduceMimeFromExtension.
+Hardened TGrispCapability.ValidateWrite to validate both caller-provided MIME and extension-deduced MIME, preventing MIME spoofing (e.g. submitting an .exe file with a text/plain header).
+GrispCore.pas
+:
+Implemented TGrispValidationResult.MakeAccepted and MakeRejected.
+Implemented TGrispEngine.ValidatePlan(const Rules: TArray<TGrispRule>; const CapName: string): TGrispValidationResult with detailed failure tracking across all rules and actions.
+MLCRD_Adapters.pas
+:
+Updated TGrispHarnessAdapterImpl.ValidatePlan to delegate to FEngine.ValidatePlan and return structured TGrispValidationResult.
+3. CLI Expansion
+GrispAgentCLI.dpr
+:
+Added --firefox: Enable Firefox Web AI automation.
+Added --port <port>: Configure TCP automation port (default 9999).
+Added --sites <list>: Comma-separated AI sites (e.g. --sites deepseek,gemini).
+Added --list-tabs: Query and display open Firefox tabs in a formatted table.
+Added --open-tab <url>: Open a URL in a new Firefox tab.
+Verification Results
+Automated Test Suite (GrispAgentTests.exe)
+Built with Embarcadero Delphi for Win64 compiler v37.0:
+
+powershell
+
+dcc64 "Projects\GrispAgentTests\GrispAgentTests.dpr" -E"EXE Output" -NU"DCU Output" -U"Source Code\Core;Source Code\Agent;Source Code\Tests;C:\Tools\RAD Studio\37.0\lib\win64\release" -I"C:\Tools\RAD Studio\37.0\lib\win64\release" -NS"System;System.Win;Winapi;Data"
+& "EXE Output\GrispAgentTests.exe"
+Test Results Summary:
+
+Core Tests: 62 Passed, 0 Failed
+Path normalization, capability checks, VFS file operations, graph transitions, parser & execution.
+Security tests: Windows drive letter rejection, .. traversal rejection, boundary containment.
+Structured plan validation: Accepted rules, escape write rejection, disallowed MIME rejection.
+MIME deduction & anti-spoofing validation.
+MLCRD Tests: 52 Passed, 0 Failed
+Candidate, critique, cross-repair flow.
+Capability negotiation & scoring.
+Reliability evolution.
+End-to-end multi-peer agent orchestration.
+Firefox protocol parsing: markdown extraction, bullet issue parsing, score extraction, site support.
+Firefox peer offline fallback & graceful integration.
+Grand Total: 114 Passed, 0 Failed (100% pass rate).
+Real-World Live Verification
+1. Live Tab Querying
+powershell
+
+& "EXE Output\GrispAgentCLI.exe" --list-tabs
+Output:
+
+
+Querying Firefox tabs on localhost:9999...
+Index  Selected   Title                                    URL
+----------------------------------------------------------------------------------------------------
+0      *          DeepSeek - Into the Unknown              https://chat.deepseek.com/
+2. Live Task Execution with Firefox Web AI Peers
+powershell
+
+& "EXE Output\GrispAgentCLI.exe" -t "Implement safe integer division" --sites deepseek,gemini
+Output:
+
+
+[INFO] Connected to Firefox Web AI on port 9999 with site(s): deepseek, gemini
+================================================================
+       ADVANCED AGENT MLCRD COOPERATIVE EXECUTION REPORT        
+================================================================
+Task: Implement safe integer division
+Active Peers: 2 | Candidates: 2 | Cross-Repairs: 4
+Activated Capabilities: run, syntax_check, semantic_check, test_execute, compile
+Tests Generated & Run: 8
+GRISP Sandbox Status: TRUE
+GRISP Diagnostics: Freeform code plan accepted
+----------------------------------------------------------------
+CHOSEN FINAL SOLUTION (Score: 0.925):
+int safe_divide(int dividend, int divisor, int *result) {
+    errno = 0;
+    if (result == NULL) { errno = EINVAL; return -1; }
+    if (divisor == 0) { errno = EDOM; return -1; }
+    if (dividend == INT_MIN && divisor == -1) { errno = ERANGE; return -1; }
+    *result = dividend / divisor;
+    return 0;
+}
+----------------------------------------------------------------
+PEER RELIABILITY EVOLUTION:
+  - Firefox_deepseek: Reliability = 0.985 (Repairs: 1, TestFails: 0, Rejects: 0)
+  - Firefox_gemini: Reliability = 0.985 (Repairs: 1, TestFails: 0, Rejects: 0)
+================================================================

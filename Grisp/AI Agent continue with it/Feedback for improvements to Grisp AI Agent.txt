@@ -1,0 +1,197 @@
+### Receipt and plan
+Thanks — I’ve received the code you pasted. I’ll analyze it now and produce a prioritized, actionable review covering **correctness**, **memory ownership**, **safety**, **robustness**, **test cases**, and **concrete fixes**.
+
+**Two sentences from your submission (for traceability):**  
+- *Minimal serialization of actions into deterministic strings for executor.*  
+- *Each Rules entry is expected as "Action|param1|param2|..."*
+
+---
+
+### Executive summary (top issues, ranked)
+1. **Memory ownership / leaks (High)** — `TAction.Params` lists are allocated in the parser and never freed by the caller after execution; this leaks memory for every parsed action.  
+2. **Resource ownership on error (Medium)** — `ParseActionStmt` frees `params` on exception, but overall ownership semantics are fragile and error‑prone.  
+3. **JSON escaping and encoding (Medium)** — `EscapeJSON` only escapes `\` and `"`; control characters and Unicode quoting are not handled; BOM handling in `ReadAllInput` is brittle for modern Delphi UTF‑16/UTF‑8 semantics.  
+4. **Lexer position tracking (Low → Medium)** — `ReadIdentOrKeyword`, `ReadNumber`, `ReadString` record `Line`/`Col` after consuming characters, so token start column/line may be incorrect for diagnostics.  
+5. **Robustness of tokenization and comment handling (Low)** — block comment scanning and `SkipWhitespaceAndComments` use manual index checks that are borderline (off‑by‑one risks) and could be simplified for clarity.  
+6. **Minor style / maintainability (Low)** — repeated manual `TStringList` allocations, ad‑hoc serialization format, and lack of centralized cleanup helpers.
+
+---
+
+### Concrete problems and fixes
+
+#### 1) Memory ownership and leaks — **fix**
+**Problem:** Parser creates `params := TStringList.Create` and assigns it to `act.Params`. The main program serializes actions and never frees those `TStringList` instances.  
+**Fix options (pick one):**
+
+**A. Free params after execution in `GrispCLI` (minimal change)**  
+After `executor.ExecuteRules(actionsArr);` add:
+
+```pascal
+// free Params lists allocated by parser
+for i := 0 to Length(rules) - 1 do
+  for j := 0 to Length(rules[i].Actions) - 1 do
+    if Assigned(rules[i].Actions[j].Params) then
+    begin
+      rules[i].Actions[j].Params.Free;
+      rules[i].Actions[j].Params := nil;
+    end;
+```
+
+**B. Make ownership explicit in types (recommended)**  
+- Change `TAction.Params` to `TStringList` but add a helper `FreeRuleArray(var Arr: TRuleArray)` that frees all nested `TStringList` and zeroes arrays. Call it in `GrispCLI` `finally` block. This centralizes cleanup and avoids leaks on early returns/exceptions.
+
+**C. Use value semantics (advanced)**  
+Return a managed object wrapper or use `TObjectList<TStringList>` to manage lifetime automatically.
+
+---
+
+#### 2) Parser exception safety
+**Problem:** `ParseActionStmt` frees `params` on exception, but other code paths may reassign `act.Params` and rely on caller to free. This is fragile.  
+**Fix:** Adopt a single ownership rule: *parser always returns actions with `Params` owned by the caller*. Document it and implement `FreeRuleArray` as above. Ensure every early exit path in `GrispCLI` calls the cleanup helper.
+
+---
+
+#### 3) JSON escaping & BOM handling
+**Problems:**
+- `EscapeJSON` does not escape control characters (e.g., `#10`, `#13`, `#9`) as `\n`, `\r`, `\t` and does not encode other non‑printable characters as `\uXXXX`.  
+- `ReadAllInput` inspects string bytes for UTF‑8 BOM which is unreliable in modern Delphi where `string` is UTF‑16; using `TFile.ReadAllText` with `TEncoding` is safer.
+
+**Fix (recommended):**
+
+Replace `EscapeJSON` with a robust implementation:
+
+```pascal
+function EscapeJSON(const S: string): string;
+var
+  i: Integer;
+  ch: Char;
+  code: Word;
+begin
+  Result := '';
+  for i := 1 to Length(S) do
+  begin
+    ch := S[i];
+    case ch of
+      '"' : Result := Result + '\"';
+      '\' : Result := Result + '\\';
+      #8  : Result := Result + '\b';
+      #9  : Result := Result + '\t';
+      #10 : Result := Result + '\n';
+      #12 : Result := Result + '\f';
+      #13 : Result := Result + '\r';
+    else
+      code := Ord(ch);
+      if code < 32 then
+        Result := Result + Format('\u%.4x', [code])
+      else
+        Result := Result + ch;
+    end;
+  end;
+end;
+```
+
+Replace `ReadAllInput` file reading with `TFile.ReadAllText` and explicit `TEncoding` detection:
+
+```pascal
+uses
+  System.IOUtils, System.SysUtils;
+
+function ReadAllInput: string;
+begin
+  if ParamCount >= 1 then
+  begin
+    if not FileExists(ParamStr(1)) then
+      raise Exception.CreateFmt('input file not found: %s', [ParamStr(1)]);
+    Result := TFile.ReadAllText(ParamStr(1), TEncoding.UTF8);
+  end
+  else
+    Result := TFile.ReadAllText('CON'); // or read from stdin via TStreamReader with TEncoding
+  // Trim leading whitespace
+  while (Length(Result) > 0) and (Result[1] <= ' ') do Delete(Result, 1, 1);
+end;
+```
+
+(If you must support arbitrary encodings, use `TFile.ReadAllBytes` and detect BOM bytes explicitly, then decode.)
+
+---
+
+#### 4) Lexer token position accuracy
+**Problem:** `ReadIdentOrKeyword`, `ReadNumber`, `ReadString` set `Result.Line`/`Result.Col` after consuming characters, so `Col` points after token end. This makes error messages show the wrong column.  
+**Fix:** Capture `startLine := FLine; startCol := FCol;` before consuming, and set `Result.Line := startLine; Result.Col := startCol;`.
+
+---
+
+#### 5) Comment scanning robustness
+**Problem:** `SkipWhitespaceAndComments` uses `FPos <= Length(FText)-1` and `FText[FPos+1]` checks; while correct in many cases, it’s clearer and safer to use `Peek` and `NextChar` and check for `#0`.  
+**Fix:** Simplify block comment handling by checking `Peek` and `PeekNext` helper that returns `#0` when out of range.
+
+---
+
+### Suggested tests to add (concrete)
+1. **Memory leak test**: parse a file with many rules/actions, run `ExecuteRules`, then run under AddressSanitizer/Valgrind (or Delphi memory profiler) to confirm no leaks.  
+2. **BOM/encoding tests**: input files with UTF‑8 BOM, UTF‑16 LE BOM, and plain ASCII; verify `ReadAllInput` returns correct text and no BOM characters remain.  
+3. **JSON escaping tests**: events with payloads containing quotes, backslashes, newlines, tabs, and control chars; verify produced JSON is valid and parseable by `TJSONObject.ParseJSONValue`.  
+4. **Lexer edge cases**: identifiers adjacent to punctuation, strings with escaped sequences, unterminated strings (should produce parse error), nested comments, and EOF inside comment.  
+5. **Parser error reporting**: intentionally malformed rule files to verify line/column in error messages point to token start.
+
+---
+
+### Tools and commands to run locally
+- **Compile with warnings as errors** (Delphi): enable all compiler hints/warnings; use `dcc32` or your IDE build with strict settings.  
+- **Memory profiler**: FastMM (enable full debug mode) or Delphi Memory Profiler to detect leaks.  
+- **Unit tests**: write DUnitX tests for parser/lexer/executor.  
+- **Static checks**: `Pascal Analyzer` or `Peganza` if available.  
+- **Fuzzing**: create random rule files and feed parser to find crashes.
+
+---
+
+### Minimal patch examples
+
+**Freeing params after execution (quick patch in `GrispCLI`):**
+```pascal
+// after executor.ExecuteRules(actionsArr);
+for i := 0 to Length(rules) - 1 do
+  for j := 0 to Length(rules[i].Actions) - 1 do
+    if Assigned(rules[i].Actions[j].Params) then
+    begin
+      rules[i].Actions[j].Params.Free;
+      rules[i].Actions[j].Params := nil;
+    end;
+```
+
+**Capture token start position (lexer):**
+```pascal
+function TLexer.ReadIdentOrKeyword: TToken;
+var
+  sb: TStringBuilder;
+  c: Char;
+  startLine, startCol: Integer;
+begin
+  startLine := FLine; startCol := FCol;
+  sb := TStringBuilder.Create;
+  try
+    ...
+    Result.Line := startLine;
+    Result.Col := startCol;
+    ...
+  finally
+    sb.Free;
+  end;
+end;
+```
+
+---
+
+### Estimated effort
+- **Small (1–2 hours)**: Add `FreeRuleArray` and call it; fix `EscapeJSON` to robust version; add token start capture.  
+- **Medium (half day)**: Replace `ReadAllInput` with robust encoding-aware reader; add unit tests for JSON escaping and BOM cases.  
+- **Large (1–2 days)**: Rework ownership model to use managed containers, add full test suite, and harden lexer comment handling and edge cases.
+
+---
+
+### Next steps I’ll take if you want me to continue
+- Produce a **patch** (diff) implementing the memory cleanup and `EscapeJSON` replacement.  
+- Generate **unit tests** (DUnitX) for the lexer/parser/executor covering the test cases above.  
+- Walk through a **refactor** to centralize ownership (e.g., `FreeRuleArray`) and show the final `GrispCLI` `try/finally` structure.
+
+Tell me which of those you want next and I’ll produce the patch or tests immediately.
