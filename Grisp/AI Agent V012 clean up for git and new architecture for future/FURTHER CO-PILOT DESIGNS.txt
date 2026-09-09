@@ -1,0 +1,2087 @@
+#### Proposal: GRISP v1.0 Protocol Package (spec, schemas, state machines, acceptance rules, GARP/1.0)
+
+Below is a complete, self-contained **GRISP v1.0 Protocol Package** you can use as the canonical design artifact. It follows your recommended implementation order: **Artifact Protocol**, **Evidence Protocol**, then **GARP/1.0**. It also includes the orchestrator state machine, deterministic acceptance rules, and migration/regression test guidance (including Regression Test #001). Use this as a normative blueprint for implementation and tests.
+
+---
+
+### 1. High-level goals (one paragraph)
+GRISP v1.0 is a deterministic, evidence-driven agent runtime that treats LLMs as **untrusted reasoning workers**. All AI-produced artifacts must be parsed into a strict internal representation (`ArtifactBundle`), every objective operation must produce structured `Evidence`, and final acceptance is decided by deterministic gates that require objective verification (compile/test/policy) and cryptographic artifact identity. Firefox (or any browser gateway) is a stateful transport implementing **GARP/1.0**; providers may return free-form text, but GRISP accepts only parsed `ArtifactBundle` objects or rejects the response.
+
+---
+
+### 2. Core JSON Schemas (canonical)
+
+> **Note:** these are canonical JSON schema fragments (informal). Use them to generate strict typed structures in Delphi, TypeScript, or your DB schema.
+
+#### 2.1 `Task` (input normalization)
+```json
+{
+  "task_id": "uuid",
+  "user_prompt": "string",
+  "target_language": "delphi|pascal|c|python|...|none",
+  "target_platform": "win64|linux|...|none",
+  "requested_artifact_kind": "EXECUTABLE|LIBRARY|UNIT|PROJECT|SCRIPT|PATCH|DOCUMENTATION|ANALYSIS",
+  "constraints": { "max_files": 10, "max_size_bytes": 1048576, ... },
+  "acceptance_tests": [ /* optional test descriptors */ ],
+  "risk_level": "R0|R1|R2|R3|R4",
+  "required_capabilities": ["compile","run","network?"],
+  "policy_profile": "string",
+  "created_at": "timestamp",
+  "metadata": { }
+}
+```
+
+#### 2.2 `ArtifactBundle`
+```json
+{
+  "artifact_id": "sha256:hex",            // content hash of canonical bundle bytes
+  "task_id": "uuid",
+  "parent_artifact_id": "sha256:hex|null",
+  "revision": 1,
+  "files": [
+    {
+      "filename": "HelloWorld.dpr",
+      "language": "delphi",
+      "kind": "source|test|manifest|binary|doc",
+      "content": "base64 or UTF-8 string",
+      "content_encoding": "utf-8|base64",
+      "sha256": "hex",
+      "size_bytes": 372
+    }
+  ],
+  "provenance": {
+    "worker_id": "string|null",
+    "provider": "deepseek|gemini|chatgpt|...",
+    "session_id": "uuid|null",
+    "message_id": "string|null",
+    "prompt_hash": "sha256:hex|null",
+    "response_hash": "sha256:hex|null",
+    "created_at": "timestamp"
+  },
+  "artifact_kind": "EXECUTABLE|UNIT|PROJECT|SCRIPT|DOC|ANALYSIS",
+  "language": "delphi",
+  "metadata": {}
+}
+```
+
+#### 2.3 `Evidence`
+```json
+{
+  "evidence_id": "uuid",
+  "task_id": "uuid",
+  "artifact_id": "sha256:hex",
+  "operation": "parse|static_validate|compile|run|test|policy_check|hash|format|lint",
+  "tool": {
+    "name": "dcc64",
+    "version": "37.0",
+    "environment_id": "env-uuid"
+  },
+  "status": "ok|failed|timed_out|crashed|parse_error",
+  "exit_code": 0,
+  "diagnostics": [
+    { "severity":"error|warning|info", "code":"E2029", "line":4, "message":"Declaration expected but end of file found" }
+  ],
+  "stdout": "string",
+  "stderr": "string",
+  "elapsed_ms": 1234,
+  "input_hash": "sha256:hex",
+  "output_hash": "sha256:hex",
+  "environment": {
+    "os":"Windows",
+    "arch":"x86_64",
+    "compiler":"dcc64 37.0",
+    "sandbox_id":"sandbox-uuid"
+  },
+  "created_at":"timestamp",
+  "metadata": {}
+}
+```
+
+#### 2.4 `ToolResult` (returned by tool engine)
+```json
+{
+  "operation": "compile|run|syntax_check|hash|read_file|write_file",
+  "status": "ok|failed|timed_out|crashed",
+  "success": true,
+  "exit_code": 0,
+  "timed_out": false,
+  "crashed": false,
+  "stdout": "string",
+  "stderr": "string",
+  "diagnostics": [ /* as above */ ],
+  "duration_ms": 1234,
+  "input_hash": "sha256:hex",
+  "output_hash": "sha256:hex",
+  "environment_id": "env-uuid"
+}
+```
+
+#### 2.5 `Decision` (final acceptance record)
+```json
+{
+  "decision_id": "uuid",
+  "task_id": "uuid",
+  "artifact_id": "sha256:hex",
+  "accepted": true,
+  "reason": "string",
+  "evidence_ids": ["uuid", "..."],
+  "policy_checks": [
+    { "policy_id":"no-network", "result":"pass|fail", "details":"" }
+  ],
+  "created_at":"timestamp",
+  "actor": "system|user:uuid"
+}
+```
+
+---
+
+### 3. Deterministic State Machine (orchestrator)
+
+Use a deterministic state machine with explicit transitions and no implicit success paths. Each transition requires evidence. Below is the canonical state graph and transition conditions.
+
+#### States
+- `TASK_ACCEPTED`
+- `TASK_NORMALIZED`
+- `WORKER_PLAN` (optional)
+- `CANDIDATE_GENERATION`
+- `ARTIFACT_PARSE`
+- `STATIC_VALIDATION`
+- `COMPILE_PENDING`
+- `COMPILED`
+- `RUNTIME_PENDING`
+- `RUNTIME_VERIFIED`
+- `TEST_PENDING`
+- `TEST_VERIFIED`
+- `ADVERSARIAL_REVIEW`
+- `CANDIDATE_RANKING`
+- `FINAL_VERIFICATION`
+- `COMMIT_PENDING`
+- `COMMITTED`
+- Failure states: `PARSE_FAILED`, `STATIC_FAILED`, `COMPILE_FAILED`, `RUNTIME_FAILED`, `TEST_FAILED`, `POLICY_REJECTED`, `TIMEOUT`, `VERIFICATION_FAILED`
+
+#### Transition rules (examples)
+- `TASK_ACCEPTED -> TASK_NORMALIZED` : always (normalizer produces canonical `Task`).
+- `TASK_NORMALIZED -> CANDIDATE_GENERATION` : when orchestrator issues `PROMPT` to workers.
+- `CANDIDATE_GENERATION -> ARTIFACT_PARSE` : when worker response arrives (response envelope).
+- `ARTIFACT_PARSE -> STATIC_VALIDATION` : if parse succeeded and `ArtifactBundle` created; else `PARSE_FAILED`.
+- `STATIC_VALIDATION -> COMPILE_PENDING` : if static checks pass for artifact kind requiring compilation; else `STATIC_FAILED`.
+- `COMPILE_PENDING -> COMPILED` : on `ToolResult` with `status=ok` and `diagnostics` empty for errors.
+- `COMPILED -> TEST_PENDING` : if tests exist; else skip to `ADVERSARIAL_REVIEW` or `CANDIDATE_RANKING`.
+- `TEST_PENDING -> TEST_VERIFIED` : if all required tests pass (objective oracles satisfied).
+- `TEST_VERIFIED -> FINAL_VERIFICATION` : run final re-hash and re-run compile/test on exact bytes.
+- `FINAL_VERIFICATION -> COMMIT_PENDING` : if all gates pass.
+- `COMMIT_PENDING -> COMMITTED` : transactional commit succeeds.
+- Any failure state prevents acceptance; no automatic transition from failure to accepted.
+
+---
+
+### 4. Hard Acceptance Gate (deterministic rule)
+
+A candidate is **ACCEPTABLE** iff all of the following are true:
+
+1. `artifact_valid` — `ArtifactBundle` parsed and `artifact_id` computed.
+2. `policy_valid` — policy engine returns `pass` for required policy checks.
+3. `all_required_objective_checks_pass` — for each required operation (compile, run, tests) the corresponding `Evidence` has `status == ok` and diagnostics contain no `severity == error`.
+4. `final_artifact_hash == verified_artifact_hash` — final verification re-hashes the bytes to match the artifact identity used in evidence.
+
+If any of these are false, the candidate is **REJECTED**. Subjective LLM scores may be used only for ranking among **eligible** candidates (those that passed the objective gates).
+
+---
+
+### 5. Artifact parsing rules (strict)
+
+- **Fast path**: If worker returns a structured envelope matching `ArtifactBundle` schema, accept it as parsed (still compute and verify `sha256`).
+- **Compatibility path**: If worker returns Markdown, attempt deterministic extraction:
+  - Accept only a single unambiguous code block per file. If multiple code blocks map to the same filename, **PARSE_ERROR**.
+  - If a filename header is present (e.g., `Pascal/Delphi:HelloWorld.dpr`), use it; otherwise, derive filename from language and artifact kind.
+  - Reject any response that contains non-code tokens interleaved inside code fences (e.g., `delphiCopyDownload`).
+- **Ambiguous**: If extraction yields multiple plausible interpretations or missing required fields, return `PARSE_ERROR` and request repair.
+- **No guessing**: Do not attempt to heuristically "fix" ambiguous content; request a repair prompt with the original response and diagnostics.
+
+---
+
+### 6. Evidence model and storage
+
+- Every tool invocation (parse, compile, run, test, policy check) MUST produce an `Evidence` record stored in the Evidence DB.
+- Evidence records are immutable and referenced by `Decision`.
+- Evidence must include `input_hash` and `output_hash` to enable replay and re-verification.
+- Evidence DB must support queries by `artifact_id`, `task_id`, `operation`, and `worker_id`.
+
+---
+
+### 7. Tool engine semantics (deterministic contract)
+
+- Tools return `ToolResult` objects (not booleans).
+- `compile` must return diagnostics array with line numbers and error codes.
+- `run` must return stdout, stderr, exit code, and resource usage.
+- `hash` must return canonical SHA-256 of bytes (use canonical serialization for `ArtifactBundle`).
+- All tool results are recorded as `Evidence`.
+
+---
+
+### 8. GARP/1.0 (Firefox AI Gateway) — wire-level summary
+
+**Transport:** TCP localhost framed messages (length-prefixed). Use a simple frame: 4-byte BE length + JSON payload. Include `request_id` and `session_id` in every message.
+
+**Core message fields (JSON):**
+```json
+{
+  "protocol":"GARP/1.0",
+  "type":"prompt|prompt_ack|generation_delta|generation_completed|get_response|response_event|ping|hello",
+  "request_id":"uuid",
+  "session_id":"uuid",
+  "tab_id":"uuid",
+  "message_id":"uuid",
+  "sequence": 1,
+  "payload": { ... }
+}
+```
+
+**Key behaviors:**
+- `PROMPT` returns immediate `prompt_ack` with `request_id`.
+- Responses stream as `generation_delta` events with `sequence` numbers; final event is `generation_completed`.
+- `CANCEL_PROMPT` cancels in-flight generation; gateway must propagate cancellation to provider and return `generation_failed` or `cancelled`.
+- `LIST_TABS`, `OPEN_TAB`, `CLOSE_TAB` use stable `tab_id` GUIDs (not numeric indices).
+- `CREATE_SESSION` binds a `session_id` to a provider and tab.
+- Gateway must support `subscribe_response` to receive events rather than polling.
+
+**Compatibility:** Providers need not implement GARP; Firefox gateway adapts provider UI and returns structured events to GRISP. GRISP must parse provider text into `ArtifactBundle` at the boundary.
+
+---
+
+### 9. Worker model and reliability
+
+- Maintain capability-specific reliability distributions per worker (Beta posterior).
+- Track separate metrics: `generation_reliability`, `critique_reliability`, `repair_reliability`, `test_design_reliability`, `protocol_reliability`.
+- Use lower confidence bound for selection to prefer conservative workers.
+
+---
+
+### 10. Test architecture and quality rules
+
+- Tests must target the actual artifact (black-box for executables).
+- Each test must declare:
+  - `test_target` (artifact filename or executable)
+  - `test_type` (black_box|unit|integration|property)
+  - `oracle` (stdout_exact, exit_code, file_exists, etc.)
+  - `coverage_intent` (what the test aims to exercise)
+- Tests that invent internal functions not present in artifact are `TEST_INVALID`.
+- Test evidence is recorded as `Evidence` with `operation=test`.
+
+---
+
+### 11. Migration & Regression Test #001
+
+**Regression Test #001 (HelloWorld)** — must be added to CI:
+
+- **Input:** Task: `write a hello world program using the programming language Delphi`
+- **Expected GRISP behavior under v1.0:**
+  - Worker responses that cannot be parsed into a valid `ArtifactBundle` are `PARSE_ERROR`.
+  - No compile attempts on raw `.txt` files or malformed content.
+  - Final acceptance must be `REJECTED` and `COMMIT` must not occur.
+- **Test assertion:** If any run results in `COMMITTED` for an artifact that lacks `COMPILED` evidence with `status=ok`, fail the regression test.
+
+Add this regression to your CI and run it on every change to the parsing/commit pipeline.
+
+---
+
+### 12. Example flows (concise)
+
+#### 12.1 Fast path (structured worker)
+1. Worker returns JSON `ArtifactBundle`.
+2. GRISP computes `sha256` for each file and bundle, stores artifact.
+3. Static validation passes.
+4. Compile tool invoked → `ToolResult` recorded as `Evidence`.
+5. Tests run → `Evidence`.
+6. Final verification re-hashes bytes and re-runs compile/tests.
+7. Commit transaction writes to `/final` and records `Decision`.
+
+#### 12.2 Compatibility path (Markdown)
+1. Worker returns Markdown with code fences.
+2. GRISP parser extracts code blocks deterministically; if ambiguous → `PARSE_ERROR`.
+3. If parsed, proceed as fast path.
+
+#### 12.3 Failure path (malformed)
+1. Worker returns UI tokens and malformed code (like your logs).
+2. Parser returns `PARSE_ERROR`.
+3. Orchestrator issues `REPAIR_REQUEST` to worker with original response and diagnostics.
+4. If repair fails after configured retries, task moves to `REPORT` with `POLICY_REJECTED` or `PARSE_FAILED`.
+
+---
+
+### 13. Operational & UX considerations
+
+- **Modes:** `strict` (default) and `draft` (developer mode). `strict` enforces acceptance gates; `draft` allows commits with warnings and requires explicit `--force-commit`.
+- **Human-in-the-loop:** For R3/R4 tasks require explicit human approval before commit.
+- **Telemetry:** Log parse failures, compile failures, and provider artifact rejection rates to prioritize adapter improvements.
+- **Backward compatibility:** Provide a compatibility shim that accepts old pipeline artifacts but marks them as `legacy` and requires manual review.
+
+---
+
+### 14. Implementation deliverables (recommended first package)
+1. **Canonical JSON schemas** for `Task`, `ArtifactBundle`, `Evidence`, `ToolResult`, `Decision`.
+2. **Reference parser** (Delphi/TS) that implements the Artifact parsing rules (fast + compatibility + PARSE_ERROR).
+3. **Evidence DB schema** (SQL or document store) and minimal API: `recordEvidence(evidence)`, `queryEvidence(...)`.
+4. **Tool engine contract** and reference `compile` adapter for Delphi (ensuring extension mapping and preflight).
+5. **GARP/1.0 spec** (framing, message types, examples) and a reference Firefox gateway adapter skeleton.
+6. **State machine implementation** (reference pseudocode or library) with deterministic transitions and evidence gating.
+7. **Regression Test #001** as a CI test case.
+8. **Policy engine skeleton** with capability grants and risk classification.
+
+---
+
+### 15. Next practical step I can produce for you now
+I can generate any of the following artifacts immediately (pick one or more):
+
+- **A. Full canonical JSON schemas** (complete, machine-ready) for `ArtifactBundle`, `Evidence`, `ToolResult`, `Task`, `Decision`.  
+- **B. A reference Delphi parser implementation** (source code) that implements the compatibility parsing rules and returns `ArtifactBundle` or `PARSE_ERROR`.  
+- **C. A minimal Evidence DB schema and SQL migration script** (Postgres) plus example queries.  
+- **D. A GARP/1.0 message spec with framed binary layout and example JSON payloads for `PROMPT`, `generation_delta`, and `generation_completed`.  
+- **E. A state-machine pseudocode implementation** (deterministic orchestrator) with transition guards and example event handling.  
+- **F. A CI regression test definition** (YAML) for Regression Test #001 that runs the pipeline and asserts no commit on compile failure.
+
+Tell me which of A–F you want first and I’ll produce it in full. If you prefer, I’ll produce A (schemas) and D (GARP spec) together as the canonical protocol package.
+
+
+
+### Overview
+
+Below are the two deliverables you requested: **A** — canonical JSON schemas for `ArtifactBundle`, `Evidence`, `ToolResult`, `Task`, and `Decision`; and **D** — the **GARP/1.0** Firefox AI Gateway protocol specification including framed binary layout and example JSON payloads for `PROMPT`, `generation_delta`, and `generation_completed`. The schemas are machine-ready and intended to be implemented as strict typed structures in Delphi, TypeScript, or a database schema. The GARP spec is transport-level normative guidance for a robust, event-driven browser gateway.
+
+---
+
+### ArtifactBundle Schema
+
+**Purpose**  
+Canonical internal representation of one or more files produced by an AI worker. Every artifact is content-hashed and carries provenance.
+
+```json
+{
+  "$id": "https://grisp.example/schemas/ArtifactBundle.json",
+  "title": "ArtifactBundle",
+  "type": "object",
+  "required": ["artifact_id","task_id","files","artifact_kind","created_at"],
+  "properties": {
+    "artifact_id": { "type": "string", "description": "sha256:<hex>" },
+    "task_id": { "type": "string", "format": "uuid" },
+    "parent_artifact_id": { "type": ["string","null"], "description": "sha256:<hex> or null" },
+    "revision": { "type": "integer", "minimum": 1 },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["filename","language","kind","content","content_encoding","sha256","size_bytes"],
+        "properties": {
+          "filename": { "type": "string" },
+          "language": { "type": "string" },
+          "kind": { "type": "string", "enum": ["source","test","manifest","binary","doc","other"] },
+          "content": { "type": "string", "description": "UTF-8 or base64 encoded content" },
+          "content_encoding": { "type": "string", "enum": ["utf-8","base64"] },
+          "sha256": { "type": "string", "description": "hex" },
+          "size_bytes": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["provider","created_at"],
+      "properties": {
+        "worker_id": { "type": ["string","null"] },
+        "provider": { "type": "string" },
+        "session_id": { "type": ["string","null"], "format": "uuid" },
+        "message_id": { "type": ["string","null"] },
+        "prompt_hash": { "type": ["string","null"], "description": "sha256:hex of prompt text" },
+        "response_hash": { "type": ["string","null"], "description": "sha256:hex of raw response" },
+        "created_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "artifact_kind": { "type": "string", "enum": ["EXECUTABLE","LIBRARY","UNIT","PROJECT","SCRIPT","PATCH","DOCUMENTATION","ANALYSIS"] },
+    "language": { "type": ["string","null"] },
+    "metadata": { "type": "object" }
+  }
+}
+```
+
+**Implementation notes**  
+- `artifact_id` is the SHA-256 of the canonical serialized bundle bytes.  
+- Files must include `content_encoding`. Systems must compute and verify `sha256` for each file before accepting the bundle.
+
+---
+
+### Evidence Schema
+
+**Purpose**  
+Structured record of any objective operation performed on an artifact or input.
+
+```json
+{
+  "$id": "https://grisp.example/schemas/Evidence.json",
+  "title": "Evidence",
+  "type": "object",
+  "required": ["evidence_id","task_id","artifact_id","operation","status","created_at"],
+  "properties": {
+    "evidence_id": { "type": "string", "format": "uuid" },
+    "task_id": { "type": "string", "format": "uuid" },
+    "artifact_id": { "type": "string", "description": "sha256:hex" },
+    "operation": { "type": "string", "enum": ["parse","static_validate","compile","run","test","policy_check","hash","format","lint","other"] },
+    "tool": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": ["string","null"] },
+        "environment_id": { "type": ["string","null"] }
+      }
+    },
+    "status": { "type": "string", "enum": ["ok","failed","timed_out","crashed","parse_error","rejected"] },
+    "exit_code": { "type": ["integer","null"] },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["severity","message"],
+        "properties": {
+          "severity": { "type": "string", "enum": ["error","warning","info"] },
+          "code": { "type": ["string","null"] },
+          "line": { "type": ["integer","null"] },
+          "message": { "type": "string" }
+        }
+      }
+    },
+    "stdout": { "type": ["string","null"] },
+    "stderr": { "type": ["string","null"] },
+    "elapsed_ms": { "type": ["integer","null"] },
+    "input_hash": { "type": ["string","null"], "description": "sha256:hex of input bytes" },
+    "output_hash": { "type": ["string","null"], "description": "sha256:hex of output bytes" },
+    "environment": { "type": "object" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "metadata": { "type": "object" }
+  }
+}
+```
+
+**Implementation notes**  
+- Evidence records are immutable and must be stored with strong integrity.  
+- `diagnostics` must include compiler error codes and line numbers when available.
+
+---
+
+### ToolResult Schema
+
+**Purpose**  
+Standardized return object for tool engine operations.
+
+```json
+{
+  "$id": "https://grisp.example/schemas/ToolResult.json",
+  "title": "ToolResult",
+  "type": "object",
+  "required": ["operation","status","duration_ms","input_hash"],
+  "properties": {
+    "operation": { "type": "string" },
+    "status": { "type": "string", "enum": ["ok","failed","timed_out","crashed"] },
+    "success": { "type": "boolean" },
+    "exit_code": { "type": ["integer","null"] },
+    "timed_out": { "type": "boolean" },
+    "crashed": { "type": "boolean" },
+    "stdout": { "type": ["string","null"] },
+    "stderr": { "type": ["string","null"] },
+    "diagnostics": { "type": "array" },
+    "duration_ms": { "type": "integer" },
+    "input_hash": { "type": "string" },
+    "output_hash": { "type": ["string","null"] },
+    "environment_id": { "type": ["string","null"] }
+  }
+}
+```
+
+**Implementation notes**  
+- Tools must return rich diagnostics rather than booleans.  
+- `input_hash` and `output_hash` enable replay and evidence linking.
+
+---
+
+### Task Schema
+
+**Purpose**  
+Normalized representation of a user request.
+
+```json
+{
+  "$id": "https://grisp.example/schemas/Task.json",
+  "title": "Task",
+  "type": "object",
+  "required": ["task_id","user_prompt","created_at"],
+  "properties": {
+    "task_id": { "type": "string", "format": "uuid" },
+    "user_prompt": { "type": "string" },
+    "target_language": { "type": ["string","null"] },
+    "target_platform": { "type": ["string","null"] },
+    "requested_artifact_kind": { "type": ["string","null"] },
+    "constraints": { "type": "object" },
+    "acceptance_tests": { "type": "array" },
+    "risk_level": { "type": "string", "enum": ["R0","R1","R2","R3","R4"] },
+    "required_capabilities": { "type": "array", "items": { "type": "string" } },
+    "policy_profile": { "type": ["string","null"] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "metadata": { "type": "object" }
+  }
+}
+```
+
+**Implementation notes**  
+- Normalizer must populate `target_language`, `requested_artifact_kind`, and `risk_level` deterministically.
+
+---
+
+### Decision Schema
+
+**Purpose**  
+Final acceptance record linking evidence to the decision.
+
+```json
+{
+  "$id": "https://grisp.example/schemas/Decision.json",
+  "title": "Decision",
+  "type": "object",
+  "required": ["decision_id","task_id","artifact_id","accepted","created_at"],
+  "properties": {
+    "decision_id": { "type": "string", "format": "uuid" },
+    "task_id": { "type": "string", "format": "uuid" },
+    "artifact_id": { "type": "string" },
+    "accepted": { "type": "boolean" },
+    "reason": { "type": "string" },
+    "evidence_ids": { "type": "array", "items": { "type": "string", "format": "uuid" } },
+    "policy_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "policy_id": { "type": "string" },
+          "result": { "type": "string", "enum": ["pass","fail"] },
+          "details": { "type": "string" }
+        }
+      }
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "actor": { "type": "string" },
+    "metadata": { "type": "object" }
+  }
+}
+```
+
+**Implementation notes**  
+- `accepted` must be computed by deterministic gates using linked evidence.
+
+---
+
+### GARP 1.0 Protocol Specification
+
+**Purpose**  
+A stable, framed, event-driven transport between GRISP and a browser AI gateway. GARP provides request correlation, streaming events, cancellation, and session/tab identity.
+
+#### Framing and Wire Format
+
+**Frame layout**  
+- **Transport:** TCP localhost, UTF-8 payloads.  
+- **Frame header:** 4-byte unsigned big-endian payload length followed by JSON payload bytes. This simple framing prevents newline ambiguity and supports binary-safe payloads.
+
+**Recommended extended frame header** (optional for future-proofing)
+```
+magic[4]         // ASCII 'GARP'
+version[1]       // 1
+flags[1]         // bitflags
+header_length[2] // length of header metadata
+payload_length[4]// length of JSON payload
+message_type[2]  // numeric code
+reserved[2]
+request_id[16]   // UUID bytes
+session_id[16]   // UUID bytes
+payload[...]     // JSON UTF-8
+```
+
+**Minimum required framing**  
+- 4-byte BE length + JSON payload. JSON must include `protocol`, `type`, `request_id`, and `session_id` fields.
+
+#### Core message envelope (JSON)
+
+All payloads must include these top-level fields:
+
+```json
+{
+  "protocol": "GARP/1.0",
+  "type": "string",
+  "request_id": "uuid",
+  "session_id": "uuid",
+  "tab_id": "uuid",
+  "message_id": "uuid",
+  "sequence": 1,
+  "payload": { }
+}
+```
+
+**Field semantics**  
+- **protocol**: must be `GARP/1.0`.  
+- **type**: message type such as `hello`, `prompt`, `prompt_ack`, `generation_delta`, `generation_completed`, `generation_failed`, `cancel_ack`, `ping`, `pong`, `list_tabs`, `open_tab`, `close_tab`.  
+- **request_id**: client-generated UUID for correlation.  
+- **session_id**: gateway session identifier bound to provider and tab.  
+- **tab_id**: stable GUID for the browser tab.  
+- **message_id**: provider message identifier.  
+- **sequence**: integer sequence number for streaming deltas.  
+- **payload**: type-specific JSON object.
+
+#### Core commands and events
+
+**HELLO**  
+- Client -> Gateway: negotiate features.  
+- Gateway -> Client: `hello_ack` with `features` array.
+
+**PROMPT**  
+- Client -> Gateway: submit prompt. Gateway returns immediate `prompt_ack`. Provider generation streams as `generation_delta` events and ends with `generation_completed`.
+
+**CANCEL_PROMPT**  
+- Client -> Gateway: request cancellation. Gateway returns `cancel_ack` and attempts to cancel provider generation.
+
+**LIST_TABS OPEN_TAB CLOSE_TAB SELECT_TAB**  
+- Tab management commands using stable `tab_id` GUIDs.
+
+**SUBSCRIBE_RESPONSE**  
+- Client subscribes to asynchronous response events for a `request_id`.
+
+#### Streaming event types
+
+- `prompt_ack` — acknowledges prompt accepted.  
+- `generation_delta` — partial text or structured chunk. Must include `sequence`.  
+- `generation_progress` — optional progress metrics.  
+- `generation_completed` — final content. Includes `finish_reason`.  
+- `generation_failed` — includes `error` and `provider_state`.  
+- `navigation` — tab navigation events.  
+- `provider_error` — provider-level errors.  
+- `session_changed` — session lifecycle events.
+
+#### Example payloads
+
+**PROMPT request**
+
+```json
+{
+  "protocol": "GARP/1.0",
+  "type": "prompt",
+  "request_id": "b3f1a6d2-8f1a-4c2b-9f2a-1a2b3c4d5e6f",
+  "session_id": "a1b2c3d4-1111-2222-3333-444455556666",
+  "tab_id": "f1e2d3c4-aaaa-bbbb-cccc-ddddeeefff00",
+  "message_id": null,
+  "sequence": 0,
+  "payload": {
+    "prompt": {
+      "text": "You are a Delphi specialist. Produce a structured ArtifactBundle JSON for a HelloWorld console program.",
+      "format": "text"
+    },
+    "options": {
+      "stream": true,
+      "timeout_ms": 120000,
+      "structured_preference": true
+    }
+  }
+}
+```
+
+**generation_delta event**
+
+```json
+{
+  "protocol": "GARP/1.0",
+  "type": "generation_delta",
+  "request_id": "b3f1a6d2-8f1a-4c2b-9f2a-1a2b3c4d5e6f",
+  "session_id": "a1b2c3d4-1111-2222-3333-444455556666",
+  "tab_id": "f1e2d3c4-aaaa-bbbb-cccc-ddddeeefff00",
+  "message_id": "msg-0001",
+  "sequence": 1,
+  "payload": {
+    "delta": "```Pascal/Delphi:HelloWorld.dpr\nprogram HelloWorld;\n\n{$APPTYPE CONSOLE}\n\nuses\n  System.SysUtils;\n\nbegin\n  WriteLn('Hello, World!');\nend.\n```"
+  }
+}
+```
+
+**generation_completed event**
+
+```json
+{
+  "protocol": "GARP/1.0",
+  "type": "generation_completed",
+  "request_id": "b3f1a6d2-8f1a-4c2b-9f2a-1a2b3c4d5e6f",
+  "session_id": "a1b2c3d4-1111-2222-3333-444455556666",
+  "tab_id": "f1e2d3c4-aaaa-bbbb-cccc-ddddeeefff00",
+  "message_id": "msg-0001",
+  "sequence": 999,
+  "payload": {
+    "content": {
+      "format": "text",
+      "text": "```Pascal/Delphi:HelloWorld.dpr\nprogram HelloWorld;\n\n{$APPTYPE CONSOLE}\n\nuses\n  System.SysUtils;\n\nbegin\n  WriteLn('Hello, World!');\nend.\n```"
+    },
+    "finish_reason": "stop",
+    "provider_state": "idle"
+  }
+}
+```
+
+**generation_failed event**
+
+```json
+{
+  "protocol": "GARP/1.0",
+  "type": "generation_failed",
+  "request_id": "b3f1a6d2-8f1a-4c2b-9f2a-1a2b3c4d5e6f",
+  "session_id": "a1b2c3d4-1111-2222-3333-444455556666",
+  "tab_id": "f1e2d3c4-aaaa-bbbb-cccc-ddddeeefff00",
+  "message_id": "msg-0001",
+  "sequence": 0,
+  "payload": {
+    "error": "provider_timeout",
+    "details": "Provider aborted generation due to internal timeout"
+  }
+}
+```
+
+#### Provider compatibility and parsing
+
+- Providers need not natively emit `ArtifactBundle`. The gateway must forward raw provider text as `generation_delta`/`generation_completed`.  
+- GRISP must parse the provider text into `ArtifactBundle` at the boundary. If parsing fails, return `PARSE_ERROR` evidence and request a repair.  
+- Structured output from provider is fast path. Markdown compatibility path is allowed. Ambiguous or malformed content must be rejected.
+
+---
+
+### Implementation Notes and Best Practices
+
+- **Canonical serialization** for `ArtifactBundle` must be defined and used when computing `artifact_id` to ensure consistent hashing across systems.  
+- **Evidence DB** must be append-only and support indexing by `artifact_id` and `task_id`.  
+- **Gateway** must support streaming and cancellation. Polling is allowed only as fallback.  
+- **Backwards compatibility**: implement a compatibility shim that accepts legacy pipeline outputs but marks them `legacy` and requires manual review.  
+- **Security**: GARP transport should be bound to localhost and authenticated if used across machines. Evidence and artifacts must be stored with access controls and optional encryption.
+
+---
+
+### Regression Test Guidance
+
+- Add Regression Test 001 HelloWorld to CI. The test asserts that malformed provider outputs that cannot be parsed into a valid `ArtifactBundle` produce `PARSE_ERROR` evidence and do not reach `COMMITTED`. The test must fail if any commit occurs without `COMPILED` evidence with `status=ok`.
+
+---
+
+### Next steps I can produce
+
+- A canonical canonicalization algorithm for `ArtifactBundle` bytes and SHA-256 computation.  
+- A reference Delphi parser implementation that implements the compatibility path and returns `ArtifactBundle` or `PARSE_ERROR`.  
+- A Postgres Evidence DB schema and example queries.  
+- A reference Firefox gateway skeleton implementing GARP/1.0 framing and event streaming.
+
+Tell me which of those you want next and I will produce it.
+
+
+
+
+### B Delphi reference parser (compatibility + strict paths)
+
+**Purpose**  
+Deterministically parse provider responses (structured JSON envelope, fenced Markdown, or raw text) into a canonical `ArtifactBundle` or return a `PARSE_ERROR` result. The parser implements the fast path (structured JSON), the compatibility path (Markdown code fences with optional filename headers), and rejects ambiguous or malformed responses.
+
+**Unit: `GrispArtifactParser.pas`**
+
+```pascal
+unit GrispArtifactParser;
+
+interface
+
+uses
+  System.SysUtils, System.Classes, System.JSON, System.Hash;
+
+type
+  TParseResultStatus = (prsOk, prsParseError);
+
+  TArtifactFile = record
+    Filename: string;
+    Language: string;
+    Kind: string;
+    Content: string; // UTF-8
+    ContentEncoding: string; // 'utf-8' or 'base64'
+    Sha256: string;
+    SizeBytes: Integer;
+  end;
+
+  TArtifactBundle = record
+    ArtifactId: string; // sha256 hex of canonical bundle bytes
+    TaskId: string;
+    ParentArtifactId: string;
+    Revision: Integer;
+    Files: TArray<TArtifactFile>;
+    Provenance: TJSONObject;
+    ArtifactKind: string;
+    Language: string;
+    Metadata: TJSONObject;
+  end;
+
+  TParseResult = record
+    Status: TParseResultStatus;
+    Bundle: TArtifactBundle;
+    ErrorMessage: string;
+  end;
+
+function ParseProviderResponse(const RawResponse: string; const TaskId: string): TParseResult;
+
+implementation
+
+uses
+  System.RegularExpressions, System.NetEncoding;
+
+{ Helper: compute SHA256 hex of UTF8 bytes }
+function SHA256Hex(const S: string): string;
+var
+  B: TBytes;
+begin
+  B := TEncoding.UTF8.GetBytes(S);
+  Result := THashSHA2.GetHashString(B, SHA256);
+  Result := LowerCase(Result);
+end;
+
+{ Helper: canonical serialization for bundle files (simple deterministic JSON ordering) }
+function CanonicalBundleHash(const Files: TArray<TArtifactFile>): string;
+var
+  I: Integer;
+  SB: TStringBuilder;
+begin
+  SB := TStringBuilder.Create;
+  try
+    for I := Low(Files) to High(Files) do
+    begin
+      SB.Append(Files[I].Filename);
+      SB.Append('|');
+      SB.Append(Files[I].Language);
+      SB.Append('|');
+      SB.Append(Files[I].Kind);
+      SB.Append('|');
+      SB.Append(Files[I].Sha256);
+      SB.Append('|');
+    end;
+    Result := SHA256Hex(SB.ToString);
+  finally
+    SB.Free;
+  end;
+end;
+
+{ Extract first fenced code block; returns header (if any) and code }
+function ExtractFirstFencedBlock(const S: string; out Header, Code: string): Boolean;
+var
+  RE: TRegEx;
+  M: TMatch;
+begin
+  Header := '';
+  Code := '';
+  RE := TRegEx.Create('```(?:\s*([^\r\n]+))?\r?\n([\s\S]*?)\r?\n```', [roIgnoreCase]);
+  M := RE.Match(S);
+  if M.Success then
+  begin
+    Header := Trim(M.Groups[1].Value);
+    Code := M.Groups[2].Value;
+    Exit(True);
+  end;
+  Result := False;
+end;
+
+{ Try parse structured JSON envelope (fast path) }
+function TryParseStructured(const Raw: string; out Bundle: TArtifactBundle): Boolean;
+var
+  JsonVal, FilesArr, FileObj, ProvObj: TJSONValue;
+  JsonObj: TJSONObject;
+  I: Integer;
+  AF: TArtifactFile;
+  JA: TJSONArray;
+begin
+  Result := False;
+  try
+    JsonVal := TJSONObject.ParseJSONValue(Raw);
+    if not (JsonVal is TJSONObject) then Exit;
+    JsonObj := JsonVal as TJSONObject;
+    if not JsonObj.TryGetValue('files', FilesArr) then Exit;
+    JA := FilesArr as TJSONArray;
+    SetLength(Bundle.Files, JA.Count);
+    for I := 0 to JA.Count - 1 do
+    begin
+      FileObj := JA.Items[I];
+      AF.Filename := (FileObj as TJSONObject).GetValue<string>('filename', '');
+      AF.Language := (FileObj as TJSONObject).GetValue<string>('language', '');
+      AF.Kind := (FileObj as TJSONObject).GetValue<string>('kind', 'source');
+      AF.ContentEncoding := (FileObj as TJSONObject).GetValue<string>('content_encoding', 'utf-8');
+      AF.Content := (FileObj as TJSONObject).GetValue<string>('content', '');
+      AF.SizeBytes := Length(TEncoding.UTF8.GetBytes(AF.Content));
+      if AF.ContentEncoding = 'base64' then
+        AF.Sha256 := SHA256Hex(TNetEncoding.Base64.DecodeStringToBytes(AF.Content).ToString)
+      else
+        AF.Sha256 := SHA256Hex(AF.Content);
+      Bundle.Files[I] := AF;
+    end;
+    Bundle.ArtifactId := CanonicalBundleHash(Bundle.Files);
+    Bundle.TaskId := JsonObj.GetValue<string>('task_id', '');
+    Bundle.ParentArtifactId := JsonObj.GetValue<string>('parent_artifact_id', '');
+    Bundle.Revision := JsonObj.GetValue<Integer>('revision', 1);
+    ProvObj := JsonObj.GetValue('provenance');
+    if ProvObj <> nil then
+      Bundle.Provenance := ProvObj.Clone as TJSONObject
+    else
+      Bundle.Provenance := TJSONObject.Create;
+    Bundle.ArtifactKind := JsonObj.GetValue<string>('artifact_kind', 'EXECUTABLE');
+    Bundle.Language := JsonObj.GetValue<string>('language', '');
+    Bundle.Metadata := TJSONObject.Create;
+    Result := True;
+  except
+    Result := False;
+  end;
+end;
+
+{ Compatibility path: parse Markdown fenced block and optional header like "Pascal/Delphi:HelloWorld.dpr" }
+function TryParseMarkdown(const Raw: string; const TaskId: string; out Bundle: TArtifactBundle): Boolean;
+var
+  Header, Code, Filename, Lang: string;
+  AF: TArtifactFile;
+begin
+  Result := False;
+  if not ExtractFirstFencedBlock(Raw, Header, Code) then Exit;
+  // Clean common UI artifacts
+  Code := TRegEx.Replace(Code, '^(delphiCopyDownload|Delphiprogram|Pascalprogram)\s*', '', [roIgnoreCase]);
+  // Determine filename from header if present
+  Filename := '';
+  Lang := '';
+  if Header <> '' then
+  begin
+    if Header.Contains(':') then
+    begin
+      Filename := Trim(Header.Substring(Header.IndexOf(':') + 1));
+      Lang := Trim(Header.Substring(0, Header.IndexOf(':')));
+    end
+    else
+      Filename := Trim(Header);
+  end;
+  if Filename = '' then
+  begin
+    // derive filename from language hint or default
+    if Lang = '' then Lang := 'delphi';
+    Filename := 'program.' + LowerCase(Lang);
+    if SameText(Lang, 'delphi') or SameText(Lang, 'pascal') then
+      Filename := 'HelloWorld.dpr';
+  end;
+  AF.Filename := Filename;
+  AF.Language := IfThen(Lang = '', 'delphi', LowerCase(Lang));
+  AF.Kind := 'source';
+  AF.ContentEncoding := 'utf-8';
+  AF.Content := Code;
+  AF.SizeBytes := Length(TEncoding.UTF8.GetBytes(AF.Content));
+  AF.Sha256 := SHA256Hex(AF.Content);
+  SetLength(Bundle.Files, 1);
+  Bundle.Files[0] := AF;
+  Bundle.TaskId := TaskId;
+  Bundle.ParentArtifactId := '';
+  Bundle.Revision := 1;
+  Bundle.Provenance := TJSONObject.Create;
+  Bundle.ArtifactKind := 'EXECUTABLE';
+  Bundle.Language := AF.Language;
+  Bundle.Metadata := TJSONObject.Create;
+  Bundle.ArtifactId := CanonicalBundleHash(Bundle.Files);
+  Result := True;
+end;
+
+function ParseProviderResponse(const RawResponse: string; const TaskId: string): TParseResult;
+var
+  Bundle: TArtifactBundle;
+begin
+  Result.Status := prsParseError;
+  Result.ErrorMessage := 'Unparsed';
+  // Fast path: structured JSON envelope
+  if TryParseStructured(RawResponse, Bundle) then
+  begin
+    Result.Status := prsOk;
+    Result.Bundle := Bundle;
+    Exit;
+  end;
+  // Compatibility path: Markdown fenced code block
+  if TryParseMarkdown(RawResponse, TaskId, Bundle) then
+  begin
+    // Basic static validation: must start with 'program' or 'unit' for Delphi
+    if (Pos(LowerCase('program'), LowerCase(Bundle.Files[0].Content)) = 1) or
+       (Pos(LowerCase('unit'), LowerCase(Bundle.Files[0].Content)) = 1) then
+    begin
+      Result.Status := prsOk;
+      Result.Bundle := Bundle;
+      Exit;
+    end
+    else
+    begin
+      Result.Status := prsParseError;
+      Result.ErrorMessage := 'Static validation failed: missing program/unit header';
+      Exit;
+    end;
+  end;
+  Result.Status := prsParseError;
+  Result.ErrorMessage := 'No structured envelope or fenced code block found';
+end;
+
+end.
+```
+
+---
+
+### C Evidence DB schema (Postgres) + example queries
+
+**Purpose**  
+Append-only Evidence store with indexes for fast queries by `artifact_id`, `task_id`, and `operation`.
+
+**SQL schema (Postgres)**
+
+```sql
+-- Evidence DB schema for GRISP v1.0
+
+CREATE TABLE grisp_evidence (
+  evidence_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  task_id UUID NOT NULL,
+  artifact_id TEXT NOT NULL, -- sha256 hex
+  operation TEXT NOT NULL,
+  tool_name TEXT,
+  tool_version TEXT,
+  environment_id TEXT,
+  status TEXT NOT NULL,
+  exit_code INTEGER,
+  diagnostics JSONB,
+  stdout TEXT,
+  stderr TEXT,
+  elapsed_ms INTEGER,
+  input_hash TEXT,
+  output_hash TEXT,
+  environment JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  metadata JSONB
+);
+
+-- Indexes for common queries
+CREATE INDEX idx_evidence_artifact ON grisp_evidence (artifact_id);
+CREATE INDEX idx_evidence_task ON grisp_evidence (task_id);
+CREATE INDEX idx_evidence_operation ON grisp_evidence (operation);
+CREATE INDEX idx_evidence_status ON grisp_evidence (status);
+
+-- Evidence immutability enforcement (soft): prevent updates by role; enforce via DB role permissions.
+REVOKE UPDATE, DELETE ON grisp_evidence FROM PUBLIC;
+
+-- Example: store evidence via function
+CREATE OR REPLACE FUNCTION grisp.record_evidence(
+  p_task_id UUID,
+  p_artifact_id TEXT,
+  p_operation TEXT,
+  p_tool_name TEXT,
+  p_tool_version TEXT,
+  p_environment_id TEXT,
+  p_status TEXT,
+  p_exit_code INTEGER,
+  p_diagnostics JSONB,
+  p_stdout TEXT,
+  p_stderr TEXT,
+  p_elapsed_ms INTEGER,
+  p_input_hash TEXT,
+  p_output_hash TEXT,
+  p_environment JSONB,
+  p_metadata JSONB
+) RETURNS UUID AS $$
+DECLARE
+  v_evidence_id UUID := gen_random_uuid();
+BEGIN
+  INSERT INTO grisp_evidence (
+    evidence_id, task_id, artifact_id, operation, tool_name, tool_version,
+    environment_id, status, exit_code, diagnostics, stdout, stderr,
+    elapsed_ms, input_hash, output_hash, environment, metadata, created_at
+  ) VALUES (
+    v_evidence_id, p_task_id, p_artifact_id, p_operation, p_tool_name, p_tool_version,
+    p_environment_id, p_status, p_exit_code, p_diagnostics, p_stdout, p_stderr,
+    p_elapsed_ms, p_input_hash, p_output_hash, p_environment, p_metadata, now()
+  );
+  RETURN v_evidence_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Example query: get all compile evidence for an artifact
+-- SELECT * FROM grisp_evidence WHERE artifact_id = 'sha256:...' AND operation = 'compile' ORDER BY created_at DESC;
+
+-- Example query: check if artifact has successful compile evidence
+-- SELECT EXISTS (
+--   SELECT 1 FROM grisp_evidence
+--   WHERE artifact_id = 'sha256:...' AND operation = 'compile' AND status = 'ok'
+-- );
+```
+
+**Notes**
+- Use `pgcrypto` or `pgcrypto`-like extension for `gen_random_uuid()`; adjust for your environment.
+- Enforce immutability by DB role permissions and by exposing only `record_evidence` function for writes.
+- Store `diagnostics` as JSONB for structured compiler errors.
+
+---
+
+### E State-machine pseudocode (deterministic orchestrator)
+
+**Purpose**  
+Deterministic orchestrator with explicit transitions, evidence gating, and no implicit acceptance.
+
+**Pseudocode (language-agnostic)**
+
+```text
+STATE = TASK_ACCEPTED
+
+on EVENT TaskSubmitted(task):
+  persist(task)
+  transition(TASK_NORMALIZED)
+
+STATE TASK_NORMALIZED:
+  normalized = normalize(task)
+  if normalized.invalid:
+    emit Decision(REJECTED, reason="normalize_failed")
+    transition(REPORT)
+  else
+    create work item
+    transition(CANDIDATE_GENERATION)
+
+STATE CANDIDATE_GENERATION:
+  for worker in select_workers(task):
+    request_id = send_prompt(worker, task.prompt)
+    record pending_request(request_id, worker)
+  wait for responses or timeout
+  if no responses:
+    transition(REPORT) // or retry policy
+  else
+    transition(ARTIFACT_PARSE)
+
+STATE ARTIFACT_PARSE:
+  for each response:
+    parse_result = parse_response(response.raw, task.task_id)
+    record Evidence(parse_op, parse_result)
+    if parse_result.status == PARSE_ERROR:
+      mark candidate rejected
+    else
+      store ArtifactBundle
+  if no parsed candidates:
+    transition(PARSE_FAILED)
+  else
+    transition(STATIC_VALIDATION)
+
+STATE STATIC_VALIDATION:
+  for each candidate:
+    static_result = static_validate(candidate)
+    record Evidence(static_validate, static_result)
+    if static_result.status != ok:
+      mark candidate rejected
+  if no candidates remain:
+    transition(STATIC_FAILED)
+  else
+    transition(COMPILE_PENDING)
+
+STATE COMPILE_PENDING:
+  for each candidate requiring compile:
+    tool_result = compile(candidate)
+    record Evidence(compile, tool_result)
+    if tool_result.status != ok:
+      mark candidate compile_failed
+  if no compiled candidates:
+    transition(COMPILE_FAILED)
+  else
+    transition(TEST_PENDING or ADVERSARIAL_REVIEW)
+
+STATE TEST_PENDING:
+  for each candidate with tests:
+    for test in tests:
+      tr = run_test(candidate, test)
+      record Evidence(test, tr)
+      if tr.status != ok:
+        mark candidate test_failed
+  if no candidates pass tests:
+    transition(TEST_FAILED)
+  else
+    transition(ADVERSARIAL_REVIEW)
+
+STATE ADVERSARIAL_REVIEW:
+  optionally run adversarial LLMs or static analyzers
+  record Evidence(adversarial, results)
+  transition(CANDIDATE_RANKING)
+
+STATE CANDIDATE_RANKING:
+  eligible = filter(candidates, objective_gates_passed)
+  if eligible.empty:
+    transition(REPORT)
+  else
+    rank_by_quality(eligible) // subjective scores allowed only now
+    winner = eligible.top
+    transition(FINAL_VERIFICATION with winner)
+
+STATE FINAL_VERIFICATION:
+  rehash = hash(winner.bundle_bytes)
+  if rehash != winner.artifact_id:
+    record Evidence(hash_mismatch)
+    transition(VERIFICATION_FAILED)
+  recompile_result = compile_exact_bytes(winner)
+  record Evidence(compile_final, recompile_result)
+  rerun_tests = run_tests_exact_bytes(winner)
+  record Evidence(test_final, rerun_tests)
+  policy_result = policy_check(winner)
+  record Evidence(policy_check, policy_result)
+  if all final evidence ok:
+    transition(COMMIT_PENDING)
+  else
+    transition(VERIFICATION_FAILED)
+
+STATE COMMIT_PENDING:
+  begin transaction
+    write files to /workspace/final/<artifact_id> atomically
+    write Decision(accepted)
+  commit
+  record Evidence(commit)
+  transition(COMMITTED)
+
+STATE REPORT:
+  assemble report with all evidence
+  notify user
+  end
+
+// Failure states: PARSE_FAILED, STATIC_FAILED, COMPILE_FAILED, TEST_FAILED, VERIFICATION_FAILED
+// Each failure state records evidence and does not auto-accept.
+
+```
+
+**Key properties**
+- Every transition that advances a candidate requires recorded `Evidence`.
+- Subjective LLM scores are used only after objective gates pass.
+- Retries are reason-specific and bounded by policy.
+- Cancellation aborts pending tool runs and pending prompts and records `Evidence(status=timed_out)`.
+
+---
+
+### F CI regression test (HelloWorld) — YAML (example for GitHub Actions)
+
+**Purpose**  
+Ensure malformed provider outputs cannot be committed. The CI job runs the parser + orchestrator in a test harness and asserts no commit when compile evidence is missing.
+
+```yaml
+name: GRISP Regression Tests
+
+on:
+  push:
+    paths:
+      - 'src/**'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+jobs:
+  regression-001-helloworld:
+    name: Regression Test 001 - HelloWorld parse/commit gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Delphi test environment (mock)
+        run: |
+          echo "Setting up mock environment"
+          # This step should prepare a mock tool engine and evidence DB for the test harness.
+
+      - name: Run GRISP test harness for HelloWorld
+        env:
+          TASK_PROMPT: "write a hello world program using the programming language Delphi"
+          MOCK_PROVIDER_RESPONSE_FILE: "tests/malformed_helloworld_response.txt"
+        run: |
+          # Run the GRISP test harness in strict mode
+          ./bin/grisp_test_harness --task "$TASK_PROMPT" --strict-verify --mock-response "$MOCK_PROVIDER_RESPONSE_FILE" --evidence-db ./tmp/evidence.db --workspace ./tmp/workspace || true
+          # The harness exits non-zero on parse/compile failures; we continue to assert conditions below.
+
+      - name: Assert no commit occurred
+        run: |
+          if [ -d "./tmp/workspace/final" ] && [ "$(ls -A ./tmp/workspace/final)" ]; then
+            echo "ERROR: Final artifacts were committed despite failures"
+            ls -la ./tmp/workspace/final
+            exit 1
+          else
+            echo "PASS: No final commit present"
+          fi
+
+      - name: Assert parse evidence recorded as PARSE_ERROR
+        run: |
+          # Query the evidence DB (mock) for parse evidence
+          python3 - <<'PY'
+import sqlite3, sys
+db='./tmp/evidence.db'
+conn=sqlite3.connect(db)
+cur=conn.cursor()
+cur.execute("SELECT status, operation FROM evidence WHERE operation='parse' ORDER BY created_at DESC LIMIT 1")
+row=cur.fetchone()
+if not row:
+    print("ERROR: No parse evidence recorded")
+    sys.exit(1)
+status, op = row
+if status != 'parse_error' and status != 'failed':
+    print("ERROR: Expected parse_error, got", status)
+    sys.exit(1)
+print("PASS: parse evidence indicates parse_error")
+PY
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grisp-regression-001-logs
+          path: ./tmp/logs
+```
+
+**Notes**
+- Replace mock harness and DB with your real test harness and evidence DB adapter.
+- The test uses a `--strict-verify` flag to enforce acceptance gates.
+- The `mock_response` file should contain the malformed provider output from your earlier run (the `delphiCopyDownload...` artifacts) to reproduce the regression.
+
+---
+
+If you want, I will now:
+- produce the **canonical bundle canonicalization algorithm** (byte-level ordering and JSON canonicalization) and a reference implementation, or
+- generate the **Postgres migration script** and a small Node/Delphi client example that records `Evidence` and queries the DB.
+
+Which would you like next?
+
+
+### Canonical Bundle Canonicalization Algorithm (spec)
+
+**Goal:** produce a deterministic byte sequence for an `ArtifactBundle` so that independent implementations compute the same SHA‑256 `artifact_id`.
+
+**Principles**
+- **Determinism:** canonical bytes must be identical across platforms for the same logical bundle.
+- **Stability:** ordering and formatting rules are fixed and explicit.
+- **Simplicity:** use UTF‑8 and JSON canonicalization rules that are easy to implement.
+- **Losslessness:** all required fields are preserved; optional fields may be omitted if null.
+
+**Canonicalization steps (ordered)**
+
+1. **Normalize file contents**
+   - Convert each file `content` to UTF‑8 bytes.
+   - Normalize line endings to LF (`\n`).
+   - Trim no content bytes; preserve exact content after normalization.
+   - If `content_encoding` is `base64`, decode to bytes and then treat as binary content; for canonical JSON embed as base64 string (see step 4).
+
+2. **Canonical file record**
+   - For each file produce a JSON object with **exact** keys in this order:
+     1. `filename` (string)
+     2. `language` (string or `""`)
+     3. `kind` (string)
+     4. `content_encoding` (string: `"utf-8"` or `"base64"`)
+     5. `content_sha256` (hex lowercase) — SHA‑256 of the normalized bytes of the file content
+     6. `size_bytes` (integer)
+   - **Do not** include the raw `content` in the canonical bundle bytes (to keep canonical bytes compact and avoid encoding differences). The content hash and size are sufficient to identify content deterministically.
+
+3. **Sort files**
+   - Sort the array of canonical file records by **filename** using Unicode codepoint order (binary comparison of UTF‑8 bytes). If filenames collide, secondary sort by `content_sha256`.
+
+4. **Canonical bundle object**
+   - Build a JSON object with **exact** keys in this order:
+     1. `task_id` (string or `""`)
+     2. `parent_artifact_id` (string or `""`)
+     3. `revision` (integer)
+     4. `artifact_kind` (string)
+     5. `language` (string or `""`)
+     6. `files` (array of canonical file records from step 2)
+     7. `provenance` (object) — include only these keys in this order if present: `provider`, `worker_id`, `session_id`, `message_id`, `prompt_hash`, `response_hash`, `created_at`. Omit nulls.
+     8. `metadata` (object) — canonicalize keys sorted by codepoint; values must be JSON primitives or nested objects canonicalized recursively with sorted keys.
+   - **Do not** include `artifact_id` in the canonical bytes.
+
+5. **JSON canonicalization rules**
+   - Use UTF‑8 encoding.
+   - No insignificant whitespace: **no** spaces or line breaks outside those required by JSON syntax.
+   - Objects: keys appear in the exact order specified above; nested objects must follow the same rule (sorted keys for `metadata`).
+   - Arrays: preserve order as produced by step 3.
+   - Strings: use JSON string escaping per RFC 8259; use `\uXXXX` escapes for control characters; do not escape non‑ASCII characters (keep UTF‑8).
+   - Numbers: use shortest decimal representation without leading zeros (e.g., `0`, `1`, `123.45`).
+   - Booleans and null: `true`, `false`, `null`.
+
+6. **Byte sequence**
+   - Serialize the canonical JSON object using the canonicalization rules to a UTF‑8 byte sequence. This byte sequence is the canonical bundle bytes.
+
+7. **artifact_id**
+   - Compute `artifact_id = "sha256:" + hex_lowercase(SHA256(canonical_bytes))`.
+
+8. **File content hashes**
+   - For each file, compute `content_sha256 = hex_lowercase(SHA256(normalized_file_bytes))` and include it in the canonical file record.
+
+**Rationale**
+- Excluding raw content from the canonical bundle bytes keeps the canonicalization deterministic and compact while still uniquely identifying content via `content_sha256`.
+- The ordered keys and sorted `files` array ensure identical serialization across implementations.
+
+---
+
+### Reference Implementation — Node.js (canonicalization + artifact_id)
+
+**File:** `canonicalizeBundle.js`  
+```javascript
+// Node.js reference: canonicalizeBundle.js
+// Usage: node canonicalizeBundle.js bundle.json
+const fs = require('fs');
+const crypto = require('crypto');
+
+function sha256Hex(buf) {
+  return crypto.createHash('sha256').update(buf).digest('hex');
+}
+
+function normalizeLineEndings(buf) {
+  // Convert CRLF -> LF
+  return Buffer.from(buf.toString('utf8').replace(/\r\n/g, '\n'), 'utf8');
+}
+
+function canonicalizeFileRecord(file) {
+  // file: { filename, language, kind, content, content_encoding }
+  let contentBytes;
+  if ((file.content_encoding || 'utf-8') === 'base64') {
+    contentBytes = Buffer.from(file.content, 'base64');
+  } else {
+    contentBytes = normalizeLineEndings(Buffer.from(file.content, 'utf8'));
+  }
+  const contentSha = sha256Hex(contentBytes);
+  return {
+    filename: file.filename,
+    language: file.language || '',
+    kind: file.kind || 'source',
+    content_encoding: file.content_encoding || 'utf-8',
+    content_sha256: contentSha,
+    size_bytes: contentBytes.length
+  };
+}
+
+function jsonStringifyCanonical(obj) {
+  // Minimal canonical JSON serializer following the spec rules:
+  // - No extra whitespace
+  // - Keys in objects must be in the order provided by the object
+  // For metadata objects we ensure keys are sorted.
+  return JSON.stringify(obj);
+}
+
+function canonicalizeBundle(bundle) {
+  // bundle: { task_id, parent_artifact_id, revision, artifact_kind, language, files[], provenance, metadata }
+  const fileRecords = bundle.files.map(canonicalizeFileRecord);
+  // sort by filename (UTF-8 codepoint order)
+  fileRecords.sort((a, b) => {
+    const A = Buffer.from(a.filename, 'utf8');
+    const B = Buffer.from(b.filename, 'utf8');
+    return A.compare(B);
+  });
+
+  // Build canonical object with exact key order
+  const canonical = {
+    task_id: bundle.task_id || '',
+    parent_artifact_id: bundle.parent_artifact_id || '',
+    revision: bundle.revision || 1,
+    artifact_kind: bundle.artifact_kind || 'EXECUTABLE',
+    language: bundle.language || '',
+    files: fileRecords,
+    provenance: {},
+    metadata: bundle.metadata || {}
+  };
+
+  // Provenance: include keys in fixed order if present
+  const prov = bundle.provenance || {};
+  const provOrdered = {};
+  ['provider','worker_id','session_id','message_id','prompt_hash','response_hash','created_at'].forEach(k => {
+    if (prov[k] !== undefined && prov[k] !== null && prov[k] !== '') provOrdered[k] = prov[k];
+  });
+  canonical.provenance = provOrdered;
+
+  // For metadata, ensure deterministic key order
+  function sortObjectKeys(obj) {
+    if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return obj;
+    const keys = Object.keys(obj).sort();
+    const out = {};
+    for (const k of keys) out[k] = sortObjectKeys(obj[k]);
+    return out;
+  }
+  canonical.metadata = sortObjectKeys(canonical.metadata);
+
+  // Serialize canonical JSON (no extra whitespace)
+  const canonicalBytes = Buffer.from(jsonStringifyCanonical(canonical), 'utf8');
+  const artifactId = 'sha256:' + sha256Hex(canonicalBytes);
+  return { canonicalBytes, artifactId, fileRecords };
+}
+
+// CLI
+if (require.main === module) {
+  const path = process.argv[2];
+  if (!path) {
+    console.error('Usage: node canonicalizeBundle.js bundle.json');
+    process.exit(2);
+  }
+  const raw = fs.readFileSync(path, 'utf8');
+  const bundle = JSON.parse(raw);
+  const { artifactId, canonicalBytes, fileRecords } = canonicalizeBundle(bundle);
+  console.log('artifact_id:', artifactId);
+  console.log('canonical_bytes_length:', canonicalBytes.length);
+  console.log('file_records:', JSON.stringify(fileRecords, null, 2));
+}
+```
+
+**Notes**
+- This reference uses `JSON.stringify` for compact JSON. For stricter canonicalization (e.g., deterministic escaping of control characters), replace `jsonStringifyCanonical` with a dedicated canonical JSON serializer (RFC 8785 or a custom implementation).
+- The Node example computes `content_sha256` and `artifact_id` per the algorithm.
+
+---
+
+### Reference Implementation — Delphi (canonicalization + artifact_id)
+
+**Unit:** `GrispCanonical.pas`  
+```pascal
+unit GrispCanonical;
+
+interface
+
+uses
+  System.SysUtils, System.Classes, System.JSON, System.Hash, System.Generics.Collections;
+
+type
+  TArtifactFile = record
+    Filename: string;
+    Language: string;
+    Kind: string;
+    Content: string; // UTF-8
+    ContentEncoding: string; // 'utf-8' or 'base64'
+    ContentSha256: string;
+    SizeBytes: Integer;
+  end;
+
+  TArtifactBundle = record
+    TaskId: string;
+    ParentArtifactId: string;
+    Revision: Integer;
+    ArtifactKind: string;
+    Language: string;
+    Files: TArray<TArtifactFile>;
+    Provenance: TJSONObject;
+    Metadata: TJSONObject;
+  end;
+
+function SHA256HexOfBytes(const B: TBytes): string;
+function NormalizeLineEndings(const S: string): string;
+function ComputeFileRecord(const Filename, Language, Kind, Content, ContentEncoding: string): TArtifactFile;
+function CanonicalizeBundle(const Bundle: TArtifactBundle; out CanonicalBytes: TBytes): string;
+
+implementation
+
+uses
+  System.NetEncoding, System.Character;
+
+function SHA256HexOfBytes(const B: TBytes): string;
+begin
+  Result := THashSHA2.GetHashString(B, SHA256);
+  Result := LowerCase(Result);
+end;
+
+function NormalizeLineEndings(const S: string): string;
+begin
+  // Convert CRLF to LF
+  Result := S.Replace(#13#10, #10);
+end;
+
+function ComputeFileRecord(const Filename, Language, Kind, Content, ContentEncoding: string): TArtifactFile;
+var
+  Bytes: TBytes;
+  Decoded: TBytes;
+begin
+  if ContentEncoding.ToLower = 'base64' then
+  begin
+    Decoded := TNetEncoding.Base64.DecodeStringToBytes(Content);
+    Bytes := Decoded;
+  end
+  else
+  begin
+    Bytes := TEncoding.UTF8.GetBytes(NormalizeLineEndings(Content));
+  end;
+  Result.Filename := Filename;
+  Result.Language := Language;
+  Result.Kind := Kind;
+  Result.ContentEncoding := IfThen(ContentEncoding = '', 'utf-8', ContentEncoding);
+  Result.SizeBytes := Length(Bytes);
+  Result.ContentSha256 := SHA256HexOfBytes(Bytes);
+end;
+
+function JSONObjectToCanonicalString(Obj: TJSONObject): string;
+var
+  // For metadata we need sorted keys; this helper returns compact JSON with sorted keys
+  Keys: TArray<string>;
+  I: Integer;
+  V: TJSONValue;
+  SB: TStringBuilder;
+begin
+  SB := TStringBuilder.Create;
+  try
+    Keys := Obj.Keys.ToArray;
+    TArray.Sort<string>(Keys);
+    SB.Append('{');
+    for I := 0 to Length(Keys)-1 do
+    begin
+      if I > 0 then SB.Append(',');
+      SB.Append('"' + Keys[I] + '":');
+      V := Obj.GetValue(Keys[I]);
+      SB.Append(V.ToJSON);
+    end;
+    SB.Append('}');
+    Result := SB.ToString;
+  finally
+    SB.Free;
+  end;
+end;
+
+function CanonicalizeBundle(const Bundle: TArtifactBundle; out CanonicalBytes: TBytes): string;
+var
+  FileRecs: TList<TArtifactFile>;
+  I: Integer;
+  CanonicalObj: TJSONObject;
+  FilesArr: TJSONArray;
+  FileObj: TJSONObject;
+  ProvObj: TJSONObject;
+  MetaStr: string;
+  CanonicalStr: string;
+begin
+  FileRecs := TList<TArtifactFile>.Create;
+  try
+    for I := Low(Bundle.Files) to High(Bundle.Files) do
+      FileRecs.Add(Bundle.Files[I]);
+    // sort by filename (UTF-8 codepoint)
+    FileRecs.Sort(TComparer<TArtifactFile>.Construct(
+      function(const L, R: TArtifactFile): Integer
+      var
+        LB, RB: TBytes;
+      begin
+        LB := TEncoding.UTF8.GetBytes(L.Filename);
+        RB := TEncoding.UTF8.GetBytes(R.Filename);
+        Result := CompareMem(LB, RB, Min(Length(LB), Length(RB))) and (Length(LB) - Length(RB));
+        // fallback to string compare if needed
+        if Result = 0 then
+          Result := CompareText(L.Filename, R.Filename);
+      end));
+
+    // Build canonical JSON object with exact key order
+    CanonicalObj := TJSONObject.Create;
+    try
+      CanonicalObj.AddPair('task_id', TJSONString.Create(Bundle.TaskId));
+      CanonicalObj.AddPair('parent_artifact_id', TJSONString.Create(Bundle.ParentArtifactId));
+      CanonicalObj.AddPair('revision', TJSONNumber.Create(Bundle.Revision));
+      CanonicalObj.AddPair('artifact_kind', TJSONString.Create(Bundle.ArtifactKind));
+      CanonicalObj.AddPair('language', TJSONString.Create(Bundle.Language));
+      FilesArr := TJSONArray.Create;
+      for I := 0 to FileRecs.Count - 1 do
+      begin
+        FileObj := TJSONObject.Create;
+        FileObj.AddPair('filename', TJSONString.Create(FileRecs[I].Filename));
+        FileObj.AddPair('language', TJSONString.Create(FileRecs[I].Language));
+        FileObj.AddPair('kind', TJSONString.Create(FileRecs[I].Kind));
+        FileObj.AddPair('content_encoding', TJSONString.Create(FileRecs[I].ContentEncoding));
+        FileObj.AddPair('content_sha256', TJSONString.Create(FileRecs[I].ContentSha256));
+        FileObj.AddPair('size_bytes', TJSONNumber.Create(FileRecs[I].SizeBytes));
+        FilesArr.Add(FileObj);
+      end;
+      CanonicalObj.AddPair('files', FilesArr);
+
+      // Provenance: include keys in fixed order if present
+      ProvObj := TJSONObject.Create;
+      if Assigned(Bundle.Provenance) then
+      begin
+        if Bundle.Provenance.GetValue('provider') <> nil then
+          ProvObj.AddPair('provider', TJSONString.Create(Bundle.Provenance.GetValue('provider').Value));
+        if Bundle.Provenance.GetValue('worker_id') <> nil then
+          ProvObj.AddPair('worker_id', TJSONString.Create(Bundle.Provenance.GetValue('worker_id').Value));
+        if Bundle.Provenance.GetValue('session_id') <> nil then
+          ProvObj.AddPair('session_id', TJSONString.Create(Bundle.Provenance.GetValue('session_id').Value));
+        if Bundle.Provenance.GetValue('message_id') <> nil then
+          ProvObj.AddPair('message_id', TJSONString.Create(Bundle.Provenance.GetValue('message_id').Value));
+        if Bundle.Provenance.GetValue('prompt_hash') <> nil then
+          ProvObj.AddPair('prompt_hash', TJSONString.Create(Bundle.Provenance.GetValue('prompt_hash').Value));
+        if Bundle.Provenance.GetValue('response_hash') <> nil then
+          ProvObj.AddPair('response_hash', TJSONString.Create(Bundle.Provenance.GetValue('response_hash').Value));
+        if Bundle.Provenance.GetValue('created_at') <> nil then
+          ProvObj.AddPair('created_at', TJSONString.Create(Bundle.Provenance.GetValue('created_at').Value));
+      end;
+      CanonicalObj.AddPair('provenance', ProvObj);
+
+      // Metadata: sort keys
+      if Assigned(Bundle.Metadata) then
+      begin
+        MetaStr := JSONObjectToCanonicalString(Bundle.Metadata);
+        CanonicalObj.AddPair('metadata', TJSONObject.ParseJSONValue(MetaStr) as TJSONObject);
+      end
+      else
+        CanonicalObj.AddPair('metadata', TJSONObject.Create);
+
+      // Serialize compact JSON (no extra whitespace)
+      CanonicalStr := CanonicalObj.ToJSON; // Delphi's ToJSON is compact
+      CanonicalBytes := TEncoding.UTF8.GetBytes(CanonicalStr);
+      Result := 'sha256:' + SHA256HexOfBytes(CanonicalBytes);
+    finally
+      CanonicalObj.Free;
+    end;
+  finally
+    FileRecs.Free;
+  end;
+end;
+
+end.
+```
+
+**Notes**
+- Delphi JSON libraries vary; ensure `ToJSON` produces compact JSON without extra whitespace. For stricter control, implement a custom serializer.
+- The Delphi example computes `content_sha256` and `artifact_id` per the canonicalization algorithm.
+
+---
+
+### Postgres migration script (Evidence table + indexes + helper function)
+
+**File:** `migrations/001_create_evidence_table.sql`  
+```sql
+-- 001_create_evidence_table.sql
+CREATE SCHEMA IF NOT EXISTS grisp;
+
+CREATE TABLE grisp.evidence (
+  evidence_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  task_id UUID NOT NULL,
+  artifact_id TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  tool_name TEXT,
+  tool_version TEXT,
+  environment_id TEXT,
+  status TEXT NOT NULL,
+  exit_code INTEGER,
+  diagnostics JSONB,
+  stdout TEXT,
+  stderr TEXT,
+  elapsed_ms INTEGER,
+  input_hash TEXT,
+  output_hash TEXT,
+  environment JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  metadata JSONB
+);
+
+CREATE INDEX grisp_evidence_artifact_idx ON grisp.evidence (artifact_id);
+CREATE INDEX grisp_evidence_task_idx ON grisp.evidence (task_id);
+CREATE INDEX grisp_evidence_operation_idx ON grisp.evidence (operation);
+CREATE INDEX grisp_evidence_status_idx ON grisp.evidence (status);
+
+-- Restrict direct updates/deletes for immutability; grant insert/select to app role
+REVOKE UPDATE, DELETE ON grisp.evidence FROM PUBLIC;
+
+-- Helper function to insert evidence (security definer recommended)
+CREATE OR REPLACE FUNCTION grisp.record_evidence(
+  p_task_id UUID,
+  p_artifact_id TEXT,
+  p_operation TEXT,
+  p_tool_name TEXT,
+  p_tool_version TEXT,
+  p_environment_id TEXT,
+  p_status TEXT,
+  p_exit_code INTEGER,
+  p_diagnostics JSONB,
+  p_stdout TEXT,
+  p_stderr TEXT,
+  p_elapsed_ms INTEGER,
+  p_input_hash TEXT,
+  p_output_hash TEXT,
+  p_environment JSONB,
+  p_metadata JSONB
+) RETURNS UUID AS $$
+DECLARE
+  v_evidence_id UUID := gen_random_uuid();
+BEGIN
+  INSERT INTO grisp.evidence (
+    evidence_id, task_id, artifact_id, operation, tool_name, tool_version,
+    environment_id, status, exit_code, diagnostics, stdout, stderr,
+    elapsed_ms, input_hash, output_hash, environment, metadata, created_at
+  ) VALUES (
+    v_evidence_id, p_task_id, p_artifact_id, p_operation, p_tool_name, p_tool_version,
+    p_environment_id, p_status, p_exit_code, p_diagnostics, p_stdout, p_stderr,
+    p_elapsed_ms, p_input_hash, p_output_hash, p_environment, p_metadata, now()
+  );
+  RETURN v_evidence_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+```
+
+**Notes**
+- Requires `pgcrypto` extension for `gen_random_uuid()` or replace with `uuid_generate_v4()` if `uuid-ossp` is used.
+- Grant `EXECUTE` on `grisp.record_evidence` to the application role and restrict direct table writes.
+
+---
+
+### Node client example (record Evidence and query)
+
+**File:** `node_client_example.js`  
+```javascript
+// Node client example: record evidence and query
+// Requires: npm install pg
+
+const { Client } = require('pg');
+
+async function recordEvidence(client, evidence) {
+  const res = await client.query(
+    `SELECT grisp.record_evidence(
+       $1::uuid, $2::text, $3::text, $4::text, $5::text, $6::text,
+       $7::text, $8::int, $9::jsonb, $10::text, $11::text, $12::int,
+       $13::text, $14::text, $15::jsonb, $16::jsonb
+     ) AS evidence_id`,
+    [
+      evidence.task_id,
+      evidence.artifact_id,
+      evidence.operation,
+      evidence.tool_name,
+      evidence.tool_version,
+      evidence.environment_id,
+      evidence.status,
+      evidence.exit_code,
+      JSON.stringify(evidence.diagnostics || []),
+      evidence.stdout,
+      evidence.stderr,
+      evidence.elapsed_ms,
+      evidence.input_hash,
+      evidence.output_hash,
+      JSON.stringify(evidence.environment || {}),
+      JSON.stringify(evidence.metadata || {})
+    ]
+  );
+  return res.rows[0].evidence_id;
+}
+
+async function queryEvidenceByArtifact(client, artifactId) {
+  const res = await client.query(
+    `SELECT evidence_id, operation, status, created_at, diagnostics
+     FROM grisp.evidence
+     WHERE artifact_id = $1
+     ORDER BY created_at DESC
+     LIMIT 50`,
+    [artifactId]
+  );
+  return res.rows;
+}
+
+// Example usage
+(async () => {
+  const client = new Client({
+    connectionString: process.env.DATABASE_URL || 'postgres://user:pass@localhost:5432/grisp'
+  });
+  await client.connect();
+
+  const evidence = {
+    task_id: '11111111-2222-3333-4444-555555555555',
+    artifact_id: 'sha256:abcdef1234567890',
+    operation: 'compile',
+    tool_name: 'dcc64',
+    tool_version: '37.0',
+    environment_id: 'env-1',
+    status: 'failed',
+    exit_code: 1,
+    diagnostics: [{ severity: 'error', code: 'E2029', line: 4, message: 'Declaration expected but end of file found' }],
+    stdout: '',
+    stderr: 'Error: ...',
+    elapsed_ms: 1234,
+    input_hash: 'sha256:input...',
+    output_hash: 'sha256:output...',
+    environment: { os: 'Windows', arch: 'x86_64' },
+    metadata: { attempt: 1 }
+  };
+
+  const evidenceId = await recordEvidence(client, evidence);
+  console.log('Recorded evidence id:', evidenceId);
+
+  const rows = await queryEvidenceByArtifact(client, evidence.artifact_id);
+  console.log('Evidence rows:', rows);
+
+  await client.end();
+})();
+```
+
+---
+
+### Delphi client example (record Evidence and query)
+
+**Unit:** `GrispEvidenceClient.pas`  
+```pascal
+unit GrispEvidenceClient;
+
+interface
+
+uses
+  System.SysUtils, System.Classes, Data.DB, FireDAC.Comp.Client, System.JSON;
+
+type
+  TGrispEvidenceClient = class
+  private
+    FConn: TFDConnection;
+  public
+    constructor Create(const AConnectionString: string);
+    destructor Destroy; override;
+    function RecordEvidence(
+      const TaskId, ArtifactId, Operation, ToolName, ToolVersion, EnvironmentId,
+      Status: string; ExitCode: Integer; Diagnostics: TJSONArray; StdOut, StdErr: string;
+      ElapsedMs: Integer; InputHash, OutputHash: string; EnvironmentObj, MetadataObj: TJSONObject): string;
+    function QueryEvidenceByArtifact(const ArtifactId: string): TJSONArray;
+  end;
+
+implementation
+
+uses
+  FireDAC.Stan.Def, FireDAC.Stan.Pool, FireDAC.Stan.Async, FireDAC.Phys, FireDAC.Phys.PG, FireDAC.DApt;
+
+constructor TGrispEvidenceClient.Create(const AConnectionString: string);
+begin
+  inherited Create;
+  FConn := TFDConnection.Create(nil);
+  FConn.Params.Text := AConnectionString;
+  FConn.LoginPrompt := False;
+  FConn.Connected := True;
+end;
+
+destructor TGrispEvidenceClient.Destroy;
+begin
+  FConn.Free;
+  inherited;
+end;
+
+function TGrispEvidenceClient.RecordEvidence(
+  const TaskId, ArtifactId, Operation, ToolName, ToolVersion, EnvironmentId,
+  Status: string; ExitCode: Integer; Diagnostics: TJSONArray; StdOut, StdErr: string;
+  ElapsedMs: Integer; InputHash, OutputHash: string; EnvironmentObj, MetadataObj: TJSONObject): string;
+var
+  Q: TFDQuery;
+begin
+  Q := TFDQuery.Create(nil);
+  try
+    Q.Connection := FConn;
+    Q.SQL.Text := 'SELECT grisp.record_evidence(:task_id, :artifact_id, :operation, :tool_name, :tool_version, :environment_id, ' +
+                  ':status, :exit_code, :diagnostics::jsonb, :stdout, :stderr, :elapsed_ms, :input_hash, :output_hash, :environment::jsonb, :metadata::jsonb) AS evidence_id';
+    Q.ParamByName('task_id').AsString := TaskId;
+    Q.ParamByName('artifact_id').AsString := ArtifactId;
+    Q.ParamByName('operation').AsString := Operation;
+    Q.ParamByName('tool_name').AsString := ToolName;
+    Q.ParamByName('tool_version').AsString := ToolVersion;
+    Q.ParamByName('environment_id').AsString := EnvironmentId;
+    Q.ParamByName('status').AsString := Status;
+    Q.ParamByName('exit_code').AsInteger := ExitCode;
+    Q.ParamByName('diagnostics').AsString := IfThen(Assigned(Diagnostics), Diagnostics.ToString, '[]');
+    Q.ParamByName('stdout').AsString := StdOut;
+    Q.ParamByName('stderr').AsString := StdErr;
+    Q.ParamByName('elapsed_ms').AsInteger := ElapsedMs;
+    Q.ParamByName('input_hash').AsString := InputHash;
+    Q.ParamByName('output_hash').AsString := OutputHash;
+    Q.ParamByName('environment').AsString := IfThen(Assigned(EnvironmentObj), EnvironmentObj.ToString, '{}');
+    Q.ParamByName('metadata').AsString := IfThen(Assigned(MetadataObj), MetadataObj.ToString, '{}');
+    Q.Open;
+    Result := Q.FieldByName('evidence_id').AsString;
+  finally
+    Q.Free;
+  end;
+end;
+
+function TGrispEvidenceClient.QueryEvidenceByArtifact(const ArtifactId: string): TJSONArray;
+var
+  Q: TFDQuery;
+  Arr: TJSONArray;
+  Obj: TJSONObject;
+begin
+  Q := TFDQuery.Create(nil);
+  Arr := TJSONArray.Create;
+  try
+    Q.Connection := FConn;
+    Q.SQL.Text := 'SELECT evidence_id, operation, status, created_at, diagnostics FROM grisp.evidence WHERE artifact_id = :artifact_id ORDER BY created_at DESC LIMIT 50';
+    Q.ParamByName('artifact_id').AsString := ArtifactId;
+    Q.Open;
+    while not Q.Eof do
+    begin
+      Obj := TJSONObject.Create;
+      Obj.AddPair('evidence_id', Q.FieldByName('evidence_id').AsString);
+      Obj.AddPair('operation', Q.FieldByName('operation').AsString);
+      Obj.AddPair('status', Q.FieldByName('status').AsString);
+      Obj.AddPair('created_at', Q.FieldByName('created_at').AsString);
+      Obj.AddPair('diagnostics', TJSONObject.ParseJSONValue(Q.FieldByName('diagnostics').AsString) as TJSONValue);
+      Arr.Add(Obj);
+      Q.Next;
+    end;
+    Result := Arr;
+  finally
+    Q.Free;
+  end;
+end;
+
+end.
+```
+
+**Notes**
+- The Delphi example uses FireDAC and assumes a PostgreSQL driver is configured. Adjust connection string and driver settings as needed.
+- Use parameterized queries to avoid SQL injection.
+
+---
+
+### Integration notes, tests, and verification
+
+- **Round‑trip test:** For each file in a bundle, compute `content_sha256` using both Node and Delphi implementations and assert equality. Then compute `artifact_id` from canonical bytes and assert equality across implementations.
+- **Regression Test #001:** Use the parser to attempt to parse the malformed HelloWorld provider output; it must return `PARSE_ERROR` and no evidence with `operation='compile'` and `status='ok'` should be recorded.
+- **DB permissions:** Grant only the application role `EXECUTE` on `grisp.record_evidence` and `SELECT` on `grisp.evidence`. Deny `UPDATE`/`DELETE` to enforce immutability.
+- **Canonical serializer caution:** If you require absolute byte-for-byte compatibility with other languages, implement a strict canonical JSON serializer (control character escaping, stable number formatting). The Node/Delphi examples use compact JSON; for production, replace with a canonical JSON library or implement RFC‑8785 style canonicalization.
+
+---
+
+If you want, I can now:
+- produce a **test vector** (concrete JSON bundle + expected `artifact_id`) and a small test harness that verifies Node and Delphi implementations produce the same `artifact_id`, or
+- generate a **Docker Compose** example that runs Postgres, the Node client test, and a mock GRISP harness to demonstrate recording evidence end‑to‑end.
+
+Which would you like next?
+
+
+
+
+### Short answer
+Yes. You are shifting GRISP from a **subjective LLM orchestration** into a **deterministic, evidence‑driven AI engineering platform** where LLMs are untrusted reasoning workers and every decision is backed by verifiable evidence.
+
+---
+
+### What that shift actually means
+- **LLMs become workers, not authorities** — they propose, critique, and repair, but they do not decide acceptance.  
+- **Objective evidence is primary** — parsing, compile results, test runs, hashes, and policy checks form the acceptance gates.  
+- **Deterministic pipelines replace heuristics** — state machines, canonical artifact formats, and explicit transitions remove ambiguity.  
+- **Provenance and auditability are first‑class** — every artifact and operation is recorded with hashes, timestamps, and tool evidence.  
+- **Browser adapters become transports** — Firefox (GARP) streams provider output reliably; GRISP parses and validates at the boundary.
+
+---
+
+### Key benefits you gain
+- **Reliability** — fewer false positives (no more “accepted despite compile failures”).  
+- **Reproducibility** — canonical bundle bytes and evidence records let you re-run and verify results deterministically.  
+- **Security and policy control** — capability gating and risk classification prevent accidental privilege escalation.  
+- **Explainability and audit trails** — every acceptance decision points to concrete evidence.  
+- **Better provider management** — capability‑specific reliability and Bayesian scoring let you pick the right worker for the job.
+
+---
+
+### Tradeoffs and costs
+- **Engineering effort** — building evidence DB, canonicalization, GARP, and state machine is nontrivial.  
+- **Latency and compute** — objective verification (compile/test/re-run) increases runtime and resource use.  
+- **Operational complexity** — sandboxing, transactional commits, and provenance storage require ops discipline.  
+- **User experience** — strict fail‑closed behavior needs clear UX for drafts, forced commits, and human approvals.
+
+---
+
+### Practical next steps you can take immediately
+- **Add the ArtifactBundle and Evidence schemas** to your codebase and enforce them at the GRISP boundary.  
+- **Implement the canonicalization and hashing** for bundles and file contents.  
+- **Gate commits on compile/test evidence** (RequireTestsPass default true).  
+- **Upgrade Firefox adapter to include request_id, session_id, and streaming events** (GARP fast path).  
+- **Add Regression Test #001** (HelloWorld) to CI to prevent regressions.
+
+---
+
+### Offer of help
+I can produce any of the following next, ready to drop into your repo:
+- **Reference canonicalizer test vector** that both Node and Delphi implementations must match.  
+- **GARP/1.0 reference gateway skeleton** (framing + example events) for Firefox.  
+- **Evidence DB migration and example queries** (Postgres) plus a small test harness.  
+- **A CI job template** that enforces the acceptance gates and Regression Test #001.
+
+Tell me which of those you want first and I’ll generate the code and tests.
+
+
+
+
+**GARP** stands for **GRISP AI Relay Protocol** — the framed, event‑driven transport spec that GRISP uses to communicate with the Firefox AI Gateway (request/session/tab correlation, streaming deltas, cancellation, and structured events).
