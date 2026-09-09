@@ -1,0 +1,144 @@
+You are **absolutely right** – Tree‑Sitter and LSP are over‑engineering for this use case. **Asking the AI model itself** to analyse the code and generate appropriate tests is not only simpler, but it leverages the LLM’s greatest strength: **understanding semantic intent from raw source code**.
+
+Let’s look at why the current implementation fails, and why a pure‑prompt approach is the superior fix.
+
+---
+
+## Why the Current Agent Fails (Even Though It Already Includes the Code)
+
+In `MLCRD_FirefoxPeer.pas` (and the heuristic peer), the `ProposeTestProgram` prompt is:
+
+```
+Task: %s
+Implementation under test:
+%s
+Write a complete C test program with a main() function and assert() statements
+testing both normal operations and edge cases (zero inputs, overflow, negative values).
+```
+
+**Two fatal flaws:**
+1. **Hardcoded language** – “Write a complete **C** test program” – this forces C regardless of what the repair actually is.
+2. **Hardcoded scenario** – “testing both normal operations and edge cases (zero inputs, overflow, negative values)” – this *bias* makes the LLM (or heuristic) produce a division‑by‑zero test even if the repair is a string‑sorting function.
+
+If we simply **fix the prompt** to be language‑agnostic and code‑aware, the LLM will naturally inspect the code and invent relevant edge cases.
+
+---
+
+## The Pure‑Prompt Fix (No Parser Required)
+
+### New Prompt Template
+```
+Task: %s
+
+Implementation under test (written in %s):
+%s
+
+Please write a complete, self-contained test program in the same language (%s) that:
+- Includes a test runner (e.g., main() with assertions, or a DUnit/fpcunit skeleton).
+- Thoroughly tests all public functions present in the implementation.
+- Covers typical use cases, edge cases, and error conditions specific to this code (e.g., if it does division, test zero divisor; if it does sorting, test empty list; if it does parsing, test malformed input).
+
+Output only the complete test program code, enclosed in a single markdown code block.
+```
+
+**What this achieves:**
+- The LLM receives the **actual code** and the **target language**.
+- It invents test cases that are **specific to that code**, not generic division.
+- It outputs in the **correct language**.
+- No Tree‑Sitter, no LSP, no project file setup – just one API call.
+
+---
+
+## What About the Heuristic Peer (No LLM)?
+
+`THeuristicPeer` currently hardcodes C division tests. That’s because it’s a deterministic stub, not an LLM.  
+**Solution:** Keep the heuristic peer as a **fallback**, but make it generate a **generic test harness** in the target language using a simple template registry.  
+E.g., for Pascal, it outputs:
+```pascal
+program TestHarness;
+begin
+  Writeln('Running tests...');
+  // Basic assertions for known functions (if regex finds them)
+end.
+```
+If the heuristic peer cannot reliably extract functions, it can fall back to a “manual test” placeholder – but the **LLM peers** (Firefox/Web) will handle the real test generation.
+
+---
+
+## A Tiny Regex Is All You Need to *Guide* the LLM (Optional)
+
+If you want to be extra safe and prevent the LLM from hallucinating function names, you can use a **very simple regex** (without full AST parsing) to extract function/procedure names from the repair code. Then inject that list into the prompt.
+
+**For Pascal/Delphi:**
+```pascal
+function\s+(\w+)\s*\(|\bprocedure\s+(\w+)\s*\(
+```
+
+**Then the prompt becomes:**
+```
+The code contains the following functions/procedures to test: [ExtractedNames].
+Please write tests specifically for these.
+```
+
+This gives the LLM a concrete anchor. It costs almost nothing to implement and avoids the complexity of Tree‑Sitter.
+
+---
+
+## Comparison: Tree‑Sitter / LSP vs. Pure‑LLM
+
+| **Aspect**                | **Tree‑Sitter / LSP**                         | **Pure‑LLM (Better Prompt)**                         |
+|---------------------------|-----------------------------------------------|------------------------------------------------------|
+| **Implementation effort** | Days to weeks (bindings, process management)  | 10–15 minutes (change the prompt string)             |
+| **Error tolerance**       | Tree‑Sitter handles syntax errors, LSP fails | LLM handles broken code naturally (inference)        |
+| **Language support**      | Requires grammar for each language            | Works for any language the LLM knows                 |
+| **Edge case detection**   | Only syntactic; cannot infer *intent*         | Infers semantic edge cases (e.g., queue empty, file not found) |
+| **Maintenance**           | High (grammar updates, versioning)            | Low (just prompt engineering)                        |
+| **Test quality**          | Gives you function names, you still write boilerplate | LLM writes the entire test harness with meaningful values |
+
+---
+
+## The Recommended Final Architecture
+
+1. **CLI `--lang`** → set `Config.PreferredLanguage`.
+2. **In `ProposeTestProgram`**:
+   - For **LLM‑backed peers** (Firefox, WebClient): Use the *pure‑prompt* approach above. Pass the code, the language, and optionally a regex‑extracted function list.
+   - For **heuristic peer**: Use a template registry that spits out a minimal, language‑specific test skeleton.
+3. **Skip Tree‑Sitter and LSP entirely** – they add zero value compared to the LLM’s built‑in comprehension, especially for the short repair snippets the agent handles.
+
+---
+
+## Concrete Example: Before vs. After
+
+**Before (hardcoded C division prompt):**
+```pascal
+PromptText := Format('... Write a complete C test program ... testing zero inputs, overflow');
+```
+→ *Always generates division‑by‑zero tests.*
+
+**After (code‑aware, language‑agnostic prompt):**
+```pascal
+PromptText := Format(
+  'Implementation under test (in %s):'#13#10 +
+  '%s'#13#10 +
+  'Write a complete test program in %s that tests all functions in this code, ' +
+  'focusing on the specific edge cases relevant to this code.',
+  [Config.PreferredLanguage, Repair.Content, Config.PreferredLanguage]
+);
+```
+→ *If the code is a `TStringList` sorter, it generates tests with empty lists, duplicate strings, and Unicode. If it’s a parser, it tests malformed input.* The LLM just does the right thing.
+
+---
+
+## Final Verdict
+
+**You are correct** – Tree‑Sitter and LSP are unnecessary complexity.  
+The agent’s malfunction is **100% a prompt‑engineering and language‑propagation bug**, not a parsing deficiency.  
+By:
+- Adding `--lang` and making it authoritative,
+- Removing the hardcoded “C” and “division” from test‑generation prompts,
+- Passing the actual repair code with a clear instruction to test *what is present*,
+
+you will immediately fix test generation without any external parsing libraries.
+
+If you want to be ultra‑robust, add that 5‑line regex to extract function names – it’s trivial and gives the LLM a useful hint, but it’s not even strictly necessary for modern LLMs (DeepSeek, Claude, Gemini).  
+**I strongly recommend this pure‑prompt approach** as the primary fix.

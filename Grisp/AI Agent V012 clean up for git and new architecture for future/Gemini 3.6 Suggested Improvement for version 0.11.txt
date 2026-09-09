@@ -1,0 +1,93 @@
+### Source Code Analysis & Architecture Overview
+
+The provided unit files (`MLCRD_Coordinator.pas`, `MLCRD_FirefoxPeer.pas`, `MLCRD_Types.pas`, and `MLCRD_Adapters.pas`) implement a **Multi-LLM Cooperative Repair and Debugging (MLCRD)** agent architecture target written for Object Pascal (Delphi / FreePascal).
+
+Here is a structural breakdown of the framework's mechanics and workflow:
+
+#### 1. Core Architecture & 12-Phase Execution Protocol
+
+The orchestration center is `TMultiLLMAgent` in `MLCRD_Coordinator.pas`. It implements a 12-phase multi-agent consensus workflow:
+
+* **Phase 1: Candidate Generation** – Web/LLM peers propose initial implementations for the given prompt.
+
+
+* **Phase 2: Cross-Critique** – Each peer reviews other candidates, detecting bugs, boundary conditions, or overflow issues.
+
+
+* **Phase 3: Repair Proposal** – Peers submit corrected code containing markdown blocks tagged with target filenames (`delphi:MyUnit.pas`).
+
+
+* **Phase 4: Capability Negotiation** – Dynamically negotiates sandboxed execution capabilities (e.g., `compile`, `run`, `test_execute`).
+
+
+* **Phase 5 & 6: Lightweight & Deep Debugging** – Runs quick syntax checks via `TGrispTestAdapterImpl` and generates multi-peer test suites. Non-trivial code triggers test generation and compile/run verification inside workspace isolation.
+
+
+* **Phase 7 & 8: Scoring & Decision Selection** – Weighted scoring ranks the candidate repairs based on zero-guard presence, overflow checks, and test passes to choose the best plan.
+
+
+* **Phase 9–10: GRISP Validation & Execution** – The final plan is submitted to `TGrispHarnessAdapterImpl` and files are exported directly into `/workspace/`.
+
+
+* **Phase 11–12: Peer Reliability Updating & Reporting** – Reliability metrics are dynamically adjusted depending on test passes or GRISP rejects, generating a full `TProtocolTrace` report.
+
+
+
+---
+
+#### 2. Key Component Breakdown
+
+* **`TFirefoxChatAIPeer` (`MLCRD_FirefoxPeer.pas`)**:
+* Implements `IWebLLMPeer` to interface with browser-driven LLM instances (e.g., DeepSeek, Gemini, Claude, ChatGPT, Grok) via a local TCP bridge (`DEFAULT_FIREFOX_PORT = 9999`).
+
+
+* Contains specialized parsers (`ExtractAllCodeBlocks`, `ExtractBulletIssues`, `ExtractCapabilitiesFromText`) to extract clean code, filenames, and structured critiques out of raw markdown responses.
+
+
+
+
+* **`TGrispCompilerRegistry` & `TRealCompiler` (`MLCRD_Adapters.pas`)**:
+* Provides native build integration for Pascal/Delphi (`dcc32`, `fpc`) and C compilers (`gcc`, `clang`).
+
+
+* Features cross-platform process execution hooks (utilizing Windows API `CreateProcess`/Pipes or FreePascal `TProcess`) to safely compile and execute test suites with configurable timeout limits.
+
+
+
+
+* **`TFileEntry` & Multi-File Support (`MLCRD_Types.pas`)**:
+* Supports complex solutions comprising multiple units or header files by storing arrays of target filenames and content (`TFileEntry`), resolving fallback file naming via heuristic pattern detection (`GuessFileNameFromContent`).
+
+
+
+An analysis of the GRISP AI Agent source files and execution log reveals several key operational bottlenecks, Web UI scraping artifacts, and architectural gaps between the multi-peer agent coordinator and the GRISP graph kernel.
+
+**Web UI Artifact Sanitization**
+
+* **Issue**: The debug log reveals residual web browser DOM text appended to model responses (e.g., `delphiCopyDownload`, `Pascal/Delphi:HelloWorld.dprCopyDownload`, and `Code snippetprogram`).
+* **Improvement**: Implement a post-processing text filter in `MLCRD_FirefoxPeer.pas` or `MLCRD_Utils.pas` that strips Web UI element text (`CopyDownload`, `Code snippet`, `Download`, etc.) and markdown code block wrappers before code parsing.
+
+**Critique Aggregation & Encoding Fixes**
+
+* **Issue**: In Phase 3 (`RepairCandidate`), the aggregated critique prompt contains corrupt replacement characters (`\uFFFD\uFFFD\uFFFDstandard project`) and broken list fragments (e.g., `- {$APPTYPE CONSOLE} Fix: Suggestion for a fix:`).
+* **Improvement**: Standardize internal string encoding to UTF-8 when building prompts. Structure candidate critiques as a clean JSON array or sanitized bullet points rather than raw string concatenation.
+
+**Non-Interactive Code Safeguards**
+
+* **Issue**: LLM peers repeatedly recommended adding `ReadLn` to keep console windows persistent. In headless automated testing and VFS sandboxed execution, `ReadLn` causes process execution to block indefinitely on `stdin`.
+* **Improvement**: Append an explicit directive to system prompts: *"Do not include blocking interactive input statements (such as ReadLn or ReadKey) in program implementations unless specifically requested by the task."*
+
+**Deep Kernel Graph (`TGrispGraph`) Integration**
+
+* **Issue**: `GrispAgentCLI.dpr` instantiates `TGrispGraph`, but task traces, candidate revisions, peer critiques, and code dependencies are held in volatile memory or JSON strings rather than the graph database.
+* **Improvement**: Model the agent state inside `TGrispGraph`. Represent LLM peers, candidates, test cases, and capability requests as distinct graph nodes (`PeerNode`, `CodeNode`, `CritiqueNode`) connected by directed edge relationships (`PROPOSED`, `CRITIQUED`, `REPAIRED`).
+
+**Custom Directory Routine Standardization**
+
+* **Issue**: Line 186 in `GrispAgentCLI.dpr` uses standard `ForceDirectories` to set up the debug log path (`ForceDirectories(TPath.GetDirectoryName(DebugLogPath));`).
+* **Improvement**: Replace `ForceDirectories` with a custom directory creation routine using Windows API or iterative directory creation to match project standards.
+
+**Response Schema Guards for Capability Requests**
+
+* **Issue**: In Phase 4 (`RequestCapabilities`), Gemini returned an unformatted program code block along with text explanation instead of strict comma-separated keywords.
+* **Improvement**: Enforce strict JSON schema responses or apply regex filtering on capability responses to guarantee clean extraction of capability identifiers (`compile, run, test_execute`).

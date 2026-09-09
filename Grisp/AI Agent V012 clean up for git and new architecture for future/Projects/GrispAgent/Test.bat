@@ -1,0 +1,2 @@
+GrispAgentCLI -t "write a hello world program using the programming language Delphi" --trace --workspace "g:\junk\testme" --lang delphi --compiler "C:\Tools\RAD Studio\37.0\bin64" --firefox --port 9999 --sites deepseek,gemini --debug --trace --prompt-tag
+pause

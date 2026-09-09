@@ -1,0 +1,349 @@
+### Analysis of provided artifacts (source, logs, terminal output)
+
+Below I analyze the **GrispAgentCLI** source, the **MLCRD_Adapters** implementation, the **terminal run output**, and the **grisp_debug.log** you attached. I summarize what the agent actually did, identify weaknesses and root causes, and give prioritized, concrete improvements (design, code, testing, and operational) to make the agent more robust, accurate, and reliable.
+
+---
+
+### What the artifacts show (concise summary)
+- **What ran:** `GrispAgentCLI` launched a task: *"write a hello world program using the programming language Delphi"*, with Firefox-based peers enabled (`deepseek`, `gemini`) and Delphi compiler path set to `C:\Tools\RAD Studio\37.0\bin64`. Debugging, prompt-tagging, trace and workspace options were enabled.
+- **Agent behavior:** The multi-peer agent solicited candidate code from two web peers (deepseek, gemini). Each peer returned minimal Delphi console programs. The agent ran an automated test harness that wrote temporary files and attempted to compile them with the configured Delphi compiler. Multiple generated tests failed with the Delphi compiler reporting `E2029 Declaration expected but end of file found` for the temporary files.
+- **Final output:** Despite compilation failures for the generated *tests*, the agent selected a final solution (a robust HelloWorld program with `System.SysUtils`, try/except, ReadLn) and wrote `/workspace/program.txt`. The agent reported tests generated & run: 8, and peer reliabilities slightly reduced but still high.
+- **Logs show:** The debug log contains the exact prompts sent to peers (with `<!-- DEBUG: ... -->` tags), the raw responses, critique and repair cycles, and the repair outputs. The debug log also shows the agent asked peers to output code in a single markdown code block with a filename header, and the peers returned code but included extra text (e.g., `delphiCopyDownloadprogram HelloWorld;` or `Delphiprogram HelloWorld;`) — i.e., the peer outputs contained concatenated tokens or formatting artifacts.
+
+Two short excerpts from the uploaded logs illustrate the behavior:
+> `You are a senior systems engineer. Write a valid Delphi console application that prints "Hello, World!". ... Output ONLY the code enclosed in a single markdown code block.`  
+> Peer responses (examples): `delphiCopyDownloadprogram HelloWorld; ...` and `Delphiprogram HelloWorld; ...`
+
+---
+
+### Key problems observed (symptoms and likely causes)
+
+#### 1) **Compilation failures of generated tests (E2029 Declaration expected but end of file found)**
+- **Symptom:** Delphi compiler errors point to the temporary test files (`grisp_test_*.txt`) and report `Declaration expected but end of file found` at line 4.
+- **Likely causes:**
+  - **Malformed test files**: The temporary files appear to have `.txt` extension and contain code that is not valid Delphi source (possibly missing final `.` or missing `end.` or containing extra non-code tokens).
+  - **Peer output formatting artifacts**: The debug log shows peers returning strings like `delphiCopyDownloadprogram HelloWorld;` or `Delphiprogram HelloWorld;` — these are concatenated tokens (site labels, "CopyDownload", or filename headers) that were not stripped before writing to the compiler input.
+  - **Agent expectation mismatch**: The agent asked for code inside a single markdown code block with a filename header (e.g., ```Pascal/Delphi:HelloWorld.dpr```) but the code returned by peers included extra prefixes/suffixes or lacked proper code fences. The agent's parser that extracts code from peer responses likely failed to robustly extract only the code block content.
+  - **Temporary file naming/extension mismatch**: The test harness wrote files with `.txt` extension (see `grisp_test_... .txt`) instead of `.dpr` or `.pas`, which may confuse the Delphi compiler or the registry logic that expects `.pas`/`.dpr`. The compiler error referencing `.txt` suggests the file content or extension was wrong.
+
+#### 2) **Peer output normalization/parsing is brittle**
+- **Symptom:** Peer responses include site-specific prefixes, capitalization differences, or appended tokens (e.g., `delphiCopyDownload`, `Delphiprogram`), and the agent still wrote them to disk for compilation.
+- **Likely causes:**
+  - **Insufficient sanitization**: The agent's code that extracts code from peer responses does not robustly strip non-code text, code fences, or site-specific artifacts.
+  - **Overly strict prompt format**: The agent required a filename header in the markdown block; peers sometimes prepend site labels or other UI tokens. The agent's parser should be tolerant to such variations.
+
+#### 3) **Test harness and compiler registry fragility**
+- **Symptom:** The `TGrispCompilerRegistry.GetCompilerForLanguage` and `TGrispTestAdapterImpl.ExecuteInternalTest` rely on file naming and language mapping that can fail when inputs are unexpected.
+- **Likely causes:**
+  - **Language vs. file extension mismatch**: `ExecuteInternalTest` chooses file extension based on `Language.ToLower = 'c'` or `'pascal'/'delphi'` string comparisons, but the `Compiler` is selected using `FConfig.PreferredLanguage` (an enum) — mismatch between the textual `Language` parameter and the configured enum can cause wrong compiler selection or exceptions (note: registry raises for Python).
+  - **Temporary file extension `.txt` used**: The debug output shows `.txt` files being compiled; Delphi expects `.dpr` or `.pas`. The registry/adapter should ensure correct extension and file content before invoking compiler.
+  - **RunProcess and CreateProcess handling**: The `RunProcess` implementation is complex and platform-dependent; timeouts or partial reads could mask errors. But primary issue is malformed source.
+
+#### 4) **Prompt engineering and peer instruction leakage**
+- **Symptom:** The debug prompts include `<!-- DEBUG: ... -->` tags and explicit instructions to output only code blocks with filename headers. Peers still returned extraneous tokens.
+- **Likely causes:**
+  - **Peers (web LLMs) sometimes include UI artifacts** (e.g., "CopyDownload", site labels) or ignore strict formatting constraints. The agent should not assume perfect compliance.
+  - **Prompt-tagging enabled**: The agent inserted debug comments into prompts (`EnablePromptTagging := PromptTag`), which may have influenced peer outputs or introduced tokens that peers echoed back.
+
+#### 5) **Agent decision despite failing tests**
+- **Symptom:** The agent selected a final solution and wrote `/workspace/program.txt` even though generated tests failed repeatedly.
+- **Likely causes:**
+  - **Scoring logic tolerates test failures**: The agent's selection criteria appear to weigh peer reliability and repairs and may accept a repaired candidate even if tests failed, or the final "chosen" solution may be the repaired code produced by peers (not the compiled test).
+  - **False-positive success reporting**: The agent reports "Plan committed and persisted" and writes files even when the test harness failed to compile the temporary test files. This can mislead users.
+
+---
+
+### Root causes (summary)
+1. **Poorly robust parsing of peer responses** — the agent writes raw peer output to files without reliably extracting only the code content.
+2. **Mismatch between expected file types and actual temporary file names/extensions** — `.txt` files used for Delphi code; compiler expects `.dpr`/`.pas`.
+3. **Over-reliance on peers following strict output formatting** — web peers often include UI tokens or deviate from exact format; agent must sanitize.
+4. **Insufficient validation before compilation** — no pre-compile sanity checks (e.g., ensure file begins with `program` or `unit`, ends with `end.`) and no fallback parsing.
+5. **Scoring/selection logic allows committing solutions despite failing automated tests** — agent should not commit code that fails compilation unless explicitly allowed.
+6. **Prompt-tagging and debug comments may leak into outputs** — debug tags are included in prompts and may be echoed back, complicating parsing.
+
+---
+
+### Concrete, prioritized improvements
+
+Below are **practical changes** (code + design + process) to address the problems. I order them by impact and ease of implementation.
+
+---
+
+#### A — Immediate fixes (high impact, low-to-medium effort)
+
+1. **Robust code extraction / sanitization layer (must implement)**
+   - **What:** Before writing any peer response to disk for compilation, run a sanitizer that:
+     - Extracts the content of the first code block if present (detect triple backticks ``` and language header).
+     - If no code fence is present, heuristically extract the longest contiguous block that looks like source (starts with `program`/`unit`/`{$APPTYPE` or `uses`).
+     - Strip leading site labels, "CopyDownload", "Delphi", or other non-code prefixes using a whitelist/regex.
+     - Remove any trailing non-code tokens.
+   - **Why:** Prevents UI artifacts and prompt echoes from being compiled.
+   - **How to test:** Unit tests for the sanitizer with representative peer outputs (from logs) and edge cases.
+
+2. **Ensure correct file extension and header/footer validation**
+   - **What:** Map language to canonical file extension and ensure the temporary filename uses `.dpr` or `.pas` for Delphi. Validate that the file content ends with `end.` (Delphi program) or otherwise is syntactically plausible before invoking compiler.
+   - **Why:** Delphi compiler errors referencing `.txt` will disappear if correct extension and content are used.
+   - **How to test:** Add tests that simulate writing sanitized code to `.dpr` and invoking compiler in a dry-run mode.
+
+3. **Pre-compile sanity checks**
+   - **What:** Implement a lightweight syntax sanity check before invoking the external compiler:
+     - For Delphi: check for `program` or `unit` at top, presence of `begin`/`end.` pairs, and no obvious binary/HTML content.
+     - If sanity check fails, mark candidate as invalid and request repair rather than compiling.
+   - **Why:** Avoids wasting compiler cycles and provides clearer diagnostics to peers.
+
+4. **Strip debug/prompt-tag comments from peer outputs**
+   - **What:** Remove `<!-- DEBUG: ... -->` and similar tags from peer responses before parsing code.
+   - **Why:** Prevents debug tags from being echoed into code.
+
+---
+
+#### B — Medium-term architectural improvements (medium impact)
+
+5. **Improve parser to accept multiple code block styles**
+   - **What:** Accept code blocks with or without language header, accept fenced blocks with filename header like `Pascal/Delphi:HelloWorld.dpr`, and parse accordingly.
+   - **Why:** Peers sometimes include filename headers or different fence styles; robust parsing reduces failures.
+
+6. **Add a "preflight" compilation mode**
+   - **What:** Implement a `--dry-compile` or `CheckOnly` mode that runs a fast syntax-only check (if compiler supports it) or a static analyzer before full compile/run.
+   - **Why:** Faster feedback loop and safer test harness.
+
+7. **Tighten the test harness file lifecycle**
+   - **What:** Ensure temporary files are created with correct extensions, unique names, and are cleaned up reliably. Log the sanitized content written to disk for traceability.
+   - **Why:** Easier debugging and reproducibility.
+
+8. **Harden `TGrispCompilerRegistry` and `TRealCompiler`**
+   - **What:** Add more robust detection of compiler executables, better error messages when compiler path is a directory vs. executable, and fallback strategies (e.g., try `dcc32`, `dcc64`, `fpc`).
+   - **Why:** Avoid exceptions and ambiguous errors when `Config.CompilerPath` is a directory.
+
+---
+
+#### C — Agent-level behavior and scoring (high impact)
+
+9. **Do not commit/persist solutions that fail compilation/tests**
+   - **What:** Change commit logic so that the agent **only** writes final solution to workspace if it passes compilation and configured tests (unless user explicitly allows committing untested code).
+   - **Why:** Prevents false-positive success reports and avoids persisting broken code.
+   - **How:** Add a `RequireTestsPass` flag in `TAgentConfiguration` (default true) and gate the final commit on test success.
+
+10. **Better repair loop and explicit repair requests**
+    - **What:** When a candidate fails sanity checks or compilation, create a structured repair prompt that includes:
+      - The sanitized code,
+      - The compiler error output,
+      - The exact file content and filename,
+      - A clear instruction: "Produce a corrected Delphi program that compiles with Embarcadero Delphi 37.0; output only the code block."
+    - **Why:** Gives peers precise context to fix the exact problem.
+
+11. **Peer response validation and rejection**
+    - **What:** After sanitization, validate candidate against a set of rules (compilable, no extraneous tokens). If invalid, mark peer candidate as rejected and reduce reliability accordingly.
+    - **Why:** Prevents bad peers from polluting the candidate pool.
+
+---
+
+#### D — Prompting and peer management (medium impact)
+
+12. **Relax strict formatting requirements in prompts and add tolerant parsing**
+    - **What:** Instead of requiring *exact* single code-block output with filename header, instruct peers to *prefer* that format but make the agent tolerant to variations. Provide examples of acceptable outputs.
+    - **Why:** Real-world LLMs sometimes add UI tokens; tolerant parsing reduces brittleness.
+
+13. **Avoid echoing debug tags into prompts sent to peers**
+    - **What:** Keep debug tags local to logs; do not include them in the user-visible prompt text sent to peers. If prompt-tagging is needed, send it in a separate metadata channel (if available) rather than inline.
+    - **Why:** Prevents peers from echoing debug comments into code.
+
+14. **Peer capability profiling and adaptive selection**
+    - **What:** Track types of errors each peer tends to produce (formatting artifacts vs. logic bugs) and prefer peers that historically produce clean, compilable code for compile-sensitive tasks.
+    - **Why:** Improves candidate quality over time.
+
+---
+
+#### E — Observability, testing, and developer ergonomics (low-to-medium effort)
+
+15. **Add unit tests for the full pipeline**
+    - **What:** Create tests that simulate peer outputs (including malformed ones from logs) and assert that the sanitizer + preflight + compile pipeline behaves correctly.
+    - **Why:** Prevent regressions and make future changes safer.
+
+16. **Improve debug logging and traceability**
+    - **What:** Log sanitized content written to disk, the exact compiler command line, and the compiler stdout/stderr. Keep these logs separate from raw peer logs to avoid confusion.
+    - **Why:** Faster root-cause analysis.
+
+17. **User-facing diagnostics**
+    - **What:** When compilation fails, present the user with:
+      - The sanitized code that was compiled,
+      - The compiler error output,
+      - A suggested next step (request repair, open interactive mode, or accept uncompiled code).
+    - **Why:** Makes failures actionable for users.
+
+---
+
+### Concrete code-level suggestions (where to change)
+
+- **Where to add sanitizer:** In the code path that receives peer responses and before `TGrispTestAdapterImpl.ExecuteInternalTest` is called. Add a function like `function SanitizePeerResponse(const Raw: string; out Filename, Language, Code: string): Boolean;` that returns the cleaned code and filename.
+- **Where to ensure extension:** In `ExecuteInternalTest`, after `SourcePath` is computed, ensure extension matches language:
+  ```pascal
+  if (Language = 'delphi') or (Language = 'pascal') then
+    SourcePath := TPath.ChangeExtension(SourcePath, '.dpr');
+  ```
+- **Where to validate content:** Add `IsLikelyDelphiSource(Code: string): Boolean` checks (regex for `program|unit`, `begin`, `end.`).
+- **Where to gate commit:** In `GrispAgentCLI` after `Agent.RunTask`, check `Agent.LastFeedback.TestPassed` (or similar) before writing to workspace.
+
+---
+
+### Testing plan (practical steps)
+1. **Unit tests for sanitizer** using the exact peer outputs from `grisp_debug.log` and `Terminal.txt`.
+2. **Integration test**: simulate a peer returning a malformed response; assert the agent rejects it and requests repair rather than compiling.
+3. **End-to-end test**: run the agent with a local Delphi compiler and a mock peer that returns a correct code block; assert compilation succeeds and final commit occurs.
+4. **Fuzz tests**: feed random UI artifacts and ensure sanitizer extracts code robustly.
+
+---
+
+### Operational recommendations
+- **Default to safe mode**: If `--firefox` peers are used, enable stricter sanitization and require test pass before commit.
+- **Expose a `--force-commit` flag** for advanced users who want to persist code even if tests fail.
+- **Telemetry**: collect anonymized metrics on parse failures, compile failures, and peer artifact rates to prioritize improvements.
+- **Documentation**: document expected peer output formats and the agent's tolerant parsing rules so integrators can adapt peers or UI.
+
+---
+
+### Quick wins you can implement now
+1. Add a sanitizer that strips `delphiCopyDownload`, `Delphiprogram`, and any leading token before `program`.
+2. Force `.dpr` extension for Delphi temporary files and ensure the file ends with `end.`.
+3. If compilation fails, do not persist the candidate; instead, present the sanitized code and compiler errors to the user and request repair.
+4. Turn off inline debug tags in prompts (or send them as metadata) to avoid echoing.
+
+---
+
+### Final note — why these changes matter
+The agent already demonstrates a strong multi-peer critique-and-repair workflow and useful traceability. The primary reliability issues are **formatting and sanitation** rather than reasoning. Fixing the parsing/validation and tightening the compile gate will dramatically reduce false failures, improve peer reliability scoring, and make the agent's outputs trustworthy and reproducible.
+
+If you want, I can:
+- Produce a **sanitizer implementation** in Pascal/Delphi (regex-based) tailored to the exact artifacts in your logs.
+- Draft **unit tests** (test vectors) for the sanitizer using the peer outputs from your `grisp_debug.log`.
+- Propose a **patch** to `TGrispTestAdapterImpl.ExecuteInternalTest` and `TGrispCompilerRegistry.GetCompilerForLanguage` to enforce correct extensions and preflight checks.
+
+Which of those would you like me to generate next?
+
+
+
+
+Further suggested improvements:
+
+
+### Summary of what I inspected
+I reviewed the **GrispAgentCLI**/**MLCRD_Adapters** source, the **terminal run output**, the **grisp_debug.log**, and the workspace files you attached. The agent solicited two web peers (deepseek, gemini), received candidate Delphi programs, generated tests, attempted to compile them with Embarcadero Delphi 37.0, and produced a final HelloWorld program in `/workspace/program.txt`. The workspace file contains a repaired program that includes `System.SysUtils`, a `try..except`, and a `ReadLn` pause.  
+Two sentences from the workspace program:  
+> **`program HelloWorld;`**  
+> **`uses System.SysUtils;`**. 
+
+---
+
+### Key failures observed (concise)
+- **Malformed inputs written to compiler** — peer responses contained UI/formatting artifacts (e.g., `delphiCopyDownloadprogram`, `Delphiprogram`) that were written to disk and compiled, producing `E2029 Declaration expected but end of file found`.  
+- **Wrong temporary file types/extensions** — tests and final candidate were saved as `.txt` (e.g., `grisp_test_*.txt`, `program.txt`) and passed to `dcc64`, causing compiler confusion and unit lookup errors.  
+- **Brittle parsing & sanitization** — the agent assumes peers will strictly follow a code-block-with-filename format; it lacks a robust sanitizer to extract only the source.  
+- **Commit-on-failure behavior** — the agent persisted a final solution despite multiple test/compile failures; this risks delivering broken code to users.  
+- **Prompt leakage and echo** — debug/prompt-tag comments were included inline and echoed back by peers, complicating parsing.
+
+---
+
+### Root causes (short)
+1. **Insufficient sanitization** of peer outputs before writing to disk.  
+2. **File naming/extension mismatch** between language and temporary filenames.  
+3. **Overly strict prompt expectations** combined with tolerant peer behavior (web LLM UI artifacts).  
+4. **Test/commit policy** that allows persisting solutions that haven’t passed compilation.
+
+---
+
+### Prioritized, concrete fixes (what to change and where)
+
+#### 1 — Immediate, high-impact fixes (implement first)
+- **Sanitizer before write** (place in the pipeline that receives peer responses, before `ExecuteInternalTest`):
+  - Extract the first fenced code block if present (detect ``` fences and optional header like `Pascal/Delphi:HelloWorld.dpr`).
+  - If no fence, find the longest contiguous block starting with `program`/`unit`/`{$APPTYPE` and ending with `end.`.
+  - Strip known UI tokens (`CopyDownload`, site labels, leading language tokens) and remove HTML/comment debug tags (`<!-- DEBUG: ... -->`).
+  - Return `(Filename, Language, CleanCode)`; **do not** write raw peer text to disk.
+- **Enforce correct extension** in `TGrispTestAdapterImpl.ExecuteInternalTest`:
+  - Map language to canonical extension (`.dpr`/`.pas` for Delphi), and use `TPath.ChangeExtension` to ensure the temp file has the right extension.
+  - Validate that the code ends with `end.` (Delphi) before compiling.
+- **Preflight sanity checks**:
+  - Lightweight checks (regex) for `program|unit`, `begin`, `end\.`; if they fail, mark candidate invalid and request repair rather than compiling.
+- **Do not commit failing solutions**:
+  - Add `RequireTestsPass: Boolean` to `TAgentConfiguration` (default `True`). Only persist/write final solution when tests/compilation succeed (or user explicitly forces commit).
+
+#### 2 — Medium-term robustness (next sprint)
+- **Improve `GetCompilerForLanguage` behavior**:
+  - Accept either a directory or an explicit executable path; if a directory is provided, search for `dcc64`, `dcc32`, `fpc`, `gcc` in that directory and PATH; provide clear error messages when nothing found.
+  - Prefer `dcc64` for Win64 builds when `--compiler` points to RAD Studio bin folder.
+- **Better repair prompts**:
+  - When compilation fails, send peers a structured repair prompt containing: sanitized code, exact compiler stderr/stdout, filename and extension, and a short instruction to output only the corrected code block.
+- **Peer response validation & rejection**:
+  - After sanitization, run a small static validator; if invalid, reject candidate and decrement peer reliability for format errors (separate from logic errors).
+
+#### 3 — Operational and developer improvements
+- **Log sanitized content** (separate from raw peer logs) and the exact compiler command line for traceability.  
+- **Unit tests** for sanitizer and the full pipeline using the exact malformed examples from your logs.  
+- **Add `--force-commit`** for advanced users who want to persist code despite failing tests.  
+- **Avoid inline debug tags** in prompts sent to peers; keep them in agent logs only or send as metadata.
+
+---
+
+### Concrete code sketch (sanitizer pseudocode in Pascal/Delphi)
+Add a function near the peer-response handling code:
+
+```pascal
+function ExtractDelphiCode(const Raw: string; out FileName, Code: string): Boolean;
+var
+  FenceStart, FenceEnd: Integer;
+  Candidate: string;
+begin
+  // 1) Remove HTML-style debug tags
+  Candidate := RegexReplace(Raw, '<!--.*?-->', '', [roIgnoreCase, roSingleLine]);
+
+  // 2) Find first triple-backtick fenced block
+  FenceStart := Pos('```', Candidate);
+  if FenceStart > 0 then
+  begin
+    FenceEnd := PosEx('```', Candidate, FenceStart + 3);
+    if FenceEnd > FenceStart then
+      Candidate := Copy(Candidate, FenceStart + 3, FenceEnd - (FenceStart + 3));
+  end;
+
+  // 3) Strip common UI tokens (e.g., 'delphiCopyDownload', 'Delphiprogram')
+  Candidate := RegexReplace(Candidate, '^(delphiCopyDownload|Delphiprogram|Pascal/Delphi:\w+)', '', [roIgnoreCase]);
+
+  // 4) Trim and ensure it looks like Delphi source
+  Candidate := Trim(Candidate);
+  if (Pos('program', LowerCase(Candidate)) = 1) or (Pos('unit', LowerCase(Candidate)) = 1) then
+  begin
+    Code := Candidate;
+    FileName := 'HelloWorld.dpr'; // or parse from fence header if present
+    Result := True;
+  end
+  else
+    Result := False;
+end;
+```
+
+Use this function to produce the sanitized `Code` and ensure the temp file uses `.dpr` extension before calling the compiler.
+
+---
+
+### Testing checklist (must-have)
+- **Unit tests** for `ExtractDelphiCode` using the exact peer outputs from `grisp_debug.log` and `program.txt`.
+- **Integration test**: mock peer returns malformed output → sanitizer extracts code → preflight passes → compile succeeds.
+- **Negative test**: malformed output that cannot be sanitized → agent requests repair and does not compile.
+- **End-to-end**: run with real `dcc64` in PATH and verify `RequireTestsPass` prevents commit on failure.
+
+---
+
+### Quick operational suggestions (practical)
+- **Default to compiler executable on PATH**: If `--compiler` is a directory, prefer searching for `dcc64`/`dcc32` in that directory; if not found, fall back to `dcc64` on PATH. This avoids forcing users to pass the exact executable path.
+- **Make debug/prompt-tag optional and non-inline**: keep debug tags out of the prompt body to avoid echoing.
+- **Expose clearer diagnostics to user**: when compilation fails, show sanitized code and compiler stderr so the user can decide next steps.
+
+---
+
+### Closing / next steps I can deliver
+I can produce any of the following next (pick one or more):
+- **A ready-to-drop-in Pascal/Delphi sanitizer implementation** (full code, unit with regex handling and tests) tailored to the exact artifacts in your logs.  
+- **A patch diff** for `TGrispTestAdapterImpl.ExecuteInternalTest` and the agent commit logic to enforce extension and `RequireTestsPass`.  
+- **Unit test vectors** (Delphi test files) that reproduce the failures and verify the sanitizer fixes them.
+
+Which of these would you like me to generate first?

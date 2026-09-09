@@ -1,0 +1,130 @@
+## Analysis of the AI Agent's Testing Capabilities
+
+The GRISP agent implements a sophisticated **multi-LLM cross‑repair protocol** with 12 phases, including **deep debugging and test generation**. However, its current implementation exhibits several critical flaws that undermine its usefulness for real‑world software development.
+
+### Architecture Overview (Testing‑relevant parts)
+
+- **Phase 6 – Deep Debugging & Test Generation**  
+  Activated when capabilities like `test_execute` are negotiated. For each repair, each peer proposes a test program (`ProposeTestProgram`). These programs are written to the VFS and then compiled/run via the `IGrispTestAdapter` (which currently only supports simple C syntax checks).  
+- **Peers** – `THeuristicPeer`, `TFirefoxChatAIPeer`, `TStubPeer` – all implement `ProposeTestProgram` with **hardcoded C templates** and a generic division‑testing example.  
+- **Language handling** – nowhere in the codebase is a language preference stored or propagated. The `TRepair.Language` field is set to `'c'` unconditionally by all peers.
+
+---
+
+## Major Malfunctions
+
+### 1. Test Language Always C
+The agent always generates C test programs, ignoring the user’s actual language (e.g., Delphi/Pascal). This stems from:
+- Hardcoded C code in `ProposeTestProgram` methods.
+- No `--lang` CLI option or internal configuration.
+- Help text and example prompts that mention C, reinforcing the bias.
+
+### 2. Tests Are Not Derived From the Actual Code
+All peers generate the **same division‑safety test** regardless of the repair content. For example, `THeuristicPeer.ProposeTestProgram` always writes:
+```c
+safe_divide(100, 5, &ok);
+safe_divide(42, 0, &ok);
+...
+```
+This is **not** appropriate for general software development – tests should be **specific to the functions and logic** present in the repair code. The agent does not analyse the repair to extract function signatures, edge cases, or invariants.
+
+### 3. Inadequate Test Execution Feedback
+The `IGrispTestAdapter` implementation (`TGrispTestAdapterImpl`) only performs trivial syntax checks (balanced parentheses/braces) and looks for hardcoded crash patterns. It does **not** actually compile/run the test program with a real compiler or harness – the “compile and run” is simulated with heuristics. Consequently, the test feedback (e.g., `TestPassed`) is unreliable.
+
+### 4. Capability Negotiation Oversimplified
+`NegotiateCapabilities` only checks for keyword presence in the task prompt and uses a fixed threshold. It does **not** consider the actual repair content or the language, so test generation may be skipped even when meaningful tests could be written.
+
+---
+
+## Improvements Proposed in the User’s Plan (Already Good)
+
+The provided plan correctly identifies many of these issues and suggests concrete fixes:
+
+- **Add a `--lang` CLI option** to propagate a preferred language.
+- **Update help/examples** to show Pascal/Delphi tasks.
+- **Emit a language metadata event** so downstream components are aware.
+- **Fix memory leaks** by freeing `TAction.Params` lists.
+- **Improve JSON escaping** (handle control characters, Unicode).
+- **Capture correct token positions** in the lexer.
+- **Replace brittle BOM handling** with robust `TFile.ReadAllText`.
+
+These are necessary but **not sufficient** – they address only the language bias and basic hygiene.
+
+---
+
+## Additional Improvements I Propose
+
+### 5. Make Test Generation Language‑Aware and Code‑Aware
+
+**Modify `IWebLLMPeer.ProposeTestProgram`** to accept a `TargetLanguage` parameter.  
+Each peer should construct a prompt that includes:
+- The **repair code** itself.
+- The **target language** (e.g., Pascal).
+- A request to generate a **complete unit test** that exercises the most critical functions and edge cases **specific to that code**.
+
+Example prompt for a Delphi peer:
+```
+Task: <user prompt>
+Code to test:
+<repair content>
+Please write a complete Delphi console test program (uses DUnit or simple assertions) that tests all public functions with normal and edge inputs.
+```
+
+This way the LLM (or heuristic peer) can produce meaningful tests in the correct language.
+
+**Add a template repository** for each supported language – e.g., for Delphi, produce a `.dpr` project with a test runner. The test adapter can then compile/run it using `dcc32` or `fpc`.
+
+### 6. Implement Real Compilation & Execution via the VFS
+
+The current `TGrispTestAdapterImpl` is a stub. Replace it with a proper adapter that:
+- Resolves the test file from the VFS to a physical path.
+- Invokes the appropriate compiler (e.g., `fpc` for Pascal, `gcc` for C) with sandboxed flags.
+- Captures stdout/stderr and exit code.
+- Returns rich `TDebugFeedback` with actual compilation errors, runtime traces, and test results.
+
+This requires **capability‑based access** to a compiler installed in the sandbox (or a container). The GRISP capability model already allows `grCompile` and `grRun` – use them.
+
+### 7. Integrate Static Analysis for Smarter Edge Cases
+
+Before test generation, perform a lightweight static scan of the repair code (e.g., using regex or a simple parser) to identify:
+- Function signatures (name, parameters, return type).
+- Potential error conditions (e.g., division, array access, pointer dereference).
+- Conditional branches that could lead to exceptions.
+
+This information can be fed into the prompt to guide the LLM toward relevant test cases, rather than always generating division tests.
+
+### 8. Make Test Generation Optional and Guided by Capabilities
+
+Currently, tests are generated only if `ShouldRunTests` returns true (based on activated capabilities). This is good, but the capability negotiation should also consider **the actual code complexity**. For trivial repairs, tests may be unnecessary. Add a heuristic: if the repair code is short and obviously safe, skip test generation to save time.
+
+### 9. Improve the Heuristic Peer to Be Language‑Agnostic
+
+The current `THeuristicPeer` always returns C code. Make it configurable with a `DefaultLanguage` property. Its `GenerateCandidate`, `RepairCandidate`, and `ProposeTestProgram` methods should use that language in their templates. For unsupported languages, fall back to a generic textual description.
+
+### 10. Add Unit Tests for the Agent’s Test Generation
+
+The existing test suite (`TestMLCRD`) already covers the flow, but it does **not** verify that the generated test programs are in the correct language or that they actually exercise the repair. Add assertions:
+- After calling `Agent.RunTask` with a specific `--lang` setting, inspect the trace to ensure all test programs have the correct language tag.
+- Verify that the test code includes references to the functions defined in the repair.
+
+### 11. Log and Expose the Test Generation Prompt
+
+For debugging, log the exact prompt sent to each peer for test generation. This helps diagnose why the peer produced a C test when Delphi was requested.
+
+---
+
+## Implementation Roadmap (Priority Order)
+
+1. **Add `--lang` CLI option** and propagate to `TMultiLLMAgent` and all peers (1–2 hours).  
+2. **Update help text** and default examples to Pascal/Delphi (15 min).  
+3. **Replace the `ProposeTestProgram` implementations** with language‑aware prompts that include the repair code (2–3 hours).  
+4. **Implement a real compiler/test runner adapter** for at least one language (Delphi with FPC) (4–6 hours).  
+5. **Add static analysis** to extract function signatures and inject them into the test prompt (2–3 hours).  
+6. **Fix memory leaks and JSON escaping** as outlined (1 hour).  
+7. **Expand the test suite** to validate language correctness (2 hours).  
+
+---
+
+## Conclusion
+
+The AI agent has strong potential as a collaborative code‑repair system, but its current testing capabilities are rudimentary and language‑fixed. The issues stem from hardcoded C templates and a lack of code analysis. By making the system language‑aware, generating tests from the actual repair code, and integrating a real execution harness, the agent can become a valuable tool for multi‑language development. The fixes proposed by the user (language flag, cleanup) are essential first steps, but deeper architectural changes are needed to achieve the desired flexibility and correctness.

@@ -1,0 +1,99 @@
+### Quick summary of the problem
+You provided a concatenated Pascal/Delphi codebase (Grisp CLI/agent, lexer, parser, executor). You say the tool **asks for C test programs** even though you want it to develop Delphi/Pascal code. I analyzed the code you attached and the likely causes. Below I list the most relevant findings, why the tool might prompt for C tests, and concrete fixes you can apply.
+
+---
+
+### Key findings (what in the code causes the behavior)
+| **Area** | **Most relevant symptom** | **Why it matters** |
+|---|---:|---|
+| **GrispAgentCLI banner/help text** | The CLI help and examples include C-related examples (e.g., “Write a safe integer division function in C”). | The agent advertises example tasks that mention C; users or automated tests may pick those examples as the default task. |
+| **Argument parsing / default task handling** | `TaskPrompt` is populated from `-t`/`--task` or left empty; no explicit language preference is stored. | If no task is supplied, external harnesses or tests may inject a default prompt (often C examples) or the help text influences user/test expectations. |
+| **Mixed codebase and example strings** | The repository contains examples and comments referencing multi-LLM tasks and C examples. | Example strings in the binary or docs can be used by test harnesses or CI to generate test inputs in C. |
+| **No language enforcement in parser/executor** | Parser and executor accept serialized actions and emit events but do not enforce or tag a target language. | Nothing in the runtime forces Pascal/Delphi as the target language; external orchestrators may choose C by default. |
+
+---
+
+### Evidence from your attached files
+- The `GrispAgentCLI` **PrintHelp** and **PrintBanner** functions include examples that explicitly mention C tasks (e.g., `GrispAgentCLI -t "Write a safe integer division function in C" --trace`).  
+- The CLI does not persist a preferred language or capability flag that would bias generation toward Pascal/Delphi.
+
+Two lines from your attached document:
+> `GrispAgentCLI -t "Write a safe integer division function in C" --trace`  
+> `GrispAgentCLI -t "Implement safe integer division" --sites deepseek,gemini`
+
+---
+
+### Why the agent/test harness ends up asking for C tests
+1. **Default/example prompts**: The help text and examples include C prompts. If a test harness or user copies examples, C becomes the de facto default.  
+2. **No language preference stored or signaled**: The CLI has no `--lang` or `--language` option and does not set a capability that restricts outputs to Pascal/Delphi. Without that, any downstream component (peers, adapters, or automated test suites) can choose C.  
+3. **External orchestrator behavior**: The agent appears designed to coordinate multiple LLM peers and adapters. Those peers or the harness that drives the agent may be configured to request C test programs for validation or unit tests. The CLI itself only forwards tasks; it doesn’t validate the requested language.
+
+---
+
+### Concrete fixes and recommendations
+#### Short-term (quick, minimal changes)
+1. **Change help/examples** to show Pascal/Delphi examples so users and tests are less likely to pick C by accident. Edit `PrintHelp` examples:
+   - Replace `"Write a safe integer division function in C"` with `"Write a safe integer division function in Pascal/Delphi"`.
+2. **Add a `--lang` option** to the CLI to let callers explicitly request `pascal` or `delphi`. Example parsing snippet:
+   ```pascal
+   else if Arg = '--lang' then
+   begin
+     Inc(I);
+     if I <= ParamCount then
+       PreferredLang := LowerCase(ParamStr(I));
+   end
+   ```
+   Then pass `PreferredLang` into the agent/peers so they can bias generation.
+
+#### Medium-term (robust, recommended)
+3. **Propagate language capability to peers/adapters**: Add a capability object or config (e.g., `CapWorkspace`/`CapSet`) that includes `PreferredLanguage := 'pascal'` and ensure adapters check it before generating tests.
+4. **Validate incoming tasks**: If `TaskPrompt` is empty, set a safe default prompt that requests Pascal/Delphi code rather than leaving it blank or relying on examples.
+5. **Add a language tag to serialized actions**: When the parser builds actions, include a metadata action like `EmitEvent|language|pascal` so the executor and downstream peers can see the intended language.
+6. **Update automated test harness**: If you control the harness that runs the agent, change its default test templates to Pascal/Delphi.
+
+#### Developer-level (prevent recurrence)
+7. **Search the repo for “C” examples** and replace or parameterize them. Grep for `integer division function in C`, `safe integer division`, or other C mentions and update.
+8. **Document language preference** in README and CLI help so integrators know to set `--lang pascal` or similar.
+
+---
+
+### Suggested code edits (concrete patch examples)
+**1) Replace example in `PrintHelp`:**
+```pascal
+Writeln('  GrispAgentCLI -t "Write a safe integer division function in Pascal/Delphi" --trace');
+```
+
+**2) Add `--lang` parsing and default:**
+```pascal
+var
+  PreferredLang: string;
+...
+PreferredLang := 'pascal'; // default
+...
+else if Arg = '--lang' then
+begin
+  Inc(I);
+  if I <= ParamCount then
+    PreferredLang := LowerCase(ParamStr(I));
+end
+...
+// later, pass PreferredLang into Agent initialization or include as an initial event
+```
+
+**3) Emit language metadata as an event before executing tasks:**
+In the executor or when building actions, add:
+```pascal
+actionsList.Add('EmitEvent|language|' + PreferredLang);
+```
+This makes the intended language explicit to downstream components.
+
+---
+
+### How I can help next
+- I can produce a small patch (diff) that implements `--lang` and emits the language event, and update the help text.  
+- I can scan the rest of your repository (if you upload more files) for other C examples and produce a list of replacements.  
+- I can draft a short README snippet explaining how to force Pascal/Delphi output from the agent and how to configure peers/adapters.
+
+---
+
+If you want, I’ll **generate the exact Pascal patch** to add `--lang` support and to emit the language metadata event (ready to drop into your `GrispAgentCLI`), and I’ll also produce a short grep list of likely files to update. Which would you prefer?
