@@ -1,0 +1,3594 @@
+I redesigned this from the ground up rather than trying to repair the existing 12-phase pipeline. The central change is that GRISP becomes a **deterministic verification-and-execution system with LLMs as untrusted reasoning workers**, while Firefox becomes a **stateful AI-provider transport/adapter layer** rather than a loose JSON command endpoint.
+
+The existing Firefox implementation already has the right general idea—parent-process orchestration with child actors handling DOM interaction—but its current protocol is too weak for a serious agent: requests have no correlation IDs, responses are effectively anonymous, tab identity is index-based, and response detection is based heavily on polling/stability heuristics.  
+
+# GRISP AI Agent
+
+## Next-Generation Architecture Specification
+
+### GRISP Agent Specification v1.0 — Deterministic, Verifiable, Multi-LLM, Browser-Assisted
+
+**Status:** NORMATIVE
+**Design goal:** Replace the current cooperative-agent pipeline with a strongly verified execution architecture.
+**Primary platforms:** Delphi/Windows, Firefox Web AI automation
+**External AI providers:** ChatGPT, Gemini, Claude, DeepSeek, Grok, Copilot, Perplexity, Inception, and future providers through adapters.
+
+---
+
+# 1. Purpose
+
+GRISP shall be a general-purpose AI software engineering agent whose primary responsibility is not merely to generate code, but to produce a **verified engineering artifact**.
+
+GRISP SHALL treat all external AI models as untrusted workers.
+
+An AI model may:
+
+* propose code;
+* critique code;
+* propose repairs;
+* propose tests;
+* propose plans;
+* rank alternatives;
+* provide analysis.
+
+An AI model SHALL NOT by itself establish correctness, security, authorization, successful compilation, successful execution, or final acceptance.
+
+The authoritative components shall be:
+
+1. deterministic parsers;
+2. GRISP policy evaluation;
+3. compiler/tool execution;
+4. sandbox execution;
+5. test execution;
+6. artifact hashing;
+7. structured evidence;
+8. deterministic acceptance rules.
+
+The fundamental invariant is:
+
+> **No unverified artifact may become an accepted GRISP result.**
+
+This specification deliberately removes the implicit assumption that successful agent orchestration means successful engineering.
+
+---
+
+# 2. Design Principles
+
+GRISP v1.0 SHALL follow this priority order:
+
+```text
+CORRECTNESS
+> SAFETY
+> DETERMINISM
+> VERIFIABILITY
+> PROVENANCE
+> ROBUSTNESS
+> CLARITY
+> PERFORMANCE
+> COST
+> STYLE
+```
+
+A lower-priority property SHALL NEVER override a higher-priority property.
+
+For example:
+
+* a fast result cannot override a failed compiler;
+* a highly trusted LLM cannot override a failed test;
+* consensus between five LLMs cannot override a GRISP policy rejection;
+* a high subjective score cannot override missing evidence.
+
+---
+
+# 3. Fundamental Architecture
+
+GRISP v1.0 SHALL consist of the following logical layers.
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                      USER REQUEST                           │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    TASK NORMALIZER                          │
+│  intent / language / constraints / artifact type / risk    │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    TASK ORCHESTRATOR                        │
+│        deterministic state machine / retry controller       │
+└───────┬─────────────────────┬──────────────────────┬────────┘
+        │                     │                      │
+        ▼                     ▼                      ▼
+┌──────────────┐      ┌──────────────┐      ┌────────────────┐
+│ AI WORKERS   │      │ TOOL ENGINE   │      │ POLICY ENGINE  │
+│ multi-LLM    │      │ compiler/run  │      │ GRISP rules    │
+└──────┬───────┘      └──────┬───────┘      └───────┬────────┘
+       │                     │                      │
+       └─────────────┬───────┴──────────────┬───────┘
+                     ▼                      ▼
+              ┌─────────────┐      ┌─────────────────┐
+              │ EVIDENCE DB │      │ ARTIFACT STORE  │
+              └──────┬──────┘      └────────┬────────┘
+                     └────────────┬─────────┘
+                                  ▼
+                       ┌─────────────────────┐
+                       │ FINAL VERIFIER       │
+                       │ hard acceptance gate │
+                       └──────────┬──────────┘
+                                  ▼
+                       ┌─────────────────────┐
+                       │ ACCEPT / REJECT     │
+                       └─────────────────────┘
+```
+
+Firefox SHALL be an implementation of the AI Worker Transport layer:
+
+```text
+GRISP Agent
+    │
+    │ GARP/1.0
+    ▼
+Firefox AI Gateway
+    │
+    ├── ChatGPT adapter
+    ├── Gemini adapter
+    ├── Claude adapter
+    ├── DeepSeek adapter
+    ├── Grok adapter
+    ├── Copilot adapter
+    ├── Perplexity adapter
+    └── Other providers
+```
+
+---
+
+# 4. Core Architectural Change
+
+The current system uses a pipeline approximately equivalent to:
+
+```text
+generate
+→ critique
+→ repair
+→ capabilities
+→ quick check
+→ tests
+→ score
+→ choose
+→ GRISP validate
+→ execute
+→ write
+```
+
+The new design SHALL instead use a **candidate/evidence model**.
+
+Every artifact exists as an object with immutable identity:
+
+```text
+Artifact
+ ├── artifact_id
+ ├── parent_artifact_id
+ ├── task_id
+ ├── revision
+ ├── files[]
+ ├── content_hash
+ ├── language
+ ├── artifact_kind
+ └── provenance
+```
+
+Every operation produces evidence:
+
+```text
+Evidence
+ ├── evidence_id
+ ├── artifact_id
+ ├── operation
+ ├── tool
+ ├── timestamp
+ ├── duration
+ ├── input_hash
+ ├── output_hash
+ ├── result
+ ├── diagnostics
+ └── environment
+```
+
+The final decision SHALL be computed from evidence, not merely from an LLM score.
+
+---
+
+# 5. Task Model
+
+Each task SHALL be normalized into:
+
+```text
+Task
+ ├── task_id
+ ├── user_prompt
+ ├── target_language
+ ├── target_platform
+ ├── requested_artifact_kind
+ ├── constraints
+ ├── acceptance_tests
+ ├── risk_level
+ ├── required_capabilities
+ └── policy_profile
+```
+
+`requested_artifact_kind` SHALL distinguish at minimum:
+
+```text
+EXECUTABLE
+LIBRARY
+UNIT
+PROJECT
+SCRIPT
+PATCH
+DOCUMENTATION
+ANALYSIS
+```
+
+This distinction is essential.
+
+A console executable SHALL be tested as an executable.
+
+A Delphi unit SHALL be tested by compiling it with an appropriate harness.
+
+A multi-file project SHALL be tested as a project.
+
+GRISP SHALL NOT ask an LLM to create a fake self-contained implementation of the thing it is supposed to test.
+
+---
+
+# 6. Task Risk Classification
+
+Every task SHALL receive a deterministic risk classification.
+
+```text
+R0  informational
+R1  ordinary code generation
+R2  code affecting files/system state
+R3  privileged/system/network/security-sensitive
+R4  destructive/high-impact
+```
+
+Risk SHALL influence:
+
+* required validation;
+* sandbox policy;
+* allowed capabilities;
+* number of independent verification paths;
+* requirement for human approval.
+
+LLM keyword matching MAY provide hints but SHALL NOT be the sole security mechanism.
+
+The current implementation uses keyword detection such as `pointer`, `memory`, `concurrency`, `security`, `division`, and `overflow` to activate capabilities. 
+
+That is insufficient as a primary policy system.
+
+---
+
+# 7. AI Worker Model
+
+An AI worker is an untrusted external reasoning engine.
+
+Each worker SHALL have:
+
+```text
+Worker
+ ├── worker_id
+ ├── provider
+ ├── model
+ ├── transport
+ ├── specialization
+ ├── capability_profile
+ ├── reliability_profile
+ └── health_state
+```
+
+The agent SHALL NOT assume that two providers are independent merely because their names differ.
+
+The system SHALL distinguish:
+
+```text
+provider
+model
+session
+browser_tab
+conversation
+worker_instance
+```
+
+---
+
+# 8. AI Roles
+
+The following roles SHOULD be supported.
+
+### Generator
+
+Produces initial candidate artifacts.
+
+### Analyst
+
+Analyzes requirements and identifies constraints.
+
+### Critic
+
+Looks for defects.
+
+### Repairer
+
+Creates a new artifact from a previous artifact plus evidence.
+
+### Test Designer
+
+Designs tests against the actual artifact contract.
+
+### Adversarial Reviewer
+
+Attempts to break the candidate.
+
+### Verifier
+
+Reviews evidence and consistency.
+
+### Documentation Agent
+
+Explains the final artifact.
+
+### Specialist
+
+Optional domain-specific roles such as:
+
+```text
+Delphi specialist
+Windows specialist
+security specialist
+performance specialist
+compiler specialist
+database specialist
+network specialist
+```
+
+---
+
+# 9. AI Outputs SHALL Be Structured
+
+The agent SHALL stop treating LLM responses as arbitrary prose that is subsequently cleaned by string replacement.
+
+The existing implementation relies on cleanup such as removing `CopyDownload`, `Delphiprogram`, and `Pascalprogram`. 
+
+That strategy SHALL be removed.
+
+Every AI operation SHALL request a structured response.
+
+Conceptually:
+
+```json
+{
+  "protocol": "GAI/1",
+  "operation": "generate",
+  "result": "ok",
+  "artifacts": [
+    {
+      "name": "HelloWorld.dpr",
+      "kind": "source",
+      "language": "delphi",
+      "content": "..."
+    }
+  ]
+}
+```
+
+Markdown SHALL be accepted only as a compatibility mode.
+
+When compatibility mode is used, GRISP SHALL parse it with a strict parser.
+
+Ambiguous extraction SHALL result in:
+
+```text
+PARSE_ERROR
+```
+
+not guessed content.
+
+---
+
+# 10. Artifact Integrity
+
+Every artifact SHALL have a cryptographic content hash.
+
+Recommended:
+
+```text
+SHA-256
+```
+
+Artifact identity SHALL therefore be:
+
+```text
+artifact_id != filename
+artifact_id != array index
+```
+
+A filename is metadata.
+
+The content hash is the immutable identity of the actual source payload.
+
+For example:
+
+```text
+Artifact:
+  filename = HelloWorld.dpr
+  sha256   = ABC123...
+```
+
+When a repair is created:
+
+```text
+parent = ABC123...
+child  = DEF456...
+```
+
+This creates a verifiable artifact lineage.
+
+---
+
+# 11. Candidate Lifecycle
+
+A candidate SHALL pass through states:
+
+```text
+CREATED
+PARSED
+NORMALIZED
+STATIC_VALID
+COMPILE_PENDING
+COMPILED
+RUNTIME_PENDING
+RUNTIME_VERIFIED
+TEST_PENDING
+TEST_VERIFIED
+POLICY_VERIFIED
+ACCEPTABLE
+SELECTED
+FINAL_VERIFIED
+COMMITTED
+```
+
+Failure states:
+
+```text
+PARSE_FAILED
+POLICY_REJECTED
+COMPILE_FAILED
+RUNTIME_FAILED
+TEST_FAILED
+TIMEOUT
+CRASHED
+VERIFICATION_FAILED
+```
+
+There SHALL be no implicit transition:
+
+```text
+failure → accepted
+```
+
+---
+
+# 12. Hard Acceptance Gates
+
+This is the most important part of the specification.
+
+A candidate SHALL NOT be selectable when:
+
+```text
+compile_ok = false
+runtime_ok = false
+required_tests_ok = false
+policy_ok = false
+artifact_parse_ok = false
+```
+
+For artifact types where compilation or execution is not applicable, the requirement SHALL be explicitly declared.
+
+A candidate with an objective failure SHALL be removed from the acceptance pool.
+
+Subjective LLM scores SHALL NOT resurrect it.
+
+---
+
+# 13. Final Verification
+
+After the winner has been selected, GRISP SHALL repeat verification against the **exact bytes that will be committed**.
+
+This SHALL include:
+
+```text
+1. re-hash final files
+2. verify artifact identity
+3. parse final artifact structure
+4. compile final artifact
+5. run final artifact if applicable
+6. run mandatory tests
+7. verify expected outputs
+8. run security/policy checks
+9. record evidence
+10. only then commit
+```
+
+No previous result may be substituted for final verification.
+
+---
+
+# 14. Test Architecture
+
+Tests SHALL target the actual artifact.
+
+## Executable
+
+For an executable:
+
+```text
+source
+ ↓
+compiler
+ ↓
+executable
+ ↓
+process runner
+ ↓
+stdout/stderr/exit code
+ ↓
+assertions
+```
+
+Example:
+
+```text
+HelloWorld.dpr
+   ↓
+HelloWorld.exe
+   ↓
+run
+   ↓
+stdout == "Hello, World!\r\n"
+exit code == 0
+```
+
+## Unit
+
+For a unit:
+
+```text
+Unit.pas
++
+generated test harness
+↓
+compile
+↓
+run tests
+```
+
+## Project
+
+For a project:
+
+```text
+project graph
+↓
+materialize files
+↓
+build
+↓
+test
+↓
+runtime verification
+```
+
+A generated test SHALL NEVER simply recreate the implementation.
+
+The existing test generator did exactly that in some cases, inventing functions such as `GetHelloWorldString` and testing the invented function rather than the actual executable. 
+
+That behavior is forbidden in v1.0.
+
+---
+
+# 15. Test Quality
+
+Every generated test SHALL declare:
+
+```text
+test_target
+test_type
+oracle
+coverage_intent
+```
+
+For example:
+
+```json
+{
+  "test_target": "HelloWorld.exe",
+  "test_type": "black_box",
+  "oracle": {
+    "stdout_exact": "Hello, World!\r\n",
+    "exit_code": 0
+  }
+}
+```
+
+A test that cannot demonstrate that it exercises the artifact SHALL be marked:
+
+```text
+TEST_INVALID
+```
+
+and SHALL NOT count as evidence.
+
+---
+
+# 16. Static Validation
+
+Before invoking expensive external AI work, GRISP SHOULD perform deterministic checks:
+
+```text
+language detection
+artifact framing
+filename validation
+encoding validation
+NUL detection
+path traversal detection
+file type validation
+maximum size
+duplicate file detection
+required project metadata
+```
+
+For Delphi:
+
+```text
+program/unit/library syntax shape
+filename/extension consistency
+obvious malformed prefixes
+unsupported directives where detectable
+```
+
+This stage SHALL reject corrupted LLM output before compilation.
+
+---
+
+# 17. Tool Execution Model
+
+The tool engine SHALL expose deterministic operations such as:
+
+```text
+compile
+run
+test
+syntax_check
+semantic_check
+format
+lint
+hash
+read_file
+write_file
+delete_file
+inspect_process
+collect_diagnostics
+```
+
+Each tool SHALL return structured results.
+
+Example:
+
+```json
+{
+  "operation": "compile",
+  "result": "failed",
+  "exit_code": 1,
+  "diagnostics": [
+    {
+      "severity": "error",
+      "code": "E2029",
+      "line": 4,
+      "message": "Declaration expected but end of file found"
+    }
+  ]
+}
+```
+
+---
+
+# 18. Tool Result Semantics
+
+Never use:
+
+```text
+Boolean only
+```
+
+A richer result is required.
+
+```text
+ToolResult
+ ├── status
+ ├── success
+ ├── exit_code
+ ├── timed_out
+ ├── crashed
+ ├── stdout
+ ├── stderr
+ ├── diagnostics[]
+ ├── duration_ms
+ ├── input_hash
+ ├── output_hash
+ └── environment_id
+```
+
+This prevents the loss of important distinctions.
+
+---
+
+# 19. Compiler Adapter
+
+Compiler selection SHALL use the language requested for the operation.
+
+The current implementation accepts a `Language` parameter but selects the compiler from `FConfig.PreferredLanguage`. 
+
+The new rule is:
+
+```text
+operation.language
+    ↓
+language adapter
+    ↓
+compiler toolchain
+```
+
+Never infer the actual compiler from unrelated global configuration.
+
+Compiler identity SHALL be recorded:
+
+```text
+compiler_name
+compiler_version
+target_platform
+target_architecture
+flags
+SDK version
+environment hash
+```
+
+---
+
+# 20. Process Isolation
+
+Code produced by external AI SHALL run in a controlled environment.
+
+The sandbox SHALL define:
+
+```text
+filesystem permissions
+network permissions
+process permissions
+memory limits
+CPU limits
+wall-clock timeout
+output limits
+child-process limits
+environment variables
+working directory
+```
+
+The process runner SHALL support:
+
+```text
+cancel
+timeout
+kill tree
+stdout capture
+stderr capture
+exit code
+crash detection
+```
+
+The current Windows process runner waits for the process, terminates it on timeout, and captures stdout/stderr, which is a useful foundation. 
+
+The redesign SHALL extend this into an explicit execution contract.
+
+---
+
+# 21. Fail-Closed GRISP Policy
+
+GRISP validation SHALL never accept an unrecognized plan merely because it failed to parse.
+
+The current implementation contains an explicit `Freeform plan accepted` fallback. 
+
+This SHALL be replaced with:
+
+```text
+unknown format
+    ↓
+POLICY_REJECTED / INVALID_PLAN
+```
+
+Only recognized structures may become executable plans.
+
+---
+
+# 22. Plan Language
+
+Instead of free-form plans, GRISP SHALL define a small deterministic execution language.
+
+Example:
+
+```text
+TASK
+  TARGET_LANGUAGE delphi
+
+FILES
+  ADD HelloWorld.dpr
+
+VALIDATE
+  SYNTAX
+  COMPILE
+  RUN
+  ASSERT_STDOUT "Hello, World!"
+
+COMMIT
+```
+
+The plan parser SHALL produce an AST.
+
+The AST SHALL be validated before execution.
+
+The AST SHALL not permit arbitrary commands unless explicitly authorized by a capability.
+
+---
+
+# 23. Capabilities
+
+Capabilities SHALL be explicit security objects.
+
+Example:
+
+```text
+compile
+run
+read_workspace
+write_workspace
+delete_workspace
+network
+browser_ai
+debug
+process_spawn
+```
+
+Capability requests SHALL not automatically grant capability access.
+
+The policy engine shall decide.
+
+A peer may request:
+
+```text
+compile
+run
+debug
+```
+
+but GRISP decides whether these are authorized.
+
+---
+
+# 24. Evidence Model
+
+The evidence system is central.
+
+Every assertion SHALL be traceable to evidence.
+
+Example:
+
+```text
+FINAL ACCEPTANCE
+    │
+    ├── compile evidence #831
+    ├── runtime evidence #832
+    ├── test evidence #833
+    ├── policy evidence #834
+    └── artifact hash #835
+```
+
+An LLM opinion is one evidence category:
+
+```text
+SUBJECTIVE_AI_EVIDENCE
+```
+
+Compiler output is:
+
+```text
+OBJECTIVE_BUILD_EVIDENCE
+```
+
+Runtime execution is:
+
+```text
+OBJECTIVE_RUNTIME_EVIDENCE
+```
+
+These SHALL never be conflated.
+
+---
+
+# 25. Scoring
+
+Subjective scores remain useful, but only after hard validation.
+
+Recommended:
+
+```text
+eligible candidates
+    ↓
+objective filter
+    ↓
+subjective ranking
+    ↓
+adversarial review
+    ↓
+final verification
+```
+
+The old approach mixes LLM scores and external evidence numerically. 
+
+The new model SHALL use:
+
+```text
+VALIDITY = Boolean gate
+
+QUALITY_SCORE =
+  correctness quality
+  + maintainability
+  + clarity
+  + performance
+  + architecture
+  + style
+```
+
+A candidate with:
+
+```text
+compile = false
+```
+
+has:
+
+```text
+eligible = false
+```
+
+regardless of quality score.
+
+---
+
+# 26. Independent Verification
+
+For high-risk tasks, GRISP SHOULD use multiple verification paths.
+
+Example:
+
+```text
+candidate A
+ ↓
+compiler
+ ↓
+tests
+ ↓
+LLM adversarial review
+ ↓
+second compiler/configuration
+ ↓
+final verification
+```
+
+The purpose of multi-LLM architecture is not to vote blindly.
+
+Its purpose is to increase the probability of finding errors before objective validation.
+
+---
+
+# 27. Consensus
+
+Consensus SHALL NOT mean:
+
+```text
+3 LLMs said yes
+=> accept
+```
+
+Instead:
+
+```text
+3 LLMs agree
+=> confidence increase
+```
+
+but:
+
+```text
+compiler fails
+=> reject
+```
+
+This makes AI consensus subordinate to objective evidence.
+
+---
+
+# 28. Peer Reliability
+
+Reliability SHALL be decomposed.
+
+At minimum:
+
+```text
+generation_reliability
+critique_reliability
+repair_reliability
+test_design_reliability
+scoring_reliability
+protocol_reliability
+```
+
+Do not store one number called:
+
+```text
+reliability
+```
+
+A provider can be excellent at Delphi generation but terrible at writing valid tests.
+
+The current system updates a broad peer reliability score from combined events. 
+
+The new system should maintain separate distributions.
+
+---
+
+# 29. Reliability Mathematics
+
+Reliability SHOULD be Bayesian or at least evidence-weighted rather than a simple fixed increment/decrement counter.
+
+For each worker and capability:
+
+```text
+successes
+failures
+attempts
+confidence interval
+recent performance
+```
+
+A Beta posterior is a simple option:
+
+```text
+Beta(α + success, β + failure)
+```
+
+Store:
+
+```text
+mean
+lower confidence bound
+upper confidence bound
+sample count
+```
+
+Selection can then favor workers with strong lower confidence bounds rather than merely high historical averages.
+
+---
+
+# 30. Retry Policy
+
+Retries SHALL be reason-specific.
+
+Examples:
+
+```text
+TRANSPORT_TIMEOUT
+    retry same request
+
+AUTH_REQUIRED
+    do not retry endlessly
+
+PARSE_ERROR
+    retry with stricter output request
+
+MODEL_ERROR
+    retry alternate provider
+
+COMPILE_FAILURE
+    repair artifact
+
+TEST_FAILURE
+    analyze failing test
+
+POLICY_REJECTION
+    do not retry blindly
+```
+
+This prevents expensive repeated loops.
+
+---
+
+# 31. State Machine
+
+The orchestrator SHALL be an explicit state machine.
+
+Recommended states:
+
+```text
+TASK_ACCEPTED
+TASK_NORMALIZED
+WORKER_PLAN
+CANDIDATE_GENERATION
+ARTIFACT_PARSE
+STATIC_VALIDATION
+OBJECTIVE_BUILD
+OBJECTIVE_RUNTIME
+TEST_DESIGN
+TEST_EXECUTION
+ADVERSARIAL_REVIEW
+CANDIDATE_RANKING
+FINAL_VERIFICATION
+COMMIT
+REPORT
+```
+
+Each transition SHALL have deterministic entry/exit conditions.
+
+---
+
+# 32. Cancellation
+
+Every task SHALL support cancellation.
+
+Cancellation SHALL propagate to:
+
+```text
+LLM request
+Firefox operation
+compiler process
+test process
+runtime process
+pending timers
+```
+
+The system SHALL not leave orphaned browser operations or processes behind.
+
+---
+
+# 33. Provenance
+
+Every artifact SHALL record:
+
+```text
+task_id
+parent_artifact_id
+worker_id
+provider
+model
+Firefox session
+browser tab/session identity
+prompt_hash
+response_hash
+creation timestamp
+tool evidence
+compiler evidence
+test evidence
+```
+
+This makes reconstruction possible.
+
+---
+
+# 34. Final Commit
+
+The commit stage SHALL be transactional.
+
+```text
+prepare
+ ↓
+verify
+ ↓
+stage
+ ↓
+hash
+ ↓
+commit
+ ↓
+verify committed bytes
+```
+
+A partially written result SHALL never be reported as committed.
+
+---
+
+# 35. Workspace
+
+The workspace SHALL distinguish:
+
+```text
+/input
+/candidates
+/tests
+/build
+/runtime
+/final
+/evidence
+/logs
+```
+
+Example:
+
+```text
+/workspace/
+    input/
+    candidates/
+    tests/
+    build/
+    runtime/
+    final/
+    evidence/
+    logs/
+```
+
+Only `/final` represents an accepted artifact.
+
+---
+
+# 36. Reporting
+
+The report SHALL explicitly separate:
+
+```text
+TASK
+ARTIFACT
+OBJECTIVE VALIDATION
+SUBJECTIVE ANALYSIS
+POLICY
+TESTS
+FINAL DECISION
+```
+
+Example:
+
+```text
+ARTIFACT PARSE       PASS
+STATIC VALIDATION    PASS
+COMPILE              PASS
+RUNTIME              PASS
+TESTS                PASS
+POLICY               PASS
+FINAL VERIFICATION   PASS
+COMMIT               PASS
+FINAL ACCEPTANCE     ACCEPTED
+```
+
+A result such as:
+
+```text
+GRISP Sandbox = TRUE
+```
+
+is insufficient.
+
+---
+
+# 37. Firefox AI Gateway
+
+## 37.1 Purpose
+
+Firefox SHALL not be treated as a collection of ad-hoc DOM scripts behind a generic command socket.
+
+It SHALL expose a stable protocol:
+
+# GARP — GRISP AI Relay Protocol
+
+Version:
+
+```text
+GARP/1.0
+```
+
+Transport:
+
+```text
+TCP localhost
+UTF-8
+length-framed binary envelope
+```
+
+JSON MAY be used as the payload serialization, but message framing SHALL NOT depend on newline termination.
+
+---
+
+# 38. Why Replace Newline-Delimited JSON
+
+The current Firefox service accumulates text until it sees `\n`, then parses one JSON command. 
+
+That works for simple commands, but it makes the wire protocol vulnerable to:
+
+* accidental embedded framing;
+* oversized messages;
+* lack of message identity;
+* lack of request cancellation;
+* ambiguous asynchronous ordering;
+* no streaming event model;
+* no protocol version negotiation.
+
+The new protocol SHALL use:
+
+```text
+4-byte unsigned big-endian payload length
++
+payload
+```
+
+or an equivalent explicit frame structure.
+
+Recommended frame:
+
+```text
+magic[4]
+version[1]
+flags[1]
+header_length[2]
+payload_length[4]
+message_type[2]
+reserved[2]
+request_id[16]
+session_id[16]
+payload[...]
+```
+
+---
+
+# 39. GARP Message Identity
+
+Every request SHALL have:
+
+```text
+request_id
+```
+
+Every browser AI session SHALL have:
+
+```text
+session_id
+```
+
+Every browser tab SHALL have a stable:
+
+```text
+tab_id
+```
+
+The current implementation identifies tabs primarily by numeric index. 
+
+That is unsuitable as a persistent identity because tab indexes can change.
+
+The new system SHALL use:
+
+```text
+tab_id = GUID
+```
+
+and expose:
+
+```text
+tab_index
+```
+
+only as informational metadata.
+
+---
+
+# 40. GARP Session Model
+
+Opening a site SHALL create or attach to an AI session.
+
+Example:
+
+```text
+session_id = 84F1...
+provider = deepseek
+tab_id = 91AA...
+conversation_id = optional provider-specific identity
+state = READY
+```
+
+The session SHALL maintain:
+
+```text
+provider
+tab
+conversation
+input_state
+generation_state
+last_request_id
+last_message_id
+```
+
+---
+
+# 41. Core GARP Commands
+
+Required commands:
+
+```text
+HELLO
+CAPABILITIES
+BROWSER_STATUS
+
+LIST_TABS
+OPEN_TAB
+CLOSE_TAB
+SELECT_TAB
+
+CREATE_SESSION
+ATTACH_SESSION
+DETACH_SESSION
+CLOSE_SESSION
+
+PROMPT
+CANCEL_PROMPT
+GET_PROMPT_STATUS
+
+GET_RESPONSE
+SUBSCRIBE_RESPONSE
+
+PING
+RESET_SESSION
+```
+
+Optional:
+
+```text
+SCREENSHOT
+DOM_DIAGNOSTICS
+PROVIDER_DIAGNOSTICS
+```
+
+---
+
+# 42. GARP Handshake
+
+First message:
+
+```json
+{
+  "type": "hello",
+  "protocol": "GARP/1.0",
+  "client_id": "GRISP-Agent-...",
+  "client_version": "1.0.0"
+}
+```
+
+Firefox responds:
+
+```json
+{
+  "type": "hello_ack",
+  "protocol": "GARP/1.0",
+  "server_id": "...",
+  "server_version": "...",
+  "browser": {
+    "name": "Firefox",
+    "version": "..."
+  },
+  "features": [
+    "streaming",
+    "cancel",
+    "sessions",
+    "stable_tabs",
+    "response_events"
+  ]
+}
+```
+
+The client and server SHALL negotiate features.
+
+---
+
+# 43. Prompt Request
+
+Example:
+
+```json
+{
+  "type": "prompt",
+  "request_id": "uuid",
+  "session_id": "uuid",
+  "prompt": {
+    "text": "...",
+    "format": "text"
+  },
+  "options": {
+    "stream": true,
+    "auto_continue": true,
+    "timeout_ms": 180000
+  }
+}
+```
+
+The response SHALL be immediate:
+
+```json
+{
+  "type": "prompt_ack",
+  "request_id": "uuid",
+  "session_id": "uuid",
+  "state": "accepted"
+}
+```
+
+The actual AI response SHALL arrive asynchronously as events.
+
+---
+
+# 44. Streaming Response Events
+
+Recommended event types:
+
+```text
+prompt_started
+input_injected
+input_submitted
+generation_started
+generation_delta
+generation_progress
+continuation_required
+continuation_submitted
+generation_completed
+generation_failed
+session_changed
+navigation
+provider_error
+auth_required
+```
+
+Example:
+
+```json
+{
+  "type": "generation_delta",
+  "request_id": "...",
+  "session_id": "...",
+  "message_id": "...",
+  "sequence": 17,
+  "text_delta": "program HelloWorld;"
+}
+```
+
+This is substantially better than repeatedly scraping the entire latest message.
+
+---
+
+# 45. Final Response Event
+
+```json
+{
+  "type": "generation_completed",
+  "request_id": "...",
+  "session_id": "...",
+  "message_id": "...",
+  "content": "...",
+  "format": "text",
+  "finish_reason": "stop",
+  "provider_state": "idle"
+}
+```
+
+This becomes authoritative.
+
+Polling MAY remain as a fallback, but event-driven streaming SHALL be preferred.
+
+---
+
+# 46. Response Identity
+
+Firefox SHALL associate a prompt with a response using:
+
+```text
+request_id
+message_id
+submission_generation
+```
+
+Never infer the new response merely by asking:
+
+```text
+what is the newest markdown node?
+```
+
+The current implementation filters messages against the previous prompt and selects the last message. 
+
+That is vulnerable to stale-message confusion.
+
+The new protocol must establish:
+
+```text
+before submission:
+  last assistant message = X
+
+after submission:
+  new assistant message = Y
+
+therefore:
+  Y belongs to this request
+```
+
+---
+
+# 47. Browser Session Synchronization
+
+Before submitting, Firefox SHALL send:
+
+```text
+SESSION_SNAPSHOT
+```
+
+containing:
+
+```text
+provider
+tab_id
+url
+page_generation
+input_ready
+conversation_identity
+last_message_id
+ui_state
+```
+
+This gives GRISP a deterministic starting point.
+
+---
+
+# 48. Page Generation
+
+Every significant navigation or SPA actor replacement SHALL increment:
+
+```text
+page_generation
+```
+
+Example:
+
+```text
+tab_id = A
+page_generation = 17
+```
+
+A response event from page generation 16 SHALL not silently overwrite generation 17 state.
+
+This directly addresses the existing workaround of reacquiring the actor after navigation.
+
+---
+
+# 49. Firefox Child Actor Responsibilities
+
+The child actor SHALL own:
+
+```text
+DOM discovery
+input interaction
+send action
+provider-specific response observation
+provider-specific state extraction
+```
+
+The parent SHALL own:
+
+```text
+connection
+sessions
+request tracking
+timeouts
+cancellation
+routing
+message identity
+stream aggregation
+browser-level state
+```
+
+This preserves the good architectural decision already present in the current implementation: polling is currently moved back to the parent because SPA navigation can destroy and recreate the child actor. 
+
+The redesign retains that principle, but replaces polling-heavy behavior with explicit session/event state.
+
+---
+
+# 50. Provider Adapter Architecture
+
+Each provider SHALL implement:
+
+```text
+ProviderAdapter
+    discoverInput()
+    inspectReadyState()
+    submitPrompt()
+    inspectGeneration()
+    inspectConversation()
+    detectContinuation()
+    continueGeneration()
+    detectAuthentication()
+    detectRateLimit()
+    detectError()
+```
+
+Provider-specific DOM selectors SHALL remain isolated.
+
+The generic engine SHALL NOT contain provider-specific selectors.
+
+---
+
+# 51. Provider Health
+
+Firefox SHALL expose:
+
+```json
+{
+  "provider": "deepseek",
+  "state": "READY",
+  "input": "ready",
+  "authenticated": true,
+  "generation": "idle",
+  "adapter_version": "..."
+}
+```
+
+Possible states:
+
+```text
+UNKNOWN
+LOADING
+READY
+BUSY
+AUTH_REQUIRED
+RATE_LIMITED
+ERROR
+UNSUPPORTED
+```
+
+This is significantly stronger than the current `waitForReady()` behavior, where timeout can resolve readiness without an explicit failure result. The caller then continues toward prompt injection. 
+
+In GARP:
+
+```text
+READY
+or
+NOT_READY
+or
+AUTH_REQUIRED
+or
+ERROR
+```
+
+must be explicit.
+
+---
+
+# 52. Firefox Prompt Lifecycle
+
+The exact state machine SHALL be:
+
+```text
+IDLE
+ ↓
+PREPARING
+ ↓
+INPUT_READY
+ ↓
+INJECTING
+ ↓
+SUBMITTING
+ ↓
+GENERATION_STARTED
+ ↓
+STREAMING
+ ↓
+CONTINUATION_REQUIRED
+ ↓
+STREAMING
+ ↓
+COMPLETE
+```
+
+Failure branches:
+
+```text
+AUTH_REQUIRED
+RATE_LIMIT
+PROVIDER_ERROR
+DOM_ERROR
+NAVIGATION_ERROR
+TIMEOUT
+CANCELLED
+```
+
+No state may silently fall through to another state.
+
+---
+
+# 53. Continuation Handling
+
+The existing implementation automatically looks for "Continue" buttons and clicks them. 
+
+The redesign SHALL preserve this capability but make it stateful.
+
+Firefox SHALL emit:
+
+```json
+{
+  "type": "continuation_required",
+  "request_id": "...",
+  "message_id": "...",
+  "reason": "provider_length_limit"
+}
+```
+
+GRISP can then decide:
+
+```text
+continue automatically
+or
+do not continue
+```
+
+The browser SHALL not silently add content without recording the event.
+
+---
+
+# 54. Cancellation
+
+GRISP:
+
+```json
+{
+  "type": "cancel_prompt",
+  "request_id": "...",
+  "reason": "task_timeout"
+}
+```
+
+Firefox:
+
+```json
+{
+  "type": "prompt_cancelled",
+  "request_id": "...",
+  "state": "cancelled"
+}
+```
+
+Provider-specific cancellation mechanisms SHALL be used where possible.
+
+Otherwise the adapter SHALL terminate observation and mark the request cancelled.
+
+---
+
+# 55. Backpressure
+
+Streaming responses can be large.
+
+GARP SHALL support:
+
+```text
+sequence numbers
+chunk sizes
+maximum in-flight bytes
+acknowledgements where necessary
+```
+
+The server SHALL not require GRISP to poll rapidly to avoid losing response information.
+
+---
+
+# 56. Reliable Event Ordering
+
+Each event SHALL contain:
+
+```text
+request_id
+sequence
+timestamp
+```
+
+Example:
+
+```text
+17 generation_delta
+18 generation_delta
+19 continuation_required
+20 continuation_submitted
+21 generation_delta
+22 generation_completed
+```
+
+If GRISP receives:
+
+```text
+21
+19
+20
+22
+```
+
+it can reorder deterministically.
+
+---
+
+# 57. Idempotency
+
+Requests SHALL support an idempotency key.
+
+For example:
+
+```text
+request_id = UUID
+```
+
+A duplicate `PROMPT` with the same request ID SHALL NOT submit the same prompt twice.
+
+This is particularly important for Firefox automation, where retries may otherwise cause duplicate messages.
+
+---
+
+# 58. Connection Resilience
+
+A broken TCP connection SHALL NOT automatically mean that the AI task is lost.
+
+Firefox SHALL maintain session state independently.
+
+GRISP may reconnect and issue:
+
+```text
+GET_PROMPT_STATUS
+```
+
+using:
+
+```text
+request_id
+session_id
+```
+
+Firefox responds:
+
+```text
+SUBMITTING
+STREAMING
+COMPLETE
+FAILED
+UNKNOWN
+```
+
+---
+
+# 59. Browser Diagnostics
+
+GARP SHALL expose diagnostics without requiring GRISP to scrape raw logs.
+
+Example:
+
+```json
+{
+  "type": "diagnostic",
+  "request_id": "...",
+  "provider": "copilot",
+  "stage": "submit",
+  "state": "button_not_ready",
+  "details": {
+    "input_found": true,
+    "button_found": true,
+    "button_enabled": false
+  }
+}
+```
+
+This will be vastly more useful than generic:
+
+```text
+Send button unavailable
+```
+
+---
+
+# 60. DOM Adapter Rules
+
+Provider adapters SHALL avoid broad selectors wherever possible.
+
+The current code contains wide fallback selectors such as:
+
+```text
+button, div[role="button"], a[role="button"], ...
+```
+
+and similarly broad message selection. This increases the probability of selecting unrelated UI elements.
+
+New rules:
+
+```text
+preferred stable selector
+↓
+semantic attribute
+↓
+provider-specific structural selector
+↓
+strict diagnostic fallback
+```
+
+A fallback SHALL identify why it believes an element is the correct element.
+
+---
+
+# 61. Deep DOM Search
+
+The existing child actor recursively walks shadow roots and DOM nodes. 
+
+The redesign SHOULD cache discovered roots where possible.
+
+Do not recursively traverse the entire DOM on every poll.
+
+Instead:
+
+```text
+page mutation
+↓
+invalidate provider cache
+↓
+rediscover only when necessary
+```
+
+This reduces both CPU cost and accidental UI matches.
+
+---
+
+# 62. Injection Strategy
+
+Provider adapters SHALL provide explicit input methods:
+
+```text
+set_value
+dispatch_input
+submit_button
+keyboard_fallback
+```
+
+The adapter SHALL report exactly which mechanism succeeded.
+
+For example:
+
+```json
+{
+  "input_method": "contenteditable",
+  "submit_method": "button_click"
+}
+```
+
+Keyboard simulation SHALL remain a last resort.
+
+The current implementation already deliberately avoids unsafe keyboard events because they caused Firefox IPC instability; that principle should remain. 
+
+---
+
+# 63. Firefox Browser Security
+
+The server currently listens on localhost port 9999.
+
+The redesigned service SHALL additionally provide:
+
+```text
+authentication token
+session secret
+origin/client identification
+maximum frame size
+connection limits
+request rate limits
+```
+
+At minimum:
+
+```text
+bind = localhost only
+random startup secret
+HELLO authentication
+```
+
+No unauthenticated local process should automatically gain AI browser-control capability.
+
+---
+
+# 64. GARP Error Model
+
+Errors SHALL be structured.
+
+Example:
+
+```json
+{
+  "type": "error",
+  "request_id": "...",
+  "code": "AUTH_REQUIRED",
+  "message": "Provider authentication required",
+  "retryable": false,
+  "provider": "gemini",
+  "state": "AUTH_REQUIRED"
+}
+```
+
+Suggested codes:
+
+```text
+PROTOCOL_ERROR
+BAD_REQUEST
+UNAUTHORIZED
+SESSION_NOT_FOUND
+TAB_NOT_FOUND
+PROVIDER_NOT_FOUND
+AUTH_REQUIRED
+INPUT_NOT_READY
+SUBMIT_FAILED
+GENERATION_TIMEOUT
+GENERATION_FAILED
+CONTINUATION_FAILED
+NAVIGATION_CHANGED
+PROVIDER_RATE_LIMIT
+DOM_UNSUPPORTED
+INTERNAL_ERROR
+```
+
+---
+
+# 65. Logging
+
+Both GRISP and Firefox SHALL log structured events.
+
+Every log record SHOULD contain:
+
+```text
+timestamp
+component
+task_id
+request_id
+session_id
+tab_id
+provider
+event
+severity
+```
+
+Plain text logs MAY be generated additionally for humans.
+
+---
+
+# 66. Debug Mode
+
+Debug mode SHALL never modify prompts.
+
+The current system uses injected HTML comments such as:
+
+```text
+<!-- DEBUG: ... -->
+```
+
+inside prompts.
+
+This is undesirable because the debugging mechanism modifies the actual input seen by the external AI.
+
+New rule:
+
+> Debug metadata SHALL travel in the transport envelope, never inside the semantic prompt.
+
+Example:
+
+```json
+{
+  "type": "prompt",
+  "request_id": "...",
+  "debug": {
+    "phase": "candidate_generation"
+  },
+  "prompt": {
+    "text": "actual user task"
+  }
+}
+```
+
+This makes debugging non-invasive.
+
+---
+
+# 67. Prompt Templates
+
+GRISP SHALL use versioned prompt templates.
+
+Example:
+
+```text
+template_id = Delphi.GenerateCandidate.v3
+template_hash = SHA256(...)
+```
+
+Every AI request records:
+
+```text
+template_id
+template_hash
+system_instructions_hash
+user_prompt_hash
+```
+
+This improves reproducibility.
+
+---
+
+# 68. AI Response Normalization
+
+The browser adapter returns raw provider content.
+
+GRISP performs normalization.
+
+Pipeline:
+
+```text
+RAW RESPONSE
+ ↓
+decode
+ ↓
+protocol verification
+ ↓
+artifact parser
+ ↓
+language parser
+ ↓
+filename validation
+ ↓
+artifact normalization
+ ↓
+hash
+```
+
+No provider-specific text-cleaning hacks belong in the core.
+
+---
+
+# 69. Filename Handling
+
+Filenames SHALL be explicit metadata, not inferred from concatenated markdown strings.
+
+Valid representation:
+
+```json
+{
+  "name": "HelloWorld.dpr",
+  "kind": "source",
+  "language": "delphi",
+  "content": "program HelloWorld;..."
+}
+```
+
+If the AI returns:
+
+````text
+```Pascal/Delphi:HelloWorld.dpr
+...
+````
+
+````
+
+the parser SHALL extract:
+
+```text
+language = Pascal/Delphi
+filename = HelloWorld.dpr
+content = ...
+````
+
+No global `StringReplace()` SHALL be necessary.
+
+---
+
+# 70. Artifact Parser Rules
+
+The parser SHALL reject:
+
+```text
+missing filename
+invalid filename
+absolute path
+../ traversal
+embedded NUL
+unknown language
+multiple conflicting filename declarations
+truncated code block
+unterminated code block
+malformed structured response
+```
+
+The existing parser currently accepts a whole response as a fallback file when it finds no code block. 
+
+In strict mode, this SHALL become:
+
+```text
+PARSE_AMBIGUOUS
+```
+
+unless the operation explicitly allows raw text.
+
+---
+
+# 71. AI Worker Isolation
+
+Each worker invocation SHALL have:
+
+```text
+input prompt
+task snapshot
+artifact snapshot
+response
+response hash
+duration
+provider metadata
+```
+
+Workers SHALL never directly modify `/final`.
+
+Only GRISP tools may write committed artifacts.
+
+---
+
+# 72. Repair Model
+
+A repair SHALL always create a new immutable artifact.
+
+```text
+Artifact A
+   │
+   ├── critique
+   ├── tool evidence
+   ▼
+Artifact B
+```
+
+Do not mutate candidate A in place.
+
+This provides clear provenance.
+
+---
+
+# 73. Adversarial Review
+
+Before final selection, GRISP SHOULD ask at least one worker to attack the candidate.
+
+Prompt:
+
+```text
+Assume this implementation is wrong.
+Find the smallest concrete input, environment, compiler condition,
+or runtime scenario that would cause it to fail.
+```
+
+The purpose is defect discovery, not democratic voting.
+
+---
+
+# 74. Bug Classification
+
+Critiques SHALL classify findings.
+
+Required categories:
+
+```text
+BUG
+SECURITY
+CONTRACT_VIOLATION
+PORTABILITY
+PERFORMANCE
+ROBUSTNESS
+STYLE
+OPTIONAL_IMPROVEMENT
+FALSE_POSITIVE
+```
+
+Only:
+
+```text
+BUG
+SECURITY
+CONTRACT_VIOLATION
+```
+
+should normally trigger automatic repair.
+
+This prevents the previous behavior where an adequate Hello World was unnecessarily modified because the AI considered `ReadLn` and explicit `System` desirable. 
+
+---
+
+# 75. Decision Engine
+
+The decision engine SHALL first construct the eligible set:
+
+```text
+eligible =
+    parsed
+    AND policy_ok
+    AND required_build_ok
+    AND required_runtime_ok
+    AND required_tests_ok
+```
+
+Then:
+
+```text
+best = argmax(
+    quality_score
+    × reviewer_confidence
+    × reliability_factor
+)
+```
+
+No ineligible candidate participates.
+
+---
+
+# 76. Determinism
+
+For the same:
+
+```text
+task
+provider responses
+compiler environment
+tool results
+policy
+```
+
+the deterministic parts of the system SHALL produce the same result.
+
+Random behavior SHALL be recorded with:
+
+```text
+seed
+```
+
+when applicable.
+
+---
+
+# 77. Timeouts
+
+Timeouts SHALL be hierarchical:
+
+```text
+task timeout
+  ├── phase timeout
+  │    ├── worker timeout
+  │    ├── browser timeout
+  │    ├── compile timeout
+  │    └── runtime timeout
+```
+
+A lower-level timeout SHALL never cause the overall task to silently report success.
+
+---
+
+# 78. Resource Limits
+
+At minimum:
+
+```text
+max prompt bytes
+max response bytes
+max artifact bytes
+max files
+max test programs
+max concurrent workers
+max execution time
+max stdout bytes
+max stderr bytes
+```
+
+---
+
+# 79. Concurrency
+
+Independent LLM operations MAY be executed concurrently.
+
+Examples:
+
+```text
+candidate generation A/B/C
+parallel
+```
+
+but state transitions SHALL remain serialized per artifact.
+
+No two operations shall mutate the same session or artifact simultaneously without a defined lock/order.
+
+---
+
+# 80. Browser Concurrency
+
+A Firefox AI session SHALL have a single active prompt by default.
+
+Attempting:
+
+```text
+PROMPT request A
+PROMPT request B
+```
+
+against the same session while A is generating SHALL yield:
+
+```text
+SESSION_BUSY
+```
+
+unless concurrent conversations are explicitly supported.
+
+This eliminates accidental double-submit problems.
+
+---
+
+# 81. Session Recovery
+
+If Firefox reloads or SPA navigation recreates an actor:
+
+```text
+session_id remains stable
+tab_id remains stable
+page_generation increments
+```
+
+Firefox rebinds the child actor automatically.
+
+GRISP need not know about the actor lifecycle.
+
+This formalizes the useful idea already present in the current implementation of reacquiring the actor after navigation. 
+
+---
+
+# 82. Browser Tab Lifecycle
+
+`OPEN_TAB` SHALL return:
+
+```json
+{
+  "tab_id": "...",
+  "index": 5,
+  "url": "..."
+}
+```
+
+`GET_TABS` SHALL expose:
+
+```text
+tab_id
+index
+title
+url
+selected
+provider
+session_id
+state
+```
+
+A changing index SHALL not change identity.
+
+---
+
+# 83. Provider Selection
+
+GRISP SHALL choose providers by policy.
+
+Example:
+
+```text
+Delphi generation:
+    Delphi specialist
+    general LLM
+
+critical verification:
+    independent provider
+
+test generation:
+    test specialist
+
+adversarial review:
+    independent provider
+```
+
+Provider choice SHALL be visible in the trace.
+
+---
+
+# 84. Multi-LLM Independence
+
+GRISP SHOULD avoid asking all providers the exact same question when independent perspectives matter.
+
+For example:
+
+```text
+Generator:
+"Produce implementation."
+
+Reviewer:
+"Assume implementation may contain hidden defects."
+
+Adversary:
+"Try to break implementation."
+
+Test designer:
+"Construct tests from the public contract."
+
+Compiler specialist:
+"Assess compiler compatibility."
+```
+
+This gives the multi-agent architecture actual diversity.
+
+---
+
+# 85. Browser Adapter Versioning
+
+Each Firefox provider adapter SHALL report:
+
+```text
+provider
+adapter_version
+supported_features
+selector_strategy_version
+```
+
+When a site changes, only that adapter should need modification.
+
+---
+
+# 86. Automatic Adapter Health Test
+
+At startup, Firefox SHALL test each configured provider adapter.
+
+Example:
+
+```text
+input discovery
+button discovery
+response discovery
+continuation discovery
+authentication detection
+```
+
+The system should report:
+
+```text
+DeepSeek adapter: PASS
+Gemini adapter: PASS
+ChatGPT adapter: PASS
+...
+```
+
+This is preferable to finding adapter breakage in the middle of an AI task.
+
+---
+
+# 87. Firefox Site Adapter Isolation
+
+Each provider SHALL have its own module:
+
+```text
+providers/
+    DeepSeekAdapter.sys.mjs
+    GeminiAdapter.sys.mjs
+    ChatGPTAdapter.sys.mjs
+    ClaudeAdapter.sys.mjs
+    GrokAdapter.sys.mjs
+    CopilotAdapter.sys.mjs
+    PerplexityAdapter.sys.mjs
+```
+
+The generic child actor should not contain enormous provider-specific selector tables.
+
+---
+
+# 88. Browser Gateway API
+
+The Firefox service should have approximately this conceptual API:
+
+```text
+connect()
+hello()
+listProviders()
+listTabs()
+openTab()
+createSession()
+sessionStatus()
+prompt()
+streamEvents()
+cancel()
+closeSession()
+disconnect()
+```
+
+GRISP should not need to know anything about DOM selectors.
+
+---
+
+# 89. Recommended GARP Event Flow
+
+Example:
+
+```text
+GRISP                         Firefox
+  │                              │
+  │ HELLO ──────────────────────>│
+  │<──────────────── HELLO_ACK   │
+  │                              │
+  │ CREATE_SESSION ─────────────>│
+  │<──────── SESSION_READY       │
+  │                              │
+  │ PROMPT ─────────────────────>│
+  │<──────── PROMPT_ACK          │
+  │<──────── INPUT_SUBMITTED     │
+  │<──────── GENERATION_STARTED  │
+  │<──────── DELTA               │
+  │<──────── DELTA               │
+  │<──────── DELTA               │
+  │<──────── CONTINUATION_REQ    │
+  │<──────── CONTINUATION_SENT   │
+  │<──────── DELTA               │
+  │<──────── GENERATION_COMPLETE │
+  │                              │
+```
+
+This is much more suitable for an AI agent than request/response polling.
+
+---
+
+# 90. Recommended GARP Transport Properties
+
+Required:
+
+```text
+UTF-8
+binary length framing
+request IDs
+session IDs
+sequence IDs
+version negotiation
+structured errors
+timeouts
+cancellation
+heartbeat
+```
+
+Recommended:
+
+```text
+compression for large streams
+message acknowledgements
+connection authentication
+diagnostic subscriptions
+```
+
+---
+
+# 91. Heartbeat
+
+Both sides SHALL support:
+
+```text
+PING
+PONG
+```
+
+Suggested interval:
+
+```text
+10–30 seconds
+```
+
+A connection that disappears should be detected independently of an active prompt.
+
+---
+
+# 92. Maximum Frame Size
+
+The gateway SHALL enforce a maximum message size.
+
+Example defaults:
+
+```text
+control frame: 1 MB
+prompt:        4 MB
+artifact:      16 MB
+stream chunk:  256 KB
+```
+
+Actual limits SHALL be configurable.
+
+---
+
+# 93. No Semantic Mutation by Transport
+
+The transport layer SHALL never:
+
+```text
+alter prompts
+insert debug comments
+rewrite code
+remove Markdown
+fix filenames
+```
+
+Transport transports data.
+
+Normalization belongs to GRISP.
+
+This produces a clean architectural boundary:
+
+```text
+Firefox = observe and transport
+GRISP = interpret and verify
+AI     = reason
+tools  = measure
+policy = authorize
+```
+
+---
+
+# 94. Firefox Source Changes Recommended
+
+The Firefox automation should be refactored from the current structure:
+
+```text
+AIAutomationService
+AIAutomationConnection
+AIAutomationUtils
+AIAutomationChild
+```
+
+into:
+
+```text
+AIAutomationService
+    └── GarpConnection
+
+AIAutomationSessionManager
+    └── AIAutomationSession
+
+AIAutomationProviderRegistry
+    ├── DeepSeekAdapter
+    ├── GeminiAdapter
+    ├── ChatGPTAdapter
+    └── ...
+
+AIAutomationChild
+    └── provider adapter bridge
+```
+
+---
+
+# 95. Firefox Parent/Child Protocol
+
+A second internal protocol SHOULD exist between parent and child actor.
+
+Conceptually:
+
+```text
+Parent:
+    PrepareSession
+    InspectReady
+    InjectPrompt
+    SubmitPrompt
+    ObserveGeneration
+    ContinueGeneration
+    CancelGeneration
+
+Child:
+    ReadyState
+    InputState
+    SubmissionState
+    GenerationEvent
+    ProviderError
+```
+
+This should be structured and request-correlated as well.
+
+---
+
+# 96. Replace Polling With Event Observation
+
+The present design repeatedly polls every 500 ms and considers text "done" after stable observations. 
+
+Polling can remain as a fallback, but the preferred order should be:
+
+```text
+provider DOM mutation/events
+    ↓
+adapter state transition
+    ↓
+parent event
+    ↓
+GARP event
+```
+
+Fallback:
+
+```text
+polling
+```
+
+This substantially reduces latency and stale-state problems.
+
+---
+
+# 97. Stable Response Detection
+
+If polling must be used, the state machine should track:
+
+```text
+response_message_id
+text_revision
+dom_revision
+streaming_state
+provider_busy_state
+```
+
+not merely:
+
+```text
+same text 2/6 times
+```
+
+Stability is a heuristic.
+
+Message identity plus provider state should be authoritative.
+
+---
+
+# 98. Authentication
+
+Firefox SHALL explicitly detect:
+
+```text
+AUTH_REQUIRED
+```
+
+and GRISP shall treat that as a deterministic state.
+
+The current system already checks login-like URLs. 
+
+The new adapter should additionally detect provider-specific authenticated/unauthenticated UI states.
+
+---
+
+# 99. Rate Limiting
+
+Provider adapters SHALL detect rate limits where possible.
+
+GARP response:
+
+```text
+RATE_LIMITED
+retry_after_ms
+```
+
+GRISP can then choose:
+
+```text
+wait
+alternate provider
+reduce concurrency
+abort
+```
+
+---
+
+# 100. AI Conversation Identity
+
+A provider session SHOULD expose an opaque:
+
+```text
+conversation_id
+```
+
+where available.
+
+This lets GRISP distinguish:
+
+```text
+new chat
+same conversation
+same tab after navigation
+provider reset
+```
+
+---
+
+# 101. Prompt/Response Hashing
+
+For each AI call:
+
+```text
+prompt_sha256
+raw_response_sha256
+normalized_response_sha256
+```
+
+shall be recorded.
+
+This makes an AI decision auditable without requiring the external provider to be deterministic.
+
+---
+
+# 102. AI Evidence Trust
+
+AI responses SHALL carry a trust level:
+
+```text
+UNVERIFIED_AI
+PEER_REVIEWED_AI
+OBJECTIVELY_CORRELATED_AI
+```
+
+Nothing from an AI model becomes:
+
+```text
+OBJECTIVE_EVIDENCE
+```
+
+merely because another AI agrees.
+
+---
+
+# 103. Final Decision Record
+
+A final decision SHALL look conceptually like:
+
+```json
+{
+  "task_id": "...",
+  "artifact_id": "...",
+  "content_hash": "...",
+  "decision": "accepted",
+  "objective": {
+    "parse": true,
+    "policy": true,
+    "compile": true,
+    "runtime": true,
+    "tests": true
+  },
+  "subjective": {
+    "quality": 0.91,
+    "reviewers": [...]
+  },
+  "evidence": [
+    "...",
+    "..."
+  ]
+}
+```
+
+The empty-evidence decision state observed in the existing trace should be impossible. The current trace can contain a final score while `evidence_scores` and `evidence_debug` are empty. 
+
+---
+
+# 104. Example Final Acceptance
+
+For a Hello World executable:
+
+```text
+Task:
+    write a hello world program in Delphi
+
+Candidate:
+    HelloWorld.dpr
+
+Artifact parse:
+    PASS
+
+Policy:
+    PASS
+
+Compile:
+    PASS
+
+Runtime:
+    PASS
+
+stdout:
+    "Hello, World!\r\n"
+
+exit code:
+    0
+
+Test:
+    PASS
+
+Adversarial review:
+    no blocking issues
+
+Final hash:
+    SHA256(...)
+
+Final verification:
+    PASS
+
+Decision:
+    ACCEPTED
+```
+
+The important point is that the result is simple because the task is simple.
+
+GRISP SHOULD NOT produce a complicated implementation merely because its agents are sophisticated.
+
+---
+
+# 105. Desired Behavior on the Previously Observed Failure
+
+Under this specification, the previous experiment would have ended approximately as follows:
+
+```text
+LLM candidates                 PASS
+artifact extraction             FAIL
+candidate normalization         FAIL
+candidate compilation           NOT ELIGIBLE
+generated test validation       FAIL
+GRISP freeform plan             REJECT
+final acceptance                REJECT
+commit                          NOT PERFORMED
+```
+
+The system would then automatically diagnose:
+
+```text
+Likely cause:
+provider response parser / artifact framing problem
+```
+
+and retry the extraction stage.
+
+That is the correct behavior.
+
+---
+
+# 106. Recovery Strategy
+
+When a generated artifact fails compilation because of structural contamination, GRISP SHALL prefer:
+
+```text
+repair parser
+```
+
+before:
+
+```text
+ask LLM to rewrite code
+```
+
+For example:
+
+```text
+Malformed filename/header
+    ↓
+strict extraction retry
+    ↓
+same source payload
+```
+
+Do not waste another LLM generation unless the source itself is actually invalid.
+
+---
+
+# 107. Human Approval
+
+Human approval SHALL be required for policy profiles configured as:
+
+```text
+destructive
+privileged
+production
+security-sensitive
+external deployment
+```
+
+Human approval SHALL occur after objective verification, not instead of it.
+
+---
+
+# 108. Production Deployment Rule
+
+GRISP SHALL never interpret:
+
+```text
+compile passed
+```
+
+as:
+
+```text
+safe for production
+```
+
+Production acceptance is a separate policy.
+
+---
+
+# 109. Backward Compatibility
+
+A compatibility adapter MAY support the current JSON-line protocol:
+
+```text
+LEGACY-GARP
+```
+
+but only as a compatibility transport.
+
+Legacy mode SHALL have:
+
+```text
+reduced guarantees
+```
+
+and SHOULD immediately translate old commands into structured internal requests.
+
+The new core MUST NOT depend on legacy protocol semantics.
+
+---
+
+# 110. Migration Strategy
+
+Recommended implementation sequence:
+
+## Phase A — GRISP Core
+
+Implement:
+
+```text
+Task
+Artifact
+Evidence
+StateMachine
+ToolResult
+FinalDecision
+```
+
+## Phase B — Hard Gates
+
+Implement:
+
+```text
+artifact parser
+compile gate
+runtime gate
+test gate
+final verification
+```
+
+## Phase C — AI Worker Layer
+
+Implement:
+
+```text
+structured AI requests
+artifact outputs
+provider abstraction
+reliability profiles
+```
+
+## Phase D — GARP/1.0
+
+Implement:
+
+```text
+handshake
+session
+request IDs
+events
+streaming
+cancellation
+```
+
+## Phase E — Firefox Refactor
+
+Move provider-specific logic into adapters.
+
+## Phase F — Advanced Intelligence
+
+Add:
+
+```text
+adversarial review
+specialists
+Bayesian reliability
+adaptive provider selection
+parallel workers
+```
+
+---
+
+# 111. Reference Internal API
+
+A conceptual Delphi core API:
+
+```pascal
+type
+  IGrispAgent = interface
+    function ExecuteTask(
+      const ATask: TGrispTask
+    ): TGrispDecision;
+  end;
+
+  IGrispArtifactStore = interface
+    function CreateArtifact(
+      const AArtifact: TGrispArtifact
+    ): TArtifactId;
+
+    function GetArtifact(
+      const AId: TArtifactId
+    ): TGrispArtifact;
+  end;
+
+  IGrispToolRunner = interface
+    function Execute(
+      const AOperation: TGrispToolOperation
+    ): TGrispToolResult;
+  end;
+
+  IGrispAIWorker = interface
+    function Execute(
+      const ARequest: TAIRequest
+    ): TAIResponse;
+  end;
+
+  IGrispPolicyEngine = interface
+    function Evaluate(
+      const ATask: TGrispTask;
+      const AArtifact: TGrispArtifact
+    ): TPolicyResult;
+  end;
+```
+
+The important architectural property is separation of responsibilities.
+
+---
+
+# 112. Reference Browser API
+
+Conceptually:
+
+```pascal
+type
+  IGarpClient = interface
+    function Connect: Boolean;
+    function CreateSession(
+      const AProvider: string
+    ): TGarpSession;
+    function Prompt(
+      const ASessionId: string;
+      const AText: string
+    ): TGarpRequestId;
+    function Cancel(
+      const ARequestId: string
+    ): Boolean;
+    function GetStatus(
+      const ARequestId: string
+    ): TGarpStatus;
+  end;
+```
+
+Events:
+
+```pascal
+procedure OnGenerationDelta(...)
+procedure OnGenerationCompleted(...)
+procedure OnProviderError(...)
+procedure OnSessionStateChanged(...)
+```
+
+---
+
+# 113. Non-Negotiable Invariants
+
+The following SHALL be treated as formal GRISP invariants.
+
+### Invariant 1
+
+```text
+UNPARSED DATA CANNOT BECOME AN ARTIFACT.
+```
+
+### Invariant 2
+
+```text
+FAILED OBJECTIVE VALIDATION CANNOT BECOME ACCEPTED.
+```
+
+### Invariant 3
+
+```text
+AI OPINION CANNOT OVERRIDE OBJECTIVE FAILURE.
+```
+
+### Invariant 4
+
+```text
+UNRECOGNIZED PLAN CANNOT EXECUTE.
+```
+
+### Invariant 5
+
+```text
+FINAL COMMITTED BYTES MUST EQUAL FINAL VERIFIED BYTES.
+```
+
+### Invariant 6
+
+```text
+EVERY ACCEPTED ARTIFACT MUST HAVE TRACEABLE EVIDENCE.
+```
+
+### Invariant 7
+
+```text
+EVERY AI REQUEST MUST HAVE A UNIQUE REQUEST ID.
+```
+
+### Invariant 8
+
+```text
+EVERY AI SESSION MUST HAVE A STABLE SESSION ID.
+```
+
+### Invariant 9
+
+```text
+TAB INDEX IS NOT TAB IDENTITY.
+```
+
+### Invariant 10
+
+```text
+TRANSPORT MUST NOT MODIFY SEMANTIC CONTENT.
+```
+
+---
+
+# 114. Success Criteria
+
+GRISP v1.0 shall be considered operationally successful only when it can demonstrate:
+
+```text
+1. Correct artifact extraction
+2. Deterministic artifact identity
+3. Objective compile verification
+4. Objective runtime verification
+5. Valid tests against actual artifacts
+6. Fail-closed policy enforcement
+7. Final artifact re-verification
+8. Complete provenance
+9. Reliable cancellation
+10. Browser session recovery
+11. Provider-independent request correlation
+12. Streaming AI responses
+13. No duplicate prompt submission
+14. No false acceptance after objective failure
+```
+
+---
+
+# 115. Recommended First Test Suite
+
+The new GRISP implementation SHALL include regression tests for:
+
+```text
+valid Delphi single-file program
+malformed markdown
+filename/header contamination
+multiple files
+duplicate filenames
+path traversal
+compile failure
+runtime crash
+runtime timeout
+test failure
+empty test
+invalid self-testing test
+stale browser response
+repeated identical prompt
+browser navigation during generation
+provider continuation
+provider authentication redirect
+provider rate limit
+connection drop during generation
+request cancellation
+duplicate request
+out-of-order streaming events
+final artifact mutation after verification
+```
+
+The previously observed Hello World run SHALL itself become a mandatory regression test.
+
+---
+
+# 116. Final Architectural Summary
+
+GRISP v1.0 is not primarily:
+
+```text
+a multi-LLM voting system
+```
+
+It is:
+
+```text
+a deterministic engineering verification system
+            +
+untrusted AI reasoning workers
+            +
+controlled execution tools
+            +
+browser-based AI transport
+```
+
+Firefox is not the intelligence layer.
+
+Firefox is the **AI communications and interaction substrate**.
+
+LLMs are not the authority.
+
+They are **reasoning workers**.
+
+The compiler is not a suggestion.
+
+It is **objective evidence**.
+
+Tests are not decorations.
+
+They are **acceptance evidence**.
+
+The GRISP policy engine is not a label.
+
+It is an **enforcement boundary**.
+
+And the final decision is not:
+
+```text
+"the agents liked this answer"
+```
+
+but:
+
+```text
+"the exact artifact was parsed,
+authorized,
+built,
+executed,
+tested,
+verified,
+and committed with complete provenance."
+```
+
+That is the architecture I recommend as the foundation for the next GRISP generation.
+
+The biggest Firefox-specific improvement is therefore **not merely "fix the selectors."** The important change is to make the browser a reliable, stateful transport endpoint with stable identities and events. Your current service already has a useful parent/child split and deliberately keeps response polling in the parent to survive SPA navigation; keep that idea, but formalize it into sessions, request IDs, message IDs, sequence numbers, provider adapters, and an event stream. 
+
+One especially important change should be implemented before anything else: **never let a browser readiness timeout, malformed AI response, failed compile, or failed test fall through into a successful-looking state.** Your current code has several places where that distinction is blurred, while the terminal run demonstrates the consequence: eight compiler failures followed by a committed solution and an apparently successful GRISP status. 
+
+The GARP/1.0 protocol in this specification is the part I'd use as the foundation for the Firefox source rewrite.

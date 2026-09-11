@@ -1,0 +1,3106 @@
+# GRISP v1.0 Implementation Contract
+
+## Revision 2
+
+**Status:** Implementation baseline
+**Normative parent:** GRISP Agent Specification v1.0
+**Primary implementation:** Delphi / Windows
+**Browser gateway:** Firefox
+**Transport:** GARP/1.0
+**AI semantic exchange:** GAI/1.0
+**Default mode:** fail-closed
+
+---
+
+# 1. Scope
+
+This document is the **implementation contract** for GRISP v1.0.
+
+It does not redefine the architecture.
+
+The architecture specification establishes the system's authority model, candidate/evidence model, hard acceptance gates, Firefox gateway concept, state-machine requirements, and non-negotiable invariants.
+
+This document defines the concrete contracts required to implement those requirements:
+
+```text
+data types
+serialization
+canonicalization
+hashing
+state transitions
+acceptance predicates
+parser behavior
+evidence semantics
+tool contracts
+commit semantics
+GAI messages
+GARP messages
+GARP framing
+Firefox interfaces
+conformance tests
+```
+
+The implementation SHALL conform to this document unless the normative architecture specification explicitly requires otherwise.
+
+---
+
+# 2. Contract layers
+
+GRISP shall have four distinct contract layers.
+
+```text
+┌─────────────────────────────────────┐
+│ GRISP Semantic Contract             │
+│ Task / Artifact / Evidence / Policy │
+│ State / Acceptance / Decision       │
+└──────────────────┬──────────────────┘
+                   │
+        ┌──────────┴──────────┐
+        ▼                     ▼
+┌─────────────────┐   ┌─────────────────┐
+│ GAI/1.0         │   │ GARP/1.0        │
+│ AI semantics    │   │ Browser transport│
+└─────────────────┘   └─────────────────┘
+        │                     │
+        └──────────┬──────────┘
+                   ▼
+        ┌─────────────────────┐
+        │ Implementation      │
+        │ Delphi / Firefox /  │
+        │ storage / tools     │
+        └─────────────────────┘
+```
+
+The implementation SHALL NOT allow:
+
+```text
+Firefox DOM semantics
+```
+
+to leak into:
+
+```text
+GRISP core semantics
+```
+
+nor allow:
+
+```text
+database representation
+```
+
+to become:
+
+```text
+acceptance semantics
+```
+
+---
+
+# 3. Canonical terminology
+
+The following terms have precise meanings.
+
+### Task
+
+Normalized user request.
+
+### AI Response
+
+Raw response received from an AI worker.
+
+An AI response is **not automatically an artifact**.
+
+### Candidate
+
+A task-specific attempt represented by an artifact plus its lifecycle state and evidence.
+
+### ArtifactBundle
+
+Canonical collection of one or more files.
+
+### ArtifactFile
+
+One file within an ArtifactBundle.
+
+### Artifact Identity
+
+Cryptographic identity of the canonical artifact representation.
+
+### Evidence
+
+Immutable record of an observation or deterministic operation.
+
+### ToolResult
+
+Immediate structured result returned by a tool invocation.
+
+### Decision
+
+Final deterministic acceptance/rejection record.
+
+### Session
+
+Logical AI conversation controlled through a worker transport.
+
+### Tab
+
+Stable browser-tab identity.
+
+### Request
+
+One AI operation associated with a unique request ID.
+
+### Message
+
+One AI response identity within a session.
+
+---
+
+# 4. Primitive conventions
+
+Unless another section explicitly overrides them:
+
+```text
+text       = Unicode string
+encoding   = UTF-8
+integer    = signed 64-bit unless explicitly specified
+boolean    = true / false
+identifier = ASCII-safe canonical string or UUID
+hash       = lowercase hexadecimal SHA-256 prefixed with "sha256:"
+timestamp  = RFC 3339 / ISO-8601 UTC
+```
+
+Hexadecimal hashes SHALL be lowercase.
+
+UUIDs SHALL use canonical textual UUID form when serialized.
+
+---
+
+# 5. Identifier types
+
+The Delphi implementation SHOULD use distinct semantic types rather than unrestricted strings where practical.
+
+Conceptually:
+
+```pascal
+type
+  TGrispTaskId = string;
+  TGrispArtifactId = string;
+  TGrispEvidenceId = string;
+  TGrispDecisionId = string;
+  TGrispWorkerId = string;
+  TGrispRequestId = string;
+  TGrispSessionId = string;
+  TGrispTabId = string;
+  TGrispMessageId = string;
+  TGrispEnvironmentId = string;
+```
+
+Semantic validation SHALL verify the expected identifier format.
+
+---
+
+# 6. Task contract
+
+Canonical task fields:
+
+```text
+task_id
+user_prompt
+target_language
+target_platform
+requested_artifact_kind
+constraints
+acceptance_tests
+risk_level
+required_capabilities
+policy_profile
+created_at
+metadata
+```
+
+`requested_artifact_kind` SHALL use a fixed registry:
+
+```text
+EXECUTABLE
+LIBRARY
+UNIT
+PROJECT
+SCRIPT
+PATCH
+DOCUMENTATION
+ANALYSIS
+```
+
+No implementation may invent a new artifact kind at runtime without explicit schema/version support.
+
+---
+
+# 7. ArtifactFile contract
+
+Canonical in-memory structure:
+
+```text
+ArtifactFile
+    filename
+    language
+    kind
+    content
+    content_encoding
+    content_sha256
+    size_bytes
+```
+
+`kind` SHALL be one of:
+
+```text
+source
+test
+manifest
+binary
+doc
+other
+```
+
+`content_encoding` SHALL be:
+
+```text
+utf-8
+base64
+```
+
+No other encoding is accepted by v1.0.
+
+---
+
+# 8. ArtifactBundle contract
+
+Canonical structure:
+
+```text
+ArtifactBundle
+    artifact_id
+    task_id
+    parent_artifact_id
+    revision
+    files[]
+    artifact_kind
+    language
+    provenance
+    metadata
+```
+
+The following fields are authoritative only after validation:
+
+```text
+artifact_id
+content_sha256
+size_bytes
+```
+
+If supplied values disagree with recomputed values:
+
+```text
+ARTIFACT_HASH_MISMATCH
+```
+
+shall be produced.
+
+The implementation shall not silently replace or repair the supplied values.
+
+---
+
+# 9. Artifact identity
+
+Two separate hashes shall be maintained conceptually.
+
+## 9.1 File content hash
+
+```text
+content_sha256 =
+SHA256(exact content bytes)
+```
+
+The hash input is the exact byte representation associated with the artifact.
+
+No implicit:
+
+```text
+CRLF → LF
+Unicode normalization
+whitespace trimming
+encoding conversion
+```
+
+is permitted before hashing.
+
+## 9.2 Artifact identity
+
+```text
+artifact_id =
+"sha256:" + SHA256(canonical_artifact_manifest_bytes)
+```
+
+The artifact manifest contains file hashes.
+
+Therefore:
+
+```text
+ArtifactBundle
+    ↓
+canonical manifest
+    ↓
+SHA-256
+    ↓
+artifact_id
+```
+
+`artifact_id` SHALL NOT be included in the manifest being hashed.
+
+---
+
+# 10. Why exact bytes matter
+
+The implementation must preserve the distinction between:
+
+```text
+logical source
+```
+
+and:
+
+```text
+physical artifact bytes
+```
+
+When an operation changes bytes, it creates a new artifact.
+
+For example:
+
+```text
+Artifact A
+   ↓
+newline normalization
+   ↓
+Artifact B
+```
+
+B must receive a different identity if its canonical manifest changes.
+
+This guarantees that verification is against the same artifact that is eventually committed.
+
+---
+
+# 11. Canonical file ordering
+
+Files SHALL be sorted before inclusion in the canonical manifest.
+
+Primary key:
+
+```text
+filename UTF-8 byte sequence
+```
+
+Comparison is lexicographical and case-sensitive.
+
+Secondary key:
+
+```text
+content_sha256 UTF-8 byte sequence
+```
+
+If both are identical, the records are semantically duplicates and SHALL normally be rejected as duplicate files rather than relying on an arbitrary tertiary ordering.
+
+The implementation SHALL NOT use locale-dependent comparison.
+
+The implementation SHALL NOT use case-insensitive comparison.
+
+The implementation SHALL NOT use Windows filesystem sort order.
+
+---
+
+# 12. Canonical artifact manifest
+
+The manifest contains exactly these top-level fields and order:
+
+```text
+task_id
+parent_artifact_id
+revision
+artifact_kind
+language
+files
+provenance
+metadata
+```
+
+The `files` array contains records:
+
+```text
+filename
+language
+kind
+content_encoding
+content_sha256
+size_bytes
+```
+
+Raw file contents are not repeated in the manifest.
+
+The actual file bytes remain stored by the ArtifactStore.
+
+---
+
+# 13. Canonical provenance
+
+The provenance object uses fixed key order:
+
+```text
+provider
+worker_id
+session_id
+tab_id
+message_id
+prompt_hash
+response_hash
+created_at
+```
+
+Absent/null values are omitted.
+
+Provenance is descriptive metadata and shall never override cryptographic artifact identity.
+
+---
+
+# 14. Metadata canonicalization
+
+`metadata` is allowed to contain:
+
+```text
+null
+boolean
+number
+string
+array
+object
+```
+
+Nested objects SHALL have keys sorted using UTF-8 bytewise lexical ordering.
+
+Arrays preserve their existing order.
+
+Metadata shall not contain executable semantics that the implementation silently interprets.
+
+---
+
+# 15. Canonical JSON serialization
+
+The canonical serializer SHALL produce:
+
+```text
+UTF-8
+no insignificant whitespace
+no line breaks outside strings
+fixed property ordering
+stable string escaping
+stable integer formatting
+```
+
+The implementation SHALL NOT depend on incidental property ordering of a JSON library.
+
+`TJSONObject.ToJSON`, `JSON.stringify`, or equivalent library behavior may be used only after conformance with the canonical serializer has been demonstrated.
+
+For cross-language interoperability, a dedicated canonical serializer is preferred.
+
+---
+
+# 16. Number representation
+
+v1.0 canonical metadata numbers SHALL use:
+
+```text
+integer
+```
+
+where practical.
+
+Floating-point numbers are NOT part of core artifact identity semantics unless explicitly introduced by a later schema revision.
+
+This avoids implementation-dependent representations such as:
+
+```text
+1
+1.0
+1e0
+```
+
+representing the same mathematical value differently.
+
+---
+
+# 17. Canonicalization algorithm
+
+The reference algorithm is:
+
+```text
+1. Obtain exact file bytes.
+2. Compute SHA-256 for every file.
+3. Validate filename uniqueness.
+4. Sort file records by filename UTF-8 bytes.
+5. Construct canonical manifest.
+6. Serialize using canonical JSON rules.
+7. Encode serialized manifest as UTF-8.
+8. SHA-256 the resulting bytes.
+9. Prefix with "sha256:".
+```
+
+Pseudo-operation:
+
+```text
+ComputeArtifactId(bundle):
+
+    for file in bundle.files:
+        file.content_sha256 = SHA256(file.exact_bytes)
+        file.size_bytes = Length(file.exact_bytes)
+
+    ValidateFileNames(bundle.files)
+
+    files := SortCanonical(bundle.files)
+
+    manifest := BuildCanonicalManifest(bundle, files)
+
+    bytes := CanonicalJsonUtf8(manifest)
+
+    return "sha256:" + SHA256(bytes)
+```
+
+---
+
+# 18. Artifact validation
+
+Before an ArtifactBundle becomes a candidate artifact:
+
+```text
+schema valid
+task_id valid
+artifact_kind valid
+language valid
+file count within limits
+filenames valid
+filenames unique
+content encoding supported
+file hashes correct
+file sizes correct
+artifact hash correct
+provenance structurally valid
+```
+
+Any failure produces:
+
+```text
+PARSE_FAILED
+```
+
+or:
+
+```text
+STATIC_FAILED
+```
+
+depending on the layer at which the failure occurs.
+
+---
+
+# 19. Filename validation
+
+The following are rejected:
+
+```text
+absolute paths
+UNC paths
+drive-qualified paths
+../
+..\ 
+embedded NUL
+empty names
+"." 
+".."
+invalid platform path components
+duplicate canonical names
+```
+
+Path semantics SHALL be validated before writing to disk.
+
+---
+
+# 20. Artifact parser contract
+
+The parser has one purpose:
+
+```text
+untrusted response
+    →
+validated ArtifactBundle
+```
+
+It SHALL never have a silent "best effort" success mode.
+
+Results:
+
+```text
+PARSED
+PARSE_ERROR
+PARSE_AMBIGUOUS
+SCHEMA_ERROR
+HASH_MISMATCH
+```
+
+---
+
+# 21. Structured response path
+
+Preferred path:
+
+```text
+GAI/1.0 structured response
+       ↓
+schema validation
+       ↓
+artifact extraction
+       ↓
+hash validation
+       ↓
+ArtifactBundle
+```
+
+This is the authoritative path.
+
+---
+
+# 22. Markdown compatibility path
+
+Markdown is compatibility-only.
+
+The parser SHALL:
+
+```text
+1. scan the entire response
+2. identify all fenced blocks
+3. identify language tags
+4. identify explicit filenames
+5. associate blocks with filenames
+6. detect conflicts
+7. validate filenames
+8. determine whether exactly one valid interpretation exists
+```
+
+It SHALL NOT:
+
+```text
+take first code block
+ignore remaining blocks
+invent a filename
+delete suspicious tokens
+guess the user's intended source
+```
+
+---
+
+# 23. Markdown ambiguity
+
+Examples:
+
+```text
+zero valid artifact interpretations
+    → PARSE_ERROR
+
+one valid interpretation
+    → PARSED
+
+two valid interpretations
+    → PARSE_AMBIGUOUS
+```
+
+A parser must prefer rejection over invention.
+
+---
+
+# 24. No heuristic cleanup
+
+The implementation shall not contain artifact extraction rules equivalent to:
+
+```text
+remove "CopyDownload"
+remove "Delphiprogram"
+remove "Pascalprogram"
+strip unexpected provider prefixes
+delete arbitrary leading tokens
+```
+
+Unexpected contamination becomes a diagnostic.
+
+Example:
+
+```text
+code
+↓
+unexpected token
+↓
+PARSE_ERROR
+```
+
+not:
+
+```text
+code
+↓
+string replacement
+↓
+maybe-valid code
+```
+
+This is consistent with the architecture's requirement that malformed output become a parse failure rather than guessed content.
+
+---
+
+# 25. Filename inference
+
+Filename inference is prohibited in strict artifact parsing.
+
+If the task explicitly supplies a filename requirement, the parser may validate against that expected filename.
+
+Otherwise:
+
+```text
+missing required filename
+    →
+PARSE_ERROR
+```
+
+The parser shall not invent:
+
+```text
+HelloWorld.dpr
+main.pas
+program.py
+```
+
+---
+
+# 26. Evidence contract
+
+Canonical Evidence fields:
+
+```text
+evidence_id
+task_id
+artifact_id
+operation
+tool
+status
+exit_code
+diagnostics[]
+stdout
+stderr
+elapsed_ms
+input_hash
+output_hash
+environment_id
+environment
+created_at
+metadata
+```
+
+Evidence is immutable.
+
+Once recorded, its semantic meaning never changes.
+
+---
+
+# 27. Evidence operation registry
+
+The following operations are defined:
+
+```text
+parse
+static_validate
+compile
+run
+test
+policy_check
+hash
+format
+lint
+commit
+browser
+other
+```
+
+New operations require protocol/schema versioning.
+
+---
+
+# 28. Evidence status registry
+
+Required statuses:
+
+```text
+ok
+failed
+timed_out
+crashed
+cancelled
+parse_error
+rejected
+```
+
+`success = true` is not a replacement for the status field.
+
+---
+
+# 29. ToolResult contract
+
+Immediate tool results:
+
+```text
+ToolResult
+    operation
+    status
+    success
+    exit_code
+    timed_out
+    crashed
+    stdout
+    stderr
+    diagnostics[]
+    duration_ms
+    input_hash
+    output_hash
+    environment_id
+```
+
+A ToolResult becomes Evidence when persisted.
+
+---
+
+# 30. Tool result consistency rules
+
+The following combinations are invalid:
+
+```text
+status = ok AND success = false
+status = timed_out AND timed_out = false
+status = crashed AND crashed = false
+status = timed_out AND exit_code = 0
+```
+
+The implementation SHOULD reject internally inconsistent ToolResults.
+
+---
+
+# 31. Diagnostic contract
+
+Each diagnostic contains:
+
+```text
+severity
+code
+line
+column
+message
+```
+
+where the tool provides those fields.
+
+Required severities:
+
+```text
+error
+warning
+info
+```
+
+Compiler adapters SHALL preserve native error codes where available.
+
+They SHALL NOT turn a compiler error into a generic message merely for convenience.
+
+---
+
+# 32. Tool input identity
+
+Every deterministic tool invocation SHALL have a reproducible input identity.
+
+Examples:
+
+```text
+compile:
+    artifact_id
+    compiler identity
+    compiler arguments
+
+run:
+    executable hash
+    runtime configuration
+
+test:
+    artifact hash
+    test descriptor hash
+```
+
+`input_hash` represents the exact serialized tool input contract.
+
+---
+
+# 33. Environment identity
+
+Every objective tool execution SHALL record:
+
+```text
+environment_id
+```
+
+The environment should identify:
+
+```text
+OS
+architecture
+compiler/tool
+tool version
+SDK
+relevant flags
+sandbox configuration
+```
+
+The environment identity shall remain stable for equivalent environments.
+
+---
+
+# 34. Compiler contract
+
+Compiler selection shall be derived from:
+
+```text
+task target language
+artifact language
+policy
+toolchain registry
+```
+
+It SHALL NOT silently use unrelated global configuration.
+
+Compiler evidence shall record:
+
+```text
+compiler_name
+compiler_version
+target_platform
+target_architecture
+flags
+SDK
+environment_id
+```
+
+---
+
+# 35. Runtime contract
+
+Executable runtime verification SHALL record at least:
+
+```text
+exit_code
+stdout
+stderr
+duration
+timeout state
+crash state
+executable hash
+environment_id
+```
+
+Optional resource metrics:
+
+```text
+CPU
+memory
+process count
+child-process count
+```
+
+---
+
+# 36. Test contract
+
+A test descriptor SHALL contain:
+
+```text
+test_id
+test_target
+test_type
+oracle
+coverage_intent
+```
+
+Supported test types:
+
+```text
+black_box
+unit
+integration
+property
+```
+
+The test target must identify the actual artifact.
+
+---
+
+# 37. Test validity
+
+A generated test is invalid when it:
+
+```text
+tests a nonexistent API
+recreates the implementation
+tests generated helper code instead of the target
+asserts an unstated contract
+cannot execute against the actual artifact
+```
+
+Such a test produces:
+
+```text
+TEST_INVALID
+```
+
+and cannot produce acceptance evidence.
+
+This directly implements the architecture's prohibition on self-testing tests that invent functions not present in the actual artifact.
+
+---
+
+# 38. Acceptance predicate
+
+The implementation shall express acceptance as a deterministic predicate.
+
+Conceptually:
+
+```text
+Acceptable(Task, Candidate) =
+    ArtifactValid
+    AND StaticValid
+    AND PolicyValid
+    AND RequiredBuildValid
+    AND RequiredRuntimeValid
+    AND RequiredTestsValid
+    AND ProvenanceComplete
+    AND FinalVerificationValid
+```
+
+The relevant predicates are determined by the task's artifact contract.
+
+Missing evidence for a required check means:
+
+```text
+false
+```
+
+not:
+
+```text
+unknown → assumed true
+```
+
+---
+
+# 39. Objective evidence rule
+
+Objective validation shall never be inferred from:
+
+```text
+LLM opinion
+worker score
+number of approving agents
+provider reputation
+previous successful run
+human confidence
+```
+
+Only the applicable objective evidence can satisfy an objective gate.
+
+---
+
+# 40. Candidate lifecycle
+
+The implementation SHALL support:
+
+```text
+CREATED
+PARSED
+NORMALIZED
+STATIC_VALID
+COMPILE_PENDING
+COMPILED
+RUNTIME_PENDING
+RUNTIME_VERIFIED
+TEST_PENDING
+TEST_VERIFIED
+POLICY_VERIFIED
+ACCEPTABLE
+SELECTED
+FINAL_VERIFIED
+COMMITTED
+```
+
+Failures:
+
+```text
+PARSE_FAILED
+STATIC_FAILED
+POLICY_REJECTED
+COMPILE_FAILED
+RUNTIME_FAILED
+TEST_FAILED
+TIMEOUT
+CANCELLED
+CRASHED
+VERIFICATION_FAILED
+COMMIT_FAILED
+```
+
+No failure state can transition directly to an accepted state.
+
+---
+
+# 41. Candidate state versus evidence
+
+State is derived from facts.
+
+Evidence is the record of those facts.
+
+Example:
+
+```text
+CompileResult(status=ok)
+        ↓
+CompileEvidence
+        ↓
+Candidate state = COMPILED
+```
+
+The implementation should not permit:
+
+```text
+state := COMPILED
+```
+
+without satisfying the corresponding transition guard.
+
+---
+
+# 42. State transition contract
+
+Every transition is defined by:
+
+```text
+CurrentState
+Event
+Guard
+NextState
+Reason
+```
+
+Example:
+
+```text
+COMPILE_PENDING
++
+CompileCompleted(status=ok)
++
+no compiler error diagnostics
+    →
+COMPILED
+```
+
+Failure:
+
+```text
+COMPILE_PENDING
++
+CompileCompleted(status=failed)
+    →
+COMPILE_FAILED
+```
+
+Unknown result:
+
+```text
+COMPILE_PENDING
++
+missing/invalid result
+    →
+VERIFICATION_FAILED
+```
+
+It must never become:
+
+```text
+COMPILED
+```
+
+by default.
+
+---
+
+# 43. Runtime applicability
+
+Runtime verification SHALL be explicitly derived from artifact kind.
+
+Example:
+
+```text
+EXECUTABLE:
+    compile = required
+    runtime = required
+    tests = task-dependent
+
+UNIT:
+    compile = required
+    runtime = usually via harness
+    tests = required where contract specifies
+
+DOCUMENTATION:
+    compile = not applicable
+    runtime = not applicable
+    schema/content checks = applicable
+```
+
+"Not applicable" is an explicit contract value.
+
+It is not inferred merely because an operation was skipped.
+
+---
+
+# 44. Candidate ranking
+
+Ranking is permitted only after objective eligibility filtering.
+
+```text
+ALL CANDIDATES
+    ↓
+objective eligibility
+    ↓
+eligible candidates
+    ↓
+subjective ranking
+```
+
+Therefore a candidate with:
+
+```text
+compile = failed
+```
+
+is removed before subjective scoring.
+
+---
+
+# 45. Subjective evidence
+
+LLM opinions may be recorded as:
+
+```text
+SUBJECTIVE_AI_EVIDENCE
+```
+
+They may contribute to:
+
+```text
+quality_score
+reviewer_confidence
+```
+
+They cannot satisfy:
+
+```text
+compile gate
+runtime gate
+test gate
+policy gate
+artifact integrity
+```
+
+---
+
+# 46. Repair semantics
+
+A repair always creates a new artifact.
+
+```text
+parent_artifact_id = previous artifact
+```
+
+The parent remains immutable.
+
+A repair must preserve evidence describing why it was requested.
+
+Example:
+
+```text
+Artifact A
+   ↓
+Compile evidence
+   ↓
+Repair request
+   ↓
+Artifact B
+```
+
+---
+
+# 47. Parser repair
+
+When the failure is structural:
+
+```text
+artifact extraction failure
+```
+
+the first recovery operation SHOULD target parsing/framing.
+
+Only when the artifact itself is invalid should an implementation repair request rewrite source code.
+
+This preserves useful source content and avoids unnecessary LLM regeneration.
+
+---
+
+# 48. Final verification contract
+
+Final verification shall operate on the exact candidate selected for commit.
+
+Required:
+
+```text
+verify artifact identity
+verify exact files
+parse final artifact
+static validate
+compile exact bytes
+runtime verify exact output
+run mandatory tests
+policy check
+record evidence
+```
+
+Any mutation between those steps invalidates the final verification.
+
+---
+
+# 49. Commit contract
+
+Commit shall be treated as a cryptographically checked materialization.
+
+```text
+FINAL_VERIFIED
+    ↓
+COMMIT_PENDING
+    ↓
+prepare
+    ↓
+stage exact bytes
+    ↓
+atomic write
+    ↓
+re-read committed bytes
+    ↓
+hash committed bytes
+    ↓
+compare against verified identity
+    ↓
+record COMMIT evidence
+    ↓
+COMMITTED
+```
+
+If the re-read hash differs:
+
+```text
+COMMIT_FAILED
+```
+
+The result SHALL NOT be reported as committed.
+
+---
+
+# 50. No force acceptance
+
+There shall be no mechanism equivalent to:
+
+```text
+--force-commit
+```
+
+that changes:
+
+```text
+REJECTED
+```
+
+into:
+
+```text
+ACCEPTED
+```
+
+A developer may export an unverified draft, but it must remain outside the accepted artifact namespace.
+
+For example:
+
+```text
+/workspace/draft/
+```
+
+versus:
+
+```text
+/workspace/final/
+```
+
+Only the latter contains accepted artifacts.
+
+---
+
+# 51. Decision contract
+
+Final Decision:
+
+```text
+decision_id
+task_id
+artifact_id
+accepted
+reason
+evidence_ids[]
+policy_checks[]
+final_verified_artifact_id
+acceptance_rule_version
+orchestrator_version
+created_at
+actor
+metadata
+```
+
+The decision must be reconstructable without querying an LLM.
+
+---
+
+# 52. Decision validity
+
+A decision with:
+
+```text
+accepted = true
+```
+
+is invalid unless:
+
+```text
+artifact exists
+artifact identity valid
+required evidence exists
+required evidence passes
+final verification passes
+policy passes
+provenance complete
+```
+
+The implementation should defend against forged or manually constructed accepted decisions.
+
+---
+
+# 53. Policy result
+
+Policy evaluation shall return structured results:
+
+```text
+PolicyResult
+    policy_profile
+    capabilities_requested[]
+    capabilities_granted[]
+    checks[]
+    result
+    reason
+```
+
+Each check:
+
+```text
+policy_id
+result
+details
+```
+
+Possible overall results:
+
+```text
+PASS
+FAIL
+REQUIRES_HUMAN_APPROVAL
+```
+
+---
+
+# 54. GAI/1.0
+
+GAI is the semantic contract between GRISP and an AI worker.
+
+Example request:
+
+```json
+{
+  "protocol": "GAI/1.0",
+  "operation": "generate",
+  "task_id": "uuid",
+  "request_id": "uuid",
+  "role": "GENERATOR",
+  "output_contract": {
+    "type": "ArtifactBundle",
+    "required": true
+  },
+  "prompt": {
+    "text": "..."
+  }
+}
+```
+
+Example response:
+
+```json
+{
+  "protocol": "GAI/1.0",
+  "operation": "generate",
+  "request_id": "uuid",
+  "result": "ok",
+  "artifacts": []
+}
+```
+
+---
+
+# 55. GAI semantic rule
+
+The worker response is untrusted.
+
+The core shall perform:
+
+```text
+decode
+ ↓
+schema validation
+ ↓
+artifact extraction
+ ↓
+artifact validation
+ ↓
+hash verification
+```
+
+GAI does not grant authority to an AI model.
+
+---
+
+# 56. GARP/1.0 role
+
+GARP is exclusively the:
+
+```text
+GRISP ↔ Firefox AI Gateway
+```
+
+transport and browser-session protocol.
+
+GARP does not define:
+
+```text
+artifact acceptance
+compile semantics
+policy semantics
+AI quality scoring
+```
+
+---
+
+# 57. GARP frame
+
+Canonical v1 frame:
+
+```text
+magic[4]
+version[1]
+flags[1]
+header_length[2]
+payload_length[4]
+message_type[2]
+reserved[2]
+request_id[16]
+session_id[16]
+payload[...]
+```
+
+All integers use:
+
+```text
+big-endian
+```
+
+`magic` is:
+
+```text
+"GARP"
+```
+
+The payload is UTF-8 JSON.
+
+---
+
+# 58. Frame constraints
+
+The gateway SHALL enforce:
+
+```text
+maximum frame size
+header validity
+payload length validity
+protocol version
+message type
+reserved-field rules
+```
+
+Recommended initial limits:
+
+```text
+control frame  = 1 MiB
+prompt         = 4 MiB
+artifact       = 16 MiB
+stream chunk   = 256 KiB
+```
+
+These values are configurable.
+
+---
+
+# 59. GARP message classes
+
+Message classes:
+
+```text
+HELLO
+COMMAND
+RESPONSE
+EVENT
+ERROR
+CONTROL
+```
+
+The protocol registry shall assign a numeric `message_type` to each supported message.
+
+The JSON `type` field remains the human-readable semantic name.
+
+---
+
+# 60. GARP message identity matrix
+
+Fields are required according to message type.
+
+| Message              | request_id      | session_id      | tab_id          | message_id | sequence |
+| -------------------- | --------------- | --------------- | --------------- | ---------- | -------- |
+| HELLO                | no              | no              | no              | no         | no       |
+| HELLO_ACK            | no              | no              | no              | no         | no       |
+| PING                 | no              | no              | no              | no         | no       |
+| PONG                 | no              | no              | no              | no         | no       |
+| CREATE_SESSION       | yes             | returned        | optional        | no         | no       |
+| PROMPT               | yes             | yes             | yes             | no         | no       |
+| PROMPT_ACK           | yes             | yes             | yes             | no         | no       |
+| GENERATION_STARTED   | yes             | yes             | yes             | yes        | yes      |
+| GENERATION_DELTA     | yes             | yes             | yes             | yes        | yes      |
+| GENERATION_COMPLETED | yes             | yes             | yes             | yes        | final    |
+| CANCEL_PROMPT        | yes             | yes             | yes             | no         | no       |
+| CANCEL_ACK           | yes             | yes             | yes             | optional   | no       |
+| ERROR                | when applicable | when applicable | when applicable | optional   | optional |
+
+This avoids incorrectly making every identifier mandatory on every protocol message.
+
+---
+
+# 61. GARP core commands
+
+Required:
+
+```text
+HELLO
+CAPABILITIES
+BROWSER_STATUS
+
+LIST_TABS
+OPEN_TAB
+CLOSE_TAB
+SELECT_TAB
+
+CREATE_SESSION
+ATTACH_SESSION
+DETACH_SESSION
+CLOSE_SESSION
+
+PROMPT
+CANCEL_PROMPT
+GET_PROMPT_STATUS
+GET_RESPONSE
+SUBSCRIBE_RESPONSE
+
+RESET_SESSION
+
+PING
+```
+
+---
+
+# 62. GARP event registry
+
+Required or strongly supported:
+
+```text
+SESSION_READY
+SESSION_CHANGED
+INPUT_SUBMITTED
+GENERATION_STARTED
+GENERATION_DELTA
+GENERATION_PROGRESS
+CONTINUATION_REQUIRED
+CONTINUATION_SUBMITTED
+GENERATION_COMPLETED
+GENERATION_FAILED
+NAVIGATION
+PROVIDER_ERROR
+AUTH_REQUIRED
+RATE_LIMITED
+DIAGNOSTIC
+```
+
+---
+
+# 63. Prompt request
+
+Canonical request:
+
+```json
+{
+  "protocol": "GARP/1.0",
+  "type": "prompt",
+  "request_id": "uuid",
+  "session_id": "uuid",
+  "tab_id": "uuid",
+  "payload": {
+    "prompt": {
+      "format": "text",
+      "text": "..."
+    },
+    "options": {
+      "stream": true,
+      "timeout_ms": 180000,
+      "auto_continue": true
+    }
+  }
+}
+```
+
+The gateway immediately returns:
+
+```json
+{
+  "protocol": "GARP/1.0",
+  "type": "prompt_ack",
+  "request_id": "uuid",
+  "session_id": "uuid",
+  "tab_id": "uuid",
+  "payload": {
+    "state": "accepted"
+  }
+}
+```
+
+---
+
+# 64. Streaming delta
+
+Example:
+
+```json
+{
+  "protocol": "GARP/1.0",
+  "type": "generation_delta",
+  "request_id": "uuid",
+  "session_id": "uuid",
+  "tab_id": "uuid",
+  "message_id": "uuid",
+  "sequence": 17,
+  "payload": {
+    "text_delta": "program HelloWorld;"
+  }
+}
+```
+
+Deltas are transport observations.
+
+They are not individually accepted artifacts.
+
+---
+
+# 65. Generation completion
+
+Example:
+
+```json
+{
+  "protocol": "GARP/1.0",
+  "type": "generation_completed",
+  "request_id": "uuid",
+  "session_id": "uuid",
+  "tab_id": "uuid",
+  "message_id": "uuid",
+  "sequence": 99,
+  "payload": {
+    "content": "...",
+    "format": "text",
+    "finish_reason": "stop",
+    "provider_state": "idle"
+  }
+}
+```
+
+The complete response becomes available to the GRISP semantic parser.
+
+---
+
+# 66. Sequence semantics
+
+For one `(request_id, message_id)` stream:
+
+```text
+sequence
+```
+
+must monotonically increase.
+
+The receiver shall detect:
+
+```text
+duplicate
+out-of-order
+gap
+unexpected reset
+```
+
+A gap SHALL NOT be silently treated as complete response data.
+
+---
+
+# 67. Duplicate request semantics
+
+`request_id` is the idempotency key.
+
+Receiving the same command again with the same `request_id` SHALL NOT cause a second provider submission.
+
+Possible result:
+
+```text
+existing request state
+```
+
+or:
+
+```text
+IDEMPOTENT_REPLAY
+```
+
+but never another prompt submission.
+
+---
+
+# 68. Session semantics
+
+A GARP session is identified by:
+
+```text
+session_id
+```
+
+A session is bound to:
+
+```text
+provider
+tab_id
+conversation identity
+```
+
+The session survives actor replacement.
+
+---
+
+# 69. Tab semantics
+
+A browser tab has:
+
+```text
+tab_id
+tab_index
+url
+title
+selected
+provider
+session_id
+state
+```
+
+`tab_id` is authoritative.
+
+`tab_index` is informational.
+
+The index may change without changing tab identity. The architecture explicitly requires this distinction.
+
+---
+
+# 70. Page generation
+
+Every major navigation/actor replacement increments:
+
+```text
+page_generation
+```
+
+Events carrying a stale page generation SHALL NOT silently modify current session state.
+
+---
+
+# 71. Firefox provider adapters
+
+Provider-specific logic belongs in dedicated modules:
+
+```text
+DeepSeekAdapter
+ChatGPTAdapter
+GeminiAdapter
+ClaudeAdapter
+GrokAdapter
+CopilotAdapter
+PerplexityAdapter
+...
+```
+
+The generic gateway shall not contain giant provider-specific selector tables.
+
+The architecture explicitly calls for this isolation.
+
+---
+
+# 72. Provider adapter interface
+
+Conceptually:
+
+```text
+DiscoverInput
+InspectReadyState
+SubmitPrompt
+InspectGeneration
+InspectConversation
+DetectContinuation
+ContinueGeneration
+DetectAuthentication
+DetectRateLimit
+DetectError
+ResetSession
+```
+
+Each adapter also reports:
+
+```text
+provider
+adapter_version
+selector_strategy_version
+supported_features
+```
+
+---
+
+# 73. Firefox parent/child boundary
+
+Parent actor owns:
+
+```text
+connection
+sessions
+requests
+timeouts
+cancellation
+routing
+event ordering
+stream aggregation
+browser-level state
+```
+
+Child actor owns:
+
+```text
+DOM discovery
+input interaction
+submission
+provider-specific observation
+provider-specific state extraction
+```
+
+This preserves the useful parent/child separation in the existing implementation while formalizing it into a protocol.
+
+---
+
+# 74. DOM observation
+
+Preferred path:
+
+```text
+DOM mutation/event
+    ↓
+provider adapter
+    ↓
+adapter state
+    ↓
+parent event
+    ↓
+GARP event
+```
+
+Polling is fallback only.
+
+Polling shall not be the authoritative basis for response identity.
+
+---
+
+# 75. Browser authentication
+
+Authentication state is explicit:
+
+```text
+READY
+AUTH_REQUIRED
+RATE_LIMITED
+ERROR
+```
+
+A readiness timeout must never be interpreted as:
+
+```text
+READY
+```
+
+If readiness cannot be established:
+
+```text
+NOT_READY
+```
+
+or an explicit failure state is returned.
+
+The original architecture specifically identifies this as a previous source of false progression.
+
+---
+
+# 76. Continuation
+
+When the provider indicates that generation can continue:
+
+```json
+{
+  "type": "continuation_required",
+  "request_id": "uuid",
+  "session_id": "uuid",
+  "message_id": "uuid",
+  "payload": {
+    "reason": "provider_length_limit"
+  }
+}
+```
+
+The gateway shall not silently click Continue without emitting an event.
+
+GRISP decides whether continuation is permitted.
+
+---
+
+# 77. GARP errors
+
+Errors shall contain:
+
+```text
+protocol
+type = error
+request_id where applicable
+session_id where applicable
+code
+retryable
+message
+provider
+state
+```
+
+Registry:
+
+```text
+PROTOCOL_ERROR
+BAD_REQUEST
+UNAUTHORIZED
+SESSION_NOT_FOUND
+TAB_NOT_FOUND
+PROVIDER_NOT_FOUND
+AUTH_REQUIRED
+INPUT_NOT_READY
+SUBMIT_FAILED
+GENERATION_TIMEOUT
+GENERATION_FAILED
+CONTINUATION_FAILED
+NAVIGATION_CHANGED
+PROVIDER_RATE_LIMIT
+DOM_UNSUPPORTED
+SESSION_BUSY
+DUPLICATE_REQUEST
+SEQUENCE_GAP
+INTERNAL_ERROR
+```
+
+---
+
+# 78. GARP connection resilience
+
+On reconnect:
+
+```text
+CONNECT
+ ↓
+HELLO
+ ↓
+CAPABILITIES
+ ↓
+GET_PROMPT_STATUS
+```
+
+The gateway retains session state independently of TCP connection state.
+
+An interrupted connection is therefore not equivalent to interrupted provider generation.
+
+---
+
+# 79. Cancellation semantics
+
+Cancellation propagates:
+
+```text
+task
+ ↓
+worker request
+ ↓
+GARP request
+ ↓
+Firefox session
+ ↓
+provider interaction
+```
+
+Each layer reports its own result.
+
+Terminal state:
+
+```text
+CANCELLED
+```
+
+means cancellation has been acknowledged.
+
+It does not mean:
+
+```text
+SUCCESS
+```
+
+---
+
+# 80. Heartbeat
+
+Both sides support:
+
+```text
+PING
+PONG
+```
+
+Heartbeat operates independently of prompt generation.
+
+Suggested period:
+
+```text
+10–30 seconds
+```
+
+A heartbeat failure does not automatically destroy persistent session identity.
+
+---
+
+# 81. GARP security
+
+Minimum:
+
+```text
+localhost-only binding
+random startup secret
+HELLO authentication
+maximum frame size
+connection limits
+rate limits
+```
+
+The browser gateway SHALL NOT expose its AI-control interface broadly by default.
+
+---
+
+# 82. Logging contract
+
+Structured logs should contain:
+
+```text
+timestamp
+component
+task_id
+request_id
+session_id
+tab_id
+provider
+event
+severity
+```
+
+Logs are diagnostic.
+
+Logs are not acceptance evidence unless explicitly captured as Evidence by an operation.
+
+---
+
+# 83. Debug data
+
+Debug information shall never be inserted into the semantic prompt.
+
+Transport:
+
+```text
+debug.phase = "candidate_generation"
+```
+
+Semantic prompt:
+
+```text
+unchanged
+```
+
+This preserves reproducibility.
+
+---
+
+# 84. Prompt versioning
+
+Every AI request should record:
+
+```text
+template_id
+template_hash
+system_instructions_hash
+prompt_hash
+```
+
+The raw provider response receives:
+
+```text
+response_hash
+```
+
+The normalized response may receive:
+
+```text
+normalized_response_hash
+```
+
+This creates an auditable transformation chain:
+
+```text
+prompt
+ ↓
+raw response
+ ↓
+normalized artifact
+```
+
+---
+
+# 85. Worker reliability
+
+Reliability data is capability-specific.
+
+At minimum:
+
+```text
+generation
+critique
+repair
+test_design
+scoring
+protocol
+```
+
+A worker SHALL NOT have only one undifferentiated reliability number.
+
+Bayesian updating may use Beta distributions:
+
+```text
+Beta(alpha + successes, beta + failures)
+```
+
+This mechanism is intentionally not required for the first core implementation.
+
+---
+
+# 86. Storage interfaces
+
+The core SHALL depend on interfaces, not PostgreSQL.
+
+Required abstractions:
+
+```pascal
+IGrispArtifactStore
+IGrispEvidenceStore
+IGrispTaskStore
+IGrispDecisionStore
+```
+
+First implementation may use:
+
+```text
+local files
+SQLite
+embedded store
+```
+
+A PostgreSQL backend can be added later without changing GRISP semantics.
+
+---
+
+# 87. Persistence integrity
+
+Artifacts and Evidence SHALL be immutable after acceptance/storage.
+
+The storage backend must prevent an application-level "update in place" from changing:
+
+```text
+artifact content
+artifact identity
+evidence content
+decision evidence references
+```
+
+A new artifact/evidence record shall be created instead.
+
+---
+
+# 88. Core Delphi units
+
+A practical initial unit structure:
+
+```text
+Grisp.Types.pas
+Grisp.Task.pas
+Grisp.Artifact.pas
+Grisp.ArtifactParser.pas
+Grisp.Canonical.pas
+Grisp.Hash.pas
+Grisp.Evidence.pas
+Grisp.Tool.pas
+Grisp.Policy.pas
+Grisp.StateMachine.pas
+Grisp.Decision.pas
+Grisp.Commit.pas
+Grisp.Agent.pas
+```
+
+Separate later:
+
+```text
+Grisp.GAI.pas
+Grisp.Garp.pas
+Grisp.Garp.Client.pas
+Grisp.Compiler.pas
+Grisp.Runtime.pas
+Grisp.Tests.pas
+```
+
+---
+
+# 89. Core interfaces
+
+Reference shape:
+
+```pascal
+type
+  IGrispAgent = interface
+    function ExecuteTask(
+      const ATask: TGrispTask
+    ): TGrispDecision;
+  end;
+
+  IGrispArtifactStore = interface
+    function CreateArtifact(
+      const AArtifact: TGrispArtifactBundle
+    ): TGrispArtifactId;
+
+    function GetArtifact(
+      const AArtifactId: TGrispArtifactId
+    ): TGrispArtifactBundle;
+  end;
+
+  IGrispEvidenceStore = interface
+    function RecordEvidence(
+      const AEvidence: TGrispEvidence
+    ): TGrispEvidenceId;
+
+    function GetEvidence(
+      const AEvidenceId: TGrispEvidenceId
+    ): TGrispEvidence;
+  end;
+
+  IGrispToolRunner = interface
+    function Execute(
+      const AOperation: TGrispToolOperation
+    ): TGrispToolResult;
+  end;
+
+  IGrispAIWorker = interface
+    function Execute(
+      const ARequest: TAIRequest
+    ): TAIResponse;
+  end;
+
+  IGrispPolicyEngine = interface
+    function Evaluate(
+      const ATask: TGrispTask;
+      const AArtifact: TGrispArtifactBundle
+    ): TPolicyResult;
+  end;
+```
+
+---
+
+# 90. Mock implementations are mandatory
+
+Before real providers are connected, the core must have:
+
+```text
+MockAIWorker
+MockCompiler
+MockRuntime
+MockTestRunner
+MockPolicyEngine
+```
+
+These make deterministic state-machine tests possible without Firefox or an external AI.
+
+This is an important implementation decision because it lets the GRISP kernel be verified independently.
+
+---
+
+# 91. Conformance test categories
+
+The implementation test suite shall be divided into:
+
+```text
+CANONICALIZATION
+PARSER
+ARTIFACT
+STATE MACHINE
+ACCEPTANCE
+TOOLS
+POLICY
+COMMIT
+GAI
+GARP
+FIREFOX
+REGRESSION
+```
+
+Tests should not require all subsystems to be running.
+
+---
+
+# 92. Canonicalization test vectors
+
+At minimum:
+
+```text
+one Delphi file
+two files
+Unicode filename
+empty file
+binary file
+metadata
+provenance
+parent artifact
+duplicate filename
+same files in different order
+```
+
+For each vector:
+
+```text
+canonical bytes
+file hashes
+artifact_id
+```
+
+are fixed expected values.
+
+Delphi must reproduce them exactly.
+
+---
+
+# 93. Parser conformance tests
+
+Required:
+
+```text
+valid structured response
+missing filename
+duplicate filename
+invalid path
+absolute filename
+NUL
+unknown language
+truncated fence
+multiple interpretations
+provider contamination
+valid Markdown compatibility case
+empty response
+invalid JSON
+wrong artifact hash
+wrong file hash
+```
+
+No test may permit silent repair of ambiguous content.
+
+---
+
+# 94. Acceptance conformance tests
+
+At minimum:
+
+```text
+compile failure → reject
+runtime failure → reject
+test failure → reject
+policy failure → reject
+missing compile evidence → reject
+missing test evidence → reject
+hash mismatch → reject
+final mutation → reject
+```
+
+Positive tests:
+
+```text
+compile pass
+runtime pass
+test pass
+policy pass
+final hash match
+→ accepted
+```
+
+---
+
+# 95. Commit conformance tests
+
+Required:
+
+```text
+successful atomic commit
+partial write
+post-write mutation
+filesystem replacement
+wrong final hash
+missing final verification
+```
+
+The final mutation test is particularly important:
+
+```text
+verify A
+modify A
+attempt commit
+```
+
+Expected:
+
+```text
+COMMIT_FAILED
+```
+
+not:
+
+```text
+COMMITTED
+```
+
+---
+
+# 96. GARP conformance tests
+
+Required:
+
+```text
+HELLO
+version mismatch
+malformed frame
+oversized frame
+duplicate request
+sequence gap
+out-of-order events
+stale page generation
+SESSION_BUSY
+cancellation
+reconnect
+heartbeat
+provider error
+authentication required
+rate limiting
+```
+
+---
+
+# 97. Historical regression R001
+
+R001 reproduces the original HelloWorld failure.
+
+Expected:
+
+```text
+provider response       RECEIVED
+artifact parsing        FAIL
+artifact creation       NOT PERFORMED
+compile                  NOT ELIGIBLE
+runtime                  NOT ELIGIBLE
+tests                    NOT ELIGIBLE
+final verification      NOT PERFORMED
+commit                   NOT PERFORMED
+decision                 REJECTED
+```
+
+This regression is explicitly required by the architecture.
+
+---
+
+# 98. Historical failure invariant
+
+A CI guard SHALL assert:
+
+```text
+IF artifact is COMMITTED
+THEN
+    compile evidence exists
+    AND compile evidence = PASS
+    AND every other applicable mandatory gate = PASS
+    AND final verification = PASS
+```
+
+Any violation fails the build.
+
+---
+
+# 99. First successful vertical slice
+
+The first implementation milestone shall be:
+
+```text
+Task
+ ↓
+MockAIWorker
+ ↓
+ArtifactParser
+ ↓
+Artifact identity
+ ↓
+Static validation
+ ↓
+Compiler adapter
+ ↓
+Runtime adapter
+ ↓
+Test runner
+ ↓
+Policy engine
+ ↓
+Final verification
+ ↓
+Commit
+```
+
+Firefox is not involved yet.
+
+PostgreSQL is not required yet.
+
+Multi-LLM intelligence is not required yet.
+
+---
+
+# 100. First negative vertical slice
+
+Immediately after the positive slice:
+
+```text
+Malformed AI response
+ ↓
+PARSE_ERROR
+ ↓
+NO ARTIFACT
+ ↓
+NO COMPILE
+ ↓
+NO TEST
+ ↓
+NO FINAL VERIFY
+ ↓
+NO COMMIT
+ ↓
+REJECTED
+```
+
+The negative path is as important as the positive path.
+
+---
+
+# 101. Second vertical slice
+
+After the deterministic core:
+
+```text
+GRISP
+ ↓
+IGrispAIWorker
+ ↓
+GARP client
+ ↓
+Firefox gateway
+ ↓
+DeepSeek adapter
+ ↓
+streaming events
+ ↓
+GRISP parser
+ ↓
+deterministic verification
+```
+
+Only one provider is required initially.
+
+DeepSeek can serve as the first adapter because the existing implementation already targets it.
+
+---
+
+# 102. Additional providers
+
+Once GARP and the first provider are stable:
+
+```text
+ChatGPT
+Gemini
+Claude
+Grok
+Copilot
+Perplexity
+...
+```
+
+are added as isolated adapters.
+
+Adding a provider SHALL NOT require changing:
+
+```text
+ArtifactParser
+StateMachine
+AcceptanceEngine
+Evidence semantics
+Commit semantics
+```
+
+That isolation is one of the main reasons for the adapter architecture.
+
+---
+
+# 103. Implementation order
+
+The practical implementation order is therefore:
+
+```text
+M0  Freeze normative architecture
+M1  Core types
+M2  Canonical serializer + hashes
+M3  Artifact parser
+M4  Evidence + ToolResult
+M5  State machine
+M6  Acceptance predicates
+M7  Policy
+M8  Compiler/runtime/test adapters
+M9  Final verification + commit
+M10 Core conformance suite
+M11 GAI/1.0
+M12 GARP/1.0
+M13 Firefox session layer
+M14 DeepSeek adapter
+M15 Browser recovery/cancellation
+M16 Additional providers
+M17 Advanced multi-worker intelligence
+```
+
+---
+
+# 104. Definition of Done for Core
+
+The GRISP Core milestone is complete only when all of these are true:
+
+```text
+Artifact identity is deterministic.
+Parser is fail-closed.
+State transitions are explicit.
+Failed objectives cannot reach acceptance.
+Evidence is immutable.
+Commit verifies final bytes.
+Historical regression R001 passes.
+Canonical test vectors pass.
+No Firefox dependency exists in the core.
+No external LLM dependency exists in the core.
+```
+
+---
+
+# 105. Definition of Done for GARP
+
+GARP is complete only when it can demonstrate:
+
+```text
+HELLO negotiation
+stable session IDs
+stable tab IDs
+request correlation
+message correlation
+ordered streaming
+duplicate suppression
+cancellation
+heartbeat
+reconnection
+structured errors
+provider state
+page generation
+```
+
+---
+
+# 106. Definition of Done for Firefox
+
+The Firefox gateway is complete only when:
+
+```text
+provider-specific logic is isolated
+DeepSeek adapter passes health checks
+prompt submission is correlated
+responses are event-driven
+stale responses are rejected
+navigation recovery works
+duplicate prompts are prevented
+authentication is explicit
+rate limiting is explicit
+cancellation is explicit
+```
+
+---
+
+# 107. Definition of Done for GRISP v1.0
+
+GRISP v1.0 is complete only when the system can demonstrate the architecture's required success criteria:
+
+```text
+correct artifact extraction
+deterministic artifact identity
+objective compile verification
+objective runtime verification
+valid tests against actual artifacts
+fail-closed policy
+final artifact re-verification
+complete provenance
+reliable cancellation
+browser session recovery
+provider-independent request correlation
+streaming AI responses
+duplicate prompt prevention
+no false acceptance after objective failure
+```
+
+These criteria are explicitly defined in the architecture specification.
+
+---
+
+# 108. Absolute implementation invariants
+
+The following shall be implemented as executable assertions and regression tests:
+
+```text
+I1  UNPARSED DATA CANNOT BECOME AN ARTIFACT.
+
+I2  FAILED OBJECTIVE VALIDATION CANNOT BECOME ACCEPTED.
+
+I3  AI OPINION CANNOT OVERRIDE OBJECTIVE FAILURE.
+
+I4  UNRECOGNIZED PLAN CANNOT EXECUTE.
+
+I5  FINAL COMMITTED BYTES MUST EQUAL FINAL VERIFIED BYTES.
+
+I6  EVERY ACCEPTED ARTIFACT MUST HAVE TRACEABLE EVIDENCE.
+
+I7  EVERY AI REQUEST MUST HAVE A UNIQUE REQUEST ID.
+
+I8  EVERY AI SESSION MUST HAVE A STABLE SESSION ID.
+
+I9  TAB INDEX IS NOT TAB IDENTITY.
+
+I10 TRANSPORT MUST NOT MODIFY SEMANTIC CONTENT.
+```
+
+These come directly from the normative specification.
+
+---
+
+# 109. What this document deliberately does NOT specify
+
+The following remain implementation choices unless required by the parent specification:
+
+```text
+PostgreSQL versus SQLite
+exact GUI
+exact logging framework
+exact Delphi JSON library
+exact process-library implementation
+exact Firefox actor framework internals
+exact Bayesian library
+exact worker scheduling algorithm
+exact filesystem layout outside the defined workspace semantics
+```
+
+Those choices must conform to the contracts above.
+
+---
+
+# 110. Canonical implementation rule
+
+The most important implementation rule is:
+
+```text
+DO NOT MAKE THE IMPLEMENTATION MORE PERMISSIVE
+THAN THE SPECIFICATION.
+```
+
+When implementation encounters ambiguity:
+
+```text
+reject
+```
+
+When evidence is missing:
+
+```text
+fail the gate
+```
+
+When identity is uncertain:
+
+```text
+fail verification
+```
+
+When the browser state is unknown:
+
+```text
+report unknown/error
+```
+
+When the AI response is malformed:
+
+```text
+PARSE_ERROR
+```
+
+When committed bytes differ from verified bytes:
+
+```text
+COMMIT_FAILED
+```
+
+The system's job is not to make questionable inputs look successful.
+
+Its job is to make the boundary between:
+
+```text
+UNVERIFIED
+```
+
+and:
+
+```text
+VERIFIED
+```
+
+unmistakable.
+
+---
+
+# 111. Final implementation principle
+
+The implementation shall preserve this transformation:
+
+```text
+UNTRUSTED INPUT
+      ↓
+STRICT INTERPRETATION
+      ↓
+IMMUTABLE ARTIFACT
+      ↓
+OBJECTIVE MEASUREMENT
+      ↓
+IMMUTABLE EVIDENCE
+      ↓
+DETERMINISTIC GATE
+      ↓
+FINAL RE-VERIFICATION
+      ↓
+BYTE-IDENTICAL COMMIT
+```
+
+and never:
+
+```text
+UNTRUSTED INPUT
+      ↓
+HEURISTIC CLEANUP
+      ↓
+ASSUMED CORRECT
+      ↓
+COMMIT
+```
+
+This implementation contract is therefore the layer from which the actual Delphi code, conformance tests, GAI definitions, and GARP implementation should now be derived.

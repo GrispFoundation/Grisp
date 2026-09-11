@@ -1,0 +1,1195 @@
+11 september 2026:
+
+It is a **good first draft in terms of direction, but weak as a GRISP v1.0 implementation**.
+
+I would **keep the overall structure and throw away a substantial amount of the implementation details**. It looks like Gemini understood the architecture reasonably well, but it has not yet internalized the most important consequence of the architecture: **GRISP must be stricter and more evidence-driven than this code currently is**.
+
+The good news is that this is exactly the kind of first draft we want an AI to produce: enough structure to review, but not something we should blindly merge.
+
+## My overall rating
+
+| Area                    |   Rating | My assessment                                              |
+| ----------------------- | -------: | ---------------------------------------------------------- |
+| Architectural direction | **8/10** | Correct general decomposition                              |
+| Delphi organization     | **7/10** | Sensible starting point                                    |
+| Fail-closed intent      | **7/10** | Clearly understood                                         |
+| Artifact model          | **3/10** | Far too weak versus specification                          |
+| Evidence model          | **3/10** | Missing most required semantics                            |
+| State machine           | **4/10** | Looks right superficially, incomplete underneath           |
+| Parser                  | **3/10** | Too permissive and heuristic                               |
+| Canonicalization        | **2/10** | Not actually our canonical artifact algorithm              |
+| GARP framing            | **5/10** | Basic framing okay, implementation unsuitable for real TCP |
+| Test quality            | **3/10** | Several tests test the mock rather than GRISP              |
+| Production readiness    | **2/10** | Definitely not ready                                       |
+
+So I would call it:
+
+> **Promising skeleton, but not yet a strong implementation.**
+
+---
+
+# 1. What Gemini got right
+
+There is a lot that is structurally useful.
+
+The unit separation:
+
+```text
+Grisp.Types
+Grisp.Canonical
+Grisp.Parser
+Grisp.GARP
+Grisp.StateMachine
+Grisp.MockCompiler
+Grisp.MockTestRunner
+Grisp.Tests
+```
+
+is a sensible beginning.
+
+It also correctly understands several major ideas from the architecture:
+
+```text
+AI response
+   ↓
+parser
+   ↓
+candidate
+   ↓
+compile
+   ↓
+test
+   ↓
+verification
+   ↓
+accept
+```
+
+and it deliberately avoids a direct:
+
+```text
+LLM → accepted
+```
+
+path.
+
+It also implemented an explicit ambiguous-code-block rejection:
+
+```pascal
+if BlockCount > 1 then
+begin
+  ACandidate.State := csRejected;
+  ACandidate.LastError := errParseAmbiguous;
+  Exit(False);
+end;
+```
+
+That's consistent with the fail-closed philosophy.
+
+The basic GARP length prefix is also correctly big-endian:
+
+```pascal
+Result[0] := Byte((Len shr 24) and $FF);
+Result[1] := Byte((Len shr 16) and $FF);
+Result[2] := Byte((Len shr 8) and $FF);
+Result[3] := Byte(Len and $FF);
+```
+
+So Gemini did understand the general transport requirement.
+
+---
+
+# 2. But there is one huge problem: it looks more complete than it actually is
+
+This is the danger.
+
+There are classes called:
+
+```text
+TGrispEvidence
+TGrispManifest
+TGrispCandidate
+TGrispStateMachine
+```
+
+which makes the implementation look close to the specification.
+
+But semantically they are **much simpler objects than the specification requires**.
+
+For example, its evidence is:
+
+```pascal
+TGrispEvidence = record
+  Timestamp: TDateTime;
+  Stage: TGrispCandidateState;
+  Success: Boolean;
+  ExitCode: Integer;
+  OutputLog: string;
+  ArtifactHash: string;
+end;
+```
+
+That is not the Evidence contract we designed.
+
+We need things such as:
+
+```text
+evidence_id
+task_id
+artifact_id
+operation
+tool
+status
+diagnostics
+stdout
+stderr
+elapsed_ms
+input_hash
+output_hash
+environment_id
+environment
+created_at
+metadata
+```
+
+The architecture explicitly treats evidence as central and reconstructable. 
+
+Gemini's structure is closer to:
+
+```text
+"proof log"
+```
+
+than to:
+
+```text
+immutable evidence record
+```
+
+That distinction is fundamental.
+
+---
+
+# 3. `TGrispManifest` is not our ArtifactBundle
+
+This:
+
+```pascal
+TGrispManifest = record
+  SessionID: TGrispSessionID;
+  TabID: TGrispTabID;
+  SourcePath: string;
+  ContentHash: string;
+  RawBytes: TBytes;
+end;
+```
+
+is basically:
+
+```text
+source bytes + metadata + hash
+```
+
+It is **not** the artifact model from the specification.
+
+We need something much closer to:
+
+```text
+ArtifactBundle
+    artifact_id
+    task_id
+    parent_artifact_id
+    revision
+    files[]
+    artifact_kind
+    language
+    provenance
+    metadata
+```
+
+with:
+
+```text
+ArtifactFile
+    filename
+    language
+    kind
+    content
+    content_encoding
+    content_sha256
+    size_bytes
+```
+
+The original design explicitly distinguishes artifact identity from filename/index and makes artifact lineage first-class. 
+
+Gemini has collapsed all of that into one raw source blob.
+
+For the real implementation, that's too weak.
+
+---
+
+# 4. The candidate ID is wrong
+
+This is particularly revealing:
+
+```pascal
+ACandidate.ID := ASessionID;
+```
+
+A **candidate ID cannot simply be the session ID**.
+
+One session may generate:
+
+```text
+Candidate A
+Candidate B
+Candidate C
+```
+
+and they all come from the same AI session.
+
+We need separate identities:
+
+```text
+session_id
+request_id
+candidate_id / artifact_id
+message_id
+```
+
+The architecture explicitly says these identities must be distinguished. 
+
+This is exactly the kind of thing the implementation contract was supposed to resolve.
+
+---
+
+# 5. The canonicalization implementation is not actually canonical artifact hashing
+
+This is probably the biggest technical weakness.
+
+Gemini's:
+
+```pascal
+ComputeSHA256(AText)
+```
+
+is perfectly fine as a SHA-256 helper.
+
+But:
+
+```pascal
+VerifyManifest
+```
+
+simply does:
+
+```pascal
+CalculatedHash := ComputeSHA256(AManifest.RawBytes);
+```
+
+That is only hashing the raw source bytes.
+
+It doesn't implement:
+
+```text
+ArtifactBundle
+    ↓
+canonical manifest
+    ↓
+canonical serialization
+    ↓
+SHA-256
+    ↓
+artifact_id
+```
+
+And the GARP `SerializeManifest()` does not fix this.
+
+So at the moment Gemini has implemented:
+
+```text
+SOURCE HASHING
+```
+
+not:
+
+```text
+GRISP ARTIFACT IDENTITY
+```
+
+Those are different things.
+
+---
+
+# 6. `SerializeManifest()` is especially problematic
+
+This code:
+
+```pascal
+Writer.Write(SessionBytes, 0, 16);
+Writer.Write(TabBytes, 0, 16);
+
+Writer.Write(Int32(Length(SourcePathBytes)));
+...
+Writer.Write(Int32(Length(HashBytes)));
+...
+Writer.Write(Int32(Length(AManifest.RawBytes)));
+```
+
+has multiple issues.
+
+First, the `Int32` fields written by `TBinaryWriter` are native-endian implementation data, not the explicitly defined network byte order.
+
+So the code claims to implement a deterministic binary protocol but is actually using a Delphi runtime serialization detail.
+
+That's unacceptable for a cross-platform/cross-language protocol.
+
+Second, the method isn't actually serializing a GARP packet. It's serializing a custom manifest blob.
+
+Third, it puts the raw source bytes into the serialized manifest, which isn't our proposed canonical artifact identity algorithm.
+
+Fourth, Delphi GUID byte representation deserves explicit treatment. `TGuid.ToByteArray` should not automatically be assumed to equal the byte-level UUID representation we want on the wire.
+
+So I would **remove this method completely and redesign it**.
+
+---
+
+# 7. There is also a dangerous `FillChar`
+
+This:
+
+```pascal
+FillChar(ACandidate, SizeOf(ACandidate), 0);
+```
+
+is not something I would permit on a Delphi record containing managed fields.
+
+`TGrispCandidate` contains:
+
+```pascal
+Manifest: TGrispManifest;
+EvidenceLog: TArray<TGrispEvidence>;
+LastError...
+```
+
+and the nested types contain:
+
+```text
+string
+TBytes
+dynamic array
+```
+
+These are managed types.
+
+Using raw `FillChar` on such a record is a classic way of bypassing Delphi's managed-memory semantics.
+
+This needs to become proper initialization, for example using an explicit initialization routine or safe record construction/default assignment.
+
+That alone means I would not merge this code as-is.
+
+---
+
+# 8. The parser is much too permissive
+
+Gemini improved it over a completely naive parser, but it still violates several important principles.
+
+It accepts:
+
+````text
+```pascal
+WriteLn("Hello");
+````
+
+````
+
+as a valid parsed candidate.
+
+There is:
+
+```pascal
+Utf8Bytes := TGrispCanonical.ToUTF8Bytes(ExtractedCode);
+````
+
+followed by no real artifact schema validation.
+
+There is no:
+
+```text
+filename
+artifact kind
+file kind
+language registry
+task association
+file hash
+artifact hash
+provenance
+```
+
+So the parser is effectively:
+
+```text
+find one code block
+↓
+turn it into RawBytes
+```
+
+That is not yet the ArtifactParser we specified.
+
+---
+
+# 9. Worse: it trims source code
+
+This line:
+
+```pascal
+ExtractedCode := Trim(ExtractedCode);
+```
+
+is absolutely something I would remove.
+
+We just spent considerable effort establishing the exact-content principle.
+
+`Trim()` changes the artifact bytes.
+
+Suppose:
+
+```text
+source = "program X;\r\n"
+```
+
+becomes:
+
+```text
+"program X;"
+```
+
+That is a different artifact.
+
+We need:
+
+```text
+raw source bytes
+    ↓
+preserve exactly
+```
+
+not:
+
+```text
+raw source
+    ↓
+Trim()
+    ↓
+different artifact
+```
+
+If normalization is desired, it must be an explicit transformation producing a new artifact.
+
+---
+
+# 10. It does not extract filenames
+
+This is another fundamental gap.
+
+The code completely ignores the language header:
+
+```pascal
+ALang
+```
+
+after finding it.
+
+It doesn't produce:
+
+```text
+HelloWorld.dpr
+```
+
+from:
+
+```text
+Pascal/Delphi:HelloWorld.dpr
+```
+
+It doesn't validate filename conflicts.
+
+It doesn't even have a filename in the candidate manifest.
+
+Our implementation contract explicitly says strict parsing must not invent filenames.
+
+Gemini's design isn't strict enough yet.
+
+---
+
+# 11. It doesn't implement structured AI responses
+
+Our desired order is:
+
+```text
+GAI structured response
+        ↓
+strict schema
+        ↓
+ArtifactBundle
+```
+
+with Markdown being compatibility mode.
+
+Gemini only implements:
+
+```text
+Markdown code fence
+```
+
+So it's actually starting with the compatibility path rather than the canonical path.
+
+That should be reversed.
+
+---
+
+# 12. The mock compiler is useful — but only as a state-machine mock
+
+I like having a mock compiler.
+
+But this:
+
+```pascal
+IsSuccess := not FForceFailure and
+             not SourceCode.Contains('[SYNTAX_ERROR]') and
+             not SourceCode.Contains('COMPILER_FAIL');
+```
+
+is not compiler verification.
+
+It's a state-machine test fixture.
+
+That's perfectly acceptable **provided we explicitly call it a MockTool**.
+
+It becomes dangerous when tests start treating this as proof that the artifact verification architecture works.
+
+The mock should simulate:
+
+```text
+compile succeeded
+compile failed
+timeout
+crash
+diagnostics
+```
+
+not inspect magic words in source.
+
+---
+
+# 13. The test runner is much worse
+
+This is the weakest part of the design.
+
+It does:
+
+```pascal
+IsSuccess := not FForceFailure and
+             not SourceCode.Contains('[TEST_FAIL]') and
+             not SourceCode.Contains('ASSERTION_ERROR');
+```
+
+That's not a test runner.
+
+It's a **test-result simulator based on source-text triggers**.
+
+The architecture explicitly says tests must target the actual artifact. 
+
+A proper mock should instead receive something like:
+
+```text
+TestDescriptor
+CandidateArtifact
+MockExecutionResult
+```
+
+and simulate objective outcomes.
+
+For example:
+
+```text
+MockTestRunner.ConfigureResult(
+    test_id,
+    success = false,
+    stdout = "...",
+    exit_code = 1
+)
+```
+
+That way the test is testing GRISP's reaction to a test failure, rather than testing whether the source contains a magic string.
+
+---
+
+# 14. The state machine is only superficially complete
+
+This:
+
+```text
+csCreated
+csParsed
+csCompiling
+csCompiled
+csTesting
+csVerified
+csRejected
+csAccepted
+```
+
+is much too compressed.
+
+It skips important semantics:
+
+```text
+STATIC_VALID
+RUNTIME_PENDING
+RUNTIME_VERIFIED
+POLICY_VERIFIED
+FINAL_VERIFICATION
+COMMIT_PENDING
+COMMITTED
+```
+
+The architecture defines a much richer candidate lifecycle. 
+
+I would not simplify it this aggressively.
+
+---
+
+# 15. `VerifyEvidenceChain()` is far too weak
+
+This is the biggest logical issue in the state machine:
+
+```pascal
+for Evidence in ACandidate.EvidenceLog do
+begin
+  if (Evidence.Stage = csCompiling) and Evidence.Success then
+    HasCompileEvidence := True;
+
+  if (Evidence.Stage = csTesting) and Evidence.Success then
+    HasTestEvidence := True;
+end;
+
+Result := HasCompileEvidence and HasTestEvidence;
+```
+
+That means:
+
+```text
+compile passed sometime
++
+test passed sometime
+=
+accepted
+```
+
+That is not GRISP.
+
+It doesn't verify:
+
+```text
+same artifact
+same candidate
+correct ordering
+policy
+static validation
+runtime
+final verification
+hash
+provenance
+test validity
+final bytes
+```
+
+A candidate could theoretically have:
+
+```text
+compile success for artifact A
+test success for artifact B
+```
+
+and this method would accept it.
+
+That violates the entire evidence philosophy.
+
+---
+
+# 16. `AcceptCandidate()` doesn't actually commit anything
+
+This message is particularly misleading:
+
+```pascal
+'Candidate successfully accepted into target codebase.'
+```
+
+No target codebase is modified.
+
+No final directory exists.
+
+No transactional commit occurs.
+
+No final re-hash occurs.
+
+No committed-byte verification occurs.
+
+It just changes:
+
+```pascal
+csVerified
+```
+
+to:
+
+```pascal
+csAccepted
+```
+
+The architecture explicitly requires final verification followed by transactional commit and verification of committed bytes. 
+
+So this isn't yet an acceptance/commit implementation.
+
+---
+
+# 17. The tests give a false sense of security
+
+The current tests prove things like:
+
+```text
+SHA256(string) == SHA256(bytes)
+```
+
+and:
+
+```text
+one code block parses
+```
+
+and:
+
+```text
+magic compile-failure string causes mock failure
+```
+
+Those are useful unit tests.
+
+But they don't prove the critical GRISP invariants.
+
+For example, we need tests where:
+
+```text
+compile passes
+test passes
+policy fails
+```
+
+and assert:
+
+```text
+REJECTED
+```
+
+We need:
+
+```text
+compile A passes
+test B passes
+```
+
+and assert:
+
+```text
+REJECTED
+```
+
+We need:
+
+```text
+final verification A
+modify A
+commit
+```
+
+and assert:
+
+```text
+COMMIT_FAILED
+```
+
+We need:
+
+```text
+missing compile evidence
+```
+
+and assert:
+
+```text
+NOT ACCEPTABLE
+```
+
+That's where the real power of this architecture lies.
+
+---
+
+# 18. GARP framing is okay for a buffer, not for TCP
+
+This is an important practical issue.
+
+Gemini wrote:
+
+```pascal
+TryUnframePacket(AStream: TStream)
+```
+
+using:
+
+```pascal
+AStream.Size
+AStream.Position
+```
+
+That is fine for:
+
+```text
+TMemoryStream
+```
+
+as used by the unit test.
+
+But a TCP socket stream isn't necessarily a seekable stream with meaningful `Size`.
+
+So this isn't yet a real streaming GARP decoder.
+
+We need an incremental frame decoder:
+
+```text
+receive bytes
+    ↓
+append to receive buffer
+    ↓
+if < 4 bytes:
+    wait
+
+read length
+    ↓
+validate maximum
+    ↓
+if incomplete:
+    wait
+
+if complete:
+    emit frame
+    ↓
+consume exactly N bytes
+```
+
+That is much more appropriate for GARP.
+
+---
+
+# 19. The GARP frame is also incomplete
+
+The specification defines the richer frame:
+
+```text
+magic
+version
+flags
+header_length
+payload_length
+message_type
+reserved
+request_id
+session_id
+payload
+```
+
+Gemini implements only:
+
+```text
+length
+payload
+```
+
+That's acceptable as a preliminary experiment, but it should be called:
+
+```text
+GARP framing prototype
+```
+
+not:
+
+```text
+GARP/1.0 implementation
+```
+
+Otherwise we risk implementing a reduced protocol and later discovering that the real protocol assumptions don't fit.
+
+---
+
+# 20. The max frame size is inconsistent
+
+Gemini uses:
+
+```pascal
+AMaxPayloadSize = 10485760
+```
+
+10 MiB.
+
+But our design has differentiated limits, such as:
+
+```text
+control frame
+prompt
+artifact
+stream chunk
+```
+
+The exact values can evolve, but the implementation should already understand that different message classes have different limits.
+
+---
+
+# 21. There's an important conceptual problem with `ArtifactHash` in evidence
+
+In the mock compiler:
+
+```pascal
+Evidence.ArtifactHash :=
+    TGrispCanonical.ComputeSHA256(SourceCode + '_MOCK_EXEC');
+```
+
+That isn't the artifact hash.
+
+It's the hash of:
+
+```text
+source + arbitrary mock suffix
+```
+
+So a field named:
+
+```text
+ArtifactHash
+```
+
+is actually an imaginary executable-output hash.
+
+That is dangerous naming.
+
+We should have explicit fields such as:
+
+```text
+input_artifact_id
+output_hash
+```
+
+because:
+
+```text
+source artifact
+≠ compiler output
+```
+
+That distinction will become very important once real compilation begins.
+
+---
+
+# 22. Some naming also needs tightening
+
+For example:
+
+```text
+Manifest
+Candidate
+EvidenceLog
+```
+
+are doing too many jobs.
+
+I would use:
+
+```text
+TGrispArtifactBundle
+TGrispArtifactFile
+TGrispCandidate
+TGrispEvidence
+TGrispToolResult
+TGrispDecision
+```
+
+Then the relationships are explicit:
+
+```text
+Candidate
+ └── ArtifactBundle
+      └── ArtifactFile[]
+
+Candidate
+ └── Evidence[]
+
+Decision
+ └── EvidenceId[]
+```
+
+That much more closely matches the actual domain model.
+
+---
+
+# 23. The good part: Gemini has given us something useful
+
+I wouldn't tell Gemini "start over."
+
+I'd tell it:
+
+> **You have the skeleton. Now bring the implementation up to the contract.**
+
+Because the skeleton is usable.
+
+In particular, retain:
+
+```text
+Grisp.Types
+Grisp.Canonical
+Grisp.Parser
+Grisp.GARP
+Grisp.StateMachine
+Grisp.MockCompiler
+Grisp.MockTestRunner
+Grisp.Tests
+```
+
+but radically improve their semantics.
+
+---
+
+# 24. What I would ask Gemini to do next
+
+Not:
+
+> "Make this better."
+
+That will probably produce another superficially improved version.
+
+I would give it a very constrained engineering task:
+
+```text
+Implement GRISP v1.0 Core Contract Revision 2.
+
+Do not introduce new architecture.
+Do not simplify the artifact model.
+Do not use FillChar on managed records.
+Do not use heuristic parser cleanup.
+Do not invent filenames.
+Do not trim artifact source bytes.
+Do not treat a session ID as a candidate ID.
+Do not use source-text magic strings as simulated compiler/test results.
+Do not treat existence of compile/test evidence as sufficient acceptance.
+Do not implement GARP using TStream.Size/Position assumptions for sockets.
+
+Implement first:
+1. exact Delphi types
+2. artifact/file identity
+3. canonical serializer
+4. parser result model
+5. evidence model
+6. tool result model
+7. candidate state machine
+8. acceptance predicate
+9. mock tool interfaces
+10. conformance tests
+
+Do not implement Firefox yet.
+Do not implement PostgreSQL yet.
+Do not implement real compiler execution yet.
+```
+
+That would force it to work on the actual kernel instead of producing more architectural-looking code.
+
+---
+
+# 25. And I would change the testing philosophy
+
+The first test suite should be something like:
+
+```text
+TEST 001
+Valid ArtifactBundle → accepted candidate
+
+TEST 002
+Malformed response → no artifact
+
+TEST 003
+Ambiguous response → no artifact
+
+TEST 004
+Wrong file hash → rejected
+
+TEST 005
+Wrong artifact hash → rejected
+
+TEST 006
+Compile failure → rejected
+
+TEST 007
+Runtime failure → rejected
+
+TEST 008
+Test failure → rejected
+
+TEST 009
+Policy failure → rejected
+
+TEST 010
+Compile A + test B → rejected
+
+TEST 011
+Missing evidence → rejected
+
+TEST 012
+Final bytes changed → rejected
+
+TEST 013
+Commit bytes differ → COMMIT_FAILED
+
+TEST 014
+Unrecognized plan → rejected
+
+TEST 015
+Accepted decision has complete evidence
+```
+
+That is a much more powerful first milestone than the current:
+
+```text
+SHA256 works
+one fence works
+mock string triggers failure
+```
+
+---
+
+# My bottom-line judgment
+
+**Gemini 3.6 is doing well as an architectural coding assistant, but this particular first implementation is still a prototype, not a GRISP core.**
+
+The most serious problems are not syntax—they are **semantic**:
+
+```text
+❌ Manifest ≠ ArtifactBundle
+❌ Hashing ≠ canonical artifact identity
+❌ Evidence ≠ proof log
+❌ Test runner ≠ actual artifact testing
+❌ AcceptCandidate ≠ final verification/commit
+❌ Session ID ≠ candidate identity
+❌ Parser ≠ strict artifact parser
+❌ GARP buffer framing ≠ TCP streaming protocol
+```
+
+And there is one very encouraging sign: the code already has enough structure that we **don't need another redesign**. We can now use the implementation contract we just produced and turn this into a proper GRISP kernel.
+
+The next thing I would do is **rewrite these exact units one by one, starting with `Grisp.Types.pas`**, because virtually every other problem flows from the current type model. The current types are simply too weak to express the guarantees our specification requires.

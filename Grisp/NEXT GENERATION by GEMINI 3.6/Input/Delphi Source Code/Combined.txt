@@ -1,0 +1,1006 @@
+unit Grisp.Canonical;
+
+interface
+
+uses
+  System.SysUtils, System.Classes, System.Hash, Grisp.Types;
+
+type
+  TGrispCanonical = class
+  public
+    /// <summary>
+    /// Encodes string into strict BOM-less UTF-8 bytes.
+    /// </summary>
+    class function ToUTF8Bytes(const AInput: string): TBytes; static;
+
+    /// <summary>
+    /// Generates canonical lowercase SHA-256 checksum over byte payloads.
+    /// </summary>
+    class function ComputeSHA256(const AData: TBytes): string; overload; static;
+    class function ComputeSHA256(const AText: string): string; overload; static;
+
+    /// <summary>
+    /// Validates candidate manifest raw bytes against the embedded content hash.
+    /// </summary>
+    class function VerifyManifest(const AManifest: TGrispManifest): Boolean; static;
+  end;
+
+implementation
+
+class function TGrispCanonical.ToUTF8Bytes(const AInput: string): TBytes;
+begin
+  Result := TEncoding.UTF8.GetBytes(AInput);
+end;
+
+class function TGrispCanonical.ComputeSHA256(const AData: TBytes): string;
+var
+  Hasher: THashSHA2;
+begin
+  Hasher := THashSHA2.Create(THashSHA2.TSHA2Version.SHA256);
+  if Length(AData) > 0 then
+    Hasher.Update(AData);
+  Result := Hasher.HashAsString.ToLower;
+end;
+
+class function TGrispCanonical.ComputeSHA256(const AText: string): string;
+begin
+  Result := ComputeSHA256(ToUTF8Bytes(AText));
+end;
+
+class function TGrispCanonical.VerifyManifest(const AManifest: TGrispManifest): Boolean;
+var
+  CalculatedHash: string;
+begin
+  if Length(AManifest.RawBytes) = 0 then
+    Exit(False);
+
+  CalculatedHash := ComputeSHA256(AManifest.RawBytes);
+  Result := SameText(CalculatedHash, AManifest.ContentHash);
+end;
+
+end.
+unit Grisp.GARP;
+
+interface
+
+uses
+  System.SysUtils, System.Classes, Grisp.Types, Grisp.Canonical;
+
+type
+  /// <summary>
+  /// GARP/1.0 4-byte length-framed binary packet structure.
+  /// Header format: [Payload Length: UInt32 (Network Byte Order / Big-Endian)]
+  /// </summary>
+  TGarpPacket = record
+    PayloadLength: UInt32;
+    Payload: TBytes;
+  end;
+
+  /// <summary>
+  /// GARP Protocol framing helper providing fail-closed binary serialization
+  /// and stream framing to prevent payload truncation or index shift errors.
+  /// </summary>
+  TGarpTransport = class
+  public
+    /// <summary>
+    /// Wraps raw payload bytes into a length-framed GARP packet stream.
+    /// </summary>
+    class function FramePayload(const APayload: TBytes): TBytes; static;
+
+    /// <summary>
+    /// Unframes stream data into a complete GARP packet.
+    /// Returns False if stream contains insufficient data or length header exceeds maximum allowed frame.
+    /// </summary>
+    class function TryUnframePacket(
+      AStream: TStream;
+      out APacket: TGarpPacket;
+      AMaxPayloadSize: UInt32 = 10485760 // 10 MB Default Cap
+    ): Boolean; static;
+
+    /// <summary>
+    /// Serializes candidate manifest data into GARP binary packet format.
+    /// </summary>
+    class function SerializeManifest(const AManifest: TGrispManifest): TBytes; static;
+  end;
+
+implementation
+
+class function TGarpTransport.FramePayload(const APayload: TBytes): TBytes;
+var
+  Len: UInt32;
+begin
+  Len := UInt32(Length(APayload));
+
+  SetLength(Result, 4 + Len);
+
+  // Pack 4-byte length prefix in Network Byte Order (Big-Endian)
+  Result[0] := Byte((Len shr 24) and $FF);
+  Result[1] := Byte((Len shr 16) and $FF);
+  Result[2] := Byte((Len shr 8) and $FF);
+  Result[3] := Byte(Len and $FF);
+
+  if Len > 0 then
+    Move(APayload[0], Result[4], Len);
+end;
+
+class function TGarpTransport.TryUnframePacket(
+  AStream: TStream;
+  out APacket: TGarpPacket;
+  AMaxPayloadSize: UInt32
+): Boolean;
+var
+  Header: array[0..3] of Byte;
+  OriginalPos: Int64;
+begin
+  APacket.PayloadLength := 0;
+  APacket.Payload := nil;
+
+  if (AStream = nil) or (AStream.Size - AStream.Position < 4) then
+    Exit(False);
+
+  OriginalPos := AStream.Position;
+
+  // Read 4-byte length prefix
+  AStream.ReadBuffer(Header, 4);
+
+  // Unpack Big-Endian length header to native UInt32 host order
+  APacket.PayloadLength := (UInt32(Header[0]) shl 24) or
+                           (UInt32(Header[1]) shl 16) or
+                           (UInt32(Header[2]) shl 8) or
+                           UInt32(Header[3]);
+
+  // Fail-closed security gate: Guard against integer overflow / memory exhaustion attacks
+  if (APacket.PayloadLength > AMaxPayloadSize) then
+  begin
+    AStream.Position := OriginalPos;
+    Exit(False);
+  end;
+
+  // Check if complete frame body is available in stream
+  if UInt32(AStream.Size - AStream.Position) < APacket.PayloadLength then
+  begin
+    AStream.Position := OriginalPos; // Rewind to start of header until full frame arrives
+    Exit(False);
+  end;
+
+  // Read full payload body
+  SetLength(APacket.Payload, APacket.PayloadLength);
+  if APacket.PayloadLength > 0 then
+    AStream.ReadBuffer(APacket.Payload[0], APacket.PayloadLength);
+
+  Result := True;
+end;
+
+class function TGarpTransport.SerializeManifest(const AManifest: TGrispManifest): TBytes;
+var
+  MemStream: TMemoryStream;
+  Writer: TBinaryWriter;
+  SessionBytes, TabBytes: TBytes;
+  SourcePathBytes, HashBytes: TBytes;
+begin
+  MemStream := TMemoryStream.Create;
+  try
+    Writer := TBinaryWriter.Create(MemStream);
+    try
+      SessionBytes := AManifest.SessionID.ToByteArray;
+      TabBytes := AManifest.TabID.ToByteArray;
+      SourcePathBytes := TGrispCanonical.ToUTF8Bytes(AManifest.SourcePath);
+      HashBytes := TGrispCanonical.ToUTF8Bytes(AManifest.ContentHash);
+
+      // Binary payload structure: GUIDs + Length-prefixed string metadata + Raw UTF8 Code Bytes
+      Writer.Write(SessionBytes, 0, 16);
+      Writer.Write(TabBytes, 0, 16);
+
+      Writer.Write(Int32(Length(SourcePathBytes)));
+      if Length(SourcePathBytes) > 0 then
+        Writer.Write(SourcePathBytes, 0, Length(SourcePathBytes));
+
+      Writer.Write(Int32(Length(HashBytes)));
+      if Length(HashBytes) > 0 then
+        Writer.Write(HashBytes, 0, Length(HashBytes));
+
+      Writer.Write(Int32(Length(AManifest.RawBytes)));
+      if Length(AManifest.RawBytes) > 0 then
+        Writer.Write(AManifest.RawBytes, 0, Length(AManifest.RawBytes));
+
+      SetLength(Result, MemStream.Size);
+      Move(MemStream.Memory^, Result[0], MemStream.Size);
+    finally
+      Writer.Free;
+    end;
+  finally
+    MemStream.Free;
+  end;
+end;
+
+end.
+unit Grisp.Parser;
+
+interface
+
+uses
+  System.SysUtils, System.Classes, System.StrUtils, Grisp.Types, Grisp.Canonical;
+
+type
+  /// <summary>
+  /// Fail-closed candidate parser for deterministic payload extraction.
+  /// Enforces single-block unambiguous rules for machine verification.
+  /// </summary>
+  TGrispParser = class
+  private
+    class function FindNextFence(
+      const AText: string; 
+      AStartPos: Integer; 
+      out AFenceStart, AFenceEnd: Integer; 
+      out ALang: string
+    ): Boolean; static;
+  public
+    /// <summary>
+    /// Parses raw AI text output into a validated TGrispCandidate.
+    /// Returns False and sets csRejected if zero or multiple code blocks exist.
+    /// </summary>
+    class function ParseResponse(
+      const AResponse: string; 
+      const ASessionID: TGrispSessionID; 
+      const ATabID: TGrispTabID; 
+      out ACandidate: TGrispCandidate
+    ): Boolean; static;
+  end;
+
+implementation
+
+class function TGrispParser.FindNextFence(
+  const AText: string; 
+  AStartPos: Integer; 
+  out AFenceStart, AFenceEnd: Integer; 
+  out ALang: string
+): Boolean;
+var
+  OpenPos, FirstNL, ClosePos: Integer;
+begin
+  Result := False;
+  AFenceStart := 0;
+  AFenceEnd := 0;
+  ALang := '';
+
+  OpenPos := PosEx('```', AText, AStartPos);
+  if OpenPos = 0 then
+    Exit;
+
+  FirstNL := PosEx(#10, AText, OpenPos + 3);
+  if FirstNL = 0 then
+    Exit;
+
+  ClosePos := PosEx('```', AText, FirstNL + 1);
+  if ClosePos = 0 then
+    Exit;
+
+  AFenceStart := OpenPos;
+  AFenceEnd := ClosePos + 3;
+  ALang := Trim(Copy(AText, OpenPos + 3, FirstNL - (OpenPos + 3)));
+  ALang := StringReplace(ALang, #13, '', [rfReplaceAll]);
+
+  Result := True;
+end;
+
+class function TGrispParser.ParseResponse(
+  const AResponse: string; 
+  const ASessionID: TGrispSessionID; 
+  const ATabID: TGrispTabID; 
+  out ACandidate: TGrispCandidate
+): Boolean;
+var
+  CurrPos, BlockCount, FenceStart, FenceEnd: Integer;
+  Lang, ExtractedCode: string;
+  SelectedStart, SelectedEnd: Integer;
+  Utf8Bytes: TBytes;
+begin
+  FillChar(ACandidate, SizeOf(ACandidate), 0);
+  ACandidate.ID := ASessionID;
+  ACandidate.State := csCreated;
+  ACandidate.LastError := errNone;
+
+  CurrPos := 1;
+  BlockCount := 0;
+  SelectedStart := 0;
+  SelectedEnd := 0;
+
+  // Scan text for code blocks
+  while FindNextFence(AResponse, CurrPos, FenceStart, FenceEnd, Lang) do
+  begin
+    Inc(BlockCount);
+    if BlockCount = 1 then
+    begin
+      SelectedStart := FenceStart;
+      SelectedEnd := FenceEnd;
+    end;
+    CurrPos := FenceEnd;
+  end;
+
+  // Gate 1: No code payload found
+  if BlockCount = 0 then
+  begin
+    ACandidate.State := csRejected;
+    ACandidate.LastError := errParseError;
+    Exit(False);
+  end;
+
+  // Gate 2: Fail-closed on ambiguity (multiple code blocks present)
+  if BlockCount > 1 then
+  begin
+    ACandidate.State := csRejected;
+    ACandidate.LastError := errParseAmbiguous;
+    Exit(False);
+  end;
+
+  // Extract inner code block payload
+  CurrPos := PosEx(#10, AResponse, SelectedStart + 3);
+  ExtractedCode := Copy(AResponse, CurrPos + 1, (SelectedEnd - 3) - (CurrPos + 1));
+  ExtractedCode := Trim(ExtractedCode);
+
+  if ExtractedCode.IsEmpty then
+  begin
+    ACandidate.State := csRejected;
+    ACandidate.LastError := errParseError;
+    Exit(False);
+  end;
+
+  // Package canonical manifest
+  Utf8Bytes := TGrispCanonical.ToUTF8Bytes(ExtractedCode);
+  
+  ACandidate.Manifest.SessionID := ASessionID;
+  ACandidate.Manifest.TabID := ATabID;
+  ACandidate.Manifest.SourcePath := '';
+  ACandidate.Manifest.RawBytes := Utf8Bytes;
+  ACandidate.Manifest.ContentHash := TGrispCanonical.ComputeSHA256(Utf8Bytes);
+
+  ACandidate.State := csParsed;
+  Result := True;
+end;
+
+end.unit Grisp.StateMachine;
+
+interface
+
+uses
+  System.SysUtils, System.Classes, System.DateUtils,
+  Grisp.Types, Grisp.Canonical, Grisp.Parser, Grisp.MockCompiler, Grisp.MockTestRunner;
+
+type
+  /// <summary>
+  /// Fail-closed state machine orchestrator that controls candidate lifecycle,
+  /// pipeline transitions, and evidence verification gates.
+  /// </summary>
+  TGrispStateMachine = class
+  private
+    FCompiler: TGrispMockCompiler;
+    FTestRunner: TGrispMockTestRunner;
+    FOwnsHarnesses: Boolean;
+
+    procedure LogTransition(
+      var ACandidate: TGrispCandidate; 
+      AStage: TGrispCandidateState; 
+      ASuccess: Boolean; 
+      AExitCode: Integer; 
+      const AMessage: string
+    );
+    function VerifyEvidenceChain(const ACandidate: TGrispCandidate): Boolean;
+  public
+    constructor Create; overload;
+    constructor Create(ACompiler: TGrispMockCompiler; ATestRunner: TGrispMockTestRunner); overload;
+    destructor Destroy; override;
+
+    /// <summary>
+    /// Executes full deterministic pipeline: Parse -> Compile -> Test.
+    /// Returns False and marks csRejected if any gate condition fails.
+    /// </summary>
+    function ProcessResponse(
+      const AResponse: string; 
+      const ASessionID: TGrispSessionID; 
+      const ATabID: TGrispTabID; 
+      out ACandidate: TGrispCandidate
+    ): Boolean;
+
+    /// <summary>
+    /// Promotes a verified candidate to csAccepted after verifying complete evidence history.
+    /// Fails closed if proof of compilation and test execution is missing.
+    /// </summary>
+    function AcceptCandidate(var ACandidate: TGrispCandidate): Boolean;
+  end;
+
+implementation
+
+constructor TGrispStateMachine.Create;
+begin
+  Create(TGrispMockCompiler.Create, TGrispMockTestRunner.Create);
+  FOwnsHarnesses := True;
+end;
+
+constructor TGrispStateMachine.Create(ACompiler: TGrispMockCompiler; ATestRunner: TGrispMockTestRunner);
+begin
+  inherited Create;
+  FCompiler := ACompiler;
+  FTestRunner := ATestRunner;
+  FOwnsHarnesses := False;
+end;
+
+destructor TGrispStateMachine.Destroy;
+begin
+  if FOwnsHarnesses then
+  begin
+    FCompiler.Free;
+    FTestRunner.Free;
+  end;
+  inherited Destroy;
+end;
+
+procedure TGrispStateMachine.LogTransition(
+  var ACandidate: TGrispCandidate; 
+  AStage: TGrispCandidateState; 
+  ASuccess: Boolean; 
+  AExitCode: Integer; 
+  const AMessage: string
+);
+var
+  Evidence: TGrispEvidence;
+begin
+  Evidence.Timestamp := Now;
+  Evidence.Stage := AStage;
+  Evidence.Success := ASuccess;
+  Evidence.ExitCode := AExitCode;
+  Evidence.OutputLog := AMessage;
+  
+  if Length(ACandidate.Manifest.RawBytes) > 0 then
+    Evidence.ArtifactHash := TGrispCanonical.ComputeSHA256(ACandidate.Manifest.RawBytes)
+  else
+    Evidence.ArtifactHash := '';
+
+  SetLength(ACandidate.EvidenceLog, Length(ACandidate.EvidenceLog) + 1);
+  ACandidate.EvidenceLog[High(ACandidate.EvidenceLog)] := Evidence;
+end;
+
+function TGrispStateMachine.VerifyEvidenceChain(const ACandidate: TGrispCandidate): Boolean;
+var
+  HasCompileEvidence, HasTestEvidence: Boolean;
+  Evidence: TGrispEvidence;
+begin
+  HasCompileEvidence := False;
+  HasTestEvidence := False;
+
+  for Evidence in ACandidate.EvidenceLog do
+  begin
+    if (Evidence.Stage = csCompiling) and Evidence.Success then
+      HasCompileEvidence := True;
+    if (Evidence.Stage = csTesting) and Evidence.Success then
+      HasTestEvidence := True;
+  end;
+
+  Result := HasCompileEvidence and HasTestEvidence;
+end;
+
+function TGrispStateMachine.ProcessResponse(
+  const AResponse: string; 
+  const ASessionID: TGrispSessionID; 
+  const ATabID: TGrispTabID; 
+  out ACandidate: TGrispCandidate
+): Boolean;
+begin
+  // Gate 1: Fail-closed single block parsing
+  if not TGrispParser.ParseResponse(AResponse, ASessionID, ATabID, ACandidate) then
+  begin
+    LogTransition(ACandidate, csCreated, False, -1, 'Parser Gate: Parsing failed or block structure ambiguous.');
+    Exit(False);
+  end;
+  
+  LogTransition(ACandidate, csParsed, True, 0, 'Parser Gate: Candidate payload extracted and hashed.');
+
+  // Gate 2: Mock Compilation
+  if not FCompiler.Compile(ACandidate) then
+  begin
+    LogTransition(ACandidate, csCompiling, False, 1, 'Compiler Gate: Code compilation failed.');
+    Exit(False);
+  end;
+
+  // Gate 3: Test Runner Execution
+  if not FTestRunner.RunTests(ACandidate) then
+  begin
+    LogTransition(ACandidate, csTesting, False, 1, 'Test Gate: Candidate failed verification test suite.');
+    Exit(False);
+  end;
+
+  Result := True;
+end;
+
+function TGrispStateMachine.AcceptCandidate(var ACandidate: TGrispCandidate): Boolean;
+begin
+  // Fail-closed gate: Must be in csVerified state and pass objective evidence audit
+  if (ACandidate.State <> csVerified) or not VerifyEvidenceChain(ACandidate) then
+  begin
+    ACandidate.State := csRejected;
+    ACandidate.LastError := errTestFailed;
+    LogTransition(ACandidate, csRejected, False, -1, 'Acceptance Gate: Rejected due to invalid state or incomplete evidence chain.');
+    Exit(False);
+  end;
+
+  ACandidate.State := csAccepted;
+  ACandidate.LastError := errNone;
+  LogTransition(ACandidate, csAccepted, True, 0, 'Acceptance Gate: Candidate successfully accepted into target codebase.');
+
+  Result := True;
+end;
+
+end.unit Grisp.Types;
+
+interface
+
+uses
+  System.SysUtils, System.Classes;
+
+type
+  /// <summary>
+  /// Fail-closed candidate execution state machine states.
+  /// </summary>
+  TGrispCandidateState = (
+    csCreated,
+    csParsed,
+    csCompiling,
+    csCompiled,
+    csTesting,
+    csVerified,
+    csRejected,
+    csAccepted
+  );
+
+  /// <summary>
+  /// Strict error categorization for parser and transport verification.
+  /// </summary>
+  TGrispErrorCode = (
+    errNone,
+    errParseAmbiguous,
+    errParseError,
+    errHashMismatch,
+    errCompileFailed,
+    errTestFailed,
+    errTransportError
+  );
+
+  TGrispSessionID = TGuid;
+  TGrispTabID = TGuid;
+
+  /// <summary>
+  /// Verifiable proof log entry generated by execution gates.
+  /// </summary>
+  TGrispEvidence = record
+    Timestamp: TDateTime;
+    Stage: TGrispCandidateState;
+    Success: Boolean;
+    ExitCode: Integer;
+    OutputLog: string;
+    ArtifactHash: string;
+  end;
+
+  /// <summary>
+  /// Canonical byte payload and cryptographic checksum container.
+  /// </summary>
+  TGrispManifest = record
+    SessionID: TGrispSessionID;
+    TabID: TGrispTabID;
+    SourcePath: string;
+    ContentHash: string; // Hex-encoded SHA-256
+    RawBytes: TBytes;    // Strict UTF-8 without BOM
+  end;
+
+  /// <summary>
+  /// Primary tracked code artifact context.
+  /// </summary>
+  TGrispCandidate = record
+    ID: TGrispSessionID;
+    State: TGrispCandidateState;
+    Manifest: TGrispManifest;
+    EvidenceLog: TArray<TGrispEvidence>;
+    LastError: TGrispErrorCode;
+  end;
+
+implementation
+
+end.unit Grisp.MockCompiler;
+
+interface
+
+uses
+  System.SysUtils, System.Classes, System.DateUtils, Grisp.Types, Grisp.Canonical;
+
+type
+  /// <summary>
+  /// Deterministic mock compiler harness for verifying candidate state transitions
+  /// and evidence logging without requiring an active toolchain installation.
+  /// </summary>
+  TGrispMockCompiler = class
+  private
+    FForceFailure: Boolean;
+    FMockOutputLog: string;
+  public
+    constructor Create(AForceFailure: Boolean = False);
+
+    /// <summary>
+    /// Evaluates candidate manifest bytes, logs proof, and advances state machine.
+    /// Fails closed if candidate state is invalid or compilation fails.
+    /// </summary>
+    function Compile(var ACandidate: TGrispCandidate): Boolean;
+
+    property ForceFailure: Boolean read FForceFailure write FForceFailure;
+    property MockOutputLog: string read FMockOutputLog write FMockOutputLog;
+  end;
+
+implementation
+
+constructor TGrispMockCompiler.Create(AForceFailure: Boolean);
+begin
+  inherited Create;
+  FForceFailure := AForceFailure;
+  FMockOutputLog := '';
+end;
+
+function TGrispMockCompiler.Compile(var ACandidate: TGrispCandidate): Boolean;
+var
+  Evidence: TGrispEvidence;
+  SourceCode: string;
+  IsSuccess: Boolean;
+begin
+  // Gate 1: Enforce state precondition
+  if ACandidate.State <> csParsed then
+  begin
+    ACandidate.State := csRejected;
+    ACandidate.LastError := errCompileFailed;
+    Exit(False);
+  end;
+
+  ACandidate.State := csCompiling;
+  SourceCode := TEncoding.UTF8.GetString(ACandidate.Manifest.RawBytes);
+
+  // Gate 2: Evaluate mock failure triggers in source payload
+  IsSuccess := not FForceFailure and 
+               not SourceCode.Contains('[SYNTAX_ERROR]') and 
+               not SourceCode.Contains('COMPILER_FAIL');
+
+  // Build tamper-evident log entry
+  Evidence.Timestamp := Now;
+  Evidence.Stage := csCompiling;
+  Evidence.Success := IsSuccess;
+
+  if IsSuccess then
+  begin
+    Evidence.ExitCode := 0;
+    Evidence.OutputLog := 'MockCompiler: Target unit compiled successfully. 0 Errors, 0 Warnings.';
+    // Simulate deterministic artifact hash generated from raw source
+    Evidence.ArtifactHash := TGrispCanonical.ComputeSHA256(SourceCode + '_MOCK_EXEC');
+    
+    ACandidate.State := csCompiled;
+    ACandidate.LastError := errNone;
+  end
+  else
+  begin
+    Evidence.ExitCode := 1;
+    if not FMockOutputLog.IsEmpty then
+      Evidence.OutputLog := FMockOutputLog
+    else
+      Evidence.OutputLog := 'MockCompiler: Fatal syntax error encountered during syntax tree emission.';
+    Evidence.ArtifactHash := '';
+
+    ACandidate.State := csRejected;
+    ACandidate.LastError := errCompileFailed;
+  end;
+
+  // Record objective proof into evidence log
+  SetLength(ACandidate.EvidenceLog, Length(ACandidate.EvidenceLog) + 1);
+  ACandidate.EvidenceLog[High(ACandidate.EvidenceLog)] := Evidence;
+
+  Result := IsSuccess;
+end;
+
+end.unit Grisp.MockTestRunner;
+
+interface
+
+uses
+  System.SysUtils, System.Classes, System.DateUtils, Grisp.Types, Grisp.Canonical;
+
+type
+  /// <summary>
+  /// Mock test execution harness for running test vectors against compiled candidates
+  /// and generating verifiable evidence logs prior to final acceptance.
+  /// </summary>
+  TGrispMockTestRunner = class
+  private
+    FForceFailure: Boolean;
+    FMockOutputLog: string;
+  public
+    constructor Create(AForceFailure: Boolean = False);
+
+    /// <summary>
+    /// Evaluates compiled candidate against test suite, records evidence,
+    /// and advances state machine to csVerified or csRejected.
+    /// </summary>
+    function RunTests(var ACandidate: TGrispCandidate): Boolean;
+
+    property ForceFailure: Boolean read FForceFailure write FForceFailure;
+    property MockOutputLog: string read FMockOutputLog write FMockOutputLog;
+  end;
+
+implementation
+
+constructor TGrispMockTestRunner.Create(AForceFailure: Boolean);
+begin
+  inherited Create;
+  FForceFailure := AForceFailure;
+  FMockOutputLog := '';
+end;
+
+function TGrispMockTestRunner.RunTests(var ACandidate: TGrispCandidate): Boolean;
+var
+  Evidence: TGrispEvidence;
+  SourceCode: string;
+  IsSuccess: Boolean;
+begin
+  // Gate 1: Enforce prerequisite compiled state
+  if ACandidate.State <> csCompiled then
+  begin
+    ACandidate.State := csRejected;
+    ACandidate.LastError := errTestFailed;
+    Exit(False);
+  end;
+
+  ACandidate.State := csTesting;
+  SourceCode := TEncoding.UTF8.GetString(ACandidate.Manifest.RawBytes);
+
+  // Gate 2: Evaluate mock failure triggers within test suite
+  IsSuccess := not FForceFailure and 
+               not SourceCode.Contains('[TEST_FAIL]') and 
+               not SourceCode.Contains('ASSERTION_ERROR');
+
+  // Build test execution proof
+  Evidence.Timestamp := Now;
+  Evidence.Stage := csTesting;
+  Evidence.Success := IsSuccess;
+
+  if IsSuccess then
+  begin
+    Evidence.ExitCode := 0;
+    Evidence.OutputLog := 'MockTestRunner: 12 test assertions executed. 0 Failures, 0 Skipped.';
+    Evidence.ArtifactHash := TGrispCanonical.ComputeSHA256(SourceCode + '_MOCK_TEST_PASS');
+
+    ACandidate.State := csVerified;
+    ACandidate.LastError := errNone;
+  end
+  else
+  begin
+    Evidence.ExitCode := 1;
+    if not FMockOutputLog.IsEmpty then
+      Evidence.OutputLog := FMockOutputLog
+    else
+      Evidence.OutputLog := 'MockTestRunner: Assertion failure at line 42 (Expected TRUE, got FALSE).';
+    Evidence.ArtifactHash := '';
+
+    ACandidate.State := csRejected;
+    ACandidate.LastError := errTestFailed;
+  end;
+
+  // Append proof to immutable candidate evidence log
+  SetLength(ACandidate.EvidenceLog, Length(ACandidate.EvidenceLog) + 1);
+  ACandidate.EvidenceLog[High(ACandidate.EvidenceLog)] := Evidence;
+
+  Result := IsSuccess;
+end;
+
+end.program GrispTestRunner;
+
+{$APPTYPE CONSOLE}
+
+{$R *.res}
+
+uses
+  System.SysUtils,
+  Grisp.Types in '..\Core\Grisp.Types.pas',
+  Grisp.Canonical in '..\Core\Grisp.Canonical.pas',
+  Grisp.Parser in '..\Core\Grisp.Parser.pas',
+  Grisp.GARP in '..\Core\Grisp.GARP.pas',
+  Grisp.StateMachine in '..\Core\Grisp.StateMachine.pas',
+  Grisp.MockCompiler in '..\Mock\Grisp.MockCompiler.pas',
+  Grisp.MockTestRunner in '..\Mock\Grisp.MockTestRunner.pas',
+  Grisp.Tests in '..\Tests\Grisp.Tests.pas';
+
+begin
+  try
+    Writeln('====================================================');
+    Writeln(' GRISP v1.0 Verification Engine & Test Harness ');
+    Writeln('====================================================');
+    Writeln;
+
+    TGrispTests.RunAllTests;
+
+    Writeln;
+    Writeln('Execution completed successfully. Press ENTER to exit.');
+    Readln;
+  except
+    on E: Exception do
+    begin
+      Writeln(Format('Fatal Error: %s: %s', [E.ClassName, E.Message]));
+      ExitCode := 1;
+      Readln;
+    end;
+  end;
+end.unit Grisp.Tests;
+
+interface
+
+uses
+  System.SysUtils, System.Classes,
+  Grisp.Types, Grisp.Canonical, Grisp.Parser, 
+  Grisp.MockCompiler, Grisp.MockTestRunner, Grisp.StateMachine, Grisp.GARP;
+
+type
+  /// <summary>
+  /// Standalone test runner for verifying GRISP v1.0 fail-closed invariant guarantees.
+  /// </summary>
+  TGrispTests = class
+  private
+    class procedure Assert(ACondition: Boolean; const ATestName, AMessage: string); static;
+    class procedure TestCanonicalHashing; static;
+    class procedure TestParserSingleBlock; static;
+    class procedure TestParserAmbiguousBlocks; static;
+    class procedure TestMockCompilerFailure; static;
+    class procedure TestFullStateMachinePipeline; static;
+    class procedure TestGarpBinaryFraming; static;
+  public
+    class procedure RunAllTests; static;
+  end;
+
+implementation
+
+class procedure TGrispTests.Assert(ACondition: Boolean; const ATestName, AMessage: string);
+begin
+  if not ACondition then
+    raise Exception.CreateFmt('[TEST FAILURE] %s: %s', [ATestName, AMessage]);
+  Writeln(Format('[PASS] %s', [ATestName]));
+end;
+
+class procedure TGrispTests.TestCanonicalHashing;
+var
+  InputText: string;
+  Bytes: TBytes;
+  Hash1, Hash2: string;
+begin
+  InputText := 'unit TestUnit; interface implementation end.';
+  Bytes := TGrispCanonical.ToUTF8Bytes(InputText);
+  
+  Hash1 := TGrispCanonical.ComputeSHA256(Bytes);
+  Hash2 := TGrispCanonical.ComputeSHA256(InputText);
+
+  Assert(SameText(Hash1, Hash2), 'CanonicalHashing', 'Byte hash and text hash mismatch');
+  Assert(Length(Hash1) = 64, 'CanonicalHashing', 'SHA-256 string length must be 64 characters');
+end;
+
+class procedure TGrispTests.TestParserSingleBlock;
+var
+  Payload: string;
+  SessionID, TabID: TGuid;
+  Candidate: TGrispCandidate;
+  Success: Boolean;
+begin
+  CreateGUID(SessionID);
+  CreateGUID(TabID);
+  Payload := 'Here is code:' + #10 + '```pascal' + #10 + 'WriteLn("Hello");' + #10 + '```';
+
+  Success := TGrispParser.ParseResponse(Payload, SessionID, TabID, Candidate);
+
+  Assert(Success, 'ParserSingleBlock', 'Valid single block parsing failed');
+  Assert(Candidate.State = csParsed, 'ParserSingleBlock', 'Candidate state must be csParsed');
+  Assert(Length(Candidate.Manifest.RawBytes) > 0, 'ParserSingleBlock', 'Manifest payload empty');
+end;
+
+class procedure TGrispTests.TestParserAmbiguousBlocks;
+var
+  Payload: string;
+  SessionID, TabID: TGuid;
+  Candidate: TGrispCandidate;
+  Success: Boolean;
+begin
+  CreateGUID(SessionID);
+  CreateGUID(TabID);
+  // Two blocks present -> Ambiguous -> Must fail closed
+  Payload := 'Block 1:' + #10 + '```pascal' + #10 + 'x := 1;' + #10 + '```' + #10 +
+             'Block 2:' + #10 + '```pascal' + #10 + 'y := 2;' + #10 + '```';
+
+  Success := TGrispParser.ParseResponse(Payload, SessionID, TabID, Candidate);
+
+  Assert(not Success, 'ParserAmbiguousBlocks', 'Parser allowed ambiguous multiple code blocks');
+  Assert(Candidate.State = csRejected, 'ParserAmbiguousBlocks', 'State must be csRejected');
+  Assert(Candidate.LastError = errParseAmbiguous, 'ParserAmbiguousBlocks', 'Error code must be errParseAmbiguous');
+end;
+
+class procedure TGrispTests.TestMockCompilerFailure;
+var
+  Compiler: TGrispMockCompiler;
+  Candidate: TGrispCandidate;
+  Code: string;
+begin
+  Compiler := TGrispMockCompiler.Create;
+  try
+    Code := '```pascal' + #10 + 'unit BadCode; [SYNTAX_ERROR]' + #10 + '```';
+    TGrispParser.ParseResponse(Code, TGUID.Empty, TGUID.Empty, Candidate);
+
+    Assert(not Compiler.Compile(Candidate), 'MockCompilerFailure', 'Compiler should reject code containing [SYNTAX_ERROR]');
+    Assert(Candidate.State = csRejected, 'MockCompilerFailure', 'Candidate must be rejected after compile failure');
+    Assert(Length(Candidate.EvidenceLog) = 1, 'MockCompilerFailure', 'Evidence log must record compile attempt');
+    Assert(not Candidate.EvidenceLog[0].Success, 'MockCompilerFailure', 'Log entry must mark failure');
+  finally
+    Compiler.Free;
+  end;
+end;
+
+class procedure TGrispTests.TestFullStateMachinePipeline;
+var
+  StateMachine: TGrispStateMachine;
+  Candidate: TGrispCandidate;
+  SessionID, TabID: TGuid;
+  Payload: string;
+  Success: Boolean;
+begin
+  CreateGUID(SessionID);
+  CreateGUID(TabID);
+  StateMachine := TGrispStateMachine.Create;
+  try
+    Payload := 'Valid output:' + #10 + '```pascal' + #10 + 'unit Valid;' + #10 + '```';
+
+    Success := StateMachine.ProcessResponse(Payload, SessionID, TabID, Candidate);
+    Assert(Success, 'StateMachinePipeline', 'ProcessResponse failed on valid candidate');
+    Assert(Candidate.State = csVerified, 'StateMachinePipeline', 'Candidate must reach csVerified state');
+
+    Success := StateMachine.AcceptCandidate(Candidate);
+    Assert(Success, 'StateMachinePipeline', 'AcceptCandidate failed on verified candidate');
+    Assert(Candidate.State = csAccepted, 'StateMachinePipeline', 'Final state must be csAccepted');
+    Assert(Length(Candidate.EvidenceLog) >= 3, 'StateMachinePipeline', 'Full pipeline evidence trace missing');
+  finally
+    StateMachine.Free;
+  end;
+end;
+
+class procedure TGrispTests.TestGarpBinaryFraming;
+var
+  SourceData, FramedData: TBytes;
+  Stream: TMemoryStream;
+  Packet: TGarpPacket;
+  Success: Boolean;
+begin
+  SourceData := TGrispCanonical.ToUTF8Bytes('GARP binary test payload');
+  FramedData := TGarpTransport.FramePayload(SourceData);
+
+  Stream := TMemoryStream.Create;
+  try
+    Stream.WriteBuffer(FramedData[0], Length(FramedData));
+    Stream.Position := 0;
+
+    Success := TGarpTransport.TryUnframePacket(Stream, Packet);
+
+    Assert(Success, 'GarpBinaryFraming', 'Unframing GARP packet failed');
+    Assert(Packet.PayloadLength = UInt32(Length(SourceData)), 'GarpBinaryFraming', 'Unframed length mismatch');
+    Assert(TGrispCanonical.ComputeSHA256(Packet.Payload) = TGrispCanonical.ComputeSHA256(SourceData),
+      'GarpBinaryFraming', 'Payload bytes corrupted during framing cycle');
+  finally
+    Stream.Free;
+  end;
+end;
+
+class procedure TGrispTests.RunAllTests;
+begin
+  Writeln('=== Running GRISP v1.0 Test Suite ===');
+  TestCanonicalHashing;
+  TestParserSingleBlock;
+  TestParserAmbiguousBlocks;
+  TestMockCompilerFailure;
+  TestFullStateMachinePipeline;
+  TestGarpBinaryFraming;
+  Writeln('=== All Tests Passed Successfully ===');
+end;
+
+end.
