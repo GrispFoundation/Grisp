@@ -1,0 +1,1353 @@
+11 september 2026:
+
+Yes. This version is **substantially better than the earlier Gemini 3.6 implementation**. It now looks like a real attempt at implementing the specification rather than merely sketching classes.
+
+But there are several **serious correctness/security problems** that mean I would **not yet call this a GRISP v1.0 conformance implementation**.
+
+My overall assessment: **good foundation, promising architecture, but still roughly 5.5–6/10 as a GRISP kernel implementation**. The biggest remaining problems are not cosmetic—they are precisely in the places where GRISP is supposed to be strongest: canonical identity, fail-closed policy, state-machine enforcement, parsing strictness, and transactional commit.
+
+## 1. `Grisp.Types` — much better
+
+This is one of the strongest parts of the new implementation.
+
+The separation into:
+
+* `Task`
+* `ArtifactBundle`
+* `ArtifactFile`
+* `Evidence`
+* `Decision`
+* `ToolResult`
+* provenance
+* diagnostics
+* explicit enums
+
+is very close to what we wanted.
+
+This is a **major improvement** over the previous `Manifest`/`Candidate` model.
+
+The evidence structure is now especially good:
+
+```pascal
+EvidenceId
+TaskId
+ArtifactId
+Operation
+Tool
+Status
+ExitCode
+Diagnostics
+StdOut
+StdErr
+ElapsedMs
+InputHash
+OutputHash
+EnvironmentId
+Environment
+CreatedAt
+MetadataJson
+```
+
+That is much closer to a real provenance model.
+
+### Problems remaining
+
+The IDs are still incomplete for the full architecture.
+
+You really want these conceptually separate:
+
+```text
+task_id
+request_id
+session_id
+tab_id
+message_id
+candidate_id
+artifact_id
+evidence_id
+decision_id
+```
+
+Your artifact has some of those through provenance, which is okay for now, but `candidate_id` is still missing entirely.
+
+That matters because:
+
+> an AI request/session is not the same thing as an artifact candidate.
+
+We previously identified that problem in Gemini's implementation, and it remains here in a different form.
+
+Also, `TGrispContentEncoding = (ceUtf8, ceBase64)` is okay, but the parser does not actually implement both encodings yet.
+
+---
+
+# 2. `Grisp.Hash` — good
+
+This is straightforward and basically sound.
+
+```pascal
+Result := 'sha256:' + LowerCase(THashSHA2.GetHashString(Stream));
+```
+
+The explicit prefix is useful.
+
+The important distinction now is:
+
+```text
+file content hash
+        ↓
+canonical artifact manifest
+        ↓
+artifact_id
+```
+
+That is the right conceptual structure.
+
+There is, however, a very important implication:
+
+### `ComputeArtifactId` does not hash the actual bytes directly
+
+It hashes the canonical manifest, which contains:
+
+```text
+content_sha256
+size_bytes
+filename
+...
+```
+
+That's acceptable and actually preferable for a structured artifact identity.
+
+But then the implementation must rigorously ensure that `ContentSHA256` cannot become stale.
+
+And that leads directly to a bug in your tests.
+
+---
+
+# 3. `Grisp.Artifact` — good idea, but one major conceptual trap
+
+This part is mostly well structured:
+
+```pascal
+BuildArtifact
+ValidateArtifact
+ComputeArtifactId
+ValidateFileName
+```
+
+The separation is correct.
+
+## But your `ValidateArtifact` copy is dangerous
+
+You do:
+
+```pascal
+CopyArtifact := AArtifact;
+if not BuildArtifact(CopyArtifact, AError) then Exit(False);
+```
+
+`TArray<TGrispArtifactFile>` is a dynamic array.
+
+A Delphi dynamic-array assignment does **not give you a completely independent deep copy of the contained data**.
+
+So `CopyArtifact.Files` and `AArtifact.Files` can share the same array storage.
+
+Then `BuildArtifact` modifies:
+
+```pascal
+AArtifact.Files[I].ContentSHA256
+AArtifact.Files[I].SizeBytes
+```
+
+That means your supposed validation operation can potentially mutate the artifact being validated.
+
+That is exactly the sort of hidden mutation we want to eliminate.
+
+### Better
+
+`ValidateArtifact` should validate the derived values **without modifying the supplied artifact**.
+
+Conceptually:
+
+```text
+Validate file bytes
+→ calculate expected content hash
+→ compare with stored ContentSHA256
+→ calculate expected SizeBytes
+→ compare
+→ construct canonical manifest from supplied values
+→ calculate expected ArtifactId
+→ compare
+```
+
+Validation must be observational.
+
+It should not "repair" the artifact.
+
+---
+
+# 4. Another very important artifact problem: stale content hash
+
+Your test says:
+
+```pascal
+B := A;
+B.Files[0].Content[0] := Ord('x');
+
+Require(B.ArtifactId <> ComputeArtifactId(B), 'mutation must change identity');
+```
+
+This is actually **wrong for your current identity architecture**.
+
+`ComputeArtifactId(B)` uses:
+
+```pascal
+B.Files[I].ContentSHA256
+```
+
+It does **not** recalculate the hash from:
+
+```pascal
+B.Files[I].Content
+```
+
+Therefore the content can be modified while `ContentSHA256` remains unchanged.
+
+So:
+
+```text
+content changed
+content_sha256 unchanged
+artifact_id unchanged
+```
+
+That is potentially dangerous.
+
+The correct invariant should be:
+
+```text
+content changed
+        ↓
+stored content_sha256 is now stale
+        ↓
+ValidateArtifact MUST FAIL
+```
+
+So your conformance test should really test:
+
+```text
+mutation → validation failure
+```
+
+rather than:
+
+```text
+mutation → ComputeArtifactId changes
+```
+
+That distinction is extremely important.
+
+I would deliberately make `ComputeArtifactId` a function over a **validated/finalized artifact representation**, rather than making it secretly repair derived fields.
+
+---
+
+# 5. `ValidateFileName` — not strong enough yet
+
+This currently catches some important cases:
+
+```pascal
+empty
+NUL
+\
+drive-qualified
+..
+../
+..\
+```
+
+Good.
+
+But for Windows filesystem security, it is still too permissive.
+
+For example:
+
+```text
+/foo.pas
+foo/bar.pas
+foo:bar.pas
+CON
+NUL
+COM1
+LPT1
+foo.
+foo 
+```
+
+and other Windows-specific path/device-name cases deserve explicit treatment.
+
+Most importantly:
+
+```pascal
+if Length(AFileName) >= 2 then
+  if AFileName[2] = ':' ...
+```
+
+only rejects a drive-qualified path such as:
+
+```text
+C:\foo.pas
+```
+
+It does **not** reject an NTFS alternate-data-stream-style name such as:
+
+```text
+foo.pas:secret
+```
+
+That is something I would absolutely not leave to `TPath.Combine`.
+
+Also `/` is not rejected as an absolute path.
+
+For GRISP, I would make filename validation deliberately boring and strict.
+
+Something like:
+
+```text
+relative path only
+no NUL
+no ':' anywhere
+no empty component
+no "." component
+no ".." component
+no leading slash
+no leading backslash
+no drive prefix
+no UNC
+no trailing dot/space in component
+no Windows device name
+```
+
+Then separately protect against reparse points/symlinks during commit.
+
+---
+
+# 6. `Grisp.Canonical` — this is one of the weakest remaining areas
+
+The *concept* is right.
+
+This is good:
+
+```pascal
+Sorted := Copy(AArtifact.Files);
+```
+
+and sorting files before canonicalization is correct.
+
+But the canonicalization implementation is **not yet rigorous enough for a deterministic protocol**.
+
+## Problem 1: `CompareStr`
+
+You use:
+
+```pascal
+CompareStr(...)
+```
+
+for ordering JSON keys and filenames.
+
+For a cryptographic canonical format, I don't want a locale-dependent/general Delphi string comparison deciding canonical byte order.
+
+We need an explicitly specified ordering, ultimately based on deterministic UTF-8 bytes.
+
+That means conceptually:
+
+```text
+Unicode string
+→ UTF-8 bytes
+→ unsigned bytewise lexicographic comparison
+```
+
+not "whatever `CompareStr` means on this Delphi runtime/environment."
+
+This is especially important because your entire artifact identity depends on it.
+
+---
+
+## Problem 2: `TJSONString.ToJSON` is being used as part of the canonical specification
+
+You have:
+
+```pascal
+function JsonQuote(const AValue: string): string;
+begin
+  Result := TJSONString.Create(AValue).ToJSON;
+end;
+```
+
+That may work in practice, but GRISP cannot rely on "whatever Delphi's JSON serializer currently does" as the definition of the wire/hash canonical form.
+
+You need the canonical representation to be **specified**, not inferred from a library implementation.
+
+For the GRISP canonical domain, I would eventually define:
+
+```text
+UTF-8
+RFC-style JSON escaping rules
+no insignificant whitespace
+object keys bytewise sorted
+arrays preserve semantic order
+integers represented canonically
+...
+```
+
+and implement that explicitly.
+
+---
+
+## Problem 3: invalid metadata is silently converted into `{}`
+
+This is dangerous:
+
+```pascal
+Metadata := TJSONObject.ParseJSONValue(AArtifact.MetadataJson);
+if Metadata = nil then
+  Metadata := TJSONObject.Create;
+```
+
+So:
+
+```text
+invalid metadata
+    ↓
+empty metadata
+    ↓
+different artifact interpretation
+```
+
+That is exactly the wrong behavior for fail-closed systems.
+
+It should be:
+
+```text
+invalid metadata → validation failure
+```
+
+Never silently normalize malformed metadata into valid metadata.
+
+---
+
+# 7. `ArtifactParser` — better separation, but still too permissive
+
+The separation:
+
+```text
+ParseStructuredArtifact
+ParseMarkdownArtifact
+```
+
+is good.
+
+And this:
+
+```pascal
+if Matches.Count > 1 then
+  Exit(prParseAmbiguous);
+```
+
+is much better than Gemini's "just take the first code block."
+
+## Serious problem: the response can override `TaskId`
+
+You have:
+
+```pascal
+if not TryGetValue<string>('task_id', AArtifact.TaskId) then
+  AArtifact.TaskId := ATaskId;
+```
+
+This means the AI can say:
+
+```json
+{
+  "task_id": "different-task",
+  ...
+}
+```
+
+and your parser accepts it.
+
+That should be the opposite.
+
+The caller owns task identity.
+
+The rule should be:
+
+```text
+external TaskId
+        ↓
+must match supplied response task_id if present
+        ↓
+otherwise parser supplies it
+        ↓
+mismatch = schema error
+```
+
+Never allow an untrusted worker response to redefine which task it belongs to.
+
+---
+
+## Serious problem: `kind` is read and then ignored
+
+You do:
+
+```pascal
+Obj.TryGetValue<string>('kind', KindName);
+AArtifact.Files[I].Kind := afkSource;
+```
+
+So the JSON says:
+
+```json
+"kind": "test"
+```
+
+and GRISP silently turns it into:
+
+```text
+source
+```
+
+That is not acceptable.
+
+Same basic issue applies to language.
+
+You read some fields, but the parser doesn't actually enforce the supplied schema.
+
+---
+
+## Base64 isn't implemented
+
+You define:
+
+```pascal
+ceUtf8
+ceBase64
+```
+
+but parsing always does:
+
+```pascal
+Bytes := TEncoding.UTF8.GetBytes(Content);
+AArtifact.Files[I].ContentEncoding := ceUtf8;
+```
+
+Therefore `ceBase64` currently exists only in the type system.
+
+That's okay for a prototype, but it should either be implemented or explicitly rejected.
+
+Fail closed means:
+
+```text
+unknown/unsupported encoding → schema error
+```
+
+not silently treating everything as UTF-8.
+
+---
+
+## No language validation
+
+This:
+
+```pascal
+Language := Header;
+```
+
+allows essentially arbitrary values.
+
+A parser should validate:
+
+```text
+language present
+language recognized
+language compatible with task
+```
+
+at least in strict mode.
+
+---
+
+# 8. Markdown parser has an especially subtle byte-preservation issue
+
+You do:
+
+````pascal
+Matches := TRegEx.Matches(
+  AResponse,
+  '```([^\r\n]*)\r?\n([\s\S]*?)\r?\n```');
+````
+
+This means the newline immediately before the closing fence is effectively excluded from the content.
+
+For example:
+
+````text
+```delphi:Hello.dpr
+abc
+````
+
+````
+
+your extracted content is:
+
+```text
+abc
+````
+
+rather than:
+
+```text
+abc\n
+```
+
+Whether that is the intended Markdown compatibility rule must be explicitly specified.
+
+GRISP's core rule should be:
+
+> parser transformations must never silently change artifact bytes.
+
+So the extraction rule needs to explicitly define whether the delimiter-associated newline belongs to the artifact.
+
+---
+
+# 9. `Grisp.Commit` — much better than Gemini, but still not transactional
+
+The good part:
+
+```pascal
+WriteAllBytes
+ReadAllBytes
+Sha256Bytes(ReadBack)
+```
+
+This is exactly the right instinct.
+
+You're verifying the bytes that actually reached disk.
+
+That is a significant improvement.
+
+## But the commit is still not transactional
+
+Suppose:
+
+```text
+file1 → written successfully
+file2 → exception
+file3 → never written
+```
+
+You are left with a partially populated directory.
+
+The function returns false, but the filesystem has already been mutated.
+
+GRISP's final commit should conceptually be:
+
+```text
+prepare
+↓
+validate paths
+↓
+create isolated staging directory
+↓
+write every file
+↓
+read every file back
+↓
+verify every content hash
+↓
+verify complete artifact identity
+↓
+atomically publish/rename staging → final
+↓
+re-read committed artifact
+↓
+verify committed identity
+↓
+record commit evidence
+```
+
+You are currently only doing the middle part.
+
+---
+
+## Also: you don't validate the artifact before committing
+
+`CommitArtifact` should not trust:
+
+```pascal
+AArtifact.ArtifactId
+AArtifact.Files[I].ContentSHA256
+```
+
+It should first do something like:
+
+```text
+ValidateArtifact(AArtifact)
+```
+
+because otherwise stale or forged derived fields can reach the commit layer.
+
+---
+
+## And this is a security issue
+
+You write directly beneath:
+
+```pascal
+Root := TPath.Combine(...)
+```
+
+and then:
+
+```pascal
+ForceDirectories(ExtractFileDir(Path));
+TFile.WriteAllBytes(Path, Written);
+```
+
+You need protection against reparse points/symlink-like filesystem redirection.
+
+The original specification explicitly cared about this.
+
+Path validation alone is not sufficient.
+
+---
+
+# 10. `Grisp.Evidence` — decent prototype
+
+This is now a reasonably sensible minimal evidence store.
+
+The immutability rule:
+
+```pascal
+if FItems.ContainsKey(Item.EvidenceId) then
+  raise EArgumentException.Create('Evidence is immutable...');
+```
+
+is good.
+
+But you still need validation on insertion.
+
+For example, this should not be accepted:
+
+```text
+EvidenceId = ''
+ArtifactId = ''
+TaskId = ''
+Operation = eoOther
+Status = esOk
+```
+
+without the evidence being checked.
+
+And eventually the evidence store needs deterministic retrieval by:
+
+```text
+task
+artifact
+operation
+sequence
+```
+
+because "find some successful compile evidence" is not enough.
+
+---
+
+# 11. `Grisp.Policy` — **major red flag**
+
+This is currently the most dangerous unit.
+
+You call it:
+
+```pascal
+TGrispFailClosedPolicy
+```
+
+but it is **not actually fail closed**.
+
+This code:
+
+```pascal
+Result.Checks[I].Passed :=
+  ATask.RequiredCapabilities[I] <> '';
+```
+
+means:
+
+```text
+if capability has a non-empty name
+    → capability is considered authorized
+```
+
+That is self-authorization.
+
+For example:
+
+```text
+RequiredCapabilities = ["write_filesystem", "execute_process"]
+```
+
+will pass.
+
+There is no:
+
+```text
+policy allowlist
+authorization database
+operator approval
+capability grant source
+risk rule
+environment restriction
+```
+
+So I would change this immediately.
+
+A genuine fail-closed policy must look more like:
+
+```text
+requested capability
+        ↓
+look up explicit authorization
+        ↓
+authorized?
+   yes → continue
+   no  → FAIL
+```
+
+and if the policy engine cannot determine the answer:
+
+```text
+unknown → FAIL
+```
+
+Not:
+
+```text
+unknown → PASS
+```
+
+This one deserves priority above most of the other cleanup.
+
+---
+
+# 12. `Grisp.StateMachine` — structurally good, semantically still too permissive
+
+This is another major area.
+
+The state names are now excellent:
+
+```text
+CREATED
+PARSED
+NORMALIZED
+STATIC_VALID
+COMPILE_PENDING
+COMPILED
+RUNTIME_PENDING
+RUNTIME_VERIFIED
+TEST_PENDING
+TEST_VERIFIED
+POLICY_VERIFIED
+ACCEPTABLE
+SELECTED
+FINAL_VERIFIED
+COMMITTED
+...
+```
+
+That's very close to the intended lifecycle.
+
+But the actual transition rules weaken it.
+
+For example:
+
+```pascal
+else if (ACurrent in [csTestVerified, csRuntimeVerified, csCompiled]) and
+  (AEvent = 'policy_ok') then
+```
+
+This means policy can pass while the candidate is merely:
+
+```text
+COMPILED
+```
+
+No runtime verification and no test verification required.
+
+Likewise:
+
+```pascal
+csCompiled → test_pending
+```
+
+allows tests without runtime verification—which may be okay depending on artifact kind—but the state machine itself doesn't express the actual gate policy.
+
+More concerning:
+
+```pascal
+else if AEvent = 'cancelled' then ...
+```
+
+is accepted from **every state**, including:
+
+```text
+COMMITTED
+```
+
+Likewise `crashed`, `timeout`, etc. can transition from states where such transitions should probably be impossible.
+
+And:
+
+```pascal
+csVerificationFailed
+csCommitFailed
+```
+
+exist but are not actually reachable from their corresponding events.
+
+So at the moment the state machine is mostly:
+
+> named states + rough legal progression
+
+rather than:
+
+> formally enforced acceptance lifecycle.
+
+That's still a big improvement from Gemini, but not finished.
+
+---
+
+# 13. `GrispConformance` is currently backwards
+
+This is probably the biggest problem in the demonstration program.
+
+You do:
+
+```pascal
+State := csCreated;
+→ parsed
+→ normalized
+→ static_ok
+```
+
+and then:
+
+```pascal
+CommitArtifact(...)
+```
+
+That demonstrates:
+
+```text
+STATIC_VALID → COMMIT
+```
+
+without:
+
+```text
+COMPILED
+RUNTIME_VERIFIED
+TEST_VERIFIED
+POLICY_VERIFIED
+ACCEPTABLE
+SELECTED
+FINAL_VERIFIED
+```
+
+Which is exactly what the GRISP architecture is supposed to prevent.
+
+So the conformance program is inadvertently testing a **spec violation**.
+
+This should become an actual end-to-end conformance test.
+
+Something closer to:
+
+```text
+CREATED
+→ PARSED
+→ NORMALIZED
+→ STATIC_VALID
+→ COMPILE_PENDING
+→ COMPILED
+→ RUNTIME_PENDING
+→ RUNTIME_VERIFIED
+→ TEST_PENDING
+→ TEST_VERIFIED
+→ POLICY_VERIFIED
+→ ACCEPTABLE
+→ SELECTED
+→ FINAL_VERIFIED
+→ COMMITTED
+```
+
+and every skipped gate should have a negative test proving it cannot commit.
+
+---
+
+# 14. Your current `Grisp.Core.Tests` test is also incorrect
+
+This one:
+
+```pascal
+B.Files[0].Content[0] := Ord('x');
+
+Require(B.ArtifactId <> ComputeArtifactId(B), 'mutation must change identity');
+```
+
+will likely fail conceptually, because `ComputeArtifactId` uses the **old stored content hash**.
+
+The correct test should be something like:
+
+```text
+original artifact validates
+
+mutate content
+
+original ArtifactId remains stored
+
+ValidateArtifact(mutated artifact) fails
+```
+
+That is actually a stronger test.
+
+---
+
+# 15. GARP JavaScript — good frame foundation
+
+This is probably your best new implementation after `Types`.
+
+This is correct and clean:
+
+```javascript
+view.setUint16(6, HEADER_LENGTH, false);
+view.setUint32(8, body.length, false);
+view.setUint16(12, messageType, false);
+...
+```
+
+Your 48-byte header calculation is also coherent:
+
+```text
+4 magic
+1 version
+1 flags
+2 header length
+4 payload length
+2 message type
+2 reserved
+16 request
+16 session
+
+= 48
+```
+
+That's good.
+
+And:
+
+```javascript
+view.setUint32(..., false)
+```
+
+explicit big-endian encoding is exactly what we want.
+
+---
+
+## But `decodeFrame` is not yet a TCP frame decoder
+
+This:
+
+```javascript
+decodeFrame(buffer)
+```
+
+assumes:
+
+> the caller already supplied exactly one complete frame.
+
+Real TCP gives you:
+
+```text
+half header
+header + half payload
+multiple frames
+frame + beginning of next frame
+```
+
+So eventually GARP needs:
+
+```text
+incremental receive buffer
+        ↓
+append bytes
+        ↓
+inspect header
+        ↓
+wait until complete frame
+        ↓
+extract frame
+        ↓
+leave remaining bytes in buffer
+```
+
+That is essential.
+
+The current decoder is a valid **frame codec**, but not a complete streaming transport decoder.
+
+---
+
+## Another important problem: malformed UTF-8
+
+You use:
+
+```javascript
+new TextDecoder().decode(...)
+```
+
+The default decoder can replace invalid UTF-8 with replacement characters.
+
+For a strict protocol, we want malformed UTF-8 rejected.
+
+Conceptually:
+
+```javascript
+new TextDecoder("utf-8", { fatal: true })
+```
+
+Then malformed bytes become a protocol error rather than silently becoming different text.
+
+That fits GRISP's fail-closed philosophy much better.
+
+---
+
+## `decodeFrame` throws away request/session identity
+
+You parse:
+
+```javascript
+requestId
+sessionId
+```
+
+but return only:
+
+```javascript
+{
+  messageType,
+  payload
+}
+```
+
+That's a major omission.
+
+The transport layer must expose:
+
+```javascript
+{
+    version,
+    flags,
+    messageType,
+    requestId,
+    sessionId,
+    payload
+}
+```
+
+because correlation is one of the fundamental GARP invariants.
+
+---
+
+# 16. `GarpSessionManager` — reasonable skeleton
+
+This is a good beginning.
+
+You correctly distinguish:
+
+```javascript
+sessionId
+provider
+tabId
+pageGeneration
+activeRequestId
+```
+
+and you correctly have:
+
+```javascript
+session.activeRequestId
+```
+
+to enforce one active prompt per session.
+
+But there is an important request-ID collision bug:
+
+```javascript
+const existing = this.#requests.get(requestId);
+if (existing) return existing;
+```
+
+Suppose:
+
+```text
+session A → request X
+session B → request X
+```
+
+The second call returns session A's request.
+
+That is not safe.
+
+It should be:
+
+```text
+same request_id + same session + compatible duplicate
+    → idempotent replay
+
+same request_id + different session
+    → REQUEST_ID_CONFLICT
+```
+
+Also `pageGeneration` is created but never actually incremented when navigation or actor replacement occurs.
+
+That is a major part of the stale-response protection described in the architecture.
+
+---
+
+# 17. `ProviderAdapter` — good architectural isolation
+
+This is a good direction:
+
+```javascript
+ProviderAdapter
+    ↓
+DeepSeekAdapter
+GeminiAdapter
+ChatGPTAdapter
+...
+```
+
+and keeping DOM knowledge out of the generic GARP/session manager is exactly right.
+
+The generic transport should not know:
+
+```text
+textarea selector
+button selector
+React component
+provider-specific DOM
+```
+
+So structurally this is good.
+
+But the methods need richer context eventually:
+
+```text
+session
+request
+pageGeneration
+deadline
+expected actor
+```
+
+and provider observations need typed results instead of:
+
+```javascript
+detectAuthentication() → "UNKNOWN"
+```
+
+That is fine as an initial stub, but not a finished adapter contract.
+
+---
+
+# My ranking of the implementation
+
+| Area                      | Assessment |
+| ------------------------- | ---------- |
+| Overall architecture      | **8/10**   |
+| Type model                | **8/10**   |
+| Evidence model            | **7.5/10** |
+| Hashing                   | **8/10**   |
+| Artifact identity concept | **7/10**   |
+| Artifact validation       | **5/10**   |
+| Filename/path security    | **4/10**   |
+| Canonicalization          | **4.5/10** |
+| Structured parser         | **5.5/10** |
+| Markdown parser           | **5/10**   |
+| Commit                    | **5/10**   |
+| Evidence store            | **6.5/10** |
+| Policy                    | **2/10**   |
+| State machine             | **4.5/10** |
+| GARP frame format         | **7.5/10** |
+| GARP streaming            | **4/10**   |
+| Session manager           | **6/10**   |
+| Provider architecture     | **7/10**   |
+| Conformance tests         | **3/10**   |
+
+## Compared with the previous Gemini implementation
+
+This is **clearly better**.
+
+The most important improvements are:
+
+```text
+Manifest
+    ↓
+real ArtifactBundle
+
+minimal evidence
+    ↓
+proper Evidence structure
+
+rough states
+    ↓
+much more complete state lifecycle
+
+single generic parser
+    ↓
+structured + Markdown compatibility paths
+
+raw source hash
+    ↓
+file hashes + canonical artifact identity
+
+simple filesystem write
+    ↓
+write + read-back verification
+
+anonymous session-centric execution
+    ↓
+task/artifact/evidence/provenance separation
+```
+
+So Gemini has moved the project forward considerably.
+
+But I would **not start building lots of higher-level GRISP logic on top of this yet**.
+
+The order I would fix it is:
+
+```text
+1. Grisp.Types
+2. Grisp.Canonical
+3. Grisp.Artifact
+4. Grisp.Policy
+5. Grisp.StateMachine
+6. Grisp.Commit
+7. ArtifactParser
+8. GARP codec/stream decoder
+9. conformance tests
+10. provider/session implementation
+```
+
+The first truly critical milestone should be:
+
+> **A malicious or malformed candidate must be unable to change its identity, impersonate another task, obtain authorization merely by asking for it, skip objective gates, or become committed through any alternate code path.**
+
+Once those properties are mechanically enforced, the rest of the system becomes much easier to trust.

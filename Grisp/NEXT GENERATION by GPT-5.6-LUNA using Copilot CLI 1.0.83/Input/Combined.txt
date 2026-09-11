@@ -1,0 +1,977 @@
+unit Grisp.Artifact;
+
+interface
+
+uses
+  System.SysUtils, System.Classes, System.JSON, System.IOUtils, Grisp.Types,
+  Grisp.Hash, Grisp.Canonical;
+
+function ValidateFileName(const AFileName: string; out AError: string): Boolean;
+function BuildArtifact(var AArtifact: TGrispArtifactBundle; out AError: string): Boolean;
+function ValidateArtifact(const AArtifact: TGrispArtifactBundle; out AError: string): Boolean;
+function ComputeArtifactId(const AArtifact: TGrispArtifactBundle): string;
+
+implementation
+
+function ValidateFileName(const AFileName: string; out AError: string): Boolean;
+begin
+  AError := '';
+  Result := AFileName <> '';
+  if not Result then AError := 'empty filename';
+  if Result and (AFileName.IndexOf(#0) >= 0) then begin Result := False; AError := 'embedded NUL'; end;
+  if Result and (AFileName[1] = '\') then begin Result := False; AError := 'absolute path'; end;
+  if Result and (Length(AFileName) >= 2) and (AFileName[2] = ':') then
+    begin Result := False; AError := 'drive-qualified path'; end;
+  if Result and ((AFileName.StartsWith('\\')) or AFileName.Contains('../') or
+    AFileName.Contains('..\' )) then begin Result := False; AError := 'path traversal'; end;
+  if Result and ((AFileName = '.') or (AFileName = '..')) then
+    begin Result := False; AError := 'invalid path component'; end;
+end;
+
+function ComputeArtifactId(const AArtifact: TGrispArtifactBundle): string;
+begin
+  Result := Sha256Text(CanonicalArtifactManifest(AArtifact));
+end;
+
+function BuildArtifact(var AArtifact: TGrispArtifactBundle; out AError: string): Boolean;
+var
+  I, J: Integer;
+begin
+  AError := '';
+  for I := 0 to Length(AArtifact.Files) - 1 do
+  begin
+    if not ValidateFileName(AArtifact.Files[I].FileName, AError) then Exit(False);
+    AArtifact.Files[I].ContentSHA256 := Sha256Bytes(AArtifact.Files[I].Content);
+    AArtifact.Files[I].SizeBytes := Length(AArtifact.Files[I].Content);
+    for J := 0 to I - 1 do
+      if CompareStr(AArtifact.Files[I].FileName, AArtifact.Files[J].FileName) = 0 then
+      begin
+        AError := 'duplicate filename: ' + AArtifact.Files[I].FileName;
+        Exit(False);
+      end;
+  end;
+  AArtifact.ArtifactId := ComputeArtifactId(AArtifact);
+  Result := True;
+end;
+
+function ValidateArtifact(const AArtifact: TGrispArtifactBundle; out AError: string): Boolean;
+var
+  CopyArtifact: TGrispArtifactBundle;
+begin
+  CopyArtifact := AArtifact;
+  if not BuildArtifact(CopyArtifact, AError) then Exit(False);
+  if (AArtifact.ArtifactId = '') or
+    not SameText(AArtifact.ArtifactId, CopyArtifact.ArtifactId) then
+  begin
+    AError := 'ARTIFACT_HASH_MISMATCH';
+    Exit(False);
+  end;
+  Result := True;
+end;
+
+end.
+unit Grisp.ArtifactParser;
+
+interface
+
+uses
+  System.SysUtils, System.JSON, System.Classes, System.RegularExpressions,
+  Grisp.Types, Grisp.Artifact, Grisp.Hash;
+
+type
+  TGrispParseResult = (prParsed, prParseError, prParseAmbiguous, prSchemaError,
+    prHashMismatch);
+
+function ParseStructuredArtifact(const AResponse: string; const ATaskId: string;
+  out AArtifact: TGrispArtifactBundle; out AError: string): TGrispParseResult;
+function ParseMarkdownArtifact(const AResponse, ATaskId: string;
+  out AArtifact: TGrispArtifactBundle; out AError: string): TGrispParseResult;
+
+implementation
+
+function ParseStructuredArtifact(const AResponse: string; const ATaskId: string;
+  out AArtifact: TGrispArtifactBundle; out AError: string): TGrispParseResult;
+var
+  Root: TJSONValue;
+  Files: TJSONArray;
+  I: Integer;
+  Obj: TJSONObject;
+  Bytes: TBytes;
+  Content, KindName, SuppliedArtifactId, SuppliedHash: string;
+begin
+  AError := '';
+  Result := prSchemaError;
+  Root := TJSONObject.ParseJSONValue(AResponse);
+  if not (Root is TJSONObject) then begin AError := 'invalid JSON'; Exit(prParseError); end;
+  try
+    if not TJSONObject(Root).TryGetValue<string>('task_id', AArtifact.TaskId) then
+      AArtifact.TaskId := ATaskId;
+    TJSONObject(Root).TryGetValue<string>('artifact_id', SuppliedArtifactId);
+    if not TJSONObject(Root).TryGetValue<TJSONArray>('files', Files) then
+      begin AError := 'files array required'; Exit(prSchemaError); end;
+    AArtifact.ArtifactKind := akUnit;
+    AArtifact.Language := 'delphi';
+    SetLength(AArtifact.Files, Files.Count);
+    for I := 0 to Files.Count - 1 do
+    begin
+      if not (Files.Items[I] is TJSONObject) then begin AError := 'file must be object'; Exit(prSchemaError); end;
+      Obj := TJSONObject(Files.Items[I]);
+      if not Obj.TryGetValue<string>('filename', AArtifact.Files[I].FileName) then
+        begin AError := 'filename required'; Exit(prSchemaError); end;
+      Obj.TryGetValue<string>('language', AArtifact.Files[I].Language);
+      Obj.TryGetValue<string>('kind', KindName);
+      Obj.TryGetValue<string>('content_sha256', SuppliedHash);
+      AArtifact.Files[I].Kind := afkSource;
+      if not Obj.TryGetValue<string>('content', Content) then
+        begin AError := 'content required'; Exit(prSchemaError); end;
+      Bytes := TEncoding.UTF8.GetBytes(Content);
+      if (SuppliedHash <> '') and
+        not SameText(SuppliedHash, Sha256Bytes(Bytes)) then
+        begin AError := 'HASH_MISMATCH'; Exit(prHashMismatch); end;
+      AError := '';
+      AArtifact.Files[I].Content := Bytes;
+      AArtifact.Files[I].ContentEncoding := ceUtf8;
+    end;
+    if not BuildArtifact(AArtifact, AError) then Exit(prHashMismatch);
+    if (SuppliedArtifactId <> '') and not SameText(SuppliedArtifactId, AArtifact.ArtifactId) then
+      begin AError := 'ARTIFACT_HASH_MISMATCH'; Exit(prHashMismatch); end;
+    Result := prParsed;
+  finally
+    Root.Free;
+  end;
+end;
+
+function ParseMarkdownArtifact(const AResponse, ATaskId: string;
+  out AArtifact: TGrispArtifactBundle; out AError: string): TGrispParseResult;
+var
+  Match: TMatch;
+  Matches: TMatchCollection;
+  Header, FileName, Language, Content: string;
+begin
+  AError := '';
+  Matches := TRegEx.Matches(AResponse, '```([^\r\n]*)\r?\n([\s\S]*?)\r?\n```');
+  if Matches.Count = 0 then begin AError := 'no fenced artifact'; Exit(prParseError); end;
+  if Matches.Count > 1 then begin AError := 'multiple interpretations'; Exit(prParseAmbiguous); end;
+  Match := Matches[0];
+  Header := Trim(Match.Groups[1].Value);
+  Content := Match.Groups[2].Value;
+  FileName := '';
+  Language := Header;
+  if Header.Contains(':') then begin
+    Language := Header.Substring(0, Header.IndexOf(':')).Trim;
+    FileName := Header.Substring(Header.IndexOf(':') + 1).Trim;
+  end;
+  if FileName = '' then begin AError := 'filename required'; Exit(prParseError); end;
+  AArtifact.TaskId := ATaskId;
+  AArtifact.ArtifactKind := akUnit;
+  AArtifact.Language := Language;
+  SetLength(AArtifact.Files, 1);
+  AArtifact.Files[0].FileName := FileName;
+  AArtifact.Files[0].Language := Language;
+  AArtifact.Files[0].Kind := afkSource;
+  AArtifact.Files[0].Content := TEncoding.UTF8.GetBytes(Content);
+  AArtifact.Files[0].ContentEncoding := ceUtf8;
+  if not BuildArtifact(AArtifact, AError) then Exit(prParseError);
+  Result := prParsed;
+end;
+
+end.
+unit Grisp.Canonical;
+
+interface
+
+uses
+  System.SysUtils, System.JSON, System.Generics.Collections, Grisp.Types;
+
+function CanonicalJson(const AValue: TJSONValue): string;
+function CanonicalArtifactManifest(const AArtifact: TGrispArtifactBundle): string;
+
+implementation
+
+function JsonQuote(const AValue: string): string;
+begin
+  Result := TJSONString.Create(AValue).ToJSON;
+end;
+
+function CanonicalJson(const AValue: TJSONValue): string;
+var
+  Pair, PairTemp: TJSONPair;
+  Pairs: TList<TJSONPair>;
+  Item: TJSONValue;
+  I, J: Integer;
+begin
+  if AValue is TJSONObject then
+  begin
+    Pairs := TList<TJSONPair>.Create;
+    try
+      for Pair in TJSONObject(AValue) do Pairs.Add(Pair);
+      for I := 0 to Pairs.Count - 1 do
+        for J := I + 1 to Pairs.Count - 1 do
+          if CompareStr(Pairs[I].JsonString.Value, Pairs[J].JsonString.Value) > 0 then
+          begin
+            PairTemp := Pairs[I];
+            Pairs[I] := Pairs[J];
+            Pairs[J] := PairTemp;
+          end;
+      Result := '{';
+      for I := 0 to Pairs.Count - 1 do
+      begin
+        if I > 0 then Result := Result + ',';
+        Result := Result + JsonQuote(Pairs[I].JsonString.Value) + ':' +
+          CanonicalJson(Pairs[I].JsonValue);
+      end;
+      Result := Result + '}';
+    finally
+      Pairs.Free;
+    end;
+  end
+  else if AValue is TJSONArray then
+  begin
+    Result := '[';
+    for I := 0 to TJSONArray(AValue).Count - 1 do
+    begin
+      if I > 0 then Result := Result + ',';
+      Item := TJSONArray(AValue).Items[I];
+      Result := Result + CanonicalJson(Item);
+    end;
+    Result := Result + ']';
+  end
+  else
+    Result := AValue.ToJSON;
+end;
+
+function CanonicalArtifactManifest(const AArtifact: TGrispArtifactBundle): string;
+var
+  Root, FileObject: TJSONObject;
+  Provenance: TJSONObject;
+  Files: TJSONArray;
+  Sorted: TArray<TGrispArtifactFile>;
+  F, Temp: TGrispArtifactFile;
+  I, J: Integer;
+  Metadata: TJSONValue;
+begin
+  Sorted := Copy(AArtifact.Files);
+  for I := 0 to Length(Sorted) - 1 do
+    for J := I + 1 to Length(Sorted) - 1 do
+      if (CompareStr(Sorted[I].FileName, Sorted[J].FileName) > 0) or
+        ((Sorted[I].FileName = Sorted[J].FileName) and
+        (CompareStr(Sorted[I].ContentSHA256, Sorted[J].ContentSHA256) > 0)) then
+      begin
+        Temp := Sorted[I];
+        Sorted[I] := Sorted[J];
+        Sorted[J] := Temp;
+      end;
+  Root := TJSONObject.Create;
+  try
+    Root.AddPair('task_id', AArtifact.TaskId);
+    if AArtifact.ParentArtifactId <> '' then
+      Root.AddPair('parent_artifact_id', AArtifact.ParentArtifactId);
+    Root.AddPair('revision', TJSONNumber.Create(AArtifact.Revision));
+    Root.AddPair('artifact_kind', ArtifactKindName(AArtifact.ArtifactKind));
+    Root.AddPair('language', AArtifact.Language);
+    Files := TJSONArray.Create;
+    Root.AddPair('files', Files);
+    for I := 0 to Length(Sorted) - 1 do
+    begin
+      F := Sorted[I];
+      FileObject := TJSONObject.Create;
+      FileObject.AddPair('filename', F.FileName);
+      FileObject.AddPair('language', F.Language);
+      FileObject.AddPair('kind', FileKindName(F.Kind));
+      FileObject.AddPair('content_encoding', ContentEncodingName(F.ContentEncoding));
+      FileObject.AddPair('content_sha256', F.ContentSHA256);
+      FileObject.AddPair('size_bytes', TJSONNumber.Create(F.SizeBytes));
+      Files.AddElement(FileObject);
+    end;
+    Provenance := TJSONObject.Create;
+    if AArtifact.Provenance.Provider <> '' then Provenance.AddPair('provider', AArtifact.Provenance.Provider);
+    if AArtifact.Provenance.WorkerId <> '' then Provenance.AddPair('worker_id', AArtifact.Provenance.WorkerId);
+    if AArtifact.Provenance.SessionId <> '' then Provenance.AddPair('session_id', AArtifact.Provenance.SessionId);
+    if AArtifact.Provenance.TabId <> '' then Provenance.AddPair('tab_id', AArtifact.Provenance.TabId);
+    if AArtifact.Provenance.MessageId <> '' then Provenance.AddPair('message_id', AArtifact.Provenance.MessageId);
+    if AArtifact.Provenance.PromptHash <> '' then Provenance.AddPair('prompt_hash', AArtifact.Provenance.PromptHash);
+    if AArtifact.Provenance.ResponseHash <> '' then Provenance.AddPair('response_hash', AArtifact.Provenance.ResponseHash);
+    if AArtifact.Provenance.CreatedAt <> '' then Provenance.AddPair('created_at', AArtifact.Provenance.CreatedAt);
+    Root.AddPair('provenance', Provenance);
+    Metadata := TJSONObject.ParseJSONValue(AArtifact.MetadataJson);
+    if Metadata = nil then Metadata := TJSONObject.Create;
+    Root.AddPair('metadata', Metadata);
+    Result := CanonicalJson(Root);
+  finally
+    Root.Free;
+  end;
+end;
+
+end.
+unit Grisp.Commit;
+
+interface
+
+uses
+  System.SysUtils, System.IOUtils, Grisp.Types, Grisp.Artifact, Grisp.Hash;
+
+function CommitArtifact(const AArtifact: TGrispArtifactBundle; const AFinalRoot: string;
+  out AEvidence: TGrispEvidence; out AError: string): Boolean;
+
+implementation
+
+function CommitArtifact(const AArtifact: TGrispArtifactBundle; const AFinalRoot: string;
+  out AEvidence: TGrispEvidence; out AError: string): Boolean;
+var
+  Root, Path: string;
+  I: Integer;
+  Written, ReadBack: TBytes;
+begin
+  AError := '';
+  AEvidence := Default(TGrispEvidence);
+  AEvidence.EvidenceId := NewUuid;
+  AEvidence.ArtifactId := AArtifact.ArtifactId;
+  AEvidence.Operation := eoCommit;
+  AEvidence.CreatedAt := UtcNowText;
+  Root := TPath.Combine(AFinalRoot, AArtifact.ArtifactId.Replace(':', '_'));
+  ForceDirectories(Root);
+  try
+    for I := 0 to Length(AArtifact.Files) - 1 do
+    begin
+      Path := TPath.Combine(Root, AArtifact.Files[I].FileName);
+      if not ValidateFileName(AArtifact.Files[I].FileName, AError) then
+        Exit(False);
+      ForceDirectories(ExtractFileDir(Path));
+      Written := AArtifact.Files[I].Content;
+      TFile.WriteAllBytes(Path, Written);
+      ReadBack := TFile.ReadAllBytes(Path);
+      if not SameText(Sha256Bytes(ReadBack), AArtifact.Files[I].ContentSHA256) then
+      begin
+        AError := 'COMMIT_FAILED: committed bytes differ';
+        AEvidence.Status := esFailed;
+        Exit(False);
+      end;
+    end;
+    AEvidence.Status := esOk;
+    AEvidence.Tool := 'local-filesystem';
+    Result := True;
+  except
+    on E: Exception do
+    begin
+      AError := 'COMMIT_FAILED: ' + E.Message;
+      AEvidence.Status := esFailed;
+      Result := False;
+    end;
+  end;
+end;
+
+end.
+unit Grisp.Evidence;
+
+interface
+
+uses
+  System.SysUtils, System.Generics.Collections, Grisp.Types;
+
+type
+  IGrispEvidenceStore = interface
+    ['{2C9E4F75-6E03-4DD4-9A64-5C1F6E2CF10A}']
+    function RecordEvidence(const AEvidence: TGrispEvidence): TGrispEvidenceId;
+    function GetEvidence(const AId: TGrispEvidenceId): TGrispEvidence;
+    function Count: Integer;
+  end;
+
+  TGrispMemoryEvidenceStore = class(TInterfacedObject, IGrispEvidenceStore)
+  private
+    FItems: TDictionary<string, TGrispEvidence>;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    function RecordEvidence(const AEvidence: TGrispEvidence): TGrispEvidenceId;
+    function GetEvidence(const AId: TGrispEvidenceId): TGrispEvidence;
+    function Count: Integer;
+  end;
+
+implementation
+
+constructor TGrispMemoryEvidenceStore.Create;
+begin
+  inherited;
+  FItems := TDictionary<string, TGrispEvidence>.Create;
+end;
+
+destructor TGrispMemoryEvidenceStore.Destroy;
+begin
+  FItems.Free;
+  inherited;
+end;
+
+function TGrispMemoryEvidenceStore.RecordEvidence(const AEvidence: TGrispEvidence): TGrispEvidenceId;
+var
+  Item: TGrispEvidence;
+begin
+  Item := AEvidence;
+  if Item.EvidenceId = '' then Item.EvidenceId := NewUuid;
+  if FItems.ContainsKey(Item.EvidenceId) then
+    raise EArgumentException.Create('Evidence is immutable and already exists');
+  FItems.Add(Item.EvidenceId, Item);
+  Result := Item.EvidenceId;
+end;
+
+function TGrispMemoryEvidenceStore.GetEvidence(const AId: TGrispEvidenceId): TGrispEvidence;
+begin
+  if not FItems.TryGetValue(AId, Result) then
+    raise EArgumentException.Create('Evidence not found: ' + AId);
+end;
+
+function TGrispMemoryEvidenceStore.Count: Integer;
+begin
+  Result := FItems.Count;
+end;
+
+end.
+unit Grisp.Hash;
+
+interface
+
+uses
+  System.SysUtils, System.Hash, System.Classes;
+
+function Sha256Bytes(const ABytes: TBytes): string;
+function Sha256Text(const AText: string): string;
+
+implementation
+
+function Sha256Bytes(const ABytes: TBytes): string;
+var
+  Stream: TMemoryStream;
+begin
+  Stream := TMemoryStream.Create;
+  try
+    if Length(ABytes) > 0 then Stream.WriteBuffer(ABytes[0], Length(ABytes));
+    Stream.Position := 0;
+    Result := 'sha256:' + LowerCase(THashSHA2.GetHashString(Stream));
+  finally
+    Stream.Free;
+  end;
+end;
+
+function Sha256Text(const AText: string): string;
+begin
+  Result := Sha256Bytes(TEncoding.UTF8.GetBytes(AText));
+end;
+
+end.
+unit Grisp.Policy;
+
+interface
+
+uses
+  System.SysUtils, Grisp.Types;
+
+type
+  TGrispPolicyCheck = record
+    PolicyId: string;
+    Passed: Boolean;
+    Details: string;
+  end;
+  TGrispPolicyResult = record
+    PolicyProfile: string;
+    CapabilitiesRequested: TArray<string>;
+    CapabilitiesGranted: TArray<string>;
+    Checks: TArray<TGrispPolicyCheck>;
+    ResultName: string;
+    Reason: string;
+  end;
+  IGrispPolicyEngine = interface
+    function Evaluate(const ATask: TGrispTask; const AArtifact: TGrispArtifactBundle): TGrispPolicyResult;
+  end;
+  TGrispFailClosedPolicy = class(TInterfacedObject, IGrispPolicyEngine)
+    function Evaluate(const ATask: TGrispTask; const AArtifact: TGrispArtifactBundle): TGrispPolicyResult;
+  end;
+
+implementation
+
+function TGrispFailClosedPolicy.Evaluate(const ATask: TGrispTask;
+  const AArtifact: TGrispArtifactBundle): TGrispPolicyResult;
+var
+  I: Integer;
+begin
+  Result.PolicyProfile := ATask.PolicyProfile;
+  Result.CapabilitiesRequested := Copy(ATask.RequiredCapabilities);
+  SetLength(Result.CapabilitiesGranted, 0);
+  SetLength(Result.Checks, Length(ATask.RequiredCapabilities));
+  Result.ResultName := 'PASS';
+  Result.Reason := '';
+  for I := 0 to Length(ATask.RequiredCapabilities) - 1 do
+  begin
+    Result.Checks[I].PolicyId := ATask.RequiredCapabilities[I];
+    Result.Checks[I].Passed := ATask.RequiredCapabilities[I] <> '';
+    Result.Checks[I].Details := 'Capability must be explicitly named and authorized';
+    if Result.Checks[I].Passed then
+    begin
+      SetLength(Result.CapabilitiesGranted, Length(Result.CapabilitiesGranted) + 1);
+      Result.CapabilitiesGranted[High(Result.CapabilitiesGranted)] := ATask.RequiredCapabilities[I];
+    end
+    else
+      Result.ResultName := 'FAIL';
+  end;
+  if AArtifact.TaskId <> ATask.TaskId then
+  begin
+    Result.ResultName := 'FAIL';
+    Result.Reason := 'artifact task mismatch';
+  end;
+end;
+
+end.
+unit Grisp.StateMachine;
+
+interface
+
+uses
+  System.SysUtils, Grisp.Types;
+
+function CandidateStateName(const AState: TGrispCandidateState): string;
+function CanTransition(const ACurrent: TGrispCandidateState;
+  const AEvent: string; out ANext: TGrispCandidateState; out AReason: string): Boolean;
+
+implementation
+
+function CandidateStateName(const AState: TGrispCandidateState): string;
+const
+  Names: array[TGrispCandidateState] of string = (
+    'CREATED', 'PARSED', 'NORMALIZED', 'STATIC_VALID', 'COMPILE_PENDING',
+    'COMPILED', 'RUNTIME_PENDING', 'RUNTIME_VERIFIED', 'TEST_PENDING',
+    'TEST_VERIFIED', 'POLICY_VERIFIED', 'ACCEPTABLE', 'SELECTED',
+    'FINAL_VERIFIED', 'COMMITTED', 'PARSE_FAILED', 'STATIC_FAILED',
+    'POLICY_REJECTED', 'COMPILE_FAILED', 'RUNTIME_FAILED', 'TEST_FAILED',
+    'TIMEOUT', 'CANCELLED', 'CRASHED', 'VERIFICATION_FAILED', 'COMMIT_FAILED');
+begin
+  Result := Names[AState];
+end;
+
+function CanTransition(const ACurrent: TGrispCandidateState;
+  const AEvent: string; out ANext: TGrispCandidateState; out AReason: string): Boolean;
+begin
+  Result := True;
+  AReason := '';
+  ANext := ACurrent;
+  if (ACurrent = csCreated) and (AEvent = 'parsed') then ANext := csParsed
+  else if (ACurrent = csParsed) and (AEvent = 'normalized') then ANext := csNormalized
+  else if (ACurrent = csNormalized) and (AEvent = 'static_ok') then ANext := csStaticValid
+  else if (ACurrent = csStaticValid) and (AEvent = 'compile_pending') then ANext := csCompilePending
+  else if (ACurrent = csCompilePending) and (AEvent = 'compile_ok') then ANext := csCompiled
+  else if (ACurrent = csCompiled) and (AEvent = 'runtime_pending') then ANext := csRuntimePending
+  else if (ACurrent = csRuntimePending) and (AEvent = 'runtime_ok') then ANext := csRuntimeVerified
+  else if (ACurrent in [csCompiled, csRuntimeVerified]) and (AEvent = 'test_pending') then ANext := csTestPending
+  else if (ACurrent = csTestPending) and (AEvent = 'test_ok') then ANext := csTestVerified
+  else if (ACurrent in [csTestVerified, csRuntimeVerified, csCompiled]) and
+    (AEvent = 'policy_ok') then ANext := csPolicyVerified
+  else if (ACurrent = csPolicyVerified) and (AEvent = 'acceptable') then ANext := csAcceptable
+  else if (ACurrent = csAcceptable) and (AEvent = 'selected') then ANext := csSelected
+  else if (ACurrent = csSelected) and (AEvent = 'final_ok') then ANext := csFinalVerified
+  else if (ACurrent = csFinalVerified) and (AEvent = 'committed') then ANext := csCommitted
+  else if AEvent = 'parse_failed' then ANext := csParseFailed
+  else if AEvent = 'static_failed' then ANext := csStaticFailed
+  else if AEvent = 'policy_failed' then ANext := csPolicyRejected
+  else if AEvent = 'compile_failed' then ANext := csCompileFailed
+  else if AEvent = 'runtime_failed' then ANext := csRuntimeFailed
+  else if AEvent = 'test_failed' then ANext := csTestFailed
+  else if AEvent = 'timeout' then ANext := csTimeout
+  else if AEvent = 'cancelled' then ANext := csCancelled
+  else if AEvent = 'crashed' then ANext := csCrashed
+  else begin Result := False; AReason := 'invalid state transition'; end;
+end;
+
+end.
+unit Grisp.Types;
+
+interface
+
+uses
+  System.SysUtils,
+  System.DateUtils,
+  System.Generics.Collections;
+
+type
+  TGrispTaskId = string;
+  TGrispArtifactId = string;
+  TGrispEvidenceId = string;
+  TGrispDecisionId = string;
+
+  TGrispArtifactKind = (akExecutable, akLibrary, akUnit, akProject, akScript,
+    akPatch, akDocumentation, akAnalysis);
+  TGrispArtifactFileKind = (afkSource, afkTest, afkManifest, afkBinary, afkDoc,
+    afkOther);
+  TGrispContentEncoding = (ceUtf8, ceBase64);
+  TGrispEvidenceOperation = (eoParse, eoStaticValidate, eoCompile, eoRun, eoTest,
+    eoPolicyCheck, eoHash, eoFormat, eoLint, eoCommit, eoBrowser, eoOther);
+  TGrispEvidenceStatus = (esOk, esFailed, esTimedOut, esCrashed, esCancelled,
+    esParseError, esRejected);
+  TGrispCandidateState = (
+    csCreated, csParsed, csNormalized, csStaticValid, csCompilePending,
+    csCompiled, csRuntimePending, csRuntimeVerified, csTestPending,
+    csTestVerified, csPolicyVerified, csAcceptable, csSelected, csFinalVerified,
+    csCommitted, csParseFailed, csStaticFailed, csPolicyRejected, csCompileFailed,
+    csRuntimeFailed, csTestFailed, csTimeout, csCancelled, csCrashed,
+    csVerificationFailed, csCommitFailed);
+
+  TGrispDiagnosticSeverity = (dsError, dsWarning, dsInfo);
+
+  TGrispDiagnostic = record
+    Severity: TGrispDiagnosticSeverity;
+    Code: string;
+    Line: Int64;
+    Column: Int64;
+    MessageText: string;
+  end;
+
+  TGrispArtifactFile = record
+    FileName: string;
+    Language: string;
+    Kind: TGrispArtifactFileKind;
+    Content: TBytes;
+    ContentEncoding: TGrispContentEncoding;
+    ContentSHA256: string;
+    SizeBytes: Int64;
+  end;
+
+  TGrispProvenance = record
+    Provider: string;
+    WorkerId: string;
+    SessionId: string;
+    TabId: string;
+    MessageId: string;
+    PromptHash: string;
+    ResponseHash: string;
+    CreatedAt: string;
+  end;
+
+  TGrispArtifactBundle = record
+    ArtifactId: TGrispArtifactId;
+    TaskId: TGrispTaskId;
+    ParentArtifactId: TGrispArtifactId;
+    Revision: Int64;
+    Files: TArray<TGrispArtifactFile>;
+    ArtifactKind: TGrispArtifactKind;
+    Language: string;
+    Provenance: TGrispProvenance;
+    MetadataJson: string;
+  end;
+
+  TGrispTask = record
+    TaskId: TGrispTaskId;
+    UserPrompt: string;
+    TargetLanguage: string;
+    TargetPlatform: string;
+    RequestedArtifactKind: TGrispArtifactKind;
+    Constraints: string;
+    AcceptanceTests: string;
+    RiskLevel: string;
+    RequiredCapabilities: TArray<string>;
+    PolicyProfile: string;
+    CreatedAt: string;
+    MetadataJson: string;
+  end;
+
+  TGrispEvidence = record
+    EvidenceId: TGrispEvidenceId;
+    TaskId: TGrispTaskId;
+    ArtifactId: TGrispArtifactId;
+    Operation: TGrispEvidenceOperation;
+    Tool: string;
+    Status: TGrispEvidenceStatus;
+    ExitCode: Int64;
+    Diagnostics: TArray<TGrispDiagnostic>;
+    StdOut: string;
+    StdErr: string;
+    ElapsedMs: Int64;
+    InputHash: string;
+    OutputHash: string;
+    EnvironmentId: string;
+    Environment: string;
+    CreatedAt: string;
+    MetadataJson: string;
+  end;
+
+  TGrispDecision = record
+    DecisionId: TGrispDecisionId;
+    TaskId: TGrispTaskId;
+    ArtifactId: TGrispArtifactId;
+    Accepted: Boolean;
+    Reason: string;
+    EvidenceIds: TArray<TGrispEvidenceId>;
+    FinalVerifiedArtifactId: TGrispArtifactId;
+    AcceptanceRuleVersion: string;
+    OrchestratorVersion: string;
+    CreatedAt: string;
+    Actor: string;
+  end;
+
+  TGrispToolResult = record
+    Operation: TGrispEvidenceOperation;
+    Status: TGrispEvidenceStatus;
+    Success: Boolean;
+    ExitCode: Int64;
+    TimedOut: Boolean;
+    Crashed: Boolean;
+    StdOut: string;
+    StdErr: string;
+    Diagnostics: TArray<TGrispDiagnostic>;
+    DurationMs: Int64;
+    InputHash: string;
+    OutputHash: string;
+    EnvironmentId: string;
+  end;
+
+function NewUuid: string;
+function UtcNowText: string;
+function ArtifactKindName(const AValue: TGrispArtifactKind): string;
+function FileKindName(const AValue: TGrispArtifactFileKind): string;
+function ContentEncodingName(const AValue: TGrispContentEncoding): string;
+function EvidenceStatusName(const AValue: TGrispEvidenceStatus): string;
+
+implementation
+
+function NewUuid: string;
+begin
+  Result := TGUID.NewGuid.ToString;
+  Result := Result.Trim(['{', '}']).ToLowerInvariant;
+end;
+
+function UtcNowText: string;
+begin
+  Result := DateToISO8601(TTimeZone.Local.ToUniversalTime(Now), True);
+end;
+
+function ArtifactKindName(const AValue: TGrispArtifactKind): string;
+const
+  Names: array[TGrispArtifactKind] of string = (
+    'EXECUTABLE', 'LIBRARY', 'UNIT', 'PROJECT', 'SCRIPT', 'PATCH',
+    'DOCUMENTATION', 'ANALYSIS');
+begin
+  Result := Names[AValue];
+end;
+
+function FileKindName(const AValue: TGrispArtifactFileKind): string;
+const
+  Names: array[TGrispArtifactFileKind] of string = (
+    'source', 'test', 'manifest', 'binary', 'doc', 'other');
+begin
+  Result := Names[AValue];
+end;
+
+function ContentEncodingName(const AValue: TGrispContentEncoding): string;
+begin
+  if AValue = ceUtf8 then Result := 'utf-8' else Result := 'base64';
+end;
+
+function EvidenceStatusName(const AValue: TGrispEvidenceStatus): string;
+const
+  Names: array[TGrispEvidenceStatus] of string = (
+    'ok', 'failed', 'timed_out', 'crashed', 'cancelled', 'parse_error',
+    'rejected');
+begin
+  Result := Names[AValue];
+end;
+
+end.
+program GrispConformance;
+
+{$APPTYPE CONSOLE}
+
+uses
+  System.SysUtils,
+  Grisp.Types in '..\Core\Grisp.Types.pas',
+  Grisp.Hash in '..\Core\Grisp.Hash.pas',
+  Grisp.Canonical in '..\Core\Grisp.Canonical.pas',
+  Grisp.Artifact in '..\Core\Grisp.Artifact.pas',
+  Grisp.ArtifactParser in '..\Core\Grisp.ArtifactParser.pas',
+  Grisp.Evidence in '..\Core\Grisp.Evidence.pas',
+  Grisp.StateMachine in '..\Core\Grisp.StateMachine.pas',
+  Grisp.Policy in '..\Core\Grisp.Policy.pas',
+  Grisp.Commit in '..\Core\Grisp.Commit.pas';
+
+var
+  Artifact: TGrispArtifactBundle;
+  ErrorText: string;
+  ParseResult: TGrispParseResult;
+  State, NextState: TGrispCandidateState;
+  Evidence: TGrispEvidence;
+begin
+  Artifact := Default(TGrispArtifactBundle);
+  ParseResult := ParseMarkdownArtifact(
+    '```delphi:HelloWorld.dpr' + sLineBreak +
+    'program HelloWorld;' + sLineBreak +
+    'begin' + sLineBreak +
+    '  Writeln(''Hello, World!'');' + sLineBreak +
+    'end.' + sLineBreak + '```',
+    NewUuid, Artifact, ErrorText);
+  if ParseResult <> prParsed then
+    raise Exception.Create('Conformance parser failure: ' + ErrorText);
+  State := csCreated;
+  if not CanTransition(State, 'parsed', NextState, ErrorText) then
+    raise Exception.Create(ErrorText);
+  State := NextState;
+  if not CanTransition(State, 'normalized', NextState, ErrorText) then
+    raise Exception.Create(ErrorText);
+  State := NextState;
+  if not CanTransition(State, 'static_ok', NextState, ErrorText) then
+    raise Exception.Create(ErrorText);
+  if not CommitArtifact(Artifact, '..\..\..\Output\Delphi Produced Executables',
+    Evidence, ErrorText) then
+    raise Exception.Create(ErrorText);
+  Writeln('GRISP core conformance slice passed: ', Artifact.ArtifactId);
+end.
+unit Grisp.Core.Tests;
+
+interface
+
+procedure RunCoreTests;
+
+implementation
+
+uses
+  System.SysUtils, Grisp.Types, Grisp.Artifact, Grisp.ArtifactParser,
+  Grisp.StateMachine;
+
+procedure Require(const ACondition: Boolean; const AMessage: string);
+begin
+  if not ACondition then raise Exception.Create(AMessage);
+end;
+
+procedure RunCoreTests;
+var
+  A, B: TGrispArtifactBundle;
+  ErrorText: string;
+begin
+  A := Default(TGrispArtifactBundle);
+  Require(ParseMarkdownArtifact('```delphi:main.pas' + sLineBreak +
+    'begin end.' + sLineBreak + '```', 'task', A, ErrorText) = prParsed,
+    'valid markdown must parse');
+  B := A;
+  B.Files[0].Content[0] := Ord('x');
+  Require(B.ArtifactId <> ComputeArtifactId(B), 'mutation must change identity');
+  Require(ParseMarkdownArtifact('```delphi:a.pas' + sLineBreak + 'x' +
+    sLineBreak + '```' + sLineBreak + '```delphi:b.pas' + sLineBreak +
+    'y' + sLineBreak + '```', 'task', A, ErrorText) = prParseAmbiguous,
+    'multiple blocks must be ambiguous');
+end;
+
+end.
+const MAGIC = new TextEncoder().encode("GARP");
+const VERSION = 1;
+const HEADER_LENGTH = 48;
+
+export const MessageType = Object.freeze({
+  HELLO: 1, HELLO_ACK: 2, PING: 3, PONG: 4, CREATE_SESSION: 10,
+  PROMPT: 20, PROMPT_ACK: 21, GENERATION_STARTED: 22,
+  GENERATION_DELTA: 23, GENERATION_COMPLETED: 24, CANCEL_PROMPT: 25,
+  CANCEL_ACK: 26, ERROR: 255
+});
+
+function uuidBytes(value) {
+  const hex = value.replace(/-/g, "");
+  if (!/^[0-9a-f]{32}$/i.test(hex)) throw new Error("invalid UUID");
+  return Uint8Array.from(hex.match(/../g).map(pair => parseInt(pair, 16)));
+}
+
+function writeUuid(view, offset, value) {
+  uuidBytes(value).forEach((byte, index) => view.setUint8(offset + index, byte));
+}
+
+export function encodeFrame(messageType, requestId, sessionId, payload,
+  flags = 0) {
+  const body = new TextEncoder().encode(JSON.stringify(payload));
+  const frame = new ArrayBuffer(HEADER_LENGTH + body.length);
+  const view = new DataView(frame);
+  new Uint8Array(frame, 0, 4).set(MAGIC);
+  view.setUint8(4, VERSION);
+  view.setUint8(5, flags);
+  view.setUint16(6, HEADER_LENGTH, false);
+  view.setUint32(8, body.length, false);
+  view.setUint16(12, messageType, false);
+  view.setUint16(14, 0, false);
+  writeUuid(view, 16, requestId);
+  writeUuid(view, 32, sessionId);
+  new Uint8Array(frame, HEADER_LENGTH).set(body);
+  return frame;
+}
+
+export function decodeFrame(buffer, limits = { maxFrameSize: 16 * 1024 * 1024 }) {
+  if (buffer.byteLength < HEADER_LENGTH) throw new Error("malformed frame");
+  const view = new DataView(buffer);
+  if (new TextDecoder().decode(new Uint8Array(buffer, 0, 4)) !== "GARP")
+    throw new Error("invalid magic");
+  if (view.getUint8(4) !== VERSION) throw new Error("unsupported protocol version");
+  if (view.getUint16(6, false) !== HEADER_LENGTH) throw new Error("invalid header");
+  const length = view.getUint32(8, false);
+  if (length > limits.maxFrameSize || HEADER_LENGTH + length !== buffer.byteLength)
+    throw new Error("invalid payload length");
+  const payload = JSON.parse(new TextDecoder().decode(
+    new Uint8Array(buffer, HEADER_LENGTH, length)));
+  return { messageType: view.getUint16(12, false), payload };
+}
+export class GarpSessionManager {
+  #sessions = new Map();
+  #requests = new Map();
+
+  createSession(provider, tabId) {
+    const sessionId = crypto.randomUUID();
+    this.#sessions.set(sessionId, {
+      sessionId, provider, tabId, state: "READY", pageGeneration: 0,
+      activeRequestId: null
+    });
+    return this.#sessions.get(sessionId);
+  }
+
+  getSession(sessionId) {
+    const session = this.#sessions.get(sessionId);
+    if (!session) throw new Error("SESSION_NOT_FOUND");
+    return session;
+  }
+
+  acceptPrompt(sessionId, requestId) {
+    const session = this.getSession(sessionId);
+    const existing = this.#requests.get(requestId);
+    if (existing) return existing;
+    if (session.activeRequestId) throw new Error("SESSION_BUSY");
+    const request = { requestId, sessionId, sequence: 0, state: "ACCEPTED" };
+    session.activeRequestId = requestId;
+    session.state = "BUSY";
+    this.#requests.set(requestId, request);
+    return request;
+  }
+
+  completePrompt(requestId, state = "COMPLETE") {
+    const request = this.#requests.get(requestId);
+    if (!request) throw new Error("REQUEST_NOT_FOUND");
+    const session = this.getSession(request.sessionId);
+    request.state = state;
+    session.state = "READY";
+    session.activeRequestId = null;
+    return request;
+  }
+
+  nextSequence(requestId) {
+    const request = this.#requests.get(requestId);
+    if (!request) throw new Error("REQUEST_NOT_FOUND");
+    return ++request.sequence;
+  }
+
+  status(requestId) {
+    const request = this.#requests.get(requestId);
+    if (!request) throw new Error("REQUEST_NOT_FOUND");
+    return { ...request };
+  }
+}
+export class ProviderAdapter {
+  constructor(provider, version = "1.0") {
+    this.provider = provider;
+    this.adapterVersion = version;
+  }
+
+  discoverInput() { throw new Error("DOM_UNSUPPORTED"); }
+  inspectReadyState() { throw new Error("DOM_UNSUPPORTED"); }
+  submitPrompt() { throw new Error("DOM_UNSUPPORTED"); }
+  inspectGeneration() { throw new Error("DOM_UNSUPPORTED"); }
+  detectContinuation() { return null; }
+  detectAuthentication() { return "UNKNOWN"; }
+  detectRateLimit() { return false; }
+  detectError() { return null; }
+}
