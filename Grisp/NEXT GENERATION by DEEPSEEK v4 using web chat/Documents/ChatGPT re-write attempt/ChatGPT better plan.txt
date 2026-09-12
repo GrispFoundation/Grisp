@@ -1,0 +1,575 @@
+I agree with the **overall direction**, but I do **not** agree with the claim that the current GSDA31 kernel is already the “hard part” or that you can simply wrap it and immediately have a real Specification Development AI Agent.
+
+The architecture should be slightly stronger.
+
+## The architecture I would use
+
+The important distinction is:
+
+```text
+                    ┌─────────────────────────────┐
+                    │        Human / User         │
+                    └──────────────┬──────────────┘
+                                   │
+                                   ▼
+                    ┌─────────────────────────────┐
+                    │     Firefox Automation      │
+                    │                             │
+                    │ page reading / DOM / forms  │
+                    │ LLM interaction / browsing   │
+                    └──────────────┬──────────────┘
+                                   │
+                              GARP / Gateway
+                                   │
+                                   ▼
+                    ┌─────────────────────────────┐
+                    │      GSDA Agent Layer       │
+                    │                             │
+                    │ Task Manager                │
+                    │ Round Orchestrator          │
+                    │ Peer Scheduler              │
+                    │ Critique Scheduler          │
+                    │ Repair Scheduler             │
+                    │ Scorer / Aggregator          │
+                    │ Consolidator                 │
+                    └──────────────┬──────────────┘
+                                   │
+                                   ▼
+                    ┌─────────────────────────────┐
+                    │       GSDA 3.1 Kernel       │
+                    │                             │
+                    │ canonicalization            │
+                    │ identities                   │
+                    │ provenance                   │
+                    │ authoritative state          │
+                    │ validation                   │
+                    │ evidence                     │
+                    │ coverage                     │
+                    │ publication gate             │
+                    │ revision lineage             │
+                    └─────────────────────────────┘
+```
+
+And then Firefox is **not itself the intelligence kernel**.
+
+It is an **external interaction/transport environment containing one or more peer adapters**.
+
+That distinction becomes very important once you have multiple AI peers.
+
+---
+
+# 1. I would change one sentence in the proposed plan
+
+The statement:
+
+> “Firefox automation becomes the peer, and GSDA31 becomes the kernel.”
+
+is slightly too simplistic.
+
+I would make it:
+
+> **Firefox automation hosts or mediates peer interactions; GSDA31 is the deterministic governance kernel; the Agent Layer schedules and coordinates untrusted reasoning peers.**
+
+That gives you:
+
+```text
+Firefox
+   ↓
+Browser Adapter / GARP
+   ↓
+GSDA Agent
+   ↓
+GSDA Kernel
+```
+
+rather than letting browser automation directly control kernel semantics.
+
+This also fits very well with the local Firefox gateway architecture you've already been developing.
+
+---
+
+# 2. The biggest missing component is actually the Agent Layer
+
+Your current implementation already has pieces of:
+
+```text
+kernel
+identity
+canonicalization
+state
+publication
+```
+
+but it does **not yet have the thing that makes it an agent**.
+
+You need something like:
+
+```pascal
+TGSDAAgent31 = class
+private
+    FKernel: TGSDAKernel31;
+    FPeers: TGSDAAgentPeerRegistry;
+    FScheduler: TGSDAAgentScheduler;
+    FRounds: TGSDAAgentRoundManager;
+    FScorer: TGSDAAgentScorer;
+    FRepair: TGSDAAgentRepairManager;
+    FConsolidator: TGSDAAgentConsolidator;
+    FGateway: TGSDAAgentGateway;
+public
+    function CreateTask(...): TGSDAId;
+    function StartRun(...): string;
+    function SubmitPeerMessage(...): ...;
+    function RunRound(...): ...;
+    function Evaluate(...): ...;
+    function Publish(...): ...;
+end;
+```
+
+The agent layer answers:
+
+> **What should happen next?**
+
+The kernel answers:
+
+> **Is this state transition valid and deterministic?**
+
+That separation is fundamental.
+
+---
+
+# 3. Firefox should not decide the GSDA state machine
+
+This is another important change.
+
+The proposed loop says:
+
+```text
+Firefox.ReadPage
+→ Candidate
+→ Critique
+→ Repair
+→ NextRound
+```
+
+I would instead make GSDA decide the workflow:
+
+```text
+GSDA:
+  CREATE_TASK
+      ↓
+  BUILD_INTENT
+      ↓
+  PLAN_ROUND
+      ↓
+  REQUEST_GENERATION
+      ↓
+  RECEIVE_PEER_RESULTS
+      ↓
+  VALIDATE
+      ↓
+  ANALYZE
+      ↓
+  SCORE
+      ↓
+  DETECT_CONFLICTS
+      ↓
+  REPAIR
+      ↓
+  CONSOLIDATE
+      ↓
+  CHECK_CONVERGENCE
+      │
+      ├── no → PLAN_NEXT_ROUND
+      │
+      └── yes
+            ↓
+       FREEZE CANDIDATE
+            ↓
+       PUBLICATION GATE
+            ↓
+       HUMAN ACCEPTANCE
+            ↓
+       COMMIT REVISION
+```
+
+Firefox then executes requests issued by the agent.
+
+That makes GSDA the **controller**, not the browser.
+
+---
+
+# 4. Do not put the HMAC secret into browser JavaScript
+
+The proposed:
+
+```text
+PeerID = "peer:firefox"
+SharedSecret = "mysecret"
+```
+
+is fine as a conceptual test, but not as the production design.
+
+If arbitrary browser JavaScript knows the shared secret, then the browser automation environment can impersonate that peer.
+
+A better design is:
+
+```text
+Firefox
+   │
+   │ local trusted gateway protocol
+   ▼
+GARP Gateway
+   │
+   │ authenticated local channel
+   ▼
+GSDA Peer Adapter
+   │
+   │ HMAC secret never exposed to page JS
+   ▼
+GSDA Kernel
+```
+
+So the secret belongs to the **trusted local adapter/gateway**, not the webpage/LLM interaction layer.
+
+---
+
+# 5. GARP is a very good fit here
+
+Given your previous Firefox gateway work, I would actually make **GARP the boundary protocol**.
+
+Something like:
+
+```text
+Firefox automation
+        ↓
+GARP
+        ↓
+GSDA Agent
+        ↓
+GSDA Kernel
+```
+
+GARP messages could represent things such as:
+
+```text
+OPEN_SESSION
+CREATE_TASK
+READ_PAGE
+REQUEST_PEER_GENERATION
+PEER_RESPONSE
+REQUEST_CRITIQUE
+REQUEST_REPAIR
+REQUEST_CONSOLIDATION
+GET_STATE
+GET_EVIDENCE
+GET_CANDIDATE
+REQUEST_PUBLICATION
+HUMAN_APPROVAL
+PUBLICATION_RESULT
+```
+
+The major advantage is that Firefox becomes replaceable.
+
+Later you could have:
+
+```text
+Firefox
+Chrome
+CLI
+Delphi IDE
+local LLM
+remote LLM
+CI agent
+```
+
+all communicating through different adapters while the deterministic GSDA kernel stays unchanged.
+
+---
+
+# 6. I would not start by adding every Firefox feature
+
+The first real milestone should be **Hello World Specification Development**.
+
+Not general web automation.
+
+For example:
+
+### Input
+
+Human gives Firefox:
+
+```text
+Create a deterministic specification for a file synchronization protocol.
+```
+
+GSDA creates:
+
+```text
+Task
+Intent
+Run
+Round 0
+```
+
+Then Firefox presents the task to three LLM peers:
+
+```text
+Peer A → proposal
+Peer B → proposal
+Peer C → proposal
+```
+
+GSDA validates all three.
+
+Then:
+
+```text
+Peer A → critique B/C
+Peer B → critique A/C
+Peer C → critique A/B
+```
+
+Then GSDA:
+
+```text
+findings
+→ score
+→ repair
+→ consolidate
+```
+
+Then:
+
+```text
+candidate specification
+→ coverage
+→ traceability
+→ publication gate
+```
+
+Then the human sees:
+
+```text
+SpecContentID
+diff
+findings
+coverage
+evidence
+```
+
+and explicitly approves.
+
+That is the first genuine **Specification Development AI Agent**.
+
+---
+
+# 7. The Agent should treat LLMs as untrusted workers
+
+This is where your original architecture becomes powerful.
+
+The agent should never ask:
+
+> “Which LLM is correct?”
+
+Instead:
+
+```text
+LLM produces claim
+        ↓
+GSDA records claim
+        ↓
+other peers inspect claim
+        ↓
+critic produces finding
+        ↓
+evidence is attached
+        ↓
+deterministic aggregation
+        ↓
+repair candidate
+        ↓
+validation
+```
+
+So:
+
+```text
+LLM = reasoning worker
+GSDA = governance machinery
+Human = publication authority
+```
+
+That is much stronger than a conventional "AI agent".
+
+---
+
+# 8. You still need the missing reasoning objects
+
+Before the Firefox agent is useful, the kernel needs actual authoritative records for at least:
+
+```text
+Requirement
+IntentElement
+Artifact
+Finding
+Repair
+ScoreSubmission
+Evidence
+Decision
+ReliabilityOutcome
+```
+
+Your current kernel has only a subset.
+
+Without those, Firefox can send lots of AI output, but GSDA cannot turn that output into a governed specification process.
+
+---
+
+# 9. The scoring/consolidation issue should be fixed before agent integration
+
+I would **not** build the browser agent on top of the current scoring implementation.
+
+The current prototype still has the problematic model:
+
+```pascal
+Final := Confidence * R * TZ * MT * PV;
+```
+
+and `Double`.
+
+That should be replaced before the agent relies on the result.
+
+Otherwise the browser agent becomes a very elaborate frontend wrapped around an unreliable decision mechanism.
+
+---
+
+# 10. The agent API should expose semantic operations, not JSON plumbing
+
+I would avoid an API like:
+
+```pascal
+IngestCandidate(... Payload: string)
+```
+
+as the main abstraction.
+
+Instead:
+
+```pascal
+CreateTask(...)
+StartRun(...)
+RegisterPeer(...)
+RequestGeneration(...)
+AcceptGeneration(...)
+CreateCritiqueRequest(...)
+AcceptCritique(...)
+CreateRepairRequest(...)
+AcceptRepair(...)
+ScoreCandidate(...)
+Consolidate(...)
+CheckConvergence(...)
+FreezeCandidate(...)
+EvaluatePublication(...)
+AcceptHumanDecision(...)
+CommitRevision(...)
+```
+
+The JSON/GARP layer can then map into those operations.
+
+That prevents Firefox automation from accidentally becoming a second kernel.
+
+---
+
+# 11. The first practical system should look like this
+
+```text
+                       HUMAN
+                         │
+                         ▼
+                  Firefox UI
+                         │
+                         ▼
+                 Firefox Adapter
+                         │
+                         ▼
+                   GARP Gateway
+                         │
+                         ▼
+                  ┌─────────────┐
+                  │ GSDA Agent  │
+                  └──────┬──────┘
+                         │
+             ┌───────────┼───────────┐
+             ▼           ▼           ▼
+          Peer A      Peer B      Peer C
+             │           │           │
+             └───────────┼───────────┘
+                         ▼
+                    GSDA Kernel
+                         │
+             ┌───────────┼───────────┐
+             ▼           ▼           ▼
+          Evidence   Traceability  Coverage
+             │           │           │
+             └───────────┼───────────┘
+                         ▼
+                  Candidate Freeze
+                         │
+                         ▼
+                 Publication Gate
+                         │
+                         ▼
+                Human Authentication
+                         │
+                         ▼
+                  Revision Commit
+```
+
+That is the architecture I would actually implement.
+
+---
+
+# 12. The implementation order I recommend
+
+Rather than immediately generating `GSDA31_FirefoxPeer.js`, I would do this:
+
+```text
+1. GSDA31 Kernel
+2. GSDA31 Agent API
+3. GSDA31 Round/State Machine
+4. GSDA31 Peer Registry + Peer Adapter
+5. GSDA31 Scoring/Reliability
+6. GSDA31 Repair/Consolidation
+7. GARP ↔ GSDA protocol
+8. Firefox adapter
+9. End-to-end Specification Development demo
+10. Adversarial/replay/conformance suite
+```
+
+The key architectural rule is:
+
+> **Firefox should be the interface to the agent, not the implementation of the agent.**
+
+And I would make the **first end-to-end milestone a real specification-development run**, not a browser scraping demo.
+
+That gives you something much more valuable:
+
+```text
+User prompt
+   ↓
+real LLM peers through Firefox/GARP
+   ↓
+real GSDA reasoning cycle
+   ↓
+real evidence
+   ↓
+real repair
+   ↓
+real deterministic consolidation
+   ↓
+real publication gate
+   ↓
+real immutable revision
+```
+
+Once that works, Firefox browsing becomes an additional capability rather than the foundation of the agent.
