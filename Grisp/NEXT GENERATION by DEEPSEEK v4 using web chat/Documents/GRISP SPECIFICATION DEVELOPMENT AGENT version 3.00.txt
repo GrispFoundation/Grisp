@@ -1,0 +1,4969 @@
+=====================================
+GRISP SPECIFICATION DEVELOPMENT AGENT
+GSDA/3.0
+=====================================
+
+Identifier:  GSDA/3.0
+Status:      Proposed normative specification
+Supersedes:  GSDA/2.13 and all earlier GSDA revisions
+Purpose:     Cooperative development, analysis, critique, repair, refinement,
+scoring, convergence, publication, and deterministic replay of
+technical specifications using multiple untrusted LLM reasoning
+peers under a deterministic kernel.
+Domain:      Pure specification development.
+Non-domain:  Compilation, execution, debugging, runtime inspection, LSP,
+tree-sitter, static analysis of target programs, OS execution,
+GRISP execution, arbitrary external software-development tools,
+arbitrary network access.
+Default:     Fail-closed for structural, identity, integrity, governance,
+resource, and publication errors.
+
+GSDA/3.0 is a major hardening and formalization release.
+
+The architecture remains:
+
+UNTRUSTED LLM PEERS
+|
+v
+ADAPTERS
+|
+v
+VALIDATED INPUTS
+|
+v
+DETERMINISTIC KERNEL
+|
+v
+AUTHORITATIVE STATE
+|
+v
+HUMAN GOVERNANCE
+|
+v
+PUBLISHED
+
+3.0 resolves contradictions in 2.13 and adds explicit executable
+contracts for identity domains, logical ordering, package staging,
+bootstrap trust, content projections, resource limits, evidence,
+reference semantics, and publication predicates.
+
+===============================================
+0. NORMATIVITY, KEYWORDS, AND META-REQUIREMENTS
+===============================================
+
+[Informative] GSDA distinguishes:
+
+NORMATIVE REQUIREMENT
+A machine-readable Requirement record with a stable requirement_id.
+
+INFORMATIVE TEXT
+Explanatory prose. Normative keywords appearing in such prose are
+non-normative only when the paragraph begins with [Informative].
+
+DATA
+Structured values representing state, evidence, provenance,
+identifiers, measurements, or other values.
+
+[Informative] Normative keywords are interpreted according to RFC 2119 and
+RFC 8174.
+
+REQ-GSDA-META-001
+Every mandatory GSDA behaviour MUST be represented as a Requirement
+record, except the META-00xx bootstrap family defined by
+meta_requirement/1.0.
+
+REQ-GSDA-META-002
+Every structured GSDA record MUST declare its schema identifier.
+
+REQ-GSDA-META-003
+A record with an unknown schema identifier or unsupported schema version
+MUST be rejected with SCHEMA_FAILURE.
+
+REQ-GSDA-META-004
+Every structured record type MUST have an entry in the authoritative
+schema registry.
+
+REQ-GSDA-META-005
+The schema language MUST be JSON Schema Draft 2020-12.
+
+REQ-GSDA-META-006
+A schema MUST declare additionalProperties = false unless it explicitly
+declares a single extension object named x_gsda_ext and the registry
+marks that schema as extensible.
+
+REQ-GSDA-META-007
+An unrecognized property MUST cause SCHEMA_FAILURE unless the property
+is contained within an explicitly permitted x_gsda_ext object.
+
+REQ-GSDA-META-008
+The rendered specification MUST be derived from spec.requirements.json.
+The rendered specification MUST NOT introduce mandatory behaviour absent
+from the requirement set.
+
+REQ-GSDA-META-009
+The META-00xx bootstrap family MUST be validated in bootstrap pass zero
+using the kernel-trusted meta_requirement/1.0 schema.
+
+REQ-GSDA-META-010
+After bootstrap pass zero, all Requirement records including META-00xx
+MUST be validated by the ordinary schema-validation path.
+
+REQ-GSDA-META-011
+A requirement_id MUST be globally unique within a specification.
+Duplicate requirement_id values MUST cause SCHEMA_FAILURE.
+
+REQ-GSDA-META-012
+The package MUST contain a normative-keyword linter named
+RunNormativeKeywordLinter.
+
+REQ-GSDA-META-013
+RunNormativeKeywordLinter MUST scan every prose file included in the
+publishable package.
+
+REQ-GSDA-META-014
+The linter MUST recognize exactly this normative keyword set:
+
+MUST
+MUST NOT
+SHALL
+SHALL NOT
+SHOULD
+SHOULD NOT
+MAY
+REQUIRED
+RECOMMENDED
+NOT RECOMMENDED
+OPTIONAL
+
+REQ-GSDA-META-015
+A normative keyword appearing outside a Requirement record MUST either:
+
+(a) be in an exempt keyword-definition paragraph, or
+(b) be in a paragraph beginning with [Informative].
+
+REQ-GSDA-META-016
+A linter occurrence not satisfying REQ-GSDA-META-015 MUST produce
+NORMATIVE_KEYWORD_LEAK and MUST block publication.
+
+REQ-GSDA-META-017
+Requirement boundaries for linter purposes MUST be established solely
+from the requirement_id values in spec.requirements.json.
+
+REQ-GSDA-META-018
+A rendered block is a Requirement block only when its first token is a
+requirement_id present in spec.requirements.json.
+
+REQ-GSDA-META-019
+The linter MUST NOT perform semantic classification of prose.
+
+REQ-GSDA-META-020
+The package MUST ship a machine-readable registry containing error codes,
+named failures, evidence kinds, identity classes, and publication
+predicates.
+
+TESTABILITY: TESTABLE
+
+====================
+1. DESIGN PRINCIPLES
+====================
+
+[Informative] GSDA is based on the separation:
+
+PEER REASONING
+produces proposals, findings, scores, evidence, and analysis.
+
+KERNEL REASONING
+produces deterministic facts, validates structure, computes
+identities, performs aggregation, and controls state transitions.
+
+HUMAN GOVERNANCE
+resolves epistemic uncertainty and accepts or rejects publication.
+
+REQ-GSDA-PRI-001
+When two candidate changes conflict regarding specification quality, the
+coordinator MUST prefer the higher-priority property.
+
+REQ-GSDA-PRI-002
+The quality priority order is:
+
+1. USER_INTENT_PRESERVATION
+2. CONSISTENCY
+3. COMPLETENESS
+4. PRECISION
+5. TRACEABILITY
+6. TESTABILITY
+7. CLARITY
+8. CONCISENESS
+9. STYLE
+
+REQ-GSDA-PRI-003
+A lower-priority preference MUST NOT silently weaken a higher-priority
+property.
+
+REQ-GSDA-PRI-004
+The quality priority order MUST NOT determine round ordering, peer
+scheduling, or unrelated resource allocation.
+
+REQ-GSDA-PRI-005
+An operation-specific tie-break MUST be applied only after the priority
+order fails to distinguish the alternatives.
+
+REQ-GSDA-PRI-006
+A coordinator Decision resolving a quality conflict MUST record the
+priority_tipping value.
+
+REQ-GSDA-PRI-007
+Only an authorized HumanDecision MAY explicitly override the priority
+order.
+
+REQ-GSDA-PRI-008
+A priority override MUST identify the affected priorities and provide
+a non-empty rationale.
+
+TESTABILITY: TESTABLE
+
+========
+2. SCOPE
+========
+
+REQ-GSDA-SCOPE-001
+GSDA MUST remain a specification-development system.
+
+REQ-GSDA-SCOPE-002
+GSDA MUST NOT require a compiler, target runtime, debugger, language
+server, tree-sitter, target-program static analyzer, or arbitrary
+external software-development tool for GSDA conformance.
+
+REQ-GSDA-SCOPE-003
+Execution of GSDA's own deterministic conformance suite is in scope.
+
+REQ-GSDA-SCOPE-004
+Execution of any target program or implementation artifact being
+specified is out of scope.
+
+REQ-GSDA-SCOPE-005
+Only explicitly configured LLM peer providers MAY be contacted over a
+network.
+
+REQ-GSDA-SCOPE-006
+The deterministic kernel MUST NOT invoke arbitrary network endpoints.
+
+REQ-GSDA-SCOPE-007
+The deterministic kernel MUST NOT spawn processes or open sockets.
+
+REQ-GSDA-SCOPE-008
+Package export MAY perform OS-boundary operations only through the
+package exporter component.
+
+REQ-GSDA-SCOPE-009
+The package exporter MUST NOT mutate authoritative coordinator state.
+
+TESTABILITY: TESTABLE
+
+=======================
+3. TRUST BOUNDARY MODEL
+=======================
+
+Trust zones:
+
+T0  External world
+T1  LLM provider
+T2  Peer adapter
+T3  Validated input store
+T4  Deterministic kernel
+T5  Authoritative state
+T6  Human acceptance
+T7  Published revision
+
+REQ-GSDA-TRUST-001
+The normal data flow MUST be:
+
+T0 -> T1 -> T2 -> T3 -> T4 -> T5 -> T6 -> T7
+
+REQ-GSDA-TRUST-002
+T5 MAY be read by T4 through defined kernel read operations.
+
+REQ-GSDA-TRUST-003
+T1 MUST NOT directly communicate with T4.
+
+REQ-GSDA-TRUST-004
+T1 MUST NOT directly write T5.
+
+REQ-GSDA-TRUST-005
+T2 MUST NOT write T5.
+
+REQ-GSDA-TRUST-006
+A peer adapter MAY write only to T3.
+
+REQ-GSDA-TRUST-007
+Every transition across a trust boundary MUST be represented in
+provenance.
+
+REQ-GSDA-TRUST-008
+The kernel MUST treat every payload originating at T1 as untrusted until
+validated.
+
+REQ-GSDA-TRUST-009
+No T1 payload may directly become authoritative state.
+
+REQ-GSDA-TRUST-010
+Authoritative state MUST be produced only by a kernel operation acting on
+validated T3 inputs.
+
+REQ-GSDA-TRUST-011
+A kernel input lacking validated T3 provenance MUST be rejected with
+PROTOCOL_FAILURE.
+
+TESTABILITY: TESTABLE
+
+===================================
+4. TERMINOLOGY AND IDENTITY CLASSES
+===================================
+
+[Informative] 3.0 distinguishes semantic identity from execution identity.
+This removes the 2.13 contradiction between deterministic identity and
+run-scoped identifiers.
+
+Identity classes:
+
+SEMANTIC_DETERMINISTIC
+Reproducible from semantic content only.
+
+EXECUTION_DETERMINISTIC
+Reproducible from an identical recorded execution context.
+
+COORDINATOR_ASSIGNED
+Assigned by the coordinator.
+
+DERIVED_EXECUTION
+Deterministically derived from execution identity.
+
+REQ-GSDA-IDC-001
+SEMANTIC_DETERMINISTIC identities MUST NOT depend on run_id, peer_id,
+round_id, wall-clock time, random values, transport state, or mutable
+history.
+
+REQ-GSDA-IDC-002
+The following identities MUST be SEMANTIC_DETERMINISTIC:
+
+task_id
+content_id
+spec_content_id
+term_record_id
+file_content_id
+
+REQ-GSDA-IDC-003
+The following identities MUST be EXECUTION_DETERMINISTIC:
+
+message_id
+artifact_id
+evidence_id
+decision_id
+finding_id
+assumption_id
+question_id
+reliability_outcome_id
+
+REQ-GSDA-IDC-004
+run_id and peer_id MUST be COORDINATOR_ASSIGNED.
+
+REQ-GSDA-IDC-005
+round_id MUST be DERIVED_EXECUTION.
+
+REQ-GSDA-IDC-006
+A deterministic identity formula MUST enumerate its complete input set.
+
+REQ-GSDA-IDC-007
+An undeclared identity input MUST NOT influence the identity.
+
+REQ-GSDA-IDC-008
+A deterministic identity MUST NOT depend on an implementation-defined
+value.
+
+REQ-GSDA-IDC-009
+A deterministic identity MUST NOT depend on a wall-clock timestamp.
+
+TESTABILITY: TESTABLE
+
+========================================
+5. ERROR, FAILURE, AND EVIDENCE TAXONOMY
+========================================
+
+Error categories:
+
+SCHEMA
+PROTOCOL
+IDENTITY
+RESOURCE
+GOVERNANCE
+LIVENESS
+PUBLICATION
+SECURITY
+
+Error codes:
+
+SCHEMA_FAILURE
+PROTOCOL_FAILURE
+IMPERSONATION_ATTEMPT
+IDENTITY_MISMATCH
+CONTENT_IDENTITY_MISMATCH
+SOURCE_REFERENCE_UNRESOLVED
+SCOPE_VIOLATION
+INPUT_BOUNDS_EXCEEDED
+AGGREGATION_BOUNDS_EXCEEDED
+RELIABILITY_BOUNDS_EXCEEDED
+GOVERNANCE_FAILURE
+LIVENESS_FAILURE
+PUBLICATION_FAILURE
+NORMATIVE_KEYWORD_LEAK
+CROSS_REFERENCE_UNRESOLVED
+CONFIG_INCOMPLETE
+TERM_COLLISION
+LINEAGE_FAILURE
+BOOTSTRAP_FAILURE
+RESOURCE_LIMIT_EXCEEDED
+PACKAGE_INTEGRITY_FAILURE
+REPLAY_FAILURE
+
+Named failures:
+
+F_INPUT_INVALID
+F_PEER_FAILURE
+F_PROTOCOL_DEGRADED
+F_INSUFFICIENT_CANDIDATES
+F_INSUFFICIENT_PEERS
+F_UNRESOLVED_CONTRADICTION
+F_UNRESOLVED_AMBIGUITY
+F_INSUFFICIENT_COVERAGE
+F_STAGNATION
+F_HUMAN_CLARIFICATION_REQUIRED
+F_REVIEW_REJECTED
+F_PUBLICATION_BLOCKED
+F_DUPLICATE_MESSAGE_CONFLICT
+F_NO_VIABLE_ARTIFACT
+F_CONFIGURATION_INVALID
+F_RESOURCE_EXHAUSTED
+F_BOOTSTRAP_INVALID
+
+Evidence kinds:
+
+LOW_RELIABILITY_AGGREGATE
+LIVENESS_PROMOTION
+RELIABILITY_SATURATION
+FLOAT_ROUNDED
+OVERLAP_DISCARDED
+INTENT_LOSS_DETECTED
+ADAPTER_SANITIZED
+STRUCTURAL_SALVAGE
+DERIVATION_CHAIN_VERIFIED
+ALTERNATE_VIABLE_PROMOTION
+REPAIR_QUOTA_APPLIED
+COVERAGE_REPORT
+SNAPSHOT_ROUND_CONTEXT
+LOW_PRECISION_COMPARISON
+INVARIANT_VIOLATION
+COMPLIANCE_LEVEL_DECLARED
+BOOTSTRAP_VERIFIED
+PACKAGE_STAGED
+PACKAGE_FROZEN
+PACKAGE_COMMITTED
+RESOURCE_LIMIT_REJECTED
+REPLAY_VERIFIED
+REFERENCE_SEMANTICS_VERIFIED
+HUMAN_REVIEW_PRESENTED
+
+REQ-GSDA-ERR-001
+Error codes, named failures, and evidence kinds MUST be three disjoint
+namespaces.
+
+REQ-GSDA-ERR-002
+Every error MUST conform to error/1.0.
+
+REQ-GSDA-ERR-003
+Each error code MUST map to exactly one error category.
+
+REQ-GSDA-ERR-004
+message_template MUST contain no peer-supplied content.
+
+REQ-GSDA-ERR-005
+Peer-supplied diagnostic material MUST be preserved only as separate
+evidence content.
+
+REQ-GSDA-ERR-006
+An implementation MUST NOT emit a named failure as an error code.
+
+REQ-GSDA-ERR-007
+An implementation MUST NOT emit an evidence kind as an error code.
+
+REQ-GSDA-ERR-008
+IMPERSONATION_ATTEMPT MUST be used when a transport-bound peer identity
+differs from the message peer_id.
+
+REQ-GSDA-ERR-009
+RESOURCE_LIMIT_EXCEEDED MUST be used for configured resource-budget
+violations not covered by a more specific bound error.
+
+REQ-GSDA-ERR-010
+PACKAGE_INTEGRITY_FAILURE MUST be used for package staging or package
+commit integrity violations.
+
+REQ-GSDA-ERR-011
+REPLAY_FAILURE MUST be used when a replay cannot reproduce required
+authoritative outputs.
+
+TESTABILITY: TESTABLE
+
+===================
+6. CANONICALIZATION
+===================
+
+REQ-GSDA-NORM-001
+GSDA canonical JSON MUST be based on RFC 8785 with these GSDA rules:
+
+* duplicate keys rejected before canonicalization;
+* NaN rejected;
+* Infinity rejected;
+* negative zero normalized to zero;
+* integer JSON values represented without exponent notation;
+* floating-point values forbidden in identity-bearing records;
+* object keys ordered by UTF-8 bytewise lexicographic order.
+
+REQ-GSDA-NORM-002
+The GSDA UTF-8 bytewise object-key order MUST supersede RFC 8785
+UTF-16 code-unit key ordering.
+
+REQ-GSDA-NORM-003
+A GSDA implementation MUST NOT use an RFC 8785 library unchanged when
+that library does not implement GSDA's UTF-8 bytewise ordering.
+
+REQ-GSDA-NORM-004
+canonical_record_jcs(X) MUST canonicalize a persisted GSDA record
+including its schema property.
+
+REQ-GSDA-NORM-005
+canonical_identity_object(X) MUST canonicalize a transient identity
+preimage using the same numeric, key-order, duplicate-key, and Unicode
+rules as canonical_record_jcs.
+
+REQ-GSDA-NORM-006
+canonical_identity_object MUST NOT require X to be a registered
+persisted record.
+
+REQ-GSDA-NORM-007
+canonical_file_json(X) MUST canonicalize parsed JSON without schema
+injection.
+
+REQ-GSDA-NORM-008
+A GSDA record containing an identity-bearing floating-point number MUST
+be rejected with SCHEMA_FAILURE.
+
+REQ-GSDA-NORM-009
+A non-identity-bearing float MAY occur only in a schema explicitly
+declaring float_tolerant = true.
+
+REQ-GSDA-NORM-010
+No schema in GSDA/3.0 MAY declare float_tolerant = true unless the
+schema registry explicitly permits it.
+
+REQ-GSDA-NORM-011
+Unicode NFC normalization MUST be used for configured term comparison.
+
+REQ-GSDA-NORM-012
+NFC normalization for term comparison MUST NOT modify the stored term
+text.
+
+REQ-GSDA-NORM-013
+Term normalization MUST be:
+
+NFC
+-> trim
+-> Unicode casefold
+-> collapse internal whitespace runs to "-"
+-> replace remaining non [a-z0-9-] with "-"
+-> collapse consecutive "-"
+-> strip leading and trailing "-"
+-> lowercase
+
+REQ-GSDA-NORM-014
+An empty normalized term_id MUST cause SCHEMA_FAILURE.
+
+REQ-GSDA-NORM-015
+All identity-bearing integer divisions MUST be floor divisions.
+
+REQ-GSDA-NORM-016
+All timestamps MUST use:
+
+YYYY-MM-DDTHH:MM:SS.sssZ
+
+REQ-GSDA-NORM-017
+A timestamp MUST NOT participate in a SEMANTIC_DETERMINISTIC identity.
+
+REQ-GSDA-NORM-018
+A timestamp MUST NOT be used as an authoritative ordering key.
+
+REQ-GSDA-NORM-019
+For textual UTF-8 package files, canonical file bytes MUST be:
+
+strip leading UTF-8 BOM
+normalize CRLF and CR to LF
+apply Unicode NFC
+encode UTF-8
+
+REQ-GSDA-NORM-020
+For binary package files, canonical file bytes MUST be the original
+bytes without Unicode decoding, NFC normalization, BOM removal, or
+line-ending conversion.
+
+REQ-GSDA-NORM-021
+The package manifest MUST record whether each file is canonicalized as
+JSON, UTF-8 text, or binary.
+
+REQ-GSDA-NORM-022
+A media-type declaration incompatible with the selected canonicalization
+mode MUST cause SCHEMA_FAILURE.
+
+REQ-GSDA-NORM-023
+file_content_id MUST use the file_content/1.0 identity formula.
+
+TESTABILITY: TESTABLE
+
+=================
+7. IDENTITY MODEL
+=================
+
+7.1 task_id
+
+REQ-GSDA-ID-001
+task_id MUST be:
+
+"task:" + sha256_hex(
+canonical_identity_object({
+"schema":            "task_identity/3.0",
+"user_prompt":       <string>,
+"user_intent":       <string>,
+"domain":            <string>,
+"target_audience":   <sorted string[]>,
+"constraints":       <sorted string[]>,
+"requested_outputs": <sorted string[]>,
+"priority_profile": <string>
+})
+)
+
+REQ-GSDA-ID-002
+namespace and target_language MUST NOT participate in task_id.
+
+7.2 run_id
+
+REQ-GSDA-ID-010
+run_id MUST identify one execution run.
+
+REQ-GSDA-ID-011
+run_id MUST be unique within the coordinator identity domain.
+
+REQ-GSDA-ID-012
+Default run_id format MUST be:
+
+run:<UUID_v4>
+
+REQ-GSDA-ID-013
+run_id MUST NOT participate in task_id, content_id, or spec_content_id.
+
+7.3 peer_id
+
+REQ-GSDA-ID-020
+peer_id MUST identify a configured peer slot.
+
+REQ-GSDA-ID-021
+peer_id MUST remain stable across model/provider upgrades unless the
+slot is explicitly retired.
+
+REQ-GSDA-ID-022
+Provider, model, and model_version MUST remain peer metadata.
+
+REQ-GSDA-ID-023
+A provider or model change MUST NOT change peer_id.
+
+REQ-GSDA-ID-024
+peer_id MUST NOT participate in SEMANTIC_DETERMINISTIC identities.
+
+7.4 round_id
+
+REQ-GSDA-ID-030
+round_id MUST be:
+
+"round:" + run_id + ":" + decimal(round_index)
+
+REQ-GSDA-ID-031
+round_index MUST begin at zero and increase monotonically by one.
+
+REQ-GSDA-ID-032
+round_id MUST NOT depend on wall-clock time.
+
+7.5 message_id
+
+REQ-GSDA-ID-040
+message_id MUST be:
+
+"msg:" + sha256_hex(
+canonical_identity_object({
+"schema":         "message_identity/3.0",
+"run_id":         <run_id>,
+"peer_id":        <peer_id>,
+"payload_schema": <payload_schema>,
+"content_id":     <payload_content_id>
+})
+)
+
+REQ-GSDA-ID-041
+message_id MUST be derived only after adapter sanitization and
+canonicalization.
+
+REQ-GSDA-ID-042
+Transport ordering MUST NOT influence message_id.
+
+REQ-GSDA-ID-043
+Timestamp MUST NOT influence message_id.
+
+REQ-GSDA-ID-044
+Repeated identical message_id with identical canonical content MUST be
+idempotent.
+
+REQ-GSDA-ID-045
+Repeated message_id with conflicting canonical content MUST produce
+PROTOCOL_FAILURE and named failure F_DUPLICATE_MESSAGE_CONFLICT.
+
+7.6 content_id
+
+REQ-GSDA-ID-050
+content_id MUST be:
+
+"content:" + sha256_hex(
+canonical_identity_object({
+"schema":  <payload schema identifier>,
+"payload": <semantic payload projection>
+})
+)
+
+REQ-GSDA-ID-051
+content_id MUST depend only on semantic payload content.
+
+REQ-GSDA-ID-052
+Provenance fields MUST NOT participate in content_id unless the schema
+explicitly declares them part of its semantic payload projection.
+
+REQ-GSDA-ID-053
+Every content-bearing schema MUST declare its identity projection.
+
+7.7 artifact_id
+
+REQ-GSDA-ID-060
+artifact_id MUST be:
+
+"art:" + sha256_hex(
+canonical_identity_object({
+"schema":              "artifact_identity/3.0",
+"task_id":             <task_id>,
+"run_id":              <run_id>,
+"artifact_kind":       <artifact_kind>,
+"content_id":          <content_id>,
+"author_peer_id":      <peer_id>,
+"author_role":         <role>,
+"round_id":            <round_id>,
+"parent_artifact_ids": <sorted artifact_id[]>,
+"message_id":          <message_id>
+})
+)
+
+REQ-GSDA-ID-061
+artifact_id MUST NOT use a collision-prone contribution_index.
+
+REQ-GSDA-ID-062
+Distinct peer messages MUST remain distinguishable even when semantic
+content is identical.
+
+7.8 evidence_id
+
+REQ-GSDA-ID-070
+evidence_id MUST be:
+
+"ev:" + sha256_hex(
+canonical_identity_object({
+"schema":        "evidence_identity/3.0",
+"run_id":        <run_id>,
+"evidence_kind": <evidence_kind>,
+"subject_ids":   <sorted identifier[]>,
+"content_id":    <content_id>,
+"produced_by":   <producer identity>
+})
+)
+
+7.9 decision_id
+
+REQ-GSDA-ID-080
+decision_id MUST be:
+
+"dec:" + sha256_hex(
+canonical_identity_object({
+"schema":       "decision_identity/3.0",
+"run_id":       <run_id>,
+"actor_type":   <actor_type>,
+"actor_id":     <actor_id>,
+"round_id":     <round_id or empty>,
+"subject_ids":  <sorted identifier[]>,
+"content_id":   <decision content_id>
+})
+)
+
+7.10 finding_subject_id
+
+REQ-GSDA-ID-090
+finding_subject_id MUST be:
+
+"fs:" + sha256_hex(
+canonical_identity_object({
+"schema":         "finding_subject_identity/3.0",
+"category":       <category>,
+"targets":        <sorted targets[]>,
+"subject_kind":   <subject_kind>,
+"subject_terms":  <sorted term_id[]>,
+"subject_params": <sorted parameter tuples>
+})
+)
+
+REQ-GSDA-ID-091
+subject_params MUST use a closed typed vocabulary.
+
+7.11 finding_id
+
+REQ-GSDA-ID-100
+finding_id MUST be:
+
+"fnd:" + sha256_hex(
+canonical_identity_object({
+"schema":             "finding_identity/3.0",
+"run_id":             <run_id>,
+"finding_subject_id": <finding_subject_id>,
+"category":           <category>,
+"severity":           <severity>,
+"blocking":           <boolean>,
+"author_peer_id":     <peer_id>,
+"round_id":           <round_id>
+})
+)
+
+REQ-GSDA-ID-101
+created_at MUST NOT participate in finding_id.
+
+7.12 assumption_id
+
+REQ-GSDA-ID-110
+assumption_id MUST be:
+
+"asm:" + sha256_hex(
+canonical_identity_object({
+"schema":    "assumption_identity/3.0",
+"run_id":    <run_id>,
+"statement": <statement>,
+"source_ids": <sorted source_id[]>,
+"status":    <status>
+})
+)
+
+7.13 question_id
+
+REQ-GSDA-ID-120
+question_id MUST be:
+
+"oq:" + sha256_hex(
+canonical_identity_object({
+"schema":                "open_question_identity/3.0",
+"run_id":                <run_id>,
+"question":              <question>,
+"affected_requirements": <sorted requirement_id[]>
+})
+)
+
+7.14 reliability_outcome_id
+
+REQ-GSDA-ID-130
+reliability_outcome_id MUST be:
+
+"ro:" + sha256_hex(
+canonical_identity_object({
+"schema":               "reliability_outcome_identity/3.0",
+"run_id":               <run_id>,
+"activity":             <activity>,
+"subject_ids":          <sorted identifier[]>,
+"attribution_peer_ids": <sorted peer_id[]>,
+"result":               <result>,
+"evidence_class":       <evidence_class>,
+"evidence_ids":         <sorted evidence_id[]>
+})
+)
+
+7.15 term_record_id
+
+REQ-GSDA-ID-140
+term_record_id MUST be:
+
+"trm:" + sha256_hex(
+canonical_identity_object({
+"schema":                       "term_record_identity/3.0",
+"term_id":                     <term_id>,
+"definition":                  <definition>,
+"aliases":                     <sorted alias[]>,
+"related_terms":               <sorted term_id[]>,
+"lineage_parent_term_record_ids":
+<sorted term_record_id[]>
+})
+)
+
+REQ-GSDA-ID-141
+term_id alone MUST NOT identify a specific historical Term record.
+
+7.16 spec_content_id
+
+REQ-GSDA-ID-150
+spec_content_id MUST be:
+
+"spec:" + sha256_hex(
+canonical_identity_object({
+"schema":                    "spec_content_identity/3.0",
+"requirements_content_id":   <content_id>,
+"glossary_content_id":       <content_id>,
+"assumptions_content_id":    <content_id>,
+"open_questions_content_id": <content_id>,
+"traceability_content_id":   <content_id>
+})
+)
+
+REQ-GSDA-ID-151
+spec_content_id MUST NOT contain run_id, peer_id, revision history,
+timestamps, review records, changelog text, or package hash.
+
+7.17 revision_id
+
+REQ-GSDA-ID-160
+revision_id MUST be global, not run-scoped.
+
+REQ-GSDA-ID-161
+revision_id MUST be:
+
+"rev:" + sha256_hex(
+canonical_identity_object({
+"schema":              "revision_identity/3.0",
+"parent_revision_ids": <sorted revision_id[]>,
+"spec_content_id":     <spec_content_id>,
+"revision_lineage":    <sorted reachable ancestor revision_id[]>
+})
+)
+
+REQ-GSDA-ID-162
+A revision MUST NOT depend on run_id.
+
+7.18 file_content_id
+
+REQ-GSDA-ID-170
+file_content_id MUST identify canonical file bytes independently of
+package history and package provenance.
+
+TESTABILITY: TESTABLE
+
+===================================
+8. LOGICAL ORDERING AND DETERMINISM
+===================================
+
+REQ-GSDA-ORD-001
+Wall-clock timestamps MUST NOT determine authoritative ordering.
+
+REQ-GSDA-ORD-002
+The coordinator MUST maintain a monotonically increasing
+logical_sequence within each run.
+
+REQ-GSDA-ORD-003
+logical_sequence MUST be assigned only by the coordinator.
+
+REQ-GSDA-ORD-004
+logical_sequence MUST be persisted as authoritative provenance for
+events whose order affects deterministic decisions.
+
+REQ-GSDA-ORD-005
+A fresh execution MAY have different timestamp values from another
+fresh execution while still satisfying deterministic semantic
+equivalence.
+
+REQ-GSDA-ORD-006
+Replay of a stored run MUST reproduce the stored timestamps exactly.
+
+REQ-GSDA-ORD-007
+Any operation that previously used created_at as an authoritative
+ordering key MUST use a logical sequence or round-relative ordering
+instead.
+
+REQ-GSDA-ORD-008
+Where a total ordering remains tied after logical ordering, the final
+tie-break MUST be bytewise identifier ordering.
+
+TESTABILITY: TESTABLE
+
+================
+9. CONFIGURATION
+================
+
+Config record:
+
+schema
+config_id
+peer_panel
+role_assignments
+prompt_profiles
+cross_repair_budget
+cross_repair_quota_policy
+minimum_peers
+maximum_peers
+maximum_candidates
+maximum_scores_per_round
+maximum_cross_repairs
+maximum_findings
+maximum_criteria
+maximum_rounds
+peer_timeout_ms
+protocol_failure_threshold
+disagreement_threshold
+criterion_weights
+criterion_rubrics
+convergence_policy
+stagnation_policy
+liveness_policy
+reliability_policy
+reliability_profile
+cold_start_alpha
+cold_start_beta
+maximum_reliability_evidence
+outcome_weights
+aggregation_bounds
+canonicalization_profile
+schema_profile
+intent_segmentation_policy
+intent_criticality_policy
+namespace
+target_language
+token_rotation_policy
+compliance_level
+resource_limits
+quorum_content_id
+
+REQ-GSDA-CFG-001
+Every value affecting deterministic coordinator behaviour MUST exist
+in the configuration record or in the kernel-pinned specification
+version.
+
+REQ-GSDA-CFG-002
+config_id MUST be computed from the fully materialized canonical
+configuration.
+
+REQ-GSDA-CFG-003
+Every default value MUST be materialized into the stored config.
+
+REQ-GSDA-CFG-004
+Each round MUST record exactly one active config_id.
+
+REQ-GSDA-CFG-005
+Changing configuration during a run MUST start a new round and MUST
+produce a coordinator Decision documenting the change and rationale.
+
+REQ-GSDA-CFG-006
+1 <= minimum_peers <= maximum_peers.
+
+REQ-GSDA-CFG-007
+len(peer_panel) MUST NOT exceed maximum_peers.
+
+REQ-GSDA-CFG-008
+maximum_criteria MUST be at least 10.
+
+REQ-GSDA-CFG-009
+maximum_rounds MUST be at least 1.
+
+REQ-GSDA-CFG-010
+peer_timeout_ms MUST be at least 1.
+
+REQ-GSDA-CFG-011
+protocol_failure_threshold MUST be at least 1.
+
+REQ-GSDA-CFG-012
+cold_start_alpha and cold_start_beta MUST each be at least 1.
+
+REQ-GSDA-CFG-013
+cold_start_alpha + cold_start_beta MUST NOT exceed
+maximum_reliability_evidence.
+
+REQ-GSDA-CFG-014
+reliability_profile MUST be FLAT or DECAYING.
+
+REQ-GSDA-CFG-015
+The aggregation limit used for semantic scoring MUST be
+config.maximum_criteria. No independent second criterion-count limit MAY
+exist.
+
+REQ-GSDA-CFG-016
+All configured weights MUST satisfy their declared aggregation bounds.
+
+REQ-GSDA-CFG-017
+minimum_peers MUST be enforceable from the configured peer panel.
+
+REQ-GSDA-CFG-018
+Every versioned sub-policy MUST resolve to an installed schema.
+
+REQ-GSDA-CFG-019
+intent_criticality_policy.critical_weight_threshold MUST be the sole
+critical-intent threshold.
+
+REQ-GSDA-CFG-020
+cross_repair_quota_policy.group_weights MUST be present.
+
+REQ-GSDA-CFG-021
+sum(group_weights) MUST be greater than zero.
+
+REQ-GSDA-CFG-022
+When partitioning is intentionally unused, one catch-all group MAY
+receive all weight, but the configured reallocation order MUST still
+apply.
+
+REQ-GSDA-CFG-023
+token_rotation_policy.max_age_seconds MUST be greater than zero and
+at most 86400.
+
+REQ-GSDA-CFG-024
+A Level 1 configuration MUST NOT invoke Level 2 publication.
+
+TESTABILITY: TESTABLE
+
+===================
+10. RESOURCE LIMITS
+===================
+
+[Informative] Resource limits exist because a malicious or pathological
+peer response can be schema-valid while still exhausting memory,
+CPU, storage, or recursion depth.
+
+Resource limits include at least:
+
+maximum_raw_response_bytes
+maximum_decoded_payload_bytes
+maximum_string_bytes
+maximum_array_items
+maximum_object_properties
+maximum_json_depth
+maximum_schema_depth
+maximum_source_refs
+maximum_derivation_steps
+maximum_evidence_ids
+maximum_parent_artifacts
+maximum_lineage_depth
+maximum_findings
+maximum_candidates
+maximum_package_files
+maximum_package_file_bytes
+maximum_total_package_bytes
+maximum_conformance_cases
+maximum_peer_messages_per_round
+
+REQ-GSDA-RES-001
+Every resource limit MUST be configured or kernel-pinned.
+
+REQ-GSDA-RES-002
+A resource limit MUST be checked before allocation of the bounded
+resource whenever feasible.
+
+REQ-GSDA-RES-003
+A resource-limit violation MUST fail closed.
+
+REQ-GSDA-RES-004
+A resource-limit rejection MUST emit
+RESOURCE_LIMIT_REJECTED evidence.
+
+REQ-GSDA-RES-005
+Resource exhaustion MUST NOT alter authoritative outputs silently.
+
+REQ-GSDA-RES-006
+A resource-bound computation MUST NOT rely on integer wraparound.
+
+TESTABILITY: TESTABLE
+
+=========================
+11. TASK, RUN, AND INTENT
+=========================
+
+Task:
+
+schema
+task_id
+user_prompt
+user_intent
+intent_elements
+domain
+namespace
+target_language
+target_audience
+constraints
+requested_outputs
+priority_profile
+created_at
+metadata
+
+IntentElement:
+
+schema
+intent_id
+text
+occurrence
+occurrence_weight
+source_refs
+
+Run:
+
+schema
+run_id
+task_id
+started_at
+coordinator_version
+kernel_version
+schema_profile
+initial_config_id
+logical_sequence_base
+
+REQ-GSDA-TASK-001
+user_intent MUST be preserved independently of peer-generated
+interpretations.
+
+REQ-GSDA-TASK-002
+The coordinator MUST NOT replace user_intent with an LLM-generated
+interpretation.
+
+REQ-GSDA-TASK-003
+Every run MUST have exactly one task_id.
+
+REQ-GSDA-TASK-004
+Every authoritative run event MUST reference run_id.
+
+REQ-GSDA-TASK-005
+ExtractIntentElements MUST be deterministic for identical source text
+and policy.
+
+REQ-GSDA-TASK-006
+Every IntentElement MUST identify its source position.
+
+REQ-GSDA-TASK-007
+occurrence MUST be zero-based and deterministic.
+
+REQ-GSDA-TASK-008
+intent_id MUST be computed per the identity rules.
+
+TESTABILITY: TESTABLE
+
+=====================
+12. INTENT EXTRACTION
+=====================
+
+REQ-GSDA-KER-INTENT-001
+ExtractIntentElements MUST accept user_prompt, user_intent, and the
+configured intent_segmentation_policy.
+
+REQ-GSDA-KER-INTENT-002
+Default HYBRID segmentation MUST:
+
+1. identify explicit marker boundaries;
+2. identify sentence boundaries;
+3. split before RFC 2119 keywords;
+4. merge fragments below the configured minimum length;
+5. resolve overlap deterministically;
+6. emit INTENT_LOSS when a fragment cannot be represented.
+
+REQ-GSDA-KER-INTENT-003
+Marker matching MUST use longest-match-first.
+
+REQ-GSDA-KER-INTENT-004
+marker_prefixes MUST be prefix-free.
+
+REQ-GSDA-KER-INTENT-005
+Overlapping segments MUST be resolved by:
+
+earlier source position;
+then longest length;
+then bytewise-smallest text.
+
+REQ-GSDA-KER-INTENT-006
+Discarded overlapping segments MUST produce OVERLAP_DISCARDED evidence.
+
+REQ-GSDA-KER-INTENT-007
+Source byte offsets MUST be measured in UTF-8 bytes for textual input.
+
+REQ-GSDA-KER-INTENT-008
+ExtractIntentElements MUST never call an LLM.
+
+REQ-GSDA-KER-INTENT-009
+Identical input and identical policy MUST produce identical IntentElement
+content and ordering.
+
+TESTABILITY: TESTABLE
+
+====================================
+13. SOURCE REFERENCES AND DERIVATION
+====================================
+
+SourceRef:
+
+schema
+source_kind
+source_id
+location
+derivation_chain
+
+source_kind:
+
+USER_PROMPT
+INPUT_DOCUMENT
+PEER_INFERENCE
+PEER_PROPOSAL
+HUMAN_DECISION
+DERIVED
+
+DerivationStep:
+
+schema
+step_kind
+step_id
+summary
+
+REQ-GSDA-SRC-001
+source_id resolution MUST be:
+
+USER_PROMPT       -> task_id
+INPUT_DOCUMENT    -> input content_id
+PEER_INFERENCE    -> evidence_id
+PEER_PROPOSAL     -> artifact_id
+HUMAN_DECISION    -> decision_id
+DERIVED           -> evidence_id
+
+REQ-GSDA-SRC-002
+An unresolved source_id MUST cause SOURCE_REFERENCE_UNRESOLVED.
+
+REQ-GSDA-SRC-003
+PEER_INFERENCE and DERIVED source references MUST contain a non-empty
+derivation_chain.
+
+REQ-GSDA-SRC-004
+A derivation_chain MUST be acyclic.
+
+REQ-GSDA-SRC-005
+A derivation_chain MUST NOT exceed 256 steps unless a stricter
+configured resource limit applies.
+
+REQ-GSDA-SRC-006
+Historical source references MUST resolve against immutable historical
+state.
+
+REQ-GSDA-SRC-007
+Superseding an artifact MUST NOT invalidate a historical source
+reference.
+
+REQ-GSDA-SRC-008
+Deletion of an object reachable from retained provenance MUST be
+prohibited.
+
+REQ-GSDA-SRC-009
+A derivation step referencing a nonexistent object MUST cause
+SOURCE_REFERENCE_UNRESOLVED.
+
+TESTABILITY: TESTABLE
+
+==============================
+14. PEERS, ROLES, AND ADAPTERS
+==============================
+
+Peer:
+
+schema
+peer_id
+provider
+model
+model_version
+adapter_id
+transport
+role_profile
+prompt_profile_id
+slot_index
+
+Roles:
+
+GENERATOR
+FORMALIZER
+CRITIC
+CONTRADICTION_ANALYST
+COMPLETENESS_ANALYST
+TERMINOLOGY_ANALYST
+TESTABILITY_ANALYST
+CROSS_REPAIRER
+SCORER
+ADVERSARIAL_REVIEWER
+CONSOLIDATOR
+
+REQ-GSDA-PEER-001
+Every participating peer MUST have a configured stable peer_id.
+
+REQ-GSDA-PEER-002
+slot_index MUST be assigned by bytewise sorting peer_panel by peer_id.
+
+REQ-GSDA-PEER-003
+slot_index MUST remain stable within a run.
+
+REQ-GSDA-PEER-004
+A provider failure MUST NOT be classified as reasoning failure.
+
+REQ-GSDA-PEER-005
+Reliability MUST be tracked per (peer_id, activity).
+
+REQ-GSDA-ROLE-001
+Every peer response MUST record the role under which it was produced.
+
+REQ-GSDA-ROLE-002
+A peer MAY hold multiple roles.
+
+REQ-GSDA-ADP-001
+The peer adapter layer is the only component permitted to sanitize raw
+provider output before kernel validation.
+
+REQ-GSDA-ADP-002
+Sanitization MUST preserve the raw provider response.
+
+REQ-GSDA-ADP-003
+The raw response MUST be retrievable through content_id.
+
+REQ-GSDA-ADP-004
+An adapter MUST NOT mutate envelope identity fields after envelope
+construction.
+
+REQ-GSDA-ADP-005
+Any adapter mutation of an envelope identity field MUST produce
+PROTOCOL_FAILURE.
+
+REQ-GSDA-ADP-006
+An adapter MUST NOT inject omitted schema-default fields.
+
+REQ-GSDA-ADP-007
+Adapter processing MUST be:
+
+RAW
+-> optional STRUCTURAL_SALVAGE
+-> SANITIZE
+-> PARSE
+-> CANONICALIZE
+-> content_id
+-> message_id
+-> ENVELOPE
+-> KERNEL_VALIDATION
+
+REQ-GSDA-ADP-008
+Structural salvage MUST be a pure function of raw bytes.
+
+REQ-GSDA-ADP-009
+Structural salvage MAY perform only:
+
+* removal of trailing bytes after one complete JSON value;
+* removal of a trailing comma before a closing bracket or brace;
+* closure of at most one unambiguous layer of opening bracket or brace;
+* removal of one unnecessary double-escape layer when the result parses.
+
+REQ-GSDA-ADP-010
+Structural salvage MUST NOT alter numeric values, identity-bearing
+strings, identifiers, required fields, or order-sensitive arrays.
+
+REQ-GSDA-ADP-011
+Structural salvage MUST be idempotent.
+
+REQ-GSDA-ADP-012
+Structural salvage MUST NOT use an LLM.
+
+REQ-GSDA-ADP-013
+Sanitization of non-identity numeric fields MAY round to integer using
+round-half-to-even when the schema permits it.
+
+REQ-GSDA-ADP-014
+A float-rounding operation MUST emit FLOAT_ROUNDED evidence.
+
+REQ-GSDA-ADP-015
+NaN, Infinity, and out-of-range adapter numeric values MUST be rejected.
+
+TESTABILITY: TESTABLE
+
+=================================
+15. GSP/3.0 PEER MESSAGE PROTOCOL
+=================================
+
+Envelope:
+
+schema                "gsp/3.0"
+message_id
+type
+peer_id
+run_id
+task_id
+round_id
+parent_ids
+confidence
+payload
+
+Types:
+
+CANDIDATE
+CRITIQUE
+REPAIR
+SCORE
+REQUIREMENT
+TERM
+QUESTION
+CONSOLIDATION
+
+REQ-GSDA-PROT-001
+Every peer message MUST contain schema, message_id, type, peer_id,
+run_id, task_id, round_id, and payload.
+
+REQ-GSDA-PROT-002
+confidence MUST be an integer from 1 through 1000.
+
+REQ-GSDA-PROT-003
+A peer message with confidence outside 1..1000 MUST be rejected with
+PROTOCOL_FAILURE.
+
+REQ-GSDA-PROT-004
+Transport identity MUST be cryptographically bound to peer_id.
+
+REQ-GSDA-PROT-005
+The token input MUST be:
+
+peer_id + "|" + transport_fingerprint
+
+REQ-GSDA-PROT-006
+transport_fingerprint MUST be:
+
+sha256_hex(
+lowercase(transport)
++ "|"
++ adapter_id
++ "|"
++ endpoint_identifier
+)
+
+REQ-GSDA-PROT-007
+Token lifetime and rotation MUST follow the configured
+token_rotation_policy.
+
+REQ-GSDA-PROT-008
+Token verification events MUST NOT influence deterministic identities
+or replay decisions.
+
+REQ-GSDA-PROT-009
+A peer message with a peer_id mismatch MUST produce
+IMPERSONATION_ATTEMPT.
+
+REQ-GSDA-PROT-010
+A partially parseable but schema-invalid message MUST be rejected.
+
+REQ-GSDA-PROT-011
+A score with confidence zero MUST be rejected.
+
+REQ-GSDA-PROT-012
+Abstention MUST be represented by omission of the criterion score or
+the entire score record as permitted by the schema.
+
+REQ-GSDA-PROT-013
+An envelope confidence and payload confidence, when both exist, MUST
+be equal.
+
+REQ-GSDA-PROT-014
+ReliabilityOutcome MUST NOT be transported as a peer message type.
+
+REQ-GSDA-PROT-015
+ReliabilityOutcome MUST be stored only through coordinator kernel
+operations.
+
+TESTABILITY: TESTABLE
+
+=========================================
+16. CONTENT, ARTIFACT, AND EVIDENCE MODEL
+=========================================
+
+Content:
+
+schema
+content_id
+payload_schema
+payload
+
+Artifact:
+
+schema
+artifact_id
+task_id
+run_id
+artifact_kind
+content_id
+parent_artifact_ids
+author_peer_id
+author_role
+round_id
+lineage
+provenance
+message_id
+
+Evidence:
+
+schema
+evidence_id
+run_id
+evidence_kind
+subject_ids
+content_id
+produced_by
+source_ids
+logical_sequence
+created_at
+
+REQ-GSDA-ART-001
+Every artifact MUST have a valid artifact_id.
+
+REQ-GSDA-ART-002
+Every artifact MUST be immutable after storage.
+
+REQ-GSDA-ART-003
+A mismatching artifact_id MUST cause IDENTITY_MISMATCH.
+
+REQ-GSDA-ART-004
+A mismatching content_id MUST cause CONTENT_IDENTITY_MISMATCH.
+
+REQ-GSDA-ART-005
+Modification of an artifact MUST create a new artifact.
+
+REQ-GSDA-ART-006
+A derived artifact MUST preserve every known parent.
+
+REQ-GSDA-ART-007
+Every typed artifact payload MUST validate against its declared schema.
+
+REQ-GSDA-EVID-001
+Every evidence record MUST have a valid evidence_id.
+
+REQ-GSDA-EVID-002
+Evidence MUST be immutable.
+
+REQ-GSDA-EVID-003
+Evidence content MUST be referenced through content_id.
+
+REQ-GSDA-EVID-004
+Every substantive kernel-generated evidence item MUST include its
+logical_sequence.
+
+REQ-GSDA-EVID-005
+Evidence MUST identify the producer as one of:
+
+peer_id
+coordinator
+human
+system
+
+REQ-GSDA-EVID-006
+Every evidence kind MUST be registered.
+
+REQ-GSDA-EVID-007
+Evidence MUST NOT silently mutate authoritative state.
+
+TESTABILITY: TESTABLE
+
+===============================================
+17. REQUIREMENTS, TERMS, ASSUMPTIONS, QUESTIONS
+===============================================
+
+Requirement:
+
+schema
+requirement_id
+subject
+normative_text
+rationale
+severity
+source_refs
+intent_links
+related_requirements
+related_terms
+related_tests
+testability
+untestable_reason
+status
+lineage
+
+Term:
+
+schema
+term_record_id
+term_id
+term
+definition
+aliases
+related_terms
+source_refs
+lineage
+
+Assumption:
+
+schema
+assumption_id
+statement
+source_refs
+status
+affected_requirements
+lineage
+
+OpenQuestion:
+
+schema
+question_id
+question
+affected_requirements
+importance
+blocking
+status
+resolution
+resolved_by
+
+REQ-GSDA-REQ-001
+Every mandatory target-domain requirement MUST have a stable
+requirement_id.
+
+REQ-GSDA-REQ-002
+GSDA requirement identifiers MUST match:
+
+REQ-GSDA-[A-Z]{2,6}-[0-9]{3,6}[A-Z]?
+
+REQ-GSDA-REQ-003
+A requirement_id MUST NOT be reused after deletion.
+
+REQ-GSDA-REQ-004
+Requirement semantic identity MUST remain stable across ordinary
+revisions unless explicitly superseded.
+
+REQ-GSDA-REQ-005
+Every requirement MUST have at least one valid source_ref.
+
+REQ-GSDA-REQ-006
+Every requirement MUST have at least one intent_link.
+
+REQ-GSDA-REQ-007
+Every requirement MUST declare TESTABLE or UNTESTABLE.
+
+REQ-GSDA-REQ-008
+An UNTESTABLE requirement MUST have a non-empty untestable_reason.
+
+REQ-GSDA-REQ-009
+Forward references MAY exist in a working state but MUST resolve at
+working-state closure.
+
+REQ-GSDA-REQ-010
+Retired requirements MUST remain historically visible.
+
+REQ-GSDA-GLO-001
+GSDA MUST maintain one authoritative glossary registry.
+
+REQ-GSDA-GLO-002
+related_terms MUST resolve.
+
+REQ-GSDA-GLO-003
+Natural-language term appearance MUST NOT by itself establish
+semantic detection.
+
+REQ-GSDA-GLO-004
+Semantic term proposals MUST originate from peer analysis or kernel
+registry logic.
+
+REQ-GSDA-GLO-005
+Changing a definition MUST produce a new term_record_id.
+
+REQ-GSDA-GLO-006
+At most one current Term record MAY exist for a term_id.
+
+REQ-GSDA-GLO-007
+Term collision detection MUST occur before normalization causes the
+distinction to disappear.
+
+REQ-GSDA-GLO-008
+Two distinct raw terms mapping to the same normalized term_id MUST
+cause TERM_COLLISION unless the records are byte-identical.
+
+REQ-GSDA-ASM-001
+Assumptions MUST remain distinguishable from requirements.
+
+REQ-GSDA-ASM-002
+UNKNOWN assumptions MUST NOT be treated as confirmed facts.
+
+REQ-GSDA-ASM-003
+Promotion of an assumption to a requirement MUST be recorded by
+Decision.
+
+REQ-GSDA-OPQ-001
+An unresolved specification decision MUST be represented as an
+OpenQuestion or explicit Assumption.
+
+REQ-GSDA-OPQ-002
+The coordinator MUST NOT invent a response to a blocking question.
+
+REQ-GSDA-OPQ-003
+A blocking OPEN question MUST block publication unless a valid human
+override applies.
+
+REQ-GSDA-OPQ-004
+resolved_by MUST be empty, a valid decision_id, or a valid peer_id.
+
+TESTABILITY: TESTABLE
+
+===============================
+18. FINDINGS AND CONTRADICTIONS
+===============================
+
+Finding:
+
+schema
+finding_id
+finding_subject_id
+category
+targets
+message
+severity
+blocking
+confidence
+rationale
+evidence_ids
+status
+unexpressable_reason
+created_at
+logical_sequence
+
+Finding categories:
+
+OMISSION
+AMBIGUITY
+CONTRADICTION_CANDIDATE
+INCONSISTENCY
+UNDEFINED_TERM
+UNTESTABLE_REQUIREMENT
+HIDDEN_ASSUMPTION
+OVER_SPECIFICATION
+UNDER_SPECIFICATION
+SCOPE_ERROR
+TRACEABILITY_ERROR
+STRUCTURAL_ERROR
+INTENT_LOSS
+TERM_CANDIDATE
+MISSING_TERM
+NORMALIZED_TERM_COLLISION
+UNDER_SPECIFICATION_EXPRESSION
+
+REQ-GSDA-FND-001
+A finding MUST have at least one target.
+
+REQ-GSDA-FND-002
+targets MUST be string[].
+
+REQ-GSDA-FND-003
+blocking MUST be explicit and MUST NOT be inferred from severity.
+
+REQ-GSDA-FND-004
+A rejected finding MUST remain historically visible.
+
+REQ-GSDA-FND-005
+A finding MUST NOT disappear because another peer disagrees.
+
+REQ-GSDA-FND-006
+subject_terms MUST contain only resolvable term_id values.
+
+REQ-GSDA-FND-007
+subject_params MUST contain only:
+
+term_id
+requirement_id
+artifact_id
+integer
+boolean
+null
+
+REQ-GSDA-FND-008
+A peer unable to express a finding in the closed vocabulary MUST emit
+UNDER_SPECIFICATION_EXPRESSION with a non-empty
+unexpressable_reason.
+
+REQ-GSDA-FND-009
+UNDER_SPECIFICATION_EXPRESSION MUST NOT participate in automated
+finding-subject collision resolution.
+
+REQ-GSDA-FND-010
+Finding equivalence MUST be established only through
+finding_subject_id and not by natural-language similarity.
+
+Contradiction levels:
+
+CANDIDATE
+PROBABLE
+ESTABLISHED
+
+REQ-GSDA-CON-001
+Heuristic contradiction detection MUST produce
+CONTRADICTION_CANDIDATE.
+
+REQ-GSDA-CON-002
+PROBABLE contradiction requires qualifying independent observations.
+
+REQ-GSDA-CON-003
+ESTABLISHED contradiction MUST require either:
+
+exact structural conflict,
+exact identity conflict with opposite modality,
+or human adjudication.
+
+REQ-GSDA-CON-004
+An ESTABLISHED contradiction MUST block publication until resolved or
+explicitly overridden.
+
+REQ-GSDA-CON-005
+The kernel contradiction pattern registry MUST be versioned.
+
+REQ-GSDA-CON-006
+A pattern MUST be a pure function of its declared inputs.
+
+REQ-GSDA-CON-007
+Promotion to ESTABLISHED MUST record the exact matching pattern.
+
+TESTABILITY: TESTABLE
+
+==================================
+19. CANDIDATES, CRITIQUES, REPAIRS
+==================================
+
+Candidate:
+
+schema
+artifact_id
+content_id
+peer_id
+run_id
+specification
+assumptions
+open_questions
+confidence
+
+Critique:
+
+schema
+artifact_id
+critic_peer_id
+target_artifact_id
+findings
+confidence
+suggested_repairs
+
+Repair:
+
+schema
+artifact_id
+repairer_peer_id
+target_artifact_id
+parent_artifact_ids
+addressed_finding_ids
+specification
+changes
+rationale
+confidence
+
+Change:
+
+schema
+kind
+target_requirement
+before
+after
+rationale
+
+REQ-GSDA-REP-001
+A critique MUST identify its target artifact.
+
+REQ-GSDA-REP-002
+A CRITICAL finding MUST identify a concrete target.
+
+REQ-GSDA-REP-003
+A repair MAY address another peer's artifact.
+
+REQ-GSDA-REP-004
+A repair MUST identify the target artifact and repairer peer.
+
+REQ-GSDA-REP-005
+A repair MUST preserve all known parent lineage.
+
+REQ-GSDA-REP-006
+A mixed repair MUST NOT be attributed entirely to the final
+consolidator when earlier contributions are known.
+
+TESTABILITY: TESTABLE
+
+===========================
+20. CROSS-REPAIR SCHEDULING
+===========================
+
+REQ-GSDA-REP-010
+Cross-repair count MUST be bounded by:
+
+B_effective =
+min(
+configured_cross_repair_budget,
+maximum_cross_repairs,
+N * C
+)
+
+where N is active peer count and C is candidate count.
+
+REQ-GSDA-REP-011
+Repair candidates MUST be triples:
+
+(target_artifact_id,
+addressed_finding_id,
+repairer_peer_id)
+
+REQ-GSDA-REP-012
+All ordering inputs MUST come from SnapshotRoundContext.
+
+REQ-GSDA-REP-013
+Mid-round reliability changes MUST NOT alter the already-established
+repair ordering.
+
+REQ-GSDA-REP-014
+Repair candidate ordering MUST be:
+
+1. blocking_finding_count DESC
+2. unaddressed_finding_count DESC
+3. target_critical_count DESC
+4. target_high_count DESC
+5. target_aggregate ASC, UNDEFINED last
+6. repairer_reliability DESC
+7. repairer_independent_observation_count DESC
+8. fairness_key ASC
+9. target_artifact_id ASC
+10. addressed_finding_id ASC
+11. repairer_peer_id ASC
+
+REQ-GSDA-REP-015
+No comparator implementation MAY use arithmetic negation to represent
+descending values.
+
+REQ-GSDA-REP-016
+No comparator implementation MAY use IEEE Infinity as a sentinel.
+
+REQ-GSDA-REP-017
+fairness_key MUST be:
+
+(round_index + slot_index) mod maximum_peers
+
+using the round's configured maximum_peers.
+
+REQ-GSDA-REP-018
+The exact ordered candidate list, snapshotted values, fairness keys,
+budget, and selected triples MUST be preserved in provenance.
+
+REQ-GSDA-REP-019
+A CRITICAL finding open for at least the configured promotion age MUST
+be eligible for liveness promotion.
+
+REQ-GSDA-REP-020
+Liveness promotion ordering MUST use:
+
+opened_round_index ASC
+finding_id ASC
+
+REQ-GSDA-REP-021
+Liveness promotion MUST NOT use wall-clock timestamps.
+
+REQ-GSDA-REP-022
+At most the configured alternate_promotion_cap promotions MAY be
+scheduled per round.
+
+REQ-GSDA-REP-023
+Unpromoted qualifying findings MUST be listed in
+ALTERNATE_VIABLE_PROMOTION evidence.
+
+REQ-GSDA-REP-024
+Cross-repair quota partitioning MUST assign each eligible finding to
+exactly one group.
+
+REQ-GSDA-REP-025
+Group precedence MUST be:
+
+A = blocking
+B = CRITICAL or HIGH but not A
+C = OMISSION, TERM_CANDIDATE, MISSING_TERM,
+NORMALIZED_TERM_COLLISION but not A or B
+D = all others
+
+REQ-GSDA-REP-026
+Sub-budget MUST be:
+
+floor(B_effective * weight / sum_weights)
+
+REQ-GSDA-REP-027
+Remainders MUST be distributed by the configured reallocation_order.
+
+REQ-GSDA-REP-028
+Unused group budget MUST be deterministically reallocated.
+
+REQ-GSDA-REP-029
+The total performed repairs MUST NOT exceed B_effective.
+
+TESTABILITY: TESTABLE
+
+===========
+21. SCORING
+===========
+
+ScoreSubmission:
+
+schema
+artifact_id
+scorer_peer_id
+target_artifact_id
+round_id
+criteria
+confidence
+strengths
+weaknesses
+rationale
+message_id
+logical_sequence
+round_index
+
+Required criteria:
+
+intent_fidelity
+completeness
+internal_consistency
+precision
+traceability
+testability
+clarity
+coherence
+source_support
+simplicity
+
+REQ-GSDA-SCR-001
+Criterion values MUST be integers in 0..1000.
+
+REQ-GSDA-SCR-002
+Confidence MUST be an integer in 1..1000.
+
+REQ-GSDA-SCR-003
+Confidence MUST NOT be interpreted as probability of truth.
+
+REQ-GSDA-SCR-004
+A peer MAY omit a criterion to abstain.
+
+REQ-GSDA-SCR-005
+Zero MUST mean unacceptable and MUST NOT mean abstention.
+
+REQ-GSDA-SCR-006
+A peer MUST NOT submit an authoritative overall score.
+
+REQ-GSDA-SCR-007
+overall_hint, when retained for compatibility, MUST be non-authoritative
+and MUST NOT affect any aggregate, ranking, publication predicate, or
+tie-break.
+
+REQ-GSDA-SCR-008
+Authoritative score selection MUST sort:
+
+round_index DESC
+logical_sequence DESC
+message_id ASC
+
+REQ-GSDA-SCR-009
+If all three keys are equal and records differ, the coordinator MUST
+fail with GOVERNANCE_FAILURE.
+
+REQ-GSDA-SCR-010
+Earlier scores MUST remain immutable historical evidence.
+
+REQ-GSDA-SCR-011
+Every required criterion MUST have a configured rubric.
+
+REQ-GSDA-SCR-012
+Rubric anchors MUST exist at:
+
+0
+250
+500
+750
+1000
+
+REQ-GSDA-SCR-013
+Rubric anchors MUST be strictly increasing.
+
+REQ-GSDA-SCR-014
+A missing criterion MUST NOT be normalized to zero.
+
+REQ-GSDA-SCR-015
+A self-score by the author of an artifact MUST remain stored but MUST
+NOT contribute to that artifact's authoritative aggregate.
+
+REQ-GSDA-SCR-016
+Scores exceeding a per-round budget MUST be deterministically retained
+or discarded according to the latest-score rule.
+
+REQ-GSDA-SCR-017
+Every discarded score MUST remain identifiable in a Decision record.
+
+TESTABILITY: TESTABLE
+
+===============
+22. AGGREGATION
+===============
+
+Rational aggregate:
+
+schema
+A
+A_rem
+denom
+status
+
+status:
+
+DEFINED
+UNDEFINED
+
+For criterion k and artifact r:
+
+Participating(i,r,k) iff
+score exists
+AND confidence >= 1
+AND peer is not excluded by self-score rule.
+
+N(r,k) =
+sum R(i,k) * C(i,r,k) * W(k) * S(i,r,k)
+
+D(r,k) =
+sum R(i,k) * C(i,r,k) * W(k)
+
+If D(r,k) > 0:
+
+A(r,k) = N(r,k) div D(r,k)
+A_rem(r,k) = N(r,k) mod D(r,k)
+denom(r,k) = D(r,k)
+status = DEFINED
+
+If D(r,k) = 0 and participating peers exist:
+
+A(r,k) = sum(S) div n
+A_rem(r,k) = sum(S) mod n
+denom(r,k) = n
+status = DEFINED
+emit LOW_RELIABILITY_AGGREGATE
+
+If no participating peer exists:
+
+A(r,k) = 0
+A_rem(r,k) = 0
+denom(r,k) = 0
+status = UNDEFINED
+
+Overall:
+
+K = defined criteria
+
+If K is empty:
+
+status = UNDEFINED
+
+Else:
+
+N(r) =
+sum w(k) * (A(r,k) * denom(r,k) + A_rem(r,k))
+
+D(r) =
+sum w(k) * denom(r,k)
+
+A(r) = N(r) div D(r)
+A_rem(r) = N(r) mod D(r)
+denom(r) = D(r)
+status = DEFINED
+
+REQ-GSDA-AGG-001
+Undefined criteria MUST NOT be treated as zero.
+
+REQ-GSDA-AGG-002
+Undefined criteria MUST be explicitly recorded.
+
+REQ-GSDA-AGG-003
+If all criteria are undefined, the overall artifact aggregate MUST
+be UNDEFINED.
+
+REQ-GSDA-AGG-004
+Configured criterion weights MUST be preserved in provenance.
+
+REQ-GSDA-AGG-005
+All aggregate arithmetic MUST use signed 128-bit semantics or a
+mathematically equivalent implementation with explicit overflow
+detection.
+
+REQ-GSDA-AGG-006
+An intermediate outside the signed 128-bit range MUST cause
+AGGREGATION_BOUNDS_EXCEEDED.
+
+REQ-GSDA-AGG-007
+A score, confidence, or weight exceeding its configured bound MUST
+cause INPUT_BOUNDS_EXCEEDED.
+
+REQ-GSDA-AGG-008
+Every aggregate MUST store A, A_rem, denom, and status.
+
+REQ-GSDA-AGG-009
+The participating peer set MUST be stored in aggregate provenance.
+
+REQ-GSDA-AGG-010
+An UNDEFINED overall aggregate MUST disqualify the artifact from
+automatic selection.
+
+REQ-GSDA-AGG-011
+A round with no viable artifact MUST route to human review and emit
+LOW_RELIABILITY_AGGREGATE evidence.
+
+REQ-GSDA-AGG-012
+The fallback aggregate for zero reliability MUST NOT contribute to
+SCORING reliability updates unless human-adjudicated.
+
+23. EXACT RATIONAL COMPARISON
+
+REQ-GSDA-AGG-020
+Artifact rational comparison MUST compare:
+
+A + A_rem / denom
+
+without constructing A * denom + A_rem merely for comparison.
+
+REQ-GSDA-AGG-021
+Comparison MUST first compare A values.
+
+REQ-GSDA-AGG-022
+Only when A values are equal may remainders be compared.
+
+REQ-GSDA-AGG-023
+Remainder comparison MUST cross-multiply:
+
+L = A_rem1 * denom2
+R = A_rem2 * denom1
+
+REQ-GSDA-AGG-024
+Cross multiplication MUST use signed 128-bit checked arithmetic.
+
+REQ-GSDA-AGG-025
+When direct cross multiplication would overflow, both fractions MUST
+first be reduced by:
+
+gcd(remainder, denominator)
+
+REQ-GSDA-AGG-026
+A second checked cross multiplication MUST then be attempted.
+
+REQ-GSDA-AGG-027
+If the reduced cross multiplication still overflows, the operation MUST
+fail with AGGREGATION_BOUNDS_EXCEEDED.
+
+REQ-GSDA-AGG-028
+The comparator MUST NOT fall back to A-only comparison after overflow.
+
+REQ-GSDA-AGG-029
+UNDEFINED aggregates MUST never enter rational comparison.
+
+24. ARTIFACT SELECTION
+
+REQ-GSDA-AGG-030
+Artifact selection MUST use this total order:
+
+1. higher exact rational aggregate
+2. higher minimum defined criterion score
+3. higher artifact-independent-observation count
+4. lower overall disagreement spread
+5. greater number of independent scoring peers
+6. artifact_id ascending bytewise
+
+REQ-GSDA-AGG-031
+artifact-independent-observation count MUST count distinct
+(provider_profile_id, model_profile_id) pairs among qualifying
+independent observations for that artifact.
+
+REQ-GSDA-AGG-032
+A peer's cumulative reliability MUST NOT substitute for artifact
+independent-observation count.
+
+TESTABILITY: TESTABLE
+
+=============================
+25. DISAGREEMENT AND VARIANCE
+=============================
+
+For participating scores:
+
+values
+n
+sum
+sum_sq
+minimum
+maximum
+mean_num
+mean_denom
+spread
+variance_num
+variance_denom
+variance_x1000
+
+REQ-GSDA-VAR-001
+Abstentions MUST NOT contribute to disagreement.
+
+REQ-GSDA-VAR-002
+The complete participating score distribution MUST be preserved.
+
+REQ-GSDA-VAR-003
+mean MUST remain an exact rational.
+
+REQ-GSDA-VAR-004
+Variance MUST be computed without first truncating mean.
+
+REQ-GSDA-VAR-005
+variance_num MUST be:
+
+n * sum_sq - sum * sum
+
+REQ-GSDA-VAR-006
+variance_denom MUST be:
+
+n * n
+
+REQ-GSDA-VAR-007
+variance_num and variance_denom MUST be reduced by gcd before storage.
+
+REQ-GSDA-VAR-008
+variance_x1000 MUST be:
+
+(variance_num * 1000) div variance_denom
+
+using floor division.
+
+REQ-GSDA-VAR-009
+A non-zero remainder in variance_x1000 conversion MUST be preserved as
+rounding metadata.
+
+REQ-GSDA-VAR-010
+Every intermediate multiplication and sum MUST be overflow checked.
+
+REQ-GSDA-VAR-011
+A spread above disagreement_threshold MUST produce HIGH_DISAGREEMENT.
+
+REQ-GSDA-VAR-012
+HIGH_DISAGREEMENT MUST be eligible to trigger a further analysis or
+refinement round.
+
+REQ-GSDA-VAR-013
+When fewer than two participating peers exist, overall disagreement
+spread MUST be zero.
+
+TESTABILITY: TESTABLE
+
+===============
+26. RELIABILITY
+===============
+
+Activities:
+
+GENERATION
+CRITIQUE
+REPAIR
+SCORING
+COMPLETENESS
+CONTRADICTION
+TERMINOLOGY
+TESTABILITY
+PROTOCOL
+
+Reliability:
+
+schema
+peer_id
+activity
+alpha
+beta
+sample_count
+independent_observation_count
+mean
+
+ReliabilityOutcome:
+
+schema
+reliability_outcome_id
+activity
+subject_ids
+attribution_peer_ids
+result
+evidence_class
+evidence_ids
+logical_sequence
+created_at
+
+IndependentObservation:
+
+schema
+observation_id
+activity
+subject_ids
+finding_subject_id
+peer_id
+provider_profile_id
+model_profile_id
+evidence_id
+logical_sequence
+created_at
+
+REQ-GSDA-REL-001
+Reliability MUST be maintained per (peer, activity).
+
+REQ-GSDA-REL-002
+A peer with no historical reliability evidence MUST use configured
+cold-start alpha and beta.
+
+REQ-GSDA-REL-003
+Reliability MUST NOT be inferred from artifact survival or selection.
+
+REQ-GSDA-REL-004
+A semantic reliability update MUST require a coordinator-issued
+ReliabilityOutcome.
+
+REQ-GSDA-REL-005
+Timeouts MUST produce no reliability update.
+
+REQ-GSDA-REL-006
+Protocol violations MUST affect PROTOCOL reliability only.
+
+REQ-GSDA-REL-007
+SUCCESS and FAILURE outcomes MUST identify evidence.
+
+REQ-GSDA-REL-008
+KERNEL_STRUCTURAL outcomes MAY affect only activities for which the
+kernel establishes objective structural validity.
+
+REQ-GSDA-REL-009
+INDEPENDENT_CORROBORATION MUST mean KERNEL_SEPARATED observations with
+identical finding_subject_id and distinct provider/model profiles.
+
+REQ-GSDA-REL-010
+KERNEL_SEPARATED MUST require that the peer prompt contained none of
+the relevant other-peer analyses, findings, scores, or aggregates before
+the peer produced the observation.
+
+REQ-GSDA-REL-011
+Real-world epistemic independence MUST NOT be claimed.
+
+REQ-GSDA-REL-012
+CORROBORATED MUST increment independent_observation_count only.
+
+REQ-GSDA-REL-013
+CORROBORATED MUST NOT increment alpha or beta.
+
+REQ-GSDA-REL-014
+INDEPENDENT_CORROBORATION MUST apply only to CONTRADICTION,
+COMPLETENESS, and TERMINOLOGY.
+
+REQ-GSDA-REL-015
+A mixed repair MUST NOT automatically inherit upstream reliability
+credit.
+
+REQ-GSDA-REL-016
+Human adjudication MAY explicitly assign credit or blame.
+
+REQ-GSDA-REL-017
+Without a qualifying outcome, reliability MUST remain unchanged.
+
+REQ-GSDA-REL-018
+All reliability updates MUST be deterministic for a fixed evidence set.
+
+REQ-GSDA-REL-019
+The reliability profile MUST use integer arithmetic only.
+
+REQ-GSDA-REL-020
+Let:
+
+total = alpha + beta
+M = maximum_reliability_evidence
+w = s + f
+
+REQ-GSDA-REL-021
+If w > M, the update MUST fail with
+RELIABILITY_BOUNDS_EXCEEDED.
+
+REQ-GSDA-REL-022
+In FLAT mode, if total + w > M, the update MUST fail with
+RELIABILITY_BOUNDS_EXCEEDED.
+
+REQ-GSDA-REL-023
+In FLAT mode:
+
+alpha' = alpha + s
+beta'  = beta + f
+
+REQ-GSDA-REL-024
+In DECAYING mode, if total + w <= M:
+
+alpha' = alpha + s
+beta'  = beta + f
+
+REQ-GSDA-REL-025
+In DECAYING mode, if total + w > M and total = 0, cold-start values
+MUST first be materialized.
+
+REQ-GSDA-REL-026
+In DECAYING mode, when total > 0:
+
+keep = M - w
+alpha_scaled = floor(alpha * keep / total)
+beta_scaled  = floor(beta  * keep / total)
+
+REQ-GSDA-REL-027
+The remaining integer remainder MUST be assigned deterministically to
+the side with the larger prior alpha/beta value, alpha on equality.
+
+REQ-GSDA-REL-028
+If keep < 0 after the zero-total materialization step, the update MUST
+fail with RELIABILITY_BOUNDS_EXCEEDED.
+
+REQ-GSDA-REL-029
+After the update, alpha' and beta' MUST both be non-negative.
+
+REQ-GSDA-REL-030
+After the update:
+
+alpha' + beta' <= M
+
+MUST hold.
+
+REQ-GSDA-REL-031
+sample_count MUST increase by s + f.
+
+REQ-GSDA-REL-032
+independent_observation_count MUST increase only through qualifying
+corroboration records.
+
+REQ-GSDA-REL-033
+A peer reaches saturation only when alpha + beta = M after update.
+
+REQ-GSDA-REL-034
+When saturated peers exceed bound_saturation_threshold, the coordinator
+MUST emit RELIABILITY_SATURATION evidence.
+
+REQ-GSDA-REL-035
+Saturation ties MUST use fairness rotation.
+
+REQ-GSDA-REL-036
+decay_mean_tolerance MUST apply only when a proportional decay step
+actually occurs.
+
+REQ-GSDA-REL-037
+A post-decay mean drift exceeding the configured tolerance MUST emit
+RELIABILITY_SATURATION evidence but MUST NOT itself reject the update.
+
+TESTABILITY: TESTABLE
+
+===========
+27. LINEAGE
+===========
+
+Lineage:
+
+schema
+parents
+parent_anc_hashes
+contributions
+ancestor_chain_hash
+
+REQ-GSDA-LIN-001
+Lineage MUST form a directed acyclic graph.
+
+REQ-GSDA-LIN-002
+A derived artifact MUST have at least one parent.
+
+REQ-GSDA-LIN-003
+A root candidate MAY have zero parents.
+
+REQ-GSDA-LIN-004
+ancestor_chain_hash MUST be computed as:
+
+"anc:" + sha256_hex(
+canonical_identity_object({
+"schema": "lineage_ancestor_chain/3.0",
+"self_id": <artifact_id>,
+"parent_anc_hashes": <sorted parent hashes>
+})
+)
+
+REQ-GSDA-LIN-005
+A root artifact MUST use an empty parent_anc_hashes list.
+
+REQ-GSDA-LIN-006
+Acyclicity MUST be checked using transitive parent-closure traversal.
+
+REQ-GSDA-LIN-007
+ancestor_chain_hash MUST be an integrity check and MUST NOT substitute
+for closure traversal.
+
+REQ-GSDA-LIN-008
+The traversal MUST be bounded by maximum_lineage_depth.
+
+REQ-GSDA-LIN-009
+A self-reference appearing in closure MUST cause LINEAGE_FAILURE.
+
+REQ-GSDA-LIN-010
+A missing parent MUST cause LINEAGE_FAILURE.
+
+REQ-GSDA-LIN-011
+A mismatching parent ancestor hash MUST cause LINEAGE_FAILURE.
+
+REQ-GSDA-LIN-012
+ancestor_chain_hash MUST NOT participate in artifact_id.
+
+REQ-GSDA-LIN-013
+Lineage MUST NOT participate in content_id.
+
+REQ-GSDA-LIN-014
+Lineage MAY participate in revision_id.
+
+TESTABILITY: TESTABLE
+
+====================================
+28. WORKING STATE AND REVISION MODEL
+====================================
+
+REQ-GSDA-WS-001
+A run MUST maintain exactly one current working specification state.
+
+REQ-GSDA-WS-002
+The current working state MUST be identified by spec_content_id.
+
+REQ-GSDA-WS-003
+There MUST be no independent semantic working_state_id.
+
+REQ-GSDA-WS-004
+An exposed working_state_id accessor, if provided, MUST exactly equal
+the current spec_content_id.
+
+REQ-GSDA-WS-005
+A changed semantic specification MUST produce a new spec_content_id.
+
+REQ-GSDA-WS-006
+A working state MUST NOT be published.
+
+Revision:
+
+schema
+revision_id
+parent_revision_ids
+spec_content_id
+created_at
+changelog
+package_hash
+compliance_level
+
+REQ-GSDA-REV-001
+A revision MUST be created only after valid human acceptance.
+
+REQ-GSDA-REV-002
+A first revision MAY have no parents.
+
+REQ-GSDA-REV-003
+Subsequent revisions MUST reference all direct parent revisions.
+
+REQ-GSDA-REV-004
+A revision MUST record a changelog.
+
+REQ-GSDA-REV-005
+Requirement IDs MUST be preserved across ordinary revisions.
+
+REQ-GSDA-REV-006
+A revision_id MUST remain global.
+
+REQ-GSDA-REV-007
+A PUBLISHED revision MUST be immutable.
+
+REQ-GSDA-REV-008
+A mutation attempt against a PUBLISHED revision MUST cause
+GOVERNANCE_FAILURE.
+
+REQ-GSDA-REV-009
+A LEVEL_1 revision MUST NOT be published.
+
+TESTABILITY: TESTABLE
+
+=============================
+29. HUMAN DECISION AND QUORUM
+=============================
+
+HumanDecision:
+
+schema
+decision_id
+run_id
+revision_id
+spec_content_id
+principal_id
+principal_role
+quorum_id
+action
+rationale
+package_hash
+review_payload_id
+package_entries
+publication_override
+override_conditions
+logical_sequence
+created_at
+
+Quorum:
+
+schema
+quorum_id
+principal_ids
+threshold
+threshold_semantics
+created_at
+
+REQ-GSDA-HUM-001
+Only a HUMAN Decision MAY satisfy the human acceptance gate.
+
+REQ-GSDA-HUM-002
+The system MUST NOT claim human acceptance on a human's behalf.
+
+REQ-GSDA-HUM-003
+A HumanDecision MUST be immutable.
+
+REQ-GSDA-HUM-004
+An ACCEPT decision MUST bind to the exact package tuple list presented
+for acceptance.
+
+REQ-GSDA-HUM-005
+An ACCEPT decision MUST bind to the exact HumanReviewPayload content_id.
+
+REQ-GSDA-HUM-006
+An ACCEPT decision MUST bind to the exact package_hash.
+
+REQ-GSDA-HUM-007
+The default quorum is one principal.
+
+REQ-GSDA-HUM-008
+COUNT quorum requires at least threshold distinct ACCEPT principals.
+
+REQ-GSDA-HUM-009
+FRACTION quorum requires at least:
+
+ceil(len(principal_ids) * threshold / 10000)
+
+distinct ACCEPT principals.
+
+REQ-GSDA-HUM-010
+Threshold MUST satisfy the configured quorum schema.
+
+REQ-GSDA-HUM-011
+A quorum record MUST be content-addressed.
+
+REQ-GSDA-HUM-012
+A configured quorum MUST participate in config_id.
+
+REQ-GSDA-HUM-013
+A publication override MUST be a HUMAN ACCEPT decision with a
+non-empty rationale.
+
+REQ-GSDA-HUM-014
+An override MUST name at least one currently blocking condition.
+
+REQ-GSDA-HUM-015
+Allowed override condition forms are:
+
+OPEN_QUESTION:<question_id>
+FINDING:<finding_id>
+CONTRADICTION:<finding_subject_id>
+COVERAGE:<intent_id>
+
+REQ-GSDA-HUM-016
+An override MUST NOT bypass:
+
+RequiredSchemasValid
+ProvenanceComplete
+RevisionIdentityValid
+PackageHashMatches
+HumanAcceptancePresent
+AcceptedTupleListMatches
+NormativeKeywordLinterClean
+PackageStaged
+PackageFrozen
+
+REQ-GSDA-HUM-017
+An invalid override MUST cause GOVERNANCE_FAILURE.
+
+TESTABILITY: TESTABLE
+
+========================
+30. HUMAN REVIEW PAYLOAD
+========================
+
+HumanReviewPayload:
+
+schema
+spec_content_id
+specification
+requirements
+blocking_findings
+open_questions
+score_summary
+score_variance
+major_disagreements
+revision_diff
+provenance
+decisions
+package_candidate
+coverage_report
+
+CoverageReport:
+
+schema
+total_intent_elements
+linked_intent_elements
+critical_total
+critical_linked
+uncovered_intent_ids
+uncovered_critical_ids
+uncovered_offsets
+
+REQ-GSDA-HUM-020
+The exact HumanReviewPayload presented to the human MUST be stored
+before acceptance.
+
+REQ-GSDA-HUM-021
+The HumanReviewPayload MUST be immutable.
+
+REQ-GSDA-HUM-022
+package_candidate MUST list every actual package file.
+
+REQ-GSDA-HUM-023
+Directory entries MUST NOT substitute for contained files.
+
+REQ-GSDA-HUM-024
+The package_candidate file set MUST match the package staging file set.
+
+REQ-GSDA-HUM-025
+CoverageReport MUST match the authoritative coverage state for the
+review.
+
+TESTABILITY: TESTABLE
+
+=========================
+31. COORDINATOR COMPONENT
+=========================
+
+REQ-GSDA-COR-001
+The coordinator MUST own authoritative state.
+
+REQ-GSDA-COR-002
+The coordinator MUST be deterministic for a fixed evidence set,
+configuration, kernel version, and stored logical order.
+
+REQ-GSDA-COR-003
+The coordinator MUST NOT call an LLM for authoritative aggregation,
+identity computation, validation, or state-transition logic.
+
+REQ-GSDA-COR-004
+The coordinator MUST NOT infer missing protocol fields.
+
+REQ-GSDA-COR-005
+Every substantive authoritative state decision MUST produce a
+Decision artifact.
+
+REQ-GSDA-COR-006
+A state mutation MUST NOT become effective before its Decision artifact
+is durably represented.
+
+REQ-GSDA-COR-007
+The coordinator MUST use SnapshotRoundContext for any round-scoped
+ordering that depends on mutable state.
+
+REQ-GSDA-COR-008
+The coordinator MUST use logical_sequence for deterministic event
+ordering.
+
+TESTABILITY: TESTABLE
+
+==========================
+32. SNAPSHOT ROUND CONTEXT
+==========================
+
+SnapshotRoundContext:
+
+schema
+round_id
+config_id
+reliability_values
+independent_observation_counts
+maximum_peers
+fairness_keys
+scheduler_seeds
+logical_sequence
+
+REQ-GSDA-SNAP-001
+SnapshotRoundContext MUST be produced once per round before any
+ordering operation that depends on mutable state.
+
+REQ-GSDA-SNAP-002
+SnapshotRoundContext MUST be immutable.
+
+REQ-GSDA-SNAP-003
+Every subsequent round provenance record depending on snapshotted
+values MUST reference the snapshot artifact.
+
+REQ-GSDA-SNAP-004
+Mid-round reliability changes MUST NOT alter a previously computed
+ordering.
+
+REQ-GSDA-SNAP-005
+Any deterministic scheduler seed MUST originate in the snapshot.
+
+REQ-GSDA-SNAP-006
+A snapshot seed MUST NOT originate from wall-clock time or external
+randomness.
+
+TESTABILITY: TESTABLE
+
+=============================
+33. COORDINATOR STATE MACHINE
+=============================
+
+Coordinator states:
+
+INIT
+VALIDATING_BOOTSTRAP
+EXTRACTING
+FORMALIZING
+SCORING
+AGGREGATING
+SCHEDULING_REPAIR
+REPAIRING
+ANALYZING
+AWAITING_HUMAN
+PUBLISHING
+PUBLISHED
+FAILED_CLOSED
+
+Run states:
+
+CREATED
+ACTIVE
+CONVERGED
+AWAITING_HUMAN
+ACCEPTED
+PUBLISHED
+TERMINATED
+FAILED_CLOSED
+
+Round phases:
+
+UNDERSTAND
+GENERATE
+CRITIQUE
+SCORE
+AGGREGATE
+REPAIR
+ANALYZE
+REFINE
+CONVERGE
+PUBLISH
+
+REQ-GSDA-CSM-001
+The coordinator state transition function MUST be:
+
+T(current_state, round_outcome, snapshot)
+
+REQ-GSDA-CSM-002
+Transition selection MUST use an ordered, machine-readable transition
+table.
+
+Transition table:
+
+1  INIT
+-> VALIDATING_BOOTSTRAP
+guard = true
+
+2  VALIDATING_BOOTSTRAP
+-> EXTRACTING
+guard = pass0_ok
+
+3  VALIDATING_BOOTSTRAP
+-> FAILED_CLOSED
+guard = !pass0_ok
+
+4  EXTRACTING
+-> FORMALIZING
+guard = true
+
+5  FORMALIZING
+-> SCORING
+guard = true
+
+6  SCORING
+-> AGGREGATING
+guard = scores_complete AND round_phase = SCORE
+
+7  SCORING
+-> ANALYZING
+guard = scores_complete AND round_phase = REFINE
+
+8  AGGREGATING
+-> SCHEDULING_REPAIR
+guard = true
+
+9  SCHEDULING_REPAIR
+-> REPAIRING
+guard = triples_remaining
+
+10  SCHEDULING_REPAIR
+-> ANALYZING
+guard = !triples_remaining
+
+11  REPAIRING
+-> SCORING
+guard = true
+
+12  ANALYZING
+-> SCORING
+guard = refine_required
+
+13  ANALYZING
+-> AWAITING_HUMAN
+guard = !refine_required
+
+14  AWAITING_HUMAN
+-> PUBLISHING
+guard = human_accept
+
+15  AWAITING_HUMAN
+-> ACTIVE
+guard = human_reject
+
+16  PUBLISHING
+-> PUBLISHED
+guard = gate_pass
+
+17  PUBLISHING
+-> FAILED_CLOSED
+guard = !gate_pass
+
+18  any except PUBLISHED
+-> FAILED_CLOSED
+guard = unrecoverable
+
+REQ-GSDA-CSM-003
+Only one transition MAY have a true guard for the same source state and
+snapshot.
+
+REQ-GSDA-CSM-004
+An undefined transition MUST cause FAILED_CLOSED and
+GOVERNANCE_FAILURE.
+
+REQ-GSDA-CSM-005
+A PUBLISHED state MUST be terminal for normal lifecycle transitions.
+
+REQ-GSDA-CSM-006
+A post-publication integrity fault MUST NOT transition the run or
+revision out of PUBLISHED.
+
+REQ-GSDA-CSM-007
+Post-publication integrity faults MUST emit INVARIANT_VIOLATION and
+mark run health degraded.
+
+REQ-GSDA-CSM-008
+round.phase MUST NOT be used as a substitute for run state.
+
+REQ-GSDA-CSM-009
+run state MUST remain authoritative for lifecycle semantics.
+
+REQ-GSDA-CSM-010
+The state transition table MUST be represented by
+coordinator_transition/3.0.json.
+
+TESTABILITY: TESTABLE
+
+===================
+34. DEFAULT PROCESS
+===================
+
+Default process:
+
+UNDERSTAND
+-> GENERATE
+-> CRITIQUE
+-> SCORE
+-> AGGREGATE
+-> REPAIR
+-> REFINE
+-> SCORE
+-> ANALYZE
+-> REFINE or CONVERGE
+-> HUMAN REVIEW
+-> PUBLISH
+
+REQ-GSDA-PROC-001
+At least one score pass MUST precede cross-repair.
+
+REQ-GSDA-PROC-002
+Cross-repair MUST target an existing artifact.
+
+REQ-GSDA-PROC-003
+Aggregation MUST occur only after required scores are collected or
+explicitly recorded unavailable.
+
+REQ-GSDA-PROC-004
+Every REFINE phase MUST identify a reason.
+
+REQ-GSDA-PROC-005
+Valid REFINE reasons are:
+
+unresolved finding
+HIGH_DISAGREEMENT
+missing requirement
+ambiguity
+contradiction
+poor criterion score
+missing traceability
+human request
+insufficient evidence
+liveness promotion
+publication repair
+
+TESTABILITY: TESTABLE
+
+==============================
+35. CONVERGENCE AND STAGNATION
+==============================
+
+Convergence requires:
+
+no blocking open questions
+no unresolved ESTABLISHED contradictions
+no blocking findings
+critical intent coverage complete
+all related requirement references resolve
+all related term references resolve
+no newly introduced CRITICAL findings
+requirement coverage stable
+terminology stable
+score movement below threshold
+no HIGH_DISAGREEMENT above threshold
+
+REQ-GSDA-CNV-001
+Score stability alone MUST NOT be sufficient for convergence.
+
+REQ-GSDA-CNV-002
+Stable rounds MUST equal convergence_policy.stable_rounds.
+
+REQ-GSDA-CNV-003
+All convergence thresholds MUST be preserved in provenance.
+
+REQ-GSDA-CNV-004
+Requirement coverage stability MUST compare requirement_id sets.
+
+REQ-GSDA-CNV-005
+Terminology stability MUST compare term_id sets and canonical
+definitions.
+
+REQ-GSDA-CNV-006
+Score movement MUST compare exact integer aggregate components rather
+than floating-point approximations.
+
+REQ-GSDA-CNV-007
+A meaningful repair MUST have a non-empty diff.
+
+REQ-GSDA-CNV-008
+A meaningful revision MUST have a non-empty semantic diff.
+
+REQ-GSDA-CNV-009
+Stagnation MUST be measured over stagnation_policy.window_rounds.
+
+REQ-GSDA-CNV-010
+Stagnation MUST be detected from absence of all configured meaningful
+change signals.
+
+REQ-GSDA-CNV-011
+On stagnation, the coordinator MUST alter at least one of:
+
+peer composition
+role assignment
+prompt strategy
+candidate-generation strategy
+analysis focus
+
+REQ-GSDA-CNV-012
+Persistent stagnation MUST eventually produce LIVENESS_FAILURE.
+
+REQ-GSDA-CNV-013
+The liveness threshold MUST be enforced after the configured number of
+stagnant rounds.
+
+REQ-GSDA-CNV-014
+A blocking ambiguity requiring human input MUST route to human review.
+
+TESTABILITY: TESTABLE
+
+===================
+36. INTENT COVERAGE
+===================
+
+REQ-GSDA-CVG-001
+Intent coverage MUST be:
+
+linked_intent_elements / total_intent_elements
+
+when total_intent_elements > 0.
+
+REQ-GSDA-CVG-002
+When total_intent_elements = 0, the coordinator MUST emit
+INTENT_LOSS_DETECTED evidence and F_INSUFFICIENT_COVERAGE.
+
+REQ-GSDA-CVG-003
+A zero-intent task MUST NOT satisfy publication merely through vacuous
+critical coverage.
+
+REQ-GSDA-CVG-004
+Critical intent elements are those whose occurrence_weight is at least
+critical_weight_threshold.
+
+REQ-GSDA-CVG-005
+When the critical subset is non-empty, critical coverage MUST equal
+the fraction linked.
+
+REQ-GSDA-CVG-006
+When critical subset is empty, critical coverage MAY be defined as
+vacuously complete only if total_intent_elements > 0.
+
+REQ-GSDA-CVG-007
+Critical coverage less than 1 MUST block publication unless validly
+overridden.
+
+REQ-GSDA-CVG-008
+Every round MUST emit COVERAGE_REPORT evidence.
+
+REQ-GSDA-CVG-009
+Coverage reports MUST include uncovered intent_ids and byte offsets.
+
+TESTABILITY: TESTABLE
+
+====================================
+37. PUBLICATION PACKAGE AND MANIFEST
+====================================
+
+Required package paths:
+
+spec.md
+spec.requirements.json
+spec.tests.json
+spec.glossary.json
+spec.open_questions.json
+spec.assumptions.json
+spec.trace.json
+spec.changelog.md
+spec.review.json
+spec.provenance.json
+spec.decisions.json
+spec.conformance.json
+spec.manifest.json
+spec.schemas/
+spec.self_conformance/
+
+Required schema directory contents:
+
+registries/3.0.json
+meta_requirement/3.0.json
+requirement/3.0.json
+term/3.0.json
+assumption/3.0.json
+open_question/3.0.json
+finding/3.0.json
+candidate/3.0.json
+critique/3.0.json
+repair/3.0.json
+change/3.0.json
+score_submission/3.0.json
+rational_aggregate/3.0.json
+reliability/3.0.json
+reliability_outcome/3.0.json
+independent_observation/3.0.json
+evidence/3.0.json
+provenance/3.0.json
+lineage/3.0.json
+aggregation_bounds/3.0.json
+quorum/3.0.json
+human_decision/3.0.json
+human_review_payload/3.0.json
+raw_response/3.0.json
+file_content/3.0.json
+package_manifest/3.0.json
+package_entry/3.0.json
+decision/3.0.json
+round/3.0.json
+revision/3.0.json
+conformance_test/3.0.json
+coverage_report/3.0.json
+peer_message/gsp/3.0.json
+migration/3.0.json
+coordinator_transition/3.0.json
+task/3.0.json
+run/3.0.json
+intent_element/3.0.json
+source_ref/3.0.json
+derivation_step/3.0.json
+peer/3.0.json
+content/3.0.json
+artifact/3.0.json
+error/3.0.json
+config/3.0.json
+resource_limits/3.0.json
+intent_segmentation_policy/3.0.json
+intent_criticality_policy/3.0.json
+convergence_policy/3.0.json
+stagnation_policy/3.0.json
+liveness_policy/3.0.json
+reliability_policy/3.0.json
+outcome_weights/3.0.json
+cross_repair_quota_policy/3.0.json
+token_rotation_policy/3.0.json
+role_assignments/3.0.json
+prompt_profiles/3.0.json
+criterion_rubrics/3.0.json
+publication_predicate/3.0.json
+bootstrap_anchor/3.0.json
+reference_semantics/3.0.json
+
+REQ-GSDA-PKG-001
+REQUIRED_PACKAGE_PATHS MUST be the sole normative list of mandatory
+package components.
+
+REQ-GSDA-PKG-002
+Directory entries MUST be satisfied by the required files contained
+within them.
+
+REQ-GSDA-PKG-003
+Every actual package file MUST appear in the manifest.
+
+REQ-GSDA-PKG-004
+The manifest MUST NOT list directories as file entries.
+
+REQ-GSDA-PKG-005
+Manifest entries MUST be sorted by UTF-8 bytewise path order.
+
+REQ-GSDA-PKG-006
+Paths MUST be UTF-8, POSIX-style, relative, case-sensitive, and MUST
+NOT contain empty, "." or ".." path segments.
+
+REQ-GSDA-PKG-007
+Package entry paths MUST be compared case-sensitively.
+
+REQ-GSDA-PKG-008
+No package file MAY be silently omitted from the accepted tuple list.
+
+REQ-GSDA-PKG-009
+Package contents MUST be bound to one revision.
+
+REQ-GSDA-PKG-010
+Revision ownership MAY be established by the manifest rather than
+embedding revision_id in every individual file.
+
+REQ-GSDA-PKG-011
+The manifest MUST include for each file:
+
+path
+canonicalization_mode
+media_type
+content_id or file_content_id
+sha256_hex
+byte_length
+
+REQ-GSDA-PKG-012
+package_hash MUST be:
+
+"pkg:" + sha256_hex(
+canonical_record_jcs(
+manifest_without_package_hash
+)
+)
+
+REQ-GSDA-PKG-013
+spec.manifest.json MUST NOT list itself as an entry in its own manifest.
+
+REQ-GSDA-PKG-014
+The manifest itself MUST nevertheless be included in the human
+acceptance tuple list.
+
+REQ-GSDA-PKG-015
+Additional package files MUST either be forbidden or included in every
+package commitment and human review artifact.
+
+REQ-GSDA-PKG-016
+GSDA/3.0 publishable packages MUST use an exact package file set:
+required files plus files explicitly admitted by the package schema
+registry.
+
+TESTABILITY: TESTABLE
+
+==========================================
+38. PACKAGE STAGING AND ATOMIC PUBLICATION
+==========================================
+
+REQ-GSDA-PUB-020
+Publication MUST operate on a staged package.
+
+REQ-GSDA-PUB-021
+The staging directory MUST be immutable after freezing.
+
+REQ-GSDA-PUB-022
+The package exporter MUST fully materialize and hash the staged package
+before freezing it.
+
+REQ-GSDA-PUB-023
+The HumanReviewPayload MUST correspond to the staged package that is
+later frozen.
+
+REQ-GSDA-PUB-024
+Human acceptance MUST commit to the frozen package tuple list.
+
+REQ-GSDA-PUB-025
+After acceptance, the publisher MUST revalidate the frozen package.
+
+REQ-GSDA-PUB-026
+The publisher MUST NOT recalculate or alter semantic package content
+between acceptance validation and commit.
+
+REQ-GSDA-PUB-027
+Any difference between frozen and accepted package state MUST cause
+PACKAGE_INTEGRITY_FAILURE.
+
+REQ-GSDA-PUB-028
+Successful publication MUST commit the frozen package atomically.
+
+REQ-GSDA-PUB-029
+If atomic commit is unavailable, publication MUST fail closed.
+
+REQ-GSDA-PUB-030
+Package export MUST explicitly defend against path traversal,
+reparse-point traversal, symlink substitution, junction substitution,
+and unintended overwrite.
+
+REQ-GSDA-PUB-031
+Failure to create or verify an ancestor directory MUST cause
+PUBLICATION_FAILURE.
+
+REQ-GSDA-PUB-032
+A failed export MUST NOT truncate or partially publish the target
+package.
+
+REQ-GSDA-PUB-033
+Staging, freezing, and commit events MUST emit corresponding evidence.
+
+TESTABILITY: TESTABLE
+
+====================
+39. PUBLICATION GATE
+====================
+
+Publication predicates:
+
+NoBlockingOpenQuestions
+NoBlockingFindings
+NoEstablishedContradictions
+CriticalIntentCoverageComplete
+IntentModelPresent
+RequiredSchemasValid
+ProvenanceComplete
+RevisionIdentityValid
+PackageHashMatches
+HumanAcceptancePresent
+AcceptedTupleListMatches
+NormativeKeywordLinterClean
+CrossReferenceLinterClean
+ConfigCompletenessClean
+PackageStaged
+PackageFrozen
+ComplianceLevelPermitsPublication
+SelfConformancePass
+ReferenceSemanticsPass
+
+REQ-GSDA-PUB-001
+A revision MAY be published only when every mandatory publication
+predicate is true or a specifically permitted human override applies.
+
+REQ-GSDA-PUB-002
+NoBlockingOpenQuestions MAY be overridden by HUM-014 through HUM-017.
+
+REQ-GSDA-PUB-003
+NoBlockingFindings MAY be overridden by HUM-014 through HUM-017.
+
+REQ-GSDA-PUB-004
+NoEstablishedContradictions MAY be overridden by HUM-014 through
+HUM-017.
+
+REQ-GSDA-PUB-005
+CriticalIntentCoverageComplete MAY be overridden only by a valid
+coverage override naming every affected intent_id.
+
+REQ-GSDA-PUB-006
+The following predicates MUST never be overridden:
+
+RequiredSchemasValid
+ProvenanceComplete
+RevisionIdentityValid
+PackageHashMatches
+HumanAcceptancePresent
+AcceptedTupleListMatches
+NormativeKeywordLinterClean
+PackageStaged
+PackageFrozen
+ReferenceSemanticsPass
+
+REQ-GSDA-PUB-007
+A failed publication predicate MUST produce PUBLICATION_FAILURE.
+
+REQ-GSDA-PUB-008
+A LEVEL_1 implementation MUST never publish.
+
+REQ-GSDA-PUB-009
+A LEVEL_2 implementation MUST pass the required LEVEL_2 self-
+conformance corpus before publication.
+
+REQ-GSDA-PUB-010
+The exact Boolean result of every publication predicate MUST be stored.
+
+REQ-GSDA-PUB-011
+Every false publication predicate MUST identify supporting evidence.
+
+REQ-GSDA-PUB-012
+Publication MUST never be determined by peer consensus, aggregate
+score, or reliability alone.
+
+TESTABILITY: TESTABLE
+
+=================
+40. REVISION DIFF
+=================
+
+Requirement matching:
+
+requirement_id
+
+Term matching:
+
+term_id
+
+Assumption matching:
+
+assumption_id
+
+Question matching:
+
+question_id
+
+REQ-GSDA-DIFF-001
+Every changed field MUST produce a recorded change.
+
+REQ-GSDA-DIFF-002
+Whitespace-only permitted normalization of normative_text MUST be
+classified REWORDED.
+
+REQ-GSDA-DIFF-003
+Changes in RFC 2119 semantics MUST be classified MODIFIED.
+
+REQ-GSDA-DIFF-004
+Changes in severity, status, intent_links, related references,
+testability, or untestable_reason MUST be recorded.
+
+REQ-GSDA-DIFF-005
+Status changes MUST be recorded independently.
+
+REQ-GSDA-DIFF-006
+Diff comparison MUST remain deterministic.
+
+REQ-GSDA-DIFF-007
+Case MUST remain significant except where a field's declared
+comparison normalization explicitly states otherwise.
+
+REQ-GSDA-DIFF-008
+Definitions and terminology stability checks MUST use the same
+declared normalization.
+
+TESTABILITY: TESTABLE
+
+========================
+41. DETERMINISTIC REPLAY
+========================
+
+REQ-GSDA-RPL-001
+A replay package MUST contain sufficient evidence to reproduce every
+authoritative coordinator decision.
+
+REQ-GSDA-RPL-002
+Replay MUST NOT require any original LLM query.
+
+REQ-GSDA-RPL-003
+Replay MUST reproduce:
+
+artifact identities
+content identities
+selected scores
+aggregate values
+variance values
+state transitions
+decisions
+spec_content_id values
+revision_id values
+logical ordering
+configuration references
+authoritative evidence relationships
+
+REQ-GSDA-RPL-004
+Replay MUST preserve original run_id, peer_id, round_id, message_id,
+and all other deterministic identity inputs.
+
+REQ-GSDA-RPL-005
+Replay MUST reuse the original schema profile.
+
+REQ-GSDA-RPL-006
+Replay MUST reuse the original kernel version.
+
+REQ-GSDA-RPL-007
+Replay MUST reuse the original per-round config_id values.
+
+REQ-GSDA-RPL-008
+Token verification events MUST NOT appear as semantic replay
+decisions.
+
+REQ-GSDA-RPL-009
+A replay mismatch MUST cause REPLAY_FAILURE.
+
+REQ-GSDA-RPL-010
+Replay verification MUST emit REPLAY_VERIFIED evidence on success.
+
+TESTABILITY: TESTABLE
+
+===================
+42. BOOTSTRAP TRUST
+===================
+
+[Informative] A self-hosting specification system cannot safely validate
+the rules that define its own bootstrap semantics solely from an
+untrusted package copy.
+
+REQ-GSDA-BOOT-001
+ValidateBootstrapMeta MUST use a kernel-trusted bootstrap anchor.
+
+REQ-GSDA-BOOT-002
+The bootstrap anchor MUST identify:
+
+bootstrap_schema_id
+bootstrap_schema_sha256
+canonicalization_profile
+specification_family
+bootstrap_version
+
+REQ-GSDA-BOOT-003
+The kernel MUST verify the package-provided bootstrap schema against the
+bootstrap anchor before pass zero.
+
+REQ-GSDA-BOOT-004
+A mismatch MUST cause BOOTSTRAP_FAILURE.
+
+REQ-GSDA-BOOT-005
+The package MUST NOT define its own bootstrap authority solely through
+the package-provided bootstrap schema.
+
+REQ-GSDA-BOOT-006
+ValidateBootstrapMeta MUST not depend on the full requirement set.
+
+REQ-GSDA-BOOT-007
+Pass zero MUST validate only the META-00xx bootstrap set.
+
+REQ-GSDA-BOOT-008
+Pass one MUST validate the full requirement set.
+
+REQ-GSDA-BOOT-009
+Successful bootstrap verification MUST emit BOOTSTRAP_VERIFIED evidence.
+
+TESTABILITY: TESTABLE
+
+========================
+43. DETERMINISTIC KERNEL
+========================
+
+Kernel operations include:
+
+ExtractRequirements
+ExtractIntentElements
+ComputeTaskId
+ComputeIntentId
+CheckRequirementIds
+CheckDanglingReferences
+CheckCoverage
+CheckIntentCoverage
+CheckTestability
+CheckGlossary
+CheckOpenQuestions
+CheckAssumptions
+CheckIntentTrace
+CheckSourceReferences
+DetectContradictionCandidates
+PromoteContradictionsByPattern
+ComputeFindingSubjectId
+ComputeFindingId
+ComputeAssumptionId
+ComputeQuestionId
+ComputeReliabilityOutcomeId
+ComputeTermRecordId
+ValidateLineage
+AggregateScores
+CompareRationalAggregate
+ComputeVariance
+UpdateReliability
+SelectLatestScore
+ComputeFairnessKey
+PromoteLiveness
+CheckConvergence
+DetectStagnation
+VerifyTransportToken
+ValidateBootstrapMeta
+ValidateAggregationBounds
+VerifyHumanAcceptance
+SnapshotRoundContext
+ComputeContentId
+ComputeArtifactId
+ComputeEvidenceId
+ComputeDecisionId
+ComputeConfigId
+ComputeSpecContentId
+ComputeRevisionId
+ComputeCanonicalRepresentation
+ComputeFileContentId
+ValidatePublicationGate
+ValidateManifest
+DiffRevisions
+RunNormativeKeywordLinter
+RunCrossReferenceLinter
+RunConfigCompletenessLinter
+ValidateResourceLimits
+ValidatePackageStaging
+ValidateReferenceSemantics
+
+REQ-GSDA-KER-001
+Every kernel operation MUST be deterministic.
+
+REQ-GSDA-KER-002
+A kernel operation MUST NOT call an LLM.
+
+REQ-GSDA-KER-003
+A kernel operation MUST return structured results.
+
+REQ-GSDA-KER-004
+A kernel operation MUST be independently testable.
+
+REQ-GSDA-KER-005
+The kernel MUST not open sockets or spawn processes.
+
+REQ-GSDA-KER-006
+The kernel MUST access only its defined stores.
+
+REQ-GSDA-KER-007
+An unauthorized resource access MUST cause SCOPE_VIOLATION.
+
+REQ-GSDA-KER-008
+Identity and canonicalization operations MUST have no dependency on
+adapter, provider, network, or UI components.
+
+REQ-GSDA-KER-009
+Aggregation and scoring operations MUST have no dependency on LLM
+services.
+
+REQ-GSDA-KER-010
+The kernel MUST use only explicitly declared resource bounds.
+
+TESTABILITY: TESTABLE
+
+========================
+44. AUTHORITATIVE STORES
+========================
+
+Authoritative stores:
+
+ContentStore
+ArtifactStore
+EvidenceStore
+DecisionStore
+RequirementModel
+GlossaryRegistry
+AssumptionRegister
+OpenQuestionRegister
+FindingRegister
+LineageModel
+RevisionModel
+ReliabilityModel
+ScoringModel
+PackageStagingStore
+ReplayStore
+
+REQ-GSDA-STORE-001
+Content, artifact, evidence, decision, and revision objects MUST be
+immutable once committed.
+
+REQ-GSDA-STORE-002
+Authoritative state MUST be modified only through coordinator kernel
+operations.
+
+REQ-GSDA-STORE-003
+Peer adapters MUST NOT modify authoritative stores.
+
+REQ-GSDA-STORE-004
+A stored object MUST be retrievable by its declared identity.
+
+REQ-GSDA-STORE-005
+A missing authoritative object referenced by an active provenance chain
+MUST be treated as a failure.
+
+REQ-GSDA-STORE-006
+Deletion of committed authoritative objects MUST be prohibited except
+for explicitly defined retention policies that preserve a cryptographic
+tombstone and never invalidate provenance.
+
+REQ-GSDA-STORE-007
+A retention mechanism MUST NOT permit historical identity reuse.
+
+TESTABILITY: TESTABLE
+
+=======================
+45. REFERENCE SEMANTICS
+=======================
+
+[Informative] 3.0 introduces a small executable reference semantics.
+The reference semantics is an oracle for kernel algorithms, not the
+production coordinator.
+
+Reference semantics covers:
+
+canonicalization
+identity
+aggregation
+rational comparison
+variance
+reliability
+lineage
+intent segmentation
+score selection
+fairness
+repair ordering
+state transitions
+publication predicates
+
+REQ-GSDA-REF-001
+The reference semantics MUST be deterministic.
+
+REQ-GSDA-REF-002
+The reference semantics MUST NOT invoke an LLM.
+
+REQ-GSDA-REF-003
+The reference semantics MUST implement the algorithm contracts exactly.
+
+REQ-GSDA-REF-004
+The reference semantics MUST be versioned independently from production
+implementation details.
+
+REQ-GSDA-REF-005
+The reference semantics MUST NOT become authoritative merely because a
+production implementation matches it.
+
+REQ-GSDA-REF-006
+Production kernels MUST be differential-tested against the reference
+semantics.
+
+REQ-GSDA-REF-007
+A mismatch between the reference semantics and a production kernel MUST
+be reported as a conformance failure.
+
+REQ-GSDA-REF-008
+The reference semantics MUST be included in the package's declared
+implementation conformance information.
+
+REQ-GSDA-REF-009
+Reference-semantics verification MUST emit
+REFERENCE_SEMANTICS_VERIFIED evidence on success.
+
+TESTABILITY: TESTABLE
+
+=====================
+46. GLOBAL INVARIANTS
+=====================
+
+REQ-GSDA-INV-001
+Every authoritative state transition MUST be produced by a kernel
+operation.
+
+REQ-GSDA-INV-002
+No peer, adapter, or human message MAY directly mutate authoritative
+state.
+
+REQ-GSDA-INV-003
+Every peer-supplied value MUST remain untrusted until validated.
+
+REQ-GSDA-INV-004
+SEMANTIC_DETERMINISTIC identities MUST be independent of execution
+history.
+
+REQ-GSDA-INV-005
+EXECUTION_DETERMINISTIC identities MUST be reproducible from their
+declared execution inputs.
+
+REQ-GSDA-INV-006
+Reliability MUST NOT determine truth, acceptance, publication, or
+contradiction resolution.
+
+REQ-GSDA-INV-007
+Reliability MAY affect scheduling, resource allocation, and explicitly
+defined tie-breaks.
+
+REQ-GSDA-INV-008
+Fairness MUST affect scheduling only.
+
+REQ-GSDA-INV-009
+Fairness MUST NOT alter score values, evidence content, reliability
+outcomes, aggregate values, or publication predicates.
+
+REQ-GSDA-INV-010
+Published revisions MUST remain immutable.
+
+REQ-GSDA-INV-011
+Historical provenance MUST remain resolvable.
+
+REQ-GSDA-INV-012
+Every authoritative decision MUST be durably represented before its
+state mutation becomes effective.
+
+REQ-GSDA-INV-013
+Publication MUST be bound to one exact package hash, review payload,
+and accepted file tuple list.
+
+REQ-GSDA-INV-014
+No normative keyword may leak outside a Requirement or [Informative]
+paragraph.
+
+REQ-GSDA-INV-015
+No deterministic identity may depend on hidden state.
+
+REQ-GSDA-INV-016
+No arithmetic operation may depend on undefined integer overflow
+behaviour.
+
+REQ-GSDA-INV-017
+No state transition may depend on an implementation-defined ordering.
+
+REQ-GSDA-INV-018
+A publication gate failure MUST NOT be silently converted into success.
+
+REQ-GSDA-INV-019
+A replay result MUST NOT be accepted as equivalent when a required
+authoritative identity differs.
+
+REQ-GSDA-INV-020
+A conformant implementation MUST fail closed on any MUST-level
+invariant violation.
+
+TESTABILITY: TESTABLE
+
+=======================
+47. ALGORITHM CONTRACTS
+=======================
+
+47.1 CompareRationalAggregate
+
+REQ-GSDA-ALG-001
+CompareRationalAggregate MUST accept:
+
+(A1, R1, D1)
+(A2, R2, D2)
+
+with:
+
+D1 > 0
+D2 > 0
+0 <= R1 < D1
+0 <= R2 < D2
+
+REQ-GSDA-ALG-002
+The algorithm MUST:
+
+1. compare A1 and A2;
+2. cross-multiply remainders if A1 = A2;
+3. detect 128-bit overflow;
+4. reduce each fraction using gcd(R,D) on overflow;
+5. retry once;
+6. fail closed if overflow remains.
+
+REQ-GSDA-ALG-003
+The result MUST be -1, 0, or +1.
+
+47.2 UpdateReliability
+
+REQ-GSDA-ALG-010
+UpdateReliability MUST satisfy the reliability rules in Section 26.
+
+REQ-GSDA-ALG-011
+Every intermediate multiplication and addition affecting alpha or beta
+MUST be bounds checked.
+
+47.3 ComputeVariance
+
+REQ-GSDA-ALG-020
+ComputeVariance MUST calculate exact integer components before the
+presentation reduction.
+
+REQ-GSDA-ALG-021
+A negative variance_num MUST cause an invariant failure.
+
+47.4 ComputeFairnessKey
+
+REQ-GSDA-ALG-030
+ComputeFairnessKey MUST be:
+
+(round_index + slot_index) mod configured_max_peers
+
+REQ-GSDA-ALG-031
+configured_max_peers MUST be at least 1.
+
+47.5 ValidateLineage
+
+REQ-GSDA-ALG-040
+ValidateLineage MUST perform transitive closure traversal and hash
+verification.
+
+47.6 ExtractIntentElements
+
+REQ-GSDA-ALG-050
+ExtractIntentElements MUST use only the declared segmentation policy.
+
+47.7 SelectLatestScore
+
+REQ-GSDA-ALG-060
+SelectLatestScore MUST sort:
+
+round_index DESC
+logical_sequence DESC
+message_id ASC
+
+REQ-GSDA-ALG-061
+SelectLatestScore MUST not use created_at.
+
+47.8 PromoteLiveness
+
+REQ-GSDA-ALG-070
+PromoteLiveness MUST use round-relative age and finding_id ordering.
+
+REQ-GSDA-ALG-071
+PromoteLiveness MUST not use wall-clock age.
+
+47.9 ComputeSpecContentId
+
+REQ-GSDA-ALG-080
+ComputeSpecContentId MUST use the exact field set from Section 7.
+
+47.10 ComputeArtifactId
+
+REQ-GSDA-ALG-090
+ComputeArtifactId MUST not use contribution_index.
+
+47.11 ComputeFileContentId
+
+REQ-GSDA-ALG-100
+ComputeFileContentId MUST use canonical file bytes and the
+file_content identity projection.
+
+47.12 ValidatePublicationGate
+
+REQ-GSDA-ALG-110
+ValidatePublicationGate MUST evaluate each publication predicate
+independently and return a structured result.
+
+47.13 ValidateResourceLimits
+
+REQ-GSDA-ALG-120
+ValidateResourceLimits MUST reject any object exceeding its declared
+resource boundary before that object is admitted as authoritative.
+
+REQ-GSDA-ALG-121
+ValidateResourceLimits MUST not use approximate arithmetic.
+
+TESTABILITY: TESTABLE
+
+====================
+48. SELF-CONFORMANCE
+====================
+
+REQ-GSDA-SELF-001
+GSDA MUST be processable by GSDA itself.
+
+REQ-GSDA-SELF-002
+GSDA MUST extract and validate its own Requirement records.
+
+REQ-GSDA-SELF-003
+GSDA MUST validate its own schemas using the kernel-trusted bootstrap
+path.
+
+REQ-GSDA-SELF-004
+GSDA MUST execute its own deterministic conformance tests.
+
+REQ-GSDA-SELF-005
+GSDA MUST detect intentionally corrupted fixtures.
+
+REQ-GSDA-SELF-006
+Every publishable revision MUST contain self-conformance evidence.
+
+REQ-GSDA-SELF-007
+Every publishable revision MUST ship the complete self-conformance
+corpus.
+
+REQ-GSDA-SELF-008
+Every self-conformance case MUST contain structured expected output.
+
+REQ-GSDA-SELF-009
+Every self-conformance case MUST declare:
+
+test_id
+requirement_ids
+fixture_id
+expected_outcome
+expected_state
+expected_error
+expected_findings
+
+REQ-GSDA-SELF-010
+Every error code MUST have at least one negative self-conformance case.
+
+REQ-GSDA-SELF-011
+Every evidence kind MUST have at least one positive case.
+
+REQ-GSDA-SELF-012
+Every named failure MUST have at least one case.
+
+REQ-GSDA-SELF-013
+Every publication predicate MUST have at least one positive and one
+negative case where meaningful.
+
+REQ-GSDA-SELF-014
+Every identity class MUST have at least one independence test.
+
+REQ-GSDA-SELF-015
+Every schema in the schema registry MUST have at least one structural
+validation test.
+
+REQ-GSDA-SELF-016
+The self-conformance index MUST map every required registry member to
+one or more test cases.
+
+REQ-GSDA-SELF-017
+The self-conformance corpus MUST be immutable within a revision.
+
+REQ-GSDA-SELF-018
+Changing the corpus MUST require a specification revision.
+
+=======================================
+49. RECOMMENDED SELF-CONFORMANCE CORPUS
+=======================================
+
+The corpus MUST include at least the following logical cases.
+
+SELF-001   clean specification
+SELF-002   dangling requirement reference
+SELF-003   missing testability
+SELF-004   missing untestable reason
+SELF-005   contradictory requirements
+SELF-006   ambiguity
+SELF-007   undefined term
+SELF-008   intent loss
+SELF-009   blocking question
+SELF-010   minority critical finding
+SELF-011   malformed peer message
+SELF-012   denominator-zero fallback
+SELF-013   mixed-repair lineage
+SELF-014   revision identity mismatch
+SELF-015   publication blocked
+SELF-016   artifact identity mismatch
+SELF-017   peer impersonation
+SELF-018   all-score abstention
+SELF-019   missing glossary term
+SELF-020   high disagreement
+SELF-021   same content different peers
+SELF-022   same content different parents
+SELF-023   identical semantic specification content
+SELF-024   same content different revision lineage
+SELF-025   mid-run config change
+SELF-026   duplicate message idempotence
+SELF-027   duplicate message conflict
+SELF-028   timeout without reliability change
+SELF-029   rescore
+SELF-030   same-provider corroboration rejected
+SELF-031   run identity does not contaminate semantic content
+SELF-032   global revision identity
+SELF-033   shared revision across runs
+SELF-034   derivation chain
+SELF-035   finding subject equivalence
+SELF-036   zero-reliability fallback
+SELF-037   undefined artifact non-viability
+SELF-038   snapshotted repair ordering
+SELF-039   stagnation
+SELF-040   package hash commitment
+SELF-041   normative keyword leak
+SELF-042   target requirement namespace
+SELF-043   canonicalization float rejection
+SELF-044   duplicate-key rejection
+SELF-045   term normalization collision
+SELF-046   comparator safety
+SELF-047   fairness rotation
+SELF-048   liveness promotion
+SELF-049   remainder preservation
+SELF-050   rational total ordering
+SELF-051   adapter float rounding
+SELF-052   human decision tuple binding
+SELF-053   package mismatch
+SELF-054   reliability saturation
+SELF-055   intent segmentation policy
+SELF-056   derived source chain
+SELF-057   term collision at ingestion
+SELF-058   undefined coordinator transition
+SELF-059   adapter envelope mutation
+SELF-060   peer content in error template
+SELF-061   duplicate requirement id
+SELF-062   normative keyword linter
+SELF-063   identity float rejection
+SELF-064   score sanitization
+SELF-065   task identity independence
+SELF-066   artifact identity independence
+SELF-067   checked 128-bit aggregation
+SELF-068   independent observation count
+SELF-069   fairness uses configured maximum
+SELF-070   intent coverage
+SELF-071   review payload identity
+SELF-072   package review mismatch
+SELF-073   quorum
+SELF-074   hybrid segmentation
+SELF-075   intent-loss evidence
+SELF-076   namespace separation
+SELF-077   evidence/error namespace separation
+SELF-078   informative keyword exemption
+SELF-079   timestamp excluded from semantic identity
+SELF-080   migration
+SELF-081   named failure namespace
+SELF-082   config schema absence
+SELF-083   maximum criteria rejection
+SELF-084   liveness promotion cap
+SELF-085   no-viable-artifact routing
+SELF-086   term normalization collision
+SELF-087   cyclic lineage
+SELF-088   missing schema
+SELF-089   revision lineage
+SELF-090   FLAT reliability overflow
+SELF-091   under-specification expression
+SELF-092   out-of-round decision
+SELF-093   phase/state compatibility
+SELF-094   liveness logical age
+SELF-095   default injection rejection
+SELF-096   store-scope violation
+SELF-097   exporter failure
+SELF-098   path safety
+SELF-099   manifest exclusion of self
+SELF-100   registry coverage
+SELF-101   manifest accepted tuple union
+SELF-102   manifest omission
+SELF-103   undefined aggregate comparison rejection
+SELF-104   proportional decay
+SELF-105   quorum threshold zero
+SELF-106   quorum threshold bounds
+SELF-107   paragraph canonicalization
+SELF-108   unsafe aggregation bound
+SELF-109   structural salvage
+SELF-110   salvage identity protection
+SELF-111   ancestor hash mismatch
+SELF-112   repair quota reallocation
+SELF-113   provider failure namespace
+SELF-114   protocol degraded
+SELF-115   insufficient candidates
+SELF-116   insufficient peers
+SELF-117   human clarification
+SELF-118   config completeness
+SELF-119   reliability bounds
+SELF-120   input-vs-aggregation bounds
+SELF-121   quotient-first rational comparison
+SELF-122   reduced comparison overflow
+SELF-123   reliability cold start
+SELF-124   s+f bound
+SELF-125   closure cycle detection
+SELF-126   score ordering by logical sequence
+SELF-127   exclusive repair groups
+SELF-128   file JSON canonicalization
+SELF-129   binary file identity
+SELF-130   Level 1 publication rejection
+SELF-131   contribution_index absence
+SELF-132   zero-intent publication protection
+SELF-133   historical source reference preservation
+SELF-134   term collision before normalization loss
+SELF-135   package staging freeze
+SELF-136   package TOCTOU protection
+SELF-137   bootstrap trust-anchor mismatch
+SELF-138   exact publication predicate result
+SELF-139   resource limit rejection
+SELF-140   replay identity mismatch
+SELF-141   reference semantics differential match
+SELF-142   timestamp variation without semantic divergence
+SELF-143   logical ordering determinism
+SELF-144   artifact semantic-content separation
+SELF-145   score submission ordering
+SELF-146   binary package byte preservation
+SELF-147   self-conformance registry completeness
+SELF-148   post-publication integrity fault
+SELF-149   fairness never alters score or aggregate
+SELF-150   reliability never determines publication
+
+REQ-GSDA-SELF-020
+The published SELF corpus MUST contain at least the cases required to
+exercise every normative algorithmic contract.
+
+REQ-GSDA-SELF-021
+Additional self-conformance cases MAY be added without changing the
+meaning of existing cases.
+
+==========================
+50. CONFORMANCE TEST MODEL
+==========================
+
+ConformanceTest:
+
+schema
+test_id
+requirement_ids
+test_class
+description
+fixture_id
+input
+expected_outcome
+expected_state
+expected_error
+expected_findings
+deterministic
+
+Test classes:
+
+STRUCTURAL
+NEGATIVE
+BOUNDARY
+DETERMINISM
+LINEAGE
+SCORING
+RELIABILITY
+PROTOCOL
+MIGRATION
+SELF_CONFORMANCE
+SECURITY
+RESOURCE
+DIFFERENTIAL
+PUBLICATION
+
+REQ-GSDA-CONF-001
+Every TESTABLE requirement MUST have at least one conformance test.
+
+REQ-GSDA-CONF-002
+Every CRITICAL requirement MUST have at least one meaningful negative
+test.
+
+REQ-GSDA-CONF-003
+Every conformance result MUST identify the tested requirement_id.
+
+REQ-GSDA-CONF-004
+Every DETERMINISM test MUST execute the same deterministic evidence set
+at least twice.
+
+REQ-GSDA-CONF-005
+Every canonicalization test MUST compare exact canonical bytes.
+
+REQ-GSDA-CONF-006
+Every comparator suite MUST test symmetry and transitivity.
+
+REQ-GSDA-CONF-007
+Replay tests MUST randomize event arrival order while preserving the
+declared logical evidence ordering where the protocol permits it.
+
+REQ-GSDA-CONF-008
+Differential tests MUST compare at least two independent kernel
+implementations or one implementation against the reference semantics.
+
+REQ-GSDA-CONF-009
+Differential conformance results MUST be reported even though they are
+not themselves the source of semantic authority.
+
+REQ-GSDA-CONF-010
+Every subtle algorithm MUST have canonical, boundary, and failure
+vectors where failure is defined.
+
+TESTABILITY: TESTABLE
+
+==================
+51. GOLDEN VECTORS
+==================
+
+REQ-GSDA-VEC-001
+The package MUST ship:
+
+spec.self_conformance/vectors/
+
+REQ-GSDA-VEC-002
+At least one vector file MUST exist for each algorithm:
+
+CompareRationalAggregate
+UpdateReliability
+ComputeVariance
+ComputeFairnessKey
+ValidateLineage
+ExtractIntentElements
+SelectLatestScore
+PromoteLiveness
+ComputeSpecContentId
+ComputeArtifactId
+ComputeTaskId
+ComputeFindingSubjectId
+ComputeTermRecordId
+ComputeFileContentId
+ComputePublicationGate
+ValidateResourceLimits
+StateTransition
+
+REQ-GSDA-VEC-003
+Every vector file MUST contain:
+
+canonical example
+boundary example
+negative example when failure is defined
+exact expected output
+
+REQ-GSDA-VEC-004
+Vectors MUST be independent of wall-clock time.
+
+REQ-GSDA-VEC-005
+Vectors MUST be independent of network responses.
+
+REQ-GSDA-VEC-006
+Vectors MUST be independently reproducible.
+
+REQ-GSDA-VEC-007
+A vector disagreement MUST be treated as a conformance defect requiring
+resolution before publication of the affected revision.
+
+TESTABILITY: TESTABLE
+
+=====================
+52. COMPLIANCE LEVELS
+=====================
+
+REQ-GSDA-COMP-001
+Every implementation MUST declare:
+
+compliance_level
+kernel_version
+schema_profile
+reference_semantics_version
+self_conformance_result
+
+REQ-GSDA-COMP-002
+LEVEL_1 MUST provide:
+
+task/run model
+intent extraction
+source reference validation
+configuration
+schema validation
+canonicalization
+semantic identity
+execution identity
+immutable stores
+requirement model
+glossary
+assumptions
+open questions
+findings
+candidate/critique/repair
+scoring
+rational aggregation
+deterministic selection
+self-conformance core
+
+REQ-GSDA-COMP-003
+LEVEL_1 MUST NOT publish.
+
+REQ-GSDA-COMP-004
+LEVEL_2 MUST additionally provide:
+
+disagreement
+adapters and GSP/3.0
+cross-repair
+reliability
+liveness
+intent coverage
+lineage
+deterministic diff
+human decisions
+quorum
+publication staging
+publication gate
+replay
+normative linter
+cross-reference linter
+config linter
+package exporter
+resource limits
+bootstrap trust
+reference semantics
+full self-conformance
+
+REQ-GSDA-COMP-005
+LEVEL_2 MUST pass the complete Level 2 self-conformance suite before
+publication.
+
+REQ-GSDA-COMP-006
+A compliance declaration mismatch between the implementation,
+conformance file, and revision MUST cause GOVERNANCE_FAILURE.
+
+TESTABILITY: TESTABLE
+
+=============
+53. MIGRATION
+=============
+
+Migration record:
+
+schema
+from_schema
+to_schema
+transformation
+migration_script_id
+created_at
+
+REQ-GSDA-MIG-001
+Every schema-version migration MUST have a migration record.
+
+REQ-GSDA-MIG-002
+A migration changing identity, canonicalization, aggregation,
+reliability, publication, or scheduling semantics MUST require a major
+version bump.
+
+REQ-GSDA-MIG-003
+Replay of a pre-migration run MUST use the original schema and kernel
+semantics.
+
+REQ-GSDA-MIG-004
+Every migration MUST have at least one MIGRATION conformance case.
+
+REQ-GSDA-MIG-005
+The migration from 2.13 to 3.0 MUST document at minimum:
+
+semantic-vs-execution identity split;
+removal of contribution_index;
+introduction of canonical_identity_object;
+binary-safe file canonicalization;
+logical ordering replacing timestamp ordering;
+explicit Evidence schema;
+explicit ScoreSubmission ordering fields;
+historical source-reference preservation;
+corrected term-collision detection;
+corrected zero-intent publication handling;
+corrected state transition from no-repair scheduling;
+package staging and freezing;
+bootstrap trust anchor;
+explicit resource limits;
+executable reference semantics.
+
+REQ-GSDA-MIG-006
+A migration MUST NOT silently reinterpret pre-migration identities.
+
+REQ-GSDA-MIG-007
+Existing 2.13 records MUST either remain valid under an explicitly
+declared compatibility layer or be migrated into new 3.0 identities.
+
+==========================
+54. CROSS-REFERENCE LINTER
+==========================
+
+REQ-GSDA-LINT-001
+RunCrossReferenceLinter MUST examine every requirement_id reference in
+the package.
+
+REQ-GSDA-LINT-002
+An unresolved requirement reference MUST produce
+CROSS_REFERENCE_UNRESOLVED.
+
+REQ-GSDA-LINT-003
+The linter MUST operate independently of semantic peer analysis.
+
+==============================
+55. CONFIG COMPLETENESS LINTER
+==============================
+
+REQ-GSDA-LINT-010
+RunConfigCompletenessLinter MUST detect every normative reference to a
+configured value.
+
+REQ-GSDA-LINT-011
+Every configured value reference MUST resolve to a field declared by
+config/3.0 or a versioned sub-schema.
+
+REQ-GSDA-LINT-012
+An unresolved configuration reference MUST produce CONFIG_INCOMPLETE.
+
+=====================================
+56. REFERENCE AND SECURITY INVARIANTS
+=====================================
+
+REQ-GSDA-SEC-001
+A peer MUST NOT impersonate another peer.
+
+REQ-GSDA-SEC-002
+A peer MUST NOT modify a stored artifact after submission.
+
+REQ-GSDA-SEC-003
+A peer MUST NOT choose the authoritative aggregate.
+
+REQ-GSDA-SEC-004
+A peer MUST NOT satisfy human acceptance.
+
+REQ-GSDA-SEC-005
+An adapter MUST NOT create authoritative decisions.
+
+REQ-GSDA-SEC-006
+A package exporter MUST NOT modify coordinator truth.
+
+REQ-GSDA-SEC-007
+The kernel MUST reject path traversal attempts.
+
+REQ-GSDA-SEC-008
+The package exporter MUST canonicalize and validate the final path
+before creation.
+
+REQ-GSDA-SEC-009
+Reparse-point traversal MUST be rejected unless explicitly permitted
+by the exporter security profile.
+
+REQ-GSDA-SEC-010
+An accepted package MUST NOT be silently replaced by a different
+package before commit.
+
+REQ-GSDA-SEC-011
+A publication commit MUST be atomic with respect to the publication
+target.
+
+REQ-GSDA-SEC-012
+A package integrity mismatch MUST fail closed.
+
+TESTABILITY: TESTABLE
+
+========================================
+57. INFORMATIVE: IMPLEMENTATION GUIDANCE
+========================================
+
+[Informative] A robust implementation can be structured as:
+
+Gsda.Types
+Gsda.Schema
+Gsda.Canonical
+Gsda.Hash
+Gsda.Identity
+Gsda.ContentStore
+Gsda.ArtifactStore
+Gsda.EvidenceStore
+Gsda.DecisionStore
+Gsda.Task
+Gsda.Intent
+Gsda.SourceRefs
+Gsda.Requirements
+Gsda.Glossary
+Gsda.Assumptions
+Gsda.OpenQuestions
+Gsda.Findings
+Gsda.Contradictions
+Gsda.Candidates
+Gsda.Critiques
+Gsda.Repairs
+Gsda.Scoring
+Gsda.Aggregation
+Gsda.Disagreement
+Gsda.Reliability
+Gsda.Lineage
+Gsda.Snapshot
+Gsda.Kernel
+Gsda.Coordinator
+Gsda.StateMachine
+Gsda.Revision
+Gsda.HumanDecision
+Gsda.Quorum
+Gsda.Package
+Gsda.PackageExporter
+Gsda.Linter
+Gsda.Replay
+Gsda.ReferenceSemantics
+Gsda.Tests
+
+[Informative] The production coordinator should be implemented only after
+the deterministic kernel and reference semantics agree on all golden
+vectors.
+
+[Informative] Two independent kernel implementations are strongly
+recommended. One should not copy implementation structure from the
+other.
+
+=====================================
+58. INFORMATIVE: IMPLEMENTATION ORDER
+=====================================
+
+[Informative] Recommended order:
+
+M0  bootstrap anchor and schema registry
+M1  canonicalization
+M2  identity
+M3  immutable stores
+M4  task and intent
+M5  source references
+M6  requirement/glossary/assumption/question models
+M7  findings and contradiction structures
+M8  scoring
+M9  aggregation
+M10 lineage
+M11 reference semantics
+M12 golden vectors
+M13 self-conformance LEVEL_1
+M14 adapters and GSP/3.0
+M15 disagreement
+M16 reliability
+M17 cross-repair
+M18 liveness
+M19 coverage
+M20 revisions and human decisions
+M21 package staging
+M22 publication gate
+M23 replay
+M24 linters
+M25 resource-security layer
+M26 LEVEL_2 self-conformance
+M27 coordinator
+
+[Informative] The coordinator is deliberately last.
+
+===========================================
+59. INFORMATIVE: WHAT GSDA DOES NOT PROMISE
+===========================================
+
+[Informative] GSDA does not promise objective truth in arbitrary domains.
+
+[Informative] GSDA does not promise deterministic LLM generation.
+
+[Informative] GSDA does not guarantee complete specification coverage.
+
+[Informative] GSDA does not treat consensus as proof.
+
+[Informative] GSDA does not treat reliability as truth.
+
+[Informative] GSDA does not claim real-world independence between model
+responses.
+
+[Informative] GSDA does not eliminate the need for human judgment.
+
+[Informative] GSDA does provide deterministic coordinator semantics,
+immutable provenance, explicit uncertainty, reproducible identities,
+bounded resource usage, deterministic replay, governed publication,
+and machine-checkable conformance.
+
+====================================
+60. INFORMATIVE: CENTRAL ABSTRACTION
+====================================
+
+[Informative] The central abstraction is:
+
+LLMs produce evidence.
+Adapters normalize transport.
+The kernel produces deterministic facts.
+The coordinator produces authoritative state.
+Reliability weights qualifying evidence.
+Humans resolve epistemic uncertainty.
+The revision is the governed specification.
+
+[Informative] No single peer is the specification.
+
+[Informative] No single peer is the reviewer.
+
+[Informative] No score is truth.
+
+[Informative] No consensus is proof.
+
+[Informative] No reliability value is authority.
+
+[Informative] The process is:
+
+PROPOSE
+-> CRITICIZE
+-> SCORE
+-> AGGREGATE
+-> REPAIR
+-> RESCORE
+-> ANALYZE
+-> REFINE
+-> REPEAT
+-> HUMAN REVIEW
+-> STAGE
+-> FREEZE
+-> PUBLISH
+
+===================
+61. FINAL PRINCIPLE
+===================
+
+[Informative] GSDA is a deterministic governance shell around
+non-deterministic reasoning workers.
+
+[Informative] The quality objective is not to discover a mythical
+perfect LLM.
+
+[Informative] The quality objective is to construct a process in which
+multiple imperfect reasoning systems can expose errors, preserve useful
+disagreement, improve candidate specifications, and converge toward a
+human-governed revision without allowing any individual model to become
+the authority.
+
+[Informative] Determinism belongs to the kernel.
+
+[Informative] Reasoning belongs to the peers.
+
+[Informative] Authority belongs to the governance process.
+
+[Informative] Publication belongs to the package commitment and human
+acceptance gate.
+
+===============
+END OF GSDA/3.0
+===============

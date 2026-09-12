@@ -1,0 +1,930 @@
+Yes. After comparing the implementation against the GRISP v1.0 specification and implementation contract, I think your suspicion is **substantially correct**—but I would phrase the problem slightly differently:
+
+> **The problem is not simply that GPT-5.6 Luna is “too weak.” The development process is too single-agent and too trusting of the implementing agent.**
+
+The current code has several places where the implementation is materially weaker than the specification. This is exactly the kind of problem where a **multi-LLM/hybrid implementation architecture makes sense**.
+
+## 1. The implementation is currently underpowered relative to the specification
+
+The specification is actually quite strong.
+
+It explicitly says that LLMs are untrusted workers and that correctness must come from deterministic parsers, tools, evidence and acceptance gates. 
+
+It also explicitly defines multi-LLM roles—Generator, Analyst, Critic, Repairer, Test Designer, Adversarial Reviewer, Verifier and specialists. 
+
+But the implementation we have is much closer to:
+
+```text
+LLM
+ ↓
+generate some Delphi
+ ↓
+parser
+ ↓
+basic validation
+ ↓
+state transitions
+ ↓
+commit
+```
+
+than:
+
+```text
+             ┌── Analyst
+             ├── Generator A
+             ├── Generator B
+             ├── Generator C
+             ├── Critic
+             ├── Delphi Specialist
+             ├── Test Designer
+             └── Adversarial Reviewer
+                       │
+                       ▼
+                 CANDIDATES
+                       │
+                       ▼
+              deterministic tools
+                       │
+             ┌─────────┴─────────┐
+             ▼                   ▼
+          compiler             tests
+             │                   │
+             └─────────┬─────────┘
+                       ▼
+                 hard gate
+                       │
+                       ▼
+                 final verifier
+                       │
+                       ▼
+                    commit
+```
+
+And there are some **very concrete discrepancies**.
+
+---
+
+# 2. I found a particularly serious problem: the "conformance" test itself bypasses the architecture
+
+This is probably the strongest evidence that the implementation process needs another layer of review.
+
+The implementation contract says:
+
+```text
+Artifact
+ ↓
+Static validation
+ ↓
+Compiler
+ ↓
+Runtime
+ ↓
+Tests
+ ↓
+Policy
+ ↓
+Final verification
+ ↓
+Commit
+```
+
+and explicitly says that an accepted artifact requires objective evidence and final verification. 
+
+Yet the current `GrispConformance` program does this:
+
+```text
+parse
+ ↓
+parsed
+ ↓
+normalized
+ ↓
+static_ok
+ ↓
+CommitArtifact(...)
+```
+
+There is no compile, runtime verification, test verification, policy verification, acceptance predicate or final verification in that path. The uploaded implementation shows the direct call to `CommitArtifact` immediately after `static_ok`. 
+
+That's not a minor missing feature.
+
+It's an architectural violation.
+
+The specification specifically says that the final commit must follow final verification and that objective failures cannot become acceptance. 
+
+### This is exactly what another AI should have caught.
+
+A good adversarial reviewer should have said:
+
+> **STOP. This test claims to demonstrate the GRISP core, but it commits an artifact without satisfying the acceptance contract. Therefore the test is testing a weaker system than the specification defines.**
+
+That is precisely the kind of defect a single implementation agent can miss because it is internally focused on making its own code compile.
+
+---
+
+# 3. The policy implementation is far too weak
+
+The contract says:
+
+> Capability requests SHALL NOT automatically grant capability access.
+
+The policy engine must decide. 
+
+But the implementation effectively does:
+
+```pascal
+Result.Checks[I].Passed :=
+  ATask.RequiredCapabilities[I] <> '';
+
+if Result.Checks[I].Passed then
+begin
+  ...
+  CapabilitiesGranted[...] :=
+    ATask.RequiredCapabilities[I];
+end;
+```
+
+So:
+
+```text
+requested = "run"
+       ↓
+non-empty?
+       ↓
+YES
+       ↓
+GRANTED
+```
+
+That isn't really an authorization system.
+
+It is basically:
+
+> "If you know the name of the capability, you get it."
+
+The implementation contract explicitly requires policy evaluation to produce structured capability decisions, and objective gates cannot be replaced by assumptions. 
+
+This is another case where an independent security specialist should have rejected the implementation.
+
+---
+
+# 4. The state machine is also weaker than it looks
+
+The contract says a state transition is:
+
+```text
+CurrentState
+Event
+Guard
+NextState
+Reason
+```
+
+and that an invalid/missing result must not silently become success. 
+
+But the implementation has essentially:
+
+```pascal
+else if AEvent = 'compile_failed' then
+  ANext := csCompileFailed
+else if AEvent = 'runtime_failed' then
+  ANext := csRuntimeFailed
+else if AEvent = 'test_failed' then
+  ANext := csTestFailed
+...
+```
+
+Those failure events aren't meaningfully constrained by current state. 
+
+So the state machine is not really enforcing the state machine contract.
+
+It is more like an event-to-enum mapper.
+
+A stronger implementation would make impossible transitions impossible:
+
+```text
+CREATED
+  + parsed_success
+      -> PARSED
+
+CREATED
+  + compile_success
+      -> INVALID_TRANSITION
+
+COMPILE_PENDING
+  + compile_ok
+      -> COMPILED
+
+PARSED
+  + compile_ok
+      -> INVALID_TRANSITION
+```
+
+And, crucially, the transition must verify the associated evidence—not merely receive a string saying `"compile_ok"`.
+
+---
+
+# 5. The artifact parser is still too permissive
+
+This is another important one.
+
+The specification says:
+
+```text
+untrusted response
+      ↓
+strict interpretation
+      ↓
+immutable artifact
+```
+
+and explicitly forbids guessing, invented filenames and heuristic cleanup. 
+
+But the implementation does things such as:
+
+```pascal
+if not TryGetValue<string>('task_id', AArtifact.TaskId) then
+  AArtifact.TaskId := ATaskId;
+```
+
+and:
+
+```pascal
+AArtifact.ArtifactKind := akUnit;
+AArtifact.Language := 'delphi';
+```
+
+So the response does **not actually have to specify those things**.
+
+The parser invents them.
+
+Even more importantly, it reads:
+
+```pascal
+kind
+```
+
+into `KindName`, but then unconditionally does:
+
+```pascal
+AArtifact.Files[I].Kind := afkSource;
+```
+
+Likewise, the contract defines `utf-8` and `base64`, but the implementation effectively assumes UTF-8 content. 
+
+That's exactly the kind of "helpful" implementation behavior GRISP was designed to eliminate.
+
+---
+
+# 6. Canonicalization is not yet trustworthy enough
+
+The implementation contract makes canonicalization **cryptographic protocol semantics**, not merely convenience serialization.
+
+It requires:
+
+```text
+UTF-8
+no insignificant whitespace
+fixed property ordering
+stable escaping
+stable integer formatting
+```
+
+and explicitly warns against depending on incidental JSON-library ordering. 
+
+The current implementation sorts **all JSON object keys alphabetically**:
+
+```pascal
+if CompareStr(Pairs[I].JsonString.Value,
+              Pairs[J].JsonString.Value) > 0 then
+```
+
+rather than implementing the explicitly defined fixed ordering for the artifact manifest. 
+
+That may or may not produce the intended canonical representation, but it is a red flag because the contract distinguishes:
+
+```text
+fixed property ordering
+```
+
+from generic lexical ordering.
+
+This should have been caught by a protocol/canonicalization reviewer.
+
+---
+
+# 7. Commit isn't yet the atomic cryptographic commit specified
+
+The specification says:
+
+```text
+FINAL_VERIFIED
+ ↓
+COMMIT_PENDING
+ ↓
+prepare
+ ↓
+stage exact bytes
+ ↓
+atomic write
+ ↓
+re-read
+ ↓
+hash
+ ↓
+compare
+ ↓
+COMMIT evidence
+ ↓
+COMMITTED
+```
+
+
+
+The implementation instead:
+
+```pascal
+ForceDirectories(Root);
+
+for each file:
+    WriteAllBytes
+    ReadAllBytes
+    hash
+```
+
+
+
+It has useful read-back verification, but it is **not an atomic multi-file commit**, and it doesn't itself establish that final verification occurred immediately before the commit.
+
+And there is no protection against:
+
+```text
+verify A
+modify A
+commit A
+```
+
+which the contract explicitly requires to fail. 
+
+---
+
+# 8. The tests are far too weak for a specification this ambitious
+
+This may be the biggest process lesson.
+
+The current `Grisp.Core.Tests` essentially tests:
+
+```text
+valid markdown parses
+mutation changes identity
+multiple markdown blocks are ambiguous
+```
+
+
+
+But the implementation contract calls for extensive conformance testing:
+
+```text
+canonicalization
+parser
+artifact
+state machine
+acceptance
+tools
+policy
+commit
+GAI
+GARP
+Firefox
+regression
+```
+
+and specifically requires:
+
+```text
+compile failure → reject
+runtime failure → reject
+test failure → reject
+policy failure → reject
+missing compile evidence → reject
+missing test evidence → reject
+hash mismatch → reject
+final mutation → reject
+```
+
+
+
+The gap is enormous.
+
+---
+
+# 9. So yes: I think we should use multiple LLMs
+
+But **not** like this:
+
+```text
+LLM A: Is implementation correct?
+LLM B: Yes
+LLM C: Yes
+=> correct
+```
+
+The specification itself correctly rejects that concept. Three LLMs agreeing only increases confidence; it does not establish correctness. 
+
+Instead I would use a **hybrid multi-agent implementation system**.
+
+## I would call it something like GRISP Implementation Review Mesh
+
+```text
+                    SPECIFICATION
+                         │
+                         ▼
+                ┌─────────────────┐
+                │ SPEC ANALYSTS   │
+                │                 │
+                │ LLM A           │
+                │ LLM B           │
+                │ LLM C           │
+                └────────┬────────┘
+                         │
+                  requirements
+                         │
+                         ▼
+                ┌─────────────────┐
+                │ CONTRACT MAP    │
+                │                 │
+                │ requirement     │
+                │ → code location │
+                │ → test          │
+                └────────┬────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │ IMPLEMENTATION AGENT │
+              │                      │
+              │ produces Delphi      │
+              └──────────┬───────────┘
+                         │
+             ┌───────────┼────────────┐
+             ▼           ▼            ▼
+          CRITIC      SECURITY     PROTOCOL
+          LLM         LLM          LLM
+             │           │            │
+             └───────────┼────────────┘
+                         ▼
+                  FINDINGS / PATCHES
+                         │
+                         ▼
+                  REPAIR AGENT
+                         │
+                         ▼
+                 DETERMINISTIC TESTS
+                         │
+              ┌──────────┴───────────┐
+              ▼                      ▼
+          compiler              test runner
+              │                      │
+              └──────────┬───────────┘
+                         ▼
+                 ACCEPTANCE ENGINE
+                         │
+                         ▼
+                 FINAL REVIEW LLM
+                         │
+                         ▼
+                DETERMINISTIC GATE
+                         │
+                  ┌──────┴──────┐
+                  ▼             ▼
+                ACCEPT        REJECT
+```
+
+---
+
+# 10. Different LLMs should have different jobs
+
+This is important.
+
+Don't simply ask five models:
+
+> "Implement GRISP."
+
+Instead:
+
+### LLM 1 — Architect
+
+Input:
+
+```text
+GRISP specification
+implementation contract
+existing repository
+```
+
+Output:
+
+```text
+implementation plan
+module boundaries
+interfaces
+invariants
+dependency graph
+```
+
+It **doesn't write code yet**.
+
+---
+
+### LLM 2 — Contract auditor
+
+Given the same specification and proposed architecture:
+
+> Find every requirement that isn't represented by a concrete implementation mechanism.
+
+Output:
+
+```text
+REQ-001 → Grisp.Artifact
+REQ-002 → Grisp.StateMachine
+REQ-003 → missing
+REQ-004 → Grisp.Commit
+...
+```
+
+This would probably have caught several of the current problems.
+
+---
+
+### LLM 3 — Implementation agent
+
+Only after the contract map exists:
+
+> Implement module X according to requirements R001–R017.
+
+Much smaller context.
+
+Much less opportunity to "interpret" the architecture.
+
+---
+
+### LLM 4 — Adversarial reviewer
+
+Give it:
+
+```text
+specification
+implementation
+tests
+```
+
+and explicitly tell it:
+
+> **Assume the implementation is wrong. Find ways it violates the specification. Do not praise it.**
+
+This is probably the most valuable role.
+
+For GRISP, I'd have several specialized adversaries:
+
+```text
+Security reviewer
+Protocol reviewer
+Delphi reviewer
+Cryptographic/canonicalization reviewer
+State-machine reviewer
+Testing reviewer
+```
+
+---
+
+### LLM 5 — Test designer
+
+Give it the specification but **not the implementation initially**.
+
+Ask:
+
+> What tests must pass if this specification is correctly implemented?
+
+That prevents the test designer from unconsciously designing tests around the implementation's existing behavior.
+
+This is particularly important because the current tests appear to validate what the implementation does rather than fully validate what the specification demands.
+
+---
+
+# 11. Then let deterministic tooling decide
+
+This is where GRISP's philosophy becomes powerful.
+
+The LLMs can say:
+
+```text
+"this looks correct"
+```
+
+but they cannot establish:
+
+```text
+compiled
+executed
+test passed
+hash matches
+policy passed
+final bytes unchanged
+```
+
+The implementation contract explicitly establishes this distinction between subjective AI evidence and objective evidence. 
+
+So the final architecture becomes:
+
+```text
+             MULTI-LLM
+                 │
+        reasoning / criticism
+                 │
+                 ▼
+          candidate code
+                 │
+                 ▼
+        DETERMINISTIC GRISP
+                 │
+       ┌─────────┼──────────┐
+       ▼         ▼          ▼
+     parser   compiler    policy
+       │         │          │
+       └─────────┼──────────┘
+                 ▼
+              tests
+                 │
+                 ▼
+          final verifier
+                 │
+                 ▼
+             commit
+```
+
+The LLMs become **brains around the deterministic kernel**, rather than the kernel itself.
+
+---
+
+# 12. I would actually change the implementation workflow now
+
+I would **not continue asking Luna to simply implement the next unit**.
+
+That risks accumulating a large amount of code with subtle contract violations.
+
+Instead, I suggest we introduce an explicit **Implementation Review Gate**.
+
+For every implementation chunk:
+
+```text
+SPEC
+ ↓
+REQUIREMENT EXTRACTION
+ ↓
+DESIGN
+ ↓
+IMPLEMENTATION
+ ↓
+INDEPENDENT REVIEW
+ ↓
+ADVERSARIAL REVIEW
+ ↓
+CONFORMANCE TESTS
+ ↓
+DETERMINISTIC BUILD
+ ↓
+ACCEPT / REJECT
+```
+
+And importantly:
+
+### The implementation agent should not be its own reviewer.
+
+That is the central change.
+
+---
+
+# 13. Even better: use multiple models *asymmetrically*
+
+I wouldn't necessarily use five different expensive models.
+
+For example:
+
+```text
+             GPT-5.6 Sol
+                  │
+             architecture
+                  │
+        ┌─────────┴─────────┐
+        ▼                   ▼
+ GPT-5.6 Luna          another LLM
+ implementation       adversarial review
+        │                   │
+        └─────────┬─────────┘
+                  ▼
+             deterministic
+                tests
+                  │
+                  ▼
+             compiler
+                  │
+                  ▼
+          acceptance engine
+```
+
+You can also deliberately give the same model contradictory roles:
+
+```text
+Pass 1:
+"Implement this."
+
+Pass 2:
+"Assume the implementation is dangerously wrong.
+Find every violation."
+
+Pass 3:
+"Act as a Delphi compiler/library expert.
+Review only technical correctness."
+
+Pass 4:
+"Act as a formal specification auditor.
+Compare every SHALL against the code."
+```
+
+This is cheaper than requiring every stage to use a different provider.
+
+---
+
+# 14. The really interesting idea: turn the specification into a machine-readable implementation contract
+
+I think this is the **next big step for GRISP**.
+
+Instead of merely having prose:
+
+```text
+The parser SHALL NOT infer filenames.
+```
+
+create something like:
+
+```text
+REQ-PARSER-007
+
+subject:
+    ArtifactParser
+
+requirement:
+    filename_inference_forbidden
+
+severity:
+    critical
+
+implementation:
+    Grisp.ArtifactParser
+
+tests:
+    Parser_MissingFilename
+    Parser_NoFilenameInference
+
+failure_effect:
+    PARSE_ERROR
+```
+
+Then the implementation project has a coverage matrix:
+
+```text
+Requirement       Code              Test              Status
+-------------------------------------------------------------
+REQ-001           Artifact.pas      R001              PASS
+REQ-002           Parser.pas        R002              PASS
+REQ-003           Parser.pas        R003              FAIL
+REQ-004           Policy.pas        R004              FAIL
+REQ-005           StateMachine.pas  R005              PASS
+...
+```
+
+Now an LLM can't simply say:
+
+> "I think we're done."
+
+The system can say:
+
+```text
+147 requirements
+132 implemented
+127 tested
+5 missing tests
+3 known violations
+
+GRISP IMPLEMENTATION:
+REJECTED
+```
+
+That is much closer to what I think you originally envisioned with GRISP.
+
+---
+
+# 15. And this fits your original multi-AI idea extremely well
+
+The implementation contract itself already anticipates advanced multi-worker intelligence as a later milestone:
+
+```text
+M16 Additional providers
+M17 Advanced multi-worker intelligence
+```
+
+
+
+I would now modify that philosophy slightly.
+
+**Don't wait until the end to introduce multi-worker intelligence.**
+
+Use it during **implementation of the specification itself**, while keeping it outside the deterministic acceptance kernel.
+
+So:
+
+```text
+              GRISP SPECIFICATION
+                       │
+                       ▼
+             MULTI-LLM ENGINEERING
+                       │
+       ┌───────────────┼────────────────┐
+       ▼               ▼                ▼
+   Architect       Implementer      Adversary
+       │               │                │
+       └───────────────┼────────────────┘
+                       ▼
+                 Human-readable
+                 implementation
+                       │
+                       ▼
+              DETERMINISTIC CORE
+                       │
+                 compiler/tests
+                       │
+                       ▼
+                 HARD ACCEPTANCE
+```
+
+The multi-LLM system **builds and repairs GRISP**.
+
+GRISP then **controls and verifies the artifacts produced by AI**.
+
+That's a beautiful recursive relationship.
+
+---
+
+# 16. My recommendation
+
+I would **pause the current implementation for a moment**.
+
+Not because it's useless—the current code is actually a useful skeleton—but because it has demonstrated exactly the danger your question identifies.
+
+The implementation contract says:
+
+> "DO NOT MAKE THE IMPLEMENTATION MORE PERMISSIVE THAN THE SPECIFICATION." 
+
+The current code has already done that in several places.
+
+So I recommend we create a new **GRISP Implementation Methodology v1.0**:
+
+```text
+1. Specification
+       ↓
+2. Requirement extraction
+       ↓
+3. Independent architecture review
+       ↓
+4. Implementation
+       ↓
+5. Independent code review
+       ↓
+6. Adversarial review
+       ↓
+7. Test generation from specification
+       ↓
+8. Deterministic compilation
+       ↓
+9. Conformance tests
+       ↓
+10. Requirement coverage
+       ↓
+11. Final verification
+       ↓
+12. Accept implementation
+```
+
+And the crucial rule:
+
+> **No AI is allowed to declare its own implementation correct.**
+
+The AI can propose, implement, criticize, repair and rank.
+
+The deterministic machinery decides whether it actually satisfies the contract.
+
+That is much more consistent with the original GRISP idea of **"LLMs as untrusted reasoning workers."** 
+
+**So yes—I think your original instinct to have multiple AI systems look at the implementation was right.** I would just elevate it from "multiple AIs reviewing the code" to a formal **multi-LLM engineering/review mesh surrounding a deterministic GRISP verification kernel**.
+
+And based on the files you've given me, I think we should do that **before writing much more GRISP code**, because we already have enough evidence that the current single-agent implementation path is producing false confidence.

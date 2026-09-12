@@ -1,0 +1,2908 @@
+from pathlib import Path
+import zipfile, textwrap, os
+
+root = Path("/mnt/data/GSDA31_Delphi")
+root.mkdir(parents=True, exist_ok=True)
+
+files = {}
+
+files["GSDA31.Types.pas"] = r'''unit GSDA31.Types;
+
+interface
+
+uses
+    System.SysUtils,
+    System.JSON,
+    System.Generics.Collections;
+
+type
+    TGSDAId = string;
+
+    TGSDAMessageKind = (
+        mkCandidate,
+        mkCritique,
+        mkRepair,
+        mkScore,
+        mkRequirement,
+        mkTerm,
+        mkQuestion,
+        mkConsolidation
+    );
+
+    TGSDAActivity = (
+        actGeneration,
+        actCritique,
+        actRepair,
+        actScoring,
+        actConsolidation,
+        actAnalysis
+    );
+
+    TGSDAFailureCode = (
+        fcNone,
+        fcSchemaFailure,
+        fcProtocolFailure,
+        fcImpersonationAttempt,
+        fcIdentityMismatch,
+        fcContentIdentityMismatch,
+        fcSourceReferenceUnresolved,
+        fcScopeViolation,
+        fcInputBoundsExceeded,
+        fcAggregationBoundsExceeded,
+        fcReliabilityBoundsExceeded,
+        fcGovernanceFailure,
+        fcLivenessFailure,
+        fcPublicationFailure,
+        fcNormativeKeywordLeak,
+        fcCrossReferenceUnresolved,
+        fcConfigIncomplete,
+        fcTermCollision,
+        fcLineageFailure
+    );
+
+    TGSDAIntentElement = class
+    public
+        IntentID: TGSDAId;
+        Text: string;
+        Occurrence: Integer;
+        Weight: Int64;
+        Critical: Boolean;
+        ByteStart: Int64;
+        ByteEnd: Int64;
+        SourceRefs: TArray<TGSDAId>;
+        LinkedArtifactIDs: TArray<TGSDAId>;
+    end;
+
+    TGSDAIntent = class
+    public
+        Elements: TObjectList<TGSDAIntentElement>;
+        constructor Create;
+        destructor Destroy; override;
+    end;
+
+    TGSDAConfig = class
+    public
+        Namespace: string;
+        TargetLanguage: string;
+        TargetAudience: TArray<string>;
+        Constraints: TArray<string>;
+        RequestedOutputs: TArray<string>;
+        PriorityProfile: string;
+        MaxRounds: Int64;
+        MaxMessagesPerRound: Int64;
+        MaxRepairDepth: Int64;
+        MinCriticalCoverageNumerator: Int64;
+        MinCriticalCoverageDenominator: Int64;
+        HmacSecret: TBytes;
+        constructor Create;
+    end;
+
+    TGSDARequirement = class
+    public
+        RequirementID: TGSDAId;
+        Text: string;
+        NormativeKeyword: string;
+        SourceRefs: TArray<TGSDAId>;
+        ArtifactIDs: TArray<TGSDAId>;
+        EvidenceIDs: TArray<TGSDAId>;
+    end;
+
+    TGSDAArtifact = class
+    public
+        ArtifactID: TGSDAId;
+        TaskID: TGSDAId;
+        RunID: TGSDAId;
+        PeerID: TGSDAId;
+        RoundID: TGSDAId;
+        LogicalSequence: Int64;
+        Kind: string;
+        ContentID: TGSDAId;
+        ParentArtifactIDs: TArray<TGSDAId>;
+        RequirementIDs: TArray<TGSDAId>;
+        SourceRefs: TArray<TGSDAId>;
+        Content: string;
+    end;
+
+    TGSDAEvidence = class
+    public
+        EvidenceID: TGSDAId;
+        RunID: TGSDAId;
+        Kind: string;
+        SubjectIDs: TArray<TGSDAId>;
+        ContentID: TGSDAId;
+        ProducedBy: TGSDAId;
+        CanonicalContent: string;
+    end;
+
+    TGSDAReasoningMessage = class
+    public
+        MessageID: TGSDAId;
+        ContentID: TGSDAId;
+        PeerID: TGSDAId;
+        RunID: TGSDAId;
+        TaskID: TGSDAId;
+        RoundID: TGSDAId;
+        LogicalSequence: Int64;
+        Kind: TGSDAMessageKind;
+        Confidence: Integer;
+        RawPayload: string;
+        CanonicalPayload: string;
+        Payload: TJSONObject;
+        constructor Create;
+        destructor Destroy; override;
+    end;
+
+    TGSDARevisionSnapshot = class
+    public
+        RevisionID: TGSDAId;
+        SpecContentID: TGSDAId;
+        PreviousRevisionID: TGSDAId;
+        PackageHash: string;
+        CanonicalPackageManifest: string;
+        CreatedAtUtc: string;
+        PackageFiles: TDictionary<string, string>;
+        constructor Create;
+        destructor Destroy; override;
+    end;
+
+    TGSDAHumanDecision = class
+    public
+        DecisionID: TGSDAId;
+        ActorID: string;
+        SpecContentID: TGSDAId;
+        Accepted: Boolean;
+        Rationale: string;
+        SignatureHex: string;
+        CreatedAtUtc: string;
+    end;
+
+    EGSDAFailure = class(Exception)
+    private
+        FCode: TGSDAFailureCode;
+    public
+        constructor Create(ACode: TGSDAFailureCode; const AMessage: string);
+        property Code: TGSDAFailureCode read FCode;
+    end;
+
+function GSDAFailureCodeName(ACode: TGSDAFailureCode): string;
+function GSDAMessageKindToString(AKind: TGSDAMessageKind): string;
+function GSDAActivityToString(AActivity: TGSDAActivity): string;
+
+implementation
+
+constructor TGSDAIntent.Create;
+begin
+    Elements := TObjectList<TGSDAIntentElement>.Create(True);
+end;
+
+destructor TGSDAIntent.Destroy;
+begin
+    Elements.Free;
+    inherited Destroy;
+end;
+
+constructor TGSDAConfig.Create;
+begin
+    MaxRounds := 8;
+    MaxMessagesPerRound := 64;
+    MaxRepairDepth := 16;
+    MinCriticalCoverageNumerator := 1;
+    MinCriticalCoverageDenominator := 1;
+end;
+
+constructor TGSDAReasoningMessage.Create;
+begin
+    Payload := nil;
+end;
+
+destructor TGSDAReasoningMessage.Destroy;
+begin
+    Payload.Free;
+    inherited Destroy;
+end;
+
+constructor TGSDARevisionSnapshot.Create;
+begin
+    PackageFiles := TDictionary<string, string>.Create;
+end;
+
+destructor TGSDARevisionSnapshot.Destroy;
+begin
+    PackageFiles.Free;
+    inherited Destroy;
+end;
+
+constructor EGSDAFailure.Create(ACode: TGSDAFailureCode; const AMessage: string);
+begin
+    inherited Create(AMessage);
+    FCode := ACode;
+end;
+
+function GSDAFailureCodeName(ACode: TGSDAFailureCode): string;
+begin
+    case ACode of
+        fcNone: Result := 'NONE';
+        fcSchemaFailure: Result := 'SCHEMA_FAILURE';
+        fcProtocolFailure: Result := 'PROTOCOL_FAILURE';
+        fcImpersonationAttempt: Result := 'IMPERSONATION_ATTEMPT';
+        fcIdentityMismatch: Result := 'IDENTITY_MISMATCH';
+        fcContentIdentityMismatch: Result := 'CONTENT_IDENTITY_MISMATCH';
+        fcSourceReferenceUnresolved: Result := 'SOURCE_REFERENCE_UNRESOLVED';
+        fcScopeViolation: Result := 'SCOPE_VIOLATION';
+        fcInputBoundsExceeded: Result := 'INPUT_BOUNDS_EXCEEDED';
+        fcAggregationBoundsExceeded: Result := 'AGGREGATION_BOUNDS_EXCEEDED';
+        fcReliabilityBoundsExceeded: Result := 'RELIABILITY_BOUNDS_EXCEEDED';
+        fcGovernanceFailure: Result := 'GOVERNANCE_FAILURE';
+        fcLivenessFailure: Result := 'LIVENESS_FAILURE';
+        fcPublicationFailure: Result := 'PUBLICATION_FAILURE';
+        fcNormativeKeywordLeak: Result := 'NORMATIVE_KEYWORD_LEAK';
+        fcCrossReferenceUnresolved: Result := 'CROSS_REFERENCE_UNRESOLVED';
+        fcConfigIncomplete: Result := 'CONFIG_INCOMPLETE';
+        fcTermCollision: Result := 'TERM_COLLISION';
+        fcLineageFailure: Result := 'LINEAGE_FAILURE';
+    else
+        Result := 'UNKNOWN';
+    end;
+end;
+
+function GSDAMessageKindToString(AKind: TGSDAMessageKind): string;
+begin
+    case AKind of
+        mkCandidate: Result := 'candidate';
+        mkCritique: Result := 'critique';
+        mkRepair: Result := 'repair';
+        mkScore: Result := 'score';
+        mkRequirement: Result := 'requirement';
+        mkTerm: Result := 'term';
+        mkQuestion: Result := 'question';
+        mkConsolidation: Result := 'consolidation';
+    end;
+end;
+
+function GSDAActivityToString(AActivity: TGSDAActivity): string;
+begin
+    case AActivity of
+        actGeneration: Result := 'GENERATION';
+        actCritique: Result := 'CRITIQUE';
+        actRepair: Result := 'REPAIR';
+        actScoring: Result := 'SCORING';
+        actConsolidation: Result := 'CONSOLIDATION';
+        actAnalysis: Result := 'ANALYSIS';
+    end;
+end;
+
+end.
+'''
+
+files["GSDA31.Canonical.pas"] = r'''unit GSDA31.Canonical;
+
+interface
+
+uses
+    System.SysUtils,
+    System.JSON,
+    System.Classes,
+    System.Generics.Collections;
+
+type
+    TGSDAJsonCanonical = class
+    private
+        class function CompareUtf8(const ALeft, ARight: string): Integer; static;
+        class procedure AppendEscapedString(const AValue: string; const ABuilder: TStringBuilder); static;
+        class procedure AppendObject(const AObject: TJSONObject; const ABuilder: TStringBuilder); static;
+        class procedure AppendArray(const AArray: TJSONArray; const ABuilder: TStringBuilder); static;
+        class procedure AppendNumber(const ANumber: TJSONNumber; const ABuilder: TStringBuilder); static;
+        class procedure AppendValue(const AValue: TJSONValue; const ABuilder: TStringBuilder); static;
+    public
+        class function Canonicalize(const AValue: TJSONValue): string; static;
+    end;
+
+implementation
+
+class function TGSDAJsonCanonical.CompareUtf8(const ALeft, ARight: string): Integer;
+var
+    LBytes: TBytes;
+    RBytes: TBytes;
+    LIndex: Integer;
+    LLength: Integer;
+begin
+    LBytes := TEncoding.UTF8.GetBytes(ALeft);
+    RBytes := TEncoding.UTF8.GetBytes(ARight);
+
+    LLength := Length(LBytes);
+    if Length(RBytes) < LLength then
+        LLength := Length(RBytes);
+
+    for LIndex := 0 to LLength - 1 do
+    begin
+        if LBytes[LIndex] < RBytes[LIndex] then
+            Exit(-1);
+        if LBytes[LIndex] > RBytes[LIndex] then
+            Exit(1);
+    end;
+
+    if Length(LBytes) < Length(RBytes) then
+        Result := -1
+    else if Length(LBytes) > Length(RBytes) then
+        Result := 1
+    else
+        Result := 0;
+end;
+
+class procedure TGSDAJsonCanonical.AppendEscapedString(
+    const AValue: string;
+    const ABuilder: TStringBuilder);
+var
+    LIndex: Integer;
+    LCode: Integer;
+    LChar: Char;
+begin
+    ABuilder.Append('"');
+
+    for LIndex := 1 to Length(AValue) do
+    begin
+        LChar := AValue[LIndex];
+        LCode := Ord(LChar);
+
+        case LChar of
+            '"': ABuilder.Append('\"');
+            '\': ABuilder.Append('\\');
+            #8: ABuilder.Append('\b');
+            #9: ABuilder.Append('\t');
+            #10: ABuilder.Append('\n');
+            #12: ABuilder.Append('\f');
+            #13: ABuilder.Append('\r');
+        else
+            if LCode < 32 then
+                ABuilder.Append('\u').Append(IntToHex(LCode, 4))
+            else
+                ABuilder.Append(LChar);
+        end;
+    end;
+
+    ABuilder.Append('"');
+end;
+
+class procedure TGSDAJsonCanonical.AppendNumber(
+    const ANumber: TJSONNumber;
+    const ABuilder: TStringBuilder);
+var
+    LText: string;
+    LIndex: Integer;
+    LHasExponent: Boolean;
+begin
+    LText := ANumber.ToString;
+
+    if LText = '' then
+        raise EGSDAFailure.Create(fcSchemaFailure, 'Empty JSON number');
+
+    for LIndex := 1 to Length(LText) do
+    begin
+        if not CharInSet(LText[LIndex], ['0'..'9', '-', '+', '.', 'e', 'E']) then
+            raise EGSDAFailure.Create(fcSchemaFailure, 'Invalid JSON number');
+    end;
+
+    if Pos('NaN', LText) > 0 then
+        raise EGSDAFailure.Create(fcSchemaFailure, 'NaN not permitted');
+
+    if Pos('Infinity', LText) > 0 then
+        raise EGSDAFailure.Create(fcSchemaFailure, 'Infinity not permitted');
+
+    if SameText(LText, '-0') or SameText(LText, '-0.0') then
+    begin
+        ABuilder.Append('0');
+        Exit;
+    end;
+
+    LHasExponent := (Pos('e', LowerCase(LText)) > 0);
+
+    if not LHasExponent then
+        ABuilder.Append(LText)
+    else
+        ABuilder.Append(LText);
+end;
+
+class procedure TGSDAJsonCanonical.AppendObject(
+    const AObject: TJSONObject;
+    const ABuilder: TStringBuilder);
+var
+    LPairs: TList<TJSONPair>;
+    LSeen: TDictionary<string, Boolean>;
+    LPair: TJSONPair;
+    LPairIndex: Integer;
+begin
+    LPairs := TList<TJSONPair>.Create;
+    LSeen := TDictionary<string, Boolean>.Create;
+    try
+        for LPair in AObject do
+        begin
+            if LSeen.ContainsKey(LPair.JsonString.Value) then
+                raise EGSDAFailure.Create(
+                    fcSchemaFailure,
+                    'Duplicate JSON object key: ' + LPair.JsonString.Value
+                );
+
+            LSeen.Add(LPair.JsonString.Value, True);
+            LPairs.Add(LPair);
+        end;
+
+        LPairs.Sort(
+            TComparer<TJSONPair>.Construct(
+                function(const ALeft, ARight: TJSONPair): Integer
+                begin
+                    Result := CompareUtf8(
+                        ALeft.JsonString.Value,
+                        ARight.JsonString.Value
+                    );
+                end
+            )
+        );
+
+        ABuilder.Append('{');
+
+        for LPairIndex := 0 to LPairs.Count - 1 do
+        begin
+            AppendEscapedString(LPairs[LPairIndex].JsonString.Value, ABuilder);
+            ABuilder.Append(':');
+            AppendValue(LPairs[LPairIndex].JsonValue, ABuilder);
+
+            if LPairIndex < LPairs.Count - 1 then
+                ABuilder.Append(',');
+        end;
+
+        ABuilder.Append('}');
+    finally
+        LSeen.Free;
+        LPairs.Free;
+    end;
+end;
+
+class procedure TGSDAJsonCanonical.AppendArray(
+    const AArray: TJSONArray;
+    const ABuilder: TStringBuilder);
+var
+    LIndex: Integer;
+begin
+    ABuilder.Append('[');
+
+    for LIndex := 0 to AArray.Count - 1 do
+    begin
+        AppendValue(AArray.Items[LIndex], ABuilder);
+
+        if LIndex < AArray.Count - 1 then
+            ABuilder.Append(',');
+    end;
+
+    ABuilder.Append(']');
+end;
+
+class procedure TGSDAJsonCanonical.AppendValue(
+    const AValue: TJSONValue;
+    const ABuilder: TStringBuilder);
+begin
+    if AValue = nil then
+        raise EGSDAFailure.Create(fcSchemaFailure, 'Missing JSON value');
+
+    if AValue is TJSONObject then
+        AppendObject(TJSONObject(AValue), ABuilder)
+    else if AValue is TJSONArray then
+        AppendArray(TJSONArray(AValue), ABuilder)
+    else if AValue is TJSONString then
+        AppendEscapedString(TJSONString(AValue).Value, ABuilder)
+    else if AValue is TJSONNumber then
+        AppendNumber(TJSONNumber(AValue), ABuilder)
+    else if AValue is TJSONBool then
+        ABuilder.Append(LowerCase(AValue.ToString))
+    else if AValue is TJSONNull then
+        ABuilder.Append('null')
+    else
+        raise EGSDAFailure.Create(fcSchemaFailure, 'Unsupported JSON node');
+end;
+
+class function TGSDAJsonCanonical.Canonicalize(const AValue: TJSONValue): string;
+var
+    LBuilder: TStringBuilder;
+begin
+    if AValue = nil then
+        raise EGSDAFailure.Create(fcSchemaFailure, 'Cannot canonicalize nil');
+
+    LBuilder := TStringBuilder.Create;
+    try
+        AppendValue(AValue, LBuilder);
+        Result := LBuilder.ToString;
+    finally
+        LBuilder.Free;
+    end;
+end;
+
+end.
+'''
+
+files["GSDA31.Crypto.pas"] = r'''unit GSDA31.Crypto;
+
+interface
+
+uses
+    System.SysUtils,
+    System.Hash,
+    System.DateUtils;
+
+function GSDA_SHA256Hex(const AValue: string): string;
+function GSDA_HMACSHA256Hex(const ASecret: TBytes; const AValue: string): string;
+function GSDA_UtcNowIso: string;
+function GSDA_ConstantTimeEquals(const ALeft, ARight: string): Boolean;
+
+implementation
+
+function GSDA_SHA256Hex(const AValue: string): string;
+begin
+    Result := THashSHA2.GetHashString(TEncoding.UTF8.GetBytes(AValue));
+end;
+
+function GSDA_HMACSHA256Hex(const ASecret: TBytes; const AValue: string): string;
+var
+    LHmac: THashSHA2;
+    LMessage: TBytes;
+begin
+    LMessage := TEncoding.UTF8.GetBytes(AValue);
+    LHmac := THashSHA2.Create;
+    try
+        Result := LHmac.GetHMACAsString(LMessage, ASecret, SHA256);
+    finally
+        LHmac.Free;
+    end;
+end;
+
+function GSDA_UtcNowIso: string;
+begin
+    Result := DateToISO8601(TTimeZone.Local.ToUniversalTime(Now), True);
+end;
+
+function GSDA_ConstantTimeEquals(const ALeft, ARight: string): Boolean;
+var
+    LIndex: Integer;
+    LDiff: Integer;
+    LBytesLeft: TBytes;
+    LBytesRight: TBytes;
+begin
+    LBytesLeft := TEncoding.UTF8.GetBytes(ALeft);
+    LBytesRight := TEncoding.UTF8.GetBytes(ARight);
+
+    LDiff := Length(LBytesLeft) xor Length(LBytesRight);
+
+    for LIndex := 0 to Length(LBytesLeft) - 1 do
+        if LIndex < Length(LBytesRight) then
+            LDiff := LDiff or (LBytesLeft[LIndex] xor LBytesRight[LIndex])
+        else
+            LDiff := LDiff or LBytesLeft[LIndex];
+
+    for LIndex := 0 to Length(LBytesRight) - 1 do
+        if LIndex >= Length(LBytesLeft) then
+            LDiff := LDiff or LBytesRight[LIndex];
+
+    Result := LDiff = 0;
+end;
+
+end.
+'''
+
+files["GSDA31.BigInt.pas"] = r'''unit GSDA31.BigInt;
+
+interface
+
+uses
+    System.SysUtils;
+
+type
+    TGSDAUInt128 = record
+        High: UInt64;
+        Low: UInt64;
+        class function Zero: TGSDAUInt128; static;
+        class function FromUInt64(AValue: UInt64): TGSDAUInt128; static;
+        function IsZero: Boolean;
+        class operator Add(const ALeft, ARight: TGSDAUInt128): TGSDAUInt128;
+        class operator Subtract(const ALeft, ARight: TGSDAUInt128): TGSDAUInt128;
+        class operator Multiply(const ALeft, ARight: TGSDAUInt128): TGSDAUInt128;
+        class operator Implicit(AValue: UInt64): TGSDAUInt128;
+        function ToDecimalString: string;
+    end;
+
+implementation
+
+class function TGSDAUInt128.Zero: TGSDAUInt128;
+begin
+    Result.High := 0;
+    Result.Low := 0;
+end;
+
+class function TGSDAUInt128.FromUInt64(AValue: UInt64): TGSDAUInt128;
+begin
+    Result.High := 0;
+    Result.Low := AValue;
+end;
+
+function TGSDAUInt128.IsZero: Boolean;
+begin
+    Result := (High = 0) and (Low = 0);
+end;
+
+class operator TGSDAUInt128.Add(
+    const ALeft, ARight: TGSDAUInt128): TGSDAUInt128;
+var
+    LCarry: UInt64;
+begin
+    Result.Low := ALeft.Low + ARight.Low;
+    LCarry := Ord(Result.Low < ALeft.Low);
+
+    if UInt64(ALeft.High) > High(UInt64) - UInt64(ARight.High) - LCarry then
+        raise EOverflow.Create('UInt128 addition overflow');
+
+    Result.High := ALeft.High + ARight.High + LCarry;
+end;
+
+class operator TGSDAUInt128.Subtract(
+    const ALeft, ARight: TGSDAUInt128): TGSDAUInt128;
+var
+    LBorrow: UInt64;
+begin
+    if (ALeft.High < ARight.High) or
+       ((ALeft.High = ARight.High) and (ALeft.Low < ARight.Low)) then
+        raise ERangeError.Create('UInt128 subtraction underflow');
+
+    LBorrow := Ord(ALeft.Low < ARight.Low);
+    Result.Low := ALeft.Low - ARight.Low;
+    Result.High := ALeft.High - ARight.High - LBorrow;
+end;
+
+class operator TGSDAUInt128.Multiply(
+    const ALeft, ARight: TGSDAUInt128): TGSDAUInt128;
+var
+    LOldHigh, LPart1, LPart2, LPart3, LCarry: UInt64;
+begin
+    { Exact result is only retained when it fits into 128 bits.
+      This implementation uses 32-bit limbs to avoid compiler-specific 128-bit types. }
+    LPart1 := (ALeft.Low and $FFFFFFFF) * (ARight.Low and $FFFFFFFF);
+    LPart2 := (ALeft.Low shr 32) * (ARight.Low and $FFFFFFFF);
+    LPart3 := (ALeft.Low and $FFFFFFFF) * (ARight.Low shr 32);
+
+    Result.Low := LPart1 + ((LPart2 + LPart3) shl 32);
+    LCarry := Ord(Result.Low < LPart1);
+
+    LOldHigh := ALeft.High * ARight.Low + ALeft.Low * ARight.High;
+    if LOldHigh < ALeft.High * ARight.Low then
+        raise EOverflow.Create('UInt128 multiplication overflow');
+
+    Result.High := LOldHigh + (LPart2 shr 32) + (LPart3 shr 32) + LCarry;
+
+    if Result.High < LOldHigh then
+        raise EOverflow.Create('UInt128 multiplication overflow');
+end;
+
+class operator TGSDAUInt128.Implicit(AValue: UInt64): TGSDAUInt128;
+begin
+    Result := FromUInt64(AValue);
+end;
+
+function TGSDAUInt128.ToDecimalString: string;
+var
+    LHigh: UInt64;
+    LLow: UInt64;
+    LPart: UInt64;
+    LDigits: string;
+begin
+    { Decimal conversion without relying on compiler-specific UInt128 support. }
+    if IsZero then
+        Exit('0');
+
+    LHigh := High;
+    LLow := Low;
+    LDigits := '';
+
+    while (LHigh <> 0) or (LLow <> 0) do
+    begin
+        LPart := LLow mod 10;
+        LLow := LLow div 10;
+
+        if (LHigh <> 0) then
+        begin
+            LLow := LLow + (LHigh mod 10) shl 63;
+            LHigh := LHigh div 10;
+        end;
+
+        LDigits := Char(Ord('0') + Integer(LPart mod 10)) + LDigits;
+    end;
+
+    Result := LDigits;
+end;
+
+end.
+'''
+
+files["GSDA31.Identity.pas"] = r'''unit GSDA31.Identity;
+
+interface
+
+uses
+    System.SysUtils,
+    System.JSON,
+    System.Generics.Collections,
+    GSDA31.Types,
+    GSDA31.Canonical,
+    GSDA31.Crypto;
+
+type
+    TGSDAIdentityService = class
+    private
+        class function SortedStringArray(const AValues: TArray<string>): TArray<string>; static;
+        class procedure AddStringArray(
+            const AObject: TJSONObject;
+            const AName: string;
+            const AValues: TArray<string>
+        ); static;
+        class function HashObject(
+            const APrefix: string;
+            const ASchema: string;
+            const AObject: TJSONObject
+        ): string; static;
+        class function CanonicalSemanticObject(
+            const ASchema: string;
+            const AObject: TJSONObject
+        ): string; static;
+    public
+        class function TaskID(const ATask: TGSDAResearchTask): string; static;
+        class function TargetContextID(const ATask: TGSDAResearchTask): string; static;
+        class function RoundID(const ARunID: string; ARoundIndex: Int64): string; static;
+        class function MessageID(
+            const ARunID, APeerID, APayloadSchema, AContentID: string
+        ): string; static;
+        class function ArtifactID(const AArtifact: TGSDAArtifact; const AMessageID: string): string; static;
+        class function EvidenceID(
+            const ARunID, AKind: string;
+            const ASubjectIDs: TArray<string>;
+            const AContentID, AProducedBy: string
+        ): string; static;
+        class function RequirementID(
+            const AText, AKeyword: string;
+            const ASourceRefs: TArray<string>
+        ): string; static;
+        class function IntentID(
+            const AText: string;
+            AOccurrence: Integer
+        ): string; static;
+        class function SpecContentID(
+            const ARequirementsJson, AGlossaryJson, AAssumptionsJson,
+                  AQuestionsJson, ATraceabilityJson: string
+        ): string; static;
+        class function RevisionID(
+            const AParentRevisionIDs: TArray<string>;
+            const ASpecContentID: string;
+            const ALineageCanonical: string
+        ): string; static;
+        class function FileContentID(const ACanonicalFileBytes: TBytes): string; static;
+    end;
+
+implementation
+
+class function TGSDAIdentityService.SortedStringArray(
+    const AValues: TArray<string>): TArray<string>;
+var
+    LList: TList<string>;
+    LValue: string;
+begin
+    LList := TList<string>.Create;
+    try
+        for LValue in AValues do
+            LList.Add(LValue);
+
+        LList.Sort(
+            TComparer<string>.Construct(
+                function(const ALeft, ARight: string): Integer
+                begin
+                    Result := CompareStr(ALeft, ARight);
+                end
+            )
+        );
+
+        Result := LList.ToArray;
+    finally
+        LList.Free;
+    end;
+end;
+
+class procedure TGSDAIdentityService.AddStringArray(
+    const AObject: TJSONObject;
+    const AName: string;
+    const AValues: TArray<string>);
+var
+    LArray: TJSONArray;
+    LValue: string;
+begin
+    LArray := TJSONArray.Create;
+    for LValue in SortedStringArray(AValues) do
+        LArray.Add(LValue);
+
+    AObject.AddPair(AName, LArray);
+end;
+
+class function TGSDAIdentityService.CanonicalSemanticObject(
+    const ASchema: string;
+    const AObject: TJSONObject): string;
+var
+    LWrapper: TJSONObject;
+begin
+    LWrapper := TJSONObject.Create;
+    try
+        LWrapper.AddPair('schema', ASchema);
+        LWrapper.AddPair('content', AObject.Clone as TJSONObject);
+        Result := TGSDAJsonCanonical.Canonicalize(LWrapper);
+    finally
+        LWrapper.Free;
+    end;
+end;
+
+class function TGSDAIdentityService.HashObject(
+    const APrefix, ASchema: string;
+    const AObject: TJSONObject): string;
+begin
+    Result := APrefix + GSDA_SHA256Hex(CanonicalSemanticObject(ASchema, AObject));
+end;
+
+class function TGSDAIdentityService.TaskID(
+    const ATask: TGSDAResearchTask): string;
+var
+    LObject: TJSONObject;
+begin
+    LObject := TJSONObject.Create;
+    try
+        LObject.AddPair('user_prompt', ATask.UserPrompt);
+        LObject.AddPair('user_intent', ATask.UserIntent);
+        LObject.AddPair('domain', ATask.Domain);
+        AddStringArray(LObject, 'target_audience', ATask.TargetAudience);
+        AddStringArray(LObject, 'constraints', ATask.Constraints);
+        AddStringArray(LObject, 'requested_outputs', ATask.RequestedOutputs);
+        LObject.AddPair('priority_profile', ATask.PriorityProfile);
+
+        Result := HashObject('task:', 'task_identity/3.1', LObject);
+    finally
+        LObject.Free;
+    end;
+end;
+
+class function TGSDAIdentityService.TargetContextID(
+    const ATask: TGSDAResearchTask): string;
+var
+    LObject: TJSONObject;
+begin
+    LObject := TJSONObject.Create;
+    try
+        LObject.AddPair('task_id', ATask.TaskID);
+        LObject.AddPair('namespace', ATask.Namespace);
+        LObject.AddPair('target_language', ATask.TargetLanguage);
+
+        Result := HashObject('ctx:', 'target_context_identity/3.1', LObject);
+    finally
+        LObject.Free;
+    end;
+end;
+
+class function TGSDAIdentityService.RoundID(
+    const ARunID: string; ARoundIndex: Int64): string;
+begin
+    if ARoundIndex < 0 then
+        raise EGSDAFailure.Create(fcInputBoundsExceeded, 'Negative round index');
+
+    Result := 'round:' + ARunID + ':' + IntToStr(ARoundIndex);
+end;
+
+class function TGSDAIdentityService.MessageID(
+    const ARunID, APeerID, APayloadSchema, AContentID: string): string;
+var
+    LObject: TJSONObject;
+begin
+    LObject := TJSONObject.Create;
+    try
+        LObject.AddPair('run_id', ARunID);
+        LObject.AddPair('peer_id', APeerID);
+        LObject.AddPair('payload_schema', APayloadSchema);
+        LObject.AddPair('content_id', AContentID);
+
+        Result := HashObject('msg:', 'message_identity/3.1', LObject);
+    finally
+        LObject.Free;
+    end;
+end;
+
+class function TGSDAIdentityService.ArtifactID(
+    const AArtifact: TGSDAArtifact;
+    const AMessageID: string): string;
+var
+    LObject: TJSONObject;
+begin
+    LObject := TJSONObject.Create;
+    try
+        LObject.AddPair('task_id', AArtifact.TaskID);
+        LObject.AddPair('run_id', AArtifact.RunID);
+        LObject.AddPair('artifact_kind', AArtifact.Kind);
+        LObject.AddPair('content_id', AArtifact.ContentID);
+        LObject.AddPair('author_peer_id', AArtifact.PeerID);
+        LObject.AddPair('round_id', AArtifact.RoundID);
+        AddStringArray(LObject, 'parent_artifact_ids', AArtifact.ParentArtifactIDs);
+        LObject.AddPair('message_id', AMessageID);
+
+        Result := HashObject('artifact:', 'artifact_identity/3.1', LObject);
+    finally
+        LObject.Free;
+    end;
+end;
+
+class function TGSDAIdentityService.EvidenceID(
+    const ARunID, AKind: string;
+    const ASubjectIDs: TArray<string>;
+    const AContentID, AProducedBy: string): string;
+var
+    LObject: TJSONObject;
+begin
+    LObject := TJSONObject.Create;
+    try
+        LObject.AddPair('run_id', ARunID);
+        LObject.AddPair('evidence_kind', AKind);
+        AddStringArray(LObject, 'subject_ids', ASubjectIDs);
+        LObject.AddPair('content_id', AContentID);
+        LObject.AddPair('produced_by', AProducedBy);
+
+        Result := HashObject('evidence:', 'evidence_identity/3.1', LObject);
+    finally
+        LObject.Free;
+    end;
+end;
+
+class function TGSDAIdentityService.RequirementID(
+    const AText, AKeyword: string;
+    const ASourceRefs: TArray<string>): string;
+var
+    LObject: TJSONObject;
+begin
+    LObject := TJSONObject.Create;
+    try
+        LObject.AddPair('text', AText);
+        LObject.AddPair('normative_keyword', AKeyword);
+        AddStringArray(LObject, 'source_refs', ASourceRefs);
+
+        Result := HashObject('req:', 'requirement_identity/3.1', LObject);
+    finally
+        LObject.Free;
+    end;
+end;
+
+class function TGSDAIdentityService.IntentID(
+    const AText: string; AOccurrence: Integer): string;
+var
+    LObject: TJSONObject;
+begin
+    LObject := TJSONObject.Create;
+    try
+        LObject.AddPair('text', AText);
+        LObject.AddPair('occurrence', TJSONNumber.Create(AOccurrence));
+
+        Result := HashObject('intent:', 'intent_element_identity/3.1', LObject);
+    finally
+        LObject.Free;
+    end;
+end;
+
+class function TGSDAIdentityService.SpecContentID(
+    const ARequirementsJson, AGlossaryJson, AAssumptionsJson,
+          AQuestionsJson, ATraceabilityJson: string): string;
+var
+    LObject: TJSONObject;
+begin
+    LObject := TJSONObject.Create;
+    try
+        LObject.AddPair(
+            'requirements',
+            TJSONObject.ParseJSONValue(ARequirementsJson)
+        );
+        LObject.AddPair(
+            'glossary',
+            TJSONObject.ParseJSONValue(AGlossaryJson)
+        );
+        LObject.AddPair(
+            'assumptions',
+            TJSONObject.ParseJSONValue(AAssumptionsJson)
+        );
+        LObject.AddPair(
+            'open_questions',
+            TJSONObject.ParseJSONValue(AQuestionsJson)
+        );
+        LObject.AddPair(
+            'traceability',
+            TJSONObject.ParseJSONValue(ATraceabilityJson)
+        );
+
+        Result := HashObject(
+            'spec:',
+            'spec_content_identity/3.1',
+            LObject
+        );
+    finally
+        LObject.Free;
+    end;
+end;
+
+class function TGSDAIdentityService.RevisionID(
+    const AParentRevisionIDs: TArray<string>;
+    const ASpecContentID, ALineageCanonical: string): string;
+var
+    LObject: TJSONObject;
+begin
+    LObject := TJSONObject.Create;
+    try
+        AddStringArray(LObject, 'parent_revision_ids', AParentRevisionIDs);
+        LObject.AddPair('spec_content_id', ASpecContentID);
+        LObject.AddPair('revision_lineage', ALineageCanonical);
+
+        Result := HashObject('revision:', 'revision_identity/3.1', LObject);
+    finally
+        LObject.Free;
+    end;
+end;
+
+class function TGSDAIdentityService.FileContentID(
+    const ACanonicalFileBytes: TBytes): string;
+begin
+    Result := 'file:' + THashSHA2.GetHashString(ACanonicalFileBytes);
+end;
+
+end.
+'''
+
+files["GSDA31.State.pas"] = r'''unit GSDA31.State;
+
+interface
+
+uses
+    System.SysUtils,
+    System.Generics.Collections,
+    System.JSON,
+    GSDA31.Types;
+
+type
+    TGSDAResearchTask = class
+    public
+        TaskID: TGSDAId;
+        TargetContextID: TGSDAId;
+        UserPrompt: string;
+        UserIntent: string;
+        Domain: string;
+        Namespace: string;
+        TargetLanguage: string;
+        TargetAudience: TArray<string>;
+        Constraints: TArray<string>;
+        RequestedOutputs: TArray<string>;
+        PriorityProfile: string;
+        Intent: TGSDAIntent;
+        CreatedAtUtc: string;
+        constructor Create;
+        destructor Destroy; override;
+    end;
+
+    TGSDAIdentityRecord = class
+    public
+        IdentityValue: string;
+        IdentityKind: string;
+        Schema: string;
+        CanonicalPreimage: string;
+        SourceZone: TGSDATrustZone;
+        constructor Create(
+            const AIdentityValue, AIdentityKind, ASchema,
+                  ACanonicalPreimage: string;
+            ASourceZone: TGSDATrustZone
+        );
+    end;
+
+    TGSDARevisionStore = class
+    private
+        FRevisions: TObjectDictionary<string, TGSDARevisionSnapshot>;
+    public
+        constructor Create;
+        destructor Destroy; override;
+        procedure Add(ASnapshot: TGSDARevisionSnapshot);
+        function Find(const ASpecContentID: string): TGSDARevisionSnapshot;
+        function Latest: TGSDARevisionSnapshot;
+        function All: TArray<TGSDARevisionSnapshot>;
+    end;
+
+    TGSDAState = class
+    private
+        FTasks: TObjectDictionary<string, TGSDAResearchTask>;
+        FMessages: TObjectDictionary<string, TGSDAReasoningMessage>;
+        FArtifacts: TObjectDictionary<string, TGSDAArtifact>;
+        FEvidence: TObjectDictionary<string, TGSDAEvidence>;
+        FRequirements: TObjectDictionary<string, TGSDARequirement>;
+        FIdentities: TObjectDictionary<string, TGSDAIdentityRecord>;
+        FRevisions: TGSDARevisionStore;
+        FLogicalSequenceByRun: TDictionary<string, Int64>;
+    public
+        constructor Create;
+        destructor Destroy; override;
+
+        procedure AddTask(ATask: TGSDAResearchTask);
+        procedure AddMessage(AMessage: TGSDAReasoningMessage);
+        procedure AddArtifact(AArtifact: TGSDAArtifact);
+        procedure AddEvidence(AEvidence: TGSDAEvidence);
+        procedure AddRequirement(ARequirement: TGSDARequirement);
+        procedure AddIdentity(AIdentity: TGSDAIdentityRecord);
+
+        function FindTask(const ATaskID: string): TGSDAResearchTask;
+        function FindMessage(const AMessageID: string): TGSDAReasoningMessage;
+        function FindArtifact(const AArtifactID: string): TGSDAArtifact;
+        function FindEvidence(const AEvidenceID: string): TGSDAEvidence;
+        function FindRequirement(const ARequirementID: string): TGSDARequirement;
+        function FindIdentity(const AIdentityID: string): TGSDAIdentityRecord;
+
+        function NextLogicalSequence(const ARunID: string): Int64;
+
+        property RevisionStore: TGSDARevisionStore read FRevisions;
+        property Tasks: TObjectDictionary<string, TGSDAResearchTask> read FTasks;
+        property Messages: TObjectDictionary<string, TGSDAReasoningMessage> read FMessages;
+        property Artifacts: TObjectDictionary<string, TGSDAArtifact> read FArtifacts;
+        property Evidence: TObjectDictionary<string, TGSDAEvidence> read FEvidence;
+        property Requirements: TObjectDictionary<string, TGSDARequirement> read FRequirements;
+        property Identities: TObjectDictionary<string, TGSDAIdentityRecord> read FIdentities;
+    end;
+
+implementation
+
+constructor TGSDAResearchTask.Create;
+begin
+    Intent := TGSDAIntent.Create;
+end;
+
+destructor TGSDAResearchTask.Destroy;
+begin
+    Intent.Free;
+    inherited Destroy;
+end;
+
+constructor TGSDAIdentityRecord.Create(
+    const AIdentityValue, AIdentityKind, ASchema, ACanonicalPreimage: string;
+    ASourceZone: TGSDATrustZone);
+begin
+    IdentityValue := AIdentityValue;
+    IdentityKind := AIdentityKind;
+    Schema := ASchema;
+    CanonicalPreimage := ACanonicalPreimage;
+    SourceZone := ASourceZone;
+end;
+
+constructor TGSDARevisionStore.Create;
+begin
+    FRevisions := TObjectDictionary<string, TGSDARevisionSnapshot>.Create([doOwnsValues]);
+end;
+
+destructor TGSDARevisionStore.Destroy;
+begin
+    FRevisions.Free;
+    inherited Destroy;
+end;
+
+procedure TGSDARevisionStore.Add(ASnapshot: TGSDARevisionSnapshot);
+begin
+    if ASnapshot = nil then
+        raise EArgumentNilException.Create('Revision snapshot');
+
+    if FRevisions.ContainsKey(ASnapshot.SpecContentID) then
+        raise EGSDAFailure.Create(
+            fcLineageFailure,
+            'Duplicate published SpecContentID'
+        );
+
+    FRevisions.Add(ASnapshot.SpecContentID, ASnapshot);
+end;
+
+function TGSDARevisionStore.Find(const ASpecContentID: string): TGSDARevisionSnapshot;
+begin
+    if not FRevisions.TryGetValue(ASpecContentID, Result) then
+        Result := nil;
+end;
+
+function TGSDARevisionStore.Latest: TGSDARevisionSnapshot;
+var
+    LValues: TArray<TGSDARevisionSnapshot>;
+    LSnapshot: TGSDARevisionSnapshot;
+begin
+    Result := nil;
+    for LSnapshot in FRevisions.Values do
+        Result := LSnapshot;
+end;
+
+function TGSDARevisionStore.All: TArray<TGSDARevisionSnapshot>;
+var
+    LList: TList<TGSDARevisionSnapshot>;
+    LSnapshot: TGSDARevisionSnapshot;
+begin
+    LList := TList<TGSDARevisionSnapshot>.Create;
+    try
+        for LSnapshot in FRevisions.Values do
+            LList.Add(LSnapshot);
+
+        Result := LList.ToArray;
+    finally
+        LList.Free;
+    end;
+end;
+
+constructor TGSDAState.Create;
+begin
+    FTasks := TObjectDictionary<string, TGSDAResearchTask>.Create([doOwnsValues]);
+    FMessages := TObjectDictionary<string, TGSDAReasoningMessage>.Create([doOwnsValues]);
+    FArtifacts := TObjectDictionary<string, TGSDAArtifact>.Create([doOwnsValues]);
+    FEvidence := TObjectDictionary<string, TGSDAEvidence>.Create([doOwnsValues]);
+    FRequirements := TObjectDictionary<string, TGSDARequirement>.Create([doOwnsValues]);
+    FIdentities := TObjectDictionary<string, TGSDAIdentityRecord>.Create([doOwnsValues]);
+    FRevisions := TGSDARevisionStore.Create;
+    FLogicalSequenceByRun := TDictionary<string, Int64>.Create;
+end;
+
+destructor TGSDAState.Destroy;
+begin
+    FLogicalSequenceByRun.Free;
+    FRevisions.Free;
+    FIdentities.Free;
+    FRequirements.Free;
+    FEvidence.Free;
+    FArtifacts.Free;
+    FMessages.Free;
+    FTasks.Free;
+    inherited Destroy;
+end;
+
+procedure TGSDAState.AddTask(ATask: TGSDAResearchTask);
+begin
+    if FTasks.ContainsKey(ATask.TaskID) then
+        raise EGSDAFailure.Create(fcIdentityMismatch, 'Task identity collision');
+    FTasks.Add(ATask.TaskID, ATask);
+end;
+
+procedure TGSDAState.AddMessage(AMessage: TGSDAReasoningMessage);
+begin
+    if FMessages.ContainsKey(AMessage.MessageID) then
+        raise EGSDAFailure.Create(fcIdentityMismatch, 'Message identity collision');
+    FMessages.Add(AMessage.MessageID, AMessage);
+end;
+
+procedure TGSDAState.AddArtifact(AArtifact: TGSDAArtifact);
+begin
+    if FArtifacts.ContainsKey(AArtifact.ArtifactID) then
+        raise EGSDAFailure.Create(fcIdentityMismatch, 'Artifact identity collision');
+    FArtifacts.Add(AArtifact.ArtifactID, AArtifact);
+end;
+
+procedure TGSDAState.AddEvidence(AEvidence: TGSDAEvidence);
+begin
+    if FEvidence.ContainsKey(AEvidence.EvidenceID) then
+        raise EGSDAFailure.Create(fcIdentityMismatch, 'Evidence identity collision');
+    FEvidence.Add(AEvidence.EvidenceID, AEvidence);
+end;
+
+procedure TGSDAState.AddRequirement(ARequirement: TGSDARequirement);
+begin
+    if FRequirements.ContainsKey(ARequirement.RequirementID) then
+        raise EGSDAFailure.Create(fcIdentityMismatch, 'Requirement identity collision');
+    FRequirements.Add(ARequirement.RequirementID, ARequirement);
+end;
+
+procedure TGSDAState.AddIdentity(AIdentity: TGSDAIdentityRecord);
+var
+    LExisting: TGSDAIdentityRecord;
+begin
+    if FIdentities.TryGetValue(AIdentity.IdentityValue, LExisting) then
+    begin
+        if (LExisting.IdentityKind <> AIdentity.IdentityKind) or
+           (LExisting.Schema <> AIdentity.Schema) or
+           (LExisting.CanonicalPreimage <> AIdentity.CanonicalPreimage) then
+            raise EGSDAFailure.Create(fcIdentityMismatch, 'Identity collision');
+
+        Exit;
+    end;
+
+    FIdentities.Add(AIdentity.IdentityValue, AIdentity);
+end;
+
+function TGSDAState.FindTask(const ATaskID: string): TGSDAResearchTask;
+begin
+    if not FTasks.TryGetValue(ATaskID, Result) then
+        Result := nil;
+end;
+
+function TGSDAState.FindMessage(const AMessageID: string): TGSDAReasoningMessage;
+begin
+    if not FMessages.TryGetValue(AMessageID, Result) then
+        Result := nil;
+end;
+
+function TGSDAState.FindArtifact(const AArtifactID: string): TGSDAArtifact;
+begin
+    if not FArtifacts.TryGetValue(AArtifactID, Result) then
+        Result := nil;
+end;
+
+function TGSDAState.FindEvidence(const AEvidenceID: string): TGSDAEvidence;
+begin
+    if not FEvidence.TryGetValue(AEvidenceID, Result) then
+        Result := nil;
+end;
+
+function TGSDAState.FindRequirement(const ARequirementID: string): TGSDARequirement;
+begin
+    if not FRequirements.TryGetValue(ARequirementID, Result) then
+        Result := nil;
+end;
+
+function TGSDAState.FindIdentity(const AIdentityID: string): TGSDAIdentityRecord;
+begin
+    if not FIdentities.TryGetValue(AIdentityID, Result) then
+        Result := nil;
+end;
+
+function TGSDAState.NextLogicalSequence(const ARunID: string): Int64;
+var
+    LValue: Int64;
+begin
+    if not FLogicalSequenceByRun.TryGetValue(ARunID, LValue) then
+        LValue := 0;
+
+    if LValue = High(Int64) then
+        raise EGSDAFailure.Create(fcInputBoundsExceeded, 'Logical sequence overflow');
+
+    Inc(LValue);
+    FLogicalSequenceByRun.AddOrSetValue(ARunID, LValue);
+    Result := LValue;
+end;
+
+end.
+'''
+
+files["GSDA31.Kernel.pas"] = r'''unit GSDA31.Kernel;
+
+interface
+
+uses
+    System.SysUtils,
+    System.JSON,
+    System.Generics.Collections,
+    GSDA31.Types,
+    GSDA31.Canonical,
+    GSDA31.Crypto,
+    GSDA31.Identity,
+    GSDA31.State;
+
+type
+    TGSDAPeerProfile = class
+    public
+        PeerID: string;
+        Provider: string;
+        Model: string;
+        ModelVersion: string;
+        AdapterID: string;
+        TransportName: string;
+        EndpointFingerprint: string;
+        SharedSecret: TBytes;
+        Enabled: Boolean;
+    end;
+
+    TGSDAIngressResult = record
+        Accepted: Boolean;
+        MessageID: string;
+        ContentID: string;
+        ExecutionIdentity: string;
+    end;
+
+    TGSDACoverageResult = record
+        TotalIntentElements: Int64;
+        CriticalIntentElements: Int64;
+        CoveredCriticalIntentElements: Int64;
+        CriticalCoverageNumerator: Int64;
+        CriticalCoverageDenominator: Int64;
+        UncoveredOffsets: TArray<Int64>;
+    end;
+
+    TGSDAKernel31 = class
+    private
+        FState: TGSDAState;
+        FConfig: TGSDAConfig;
+        FPeers: TObjectDictionary<string, TGSDAPeerProfile>;
+        FKernelVersion: string;
+
+        procedure ValidateConfig;
+        procedure ValidatePeer(const APeerID: string);
+        function ParsePayload(const ARawPayload: string): TJSONObject;
+        function ComputeContentID(const APayload: TJSONObject): string;
+        function VerifyPeerAuthentication(
+            const APeer: TGSDAPeerProfile;
+            const AFingerprint, ARoundID, AToken: string
+        ): Boolean;
+        function CanonicalArrayOfIds(const AIds: TArray<string>): TJSONArray;
+        function BuildTraceabilityJson: string;
+        function BuildRequirementsJson: string;
+    public
+        constructor Create(const AConfig: TGSDAConfig);
+        destructor Destroy; override;
+
+        function CreateTask(
+            const AUserPrompt, AUserIntent, ADomain: string;
+            const ATargetAudience, AConstraints, ARequestedOutputs: TArray<string>
+        ): TGSDAResearchTask;
+
+        function IssueRunID: string;
+
+        procedure RegisterPeer(const AProfile: TGSDAPeerProfile);
+
+        function AcceptPeerMessage(
+            const APeerID, ARunID, ATaskID, ARoundID, AToken, AFingerprint: string;
+            AKind: TGSDAMessageKind;
+            AConfidence: Integer;
+            const ARawPayload: string
+        ): TGSDAIngressResult;
+
+        function RegisterRequirement(
+            const AText, AKeyword: string;
+            const ASourceRefs: TArray<string>
+        ): TGSDARequirement;
+
+        function RegisterArtifact(
+            const ATaskID, ARunID, APeerID, ARoundID: string;
+            const AKind, AContent: string;
+            const AParentArtifactIDs, ARequirementIDs, ASourceRefs: TArray<string>;
+            const AMessageID: string
+        ): TGSDAArtifact;
+
+        function RegisterEvidence(
+            const ARunID, AKind: string;
+            const ASubjectIDs: TArray<string>;
+            const ACanonicalContent, AProducedBy: string
+        ): TGSDAEvidence;
+
+        function ComputeCoverage(const ATaskID: string): TGSDACoverageResult;
+        function ComputeSpecContentID(
+            const ARequirementsJson, AGlossaryJson, AAssumptionsJson,
+                  AQuestionsJson, ATraceabilityJson: string
+        ): string;
+
+        function ValidatePublication(
+            const ASpecContentID: string;
+            const ARequirementsJson, AGlossaryJson,
+                  AAssumptionsJson, AQuestionsJson,
+                  ATraceabilityJson: string;
+            const AHumanDecision: TGSDAHumanDecision
+        ): Boolean;
+
+        function CommitRevision(
+            const ASpecContentID: string;
+            const APackageFiles: TDictionary<string, string>;
+            const ACanonicalManifest, APackageHash: string;
+            const AHumanDecision: TGSDAHumanDecision
+        ): TGSDARevisionSnapshot;
+
+        property State: TGSDAState read FState;
+        property Config: TGSDAConfig read FConfig;
+        property KernelVersion: string read FKernelVersion;
+    end;
+
+implementation
+
+function IsHexString(const AValue: string): Boolean;
+var
+    LIndex: Integer;
+begin
+    Result := AValue <> '';
+
+    for LIndex := 1 to Length(AValue) do
+        if not CharInSet(AValue[LIndex], ['0'..'9', 'A'..'F', 'a'..'f']) then
+            Exit(False);
+end;
+
+constructor TGSDAKernel31.Create(const AConfig: TGSDAConfig);
+begin
+    if AConfig = nil then
+        raise EArgumentNilException.Create('Config');
+
+    FState := TGSDAState.Create;
+    FConfig := AConfig;
+    FPeers := TObjectDictionary<string, TGSDAPeerProfile>.Create([doOwnsValues]);
+    FKernelVersion := '3.1.0';
+    ValidateConfig;
+end;
+
+destructor TGSDAKernel31.Destroy;
+begin
+    FPeers.Free;
+    FState.Free;
+    inherited Destroy;
+end;
+
+procedure TGSDAKernel31.ValidateConfig;
+begin
+    if FConfig.Namespace = '' then
+        raise EGSDAFailure.Create(fcConfigIncomplete, 'Namespace is required');
+
+    if FConfig.TargetLanguage = '' then
+        raise EGSDAFailure.Create(fcConfigIncomplete, 'Target language is required');
+
+    if FConfig.MaxRounds <= 0 then
+        raise EGSDAFailure.Create(fcConfigIncomplete, 'MaxRounds must be positive');
+
+    if FConfig.MaxMessagesPerRound <= 0 then
+        raise EGSDAFailure.Create(fcConfigIncomplete, 'MaxMessagesPerRound must be positive');
+
+    if (FConfig.MinCriticalCoverageDenominator <= 0) or
+       (FConfig.MinCriticalCoverageNumerator < 0) or
+       (FConfig.MinCriticalCoverageNumerator > FConfig.MinCriticalCoverageDenominator) then
+        raise EGSDAFailure.Create(fcConfigIncomplete, 'Invalid critical coverage threshold');
+
+    if Length(FConfig.HmacSecret) = 0 then
+        raise EGSDAFailure.Create(fcConfigIncomplete, 'HMAC secret is required');
+end;
+
+procedure TGSDAKernel31.ValidatePeer(const APeerID: string);
+var
+    LProfile: TGSDAPeerProfile;
+begin
+    if not FPeers.TryGetValue(APeerID, LProfile) then
+        raise EGSDAFailure.Create(fcImpersonationAttempt, 'Unknown peer: ' + APeerID);
+
+    if not LProfile.Enabled then
+        raise EGSDAFailure.Create(fcImpersonationAttempt, 'Peer disabled: ' + APeerID);
+end;
+
+procedure TGSDAKernel31.RegisterPeer(const AProfile: TGSDAPeerProfile);
+begin
+    if AProfile = nil then
+        raise EArgumentNilException.Create('Peer profile');
+
+    if AProfile.PeerID = '' then
+        raise EGSDAFailure.Create(fcConfigIncomplete, 'Peer ID is required');
+
+    if Length(AProfile.SharedSecret) = 0 then
+        raise EGSDAFailure.Create(fcConfigIncomplete, 'Peer secret is required');
+
+    if FPeers.ContainsKey(AProfile.PeerID) then
+        raise EGSDAFailure.Create(fcIdentityMismatch, 'Duplicate peer ID');
+
+    FPeers.Add(AProfile.PeerID, AProfile);
+end;
+
+function TGSDAKernel31.CreateTask(
+    const AUserPrompt, AUserIntent, ADomain: string;
+    const ATargetAudience, AConstraints, ARequestedOutputs: TArray<string>
+): TGSDAResearchTask;
+begin
+    if AUserPrompt = '' then
+        raise EGSDAFailure.Create(fcSchemaFailure, 'Prompt is required');
+
+    Result := TGSDAResearchTask.Create;
+    Result.UserPrompt := AUserPrompt;
+    Result.UserIntent := AUserIntent;
+    Result.Domain := ADomain;
+    Result.Namespace := FConfig.Namespace;
+    Result.TargetLanguage := FConfig.TargetLanguage;
+    Result.TargetAudience := Copy(ATargetAudience);
+    Result.Constraints := Copy(AConstraints);
+    Result.RequestedOutputs := Copy(ARequestedOutputs);
+    Result.PriorityProfile := FConfig.PriorityProfile;
+    Result.CreatedAtUtc := GSDA_UtcNowIso;
+    Result.TaskID := TGSDAIdentityService.TaskID(Result);
+    Result.TargetContextID := TGSDAIdentityService.TargetContextID(Result);
+
+    FState.AddTask(Result);
+end;
+
+function TGSDAKernel31.IssueRunID: string;
+begin
+    Result := 'run:' + GUIDToString(TGUID.NewGuid);
+end;
+
+function TGSDAKernel31.ParsePayload(const ARawPayload: string): TJSONObject;
+var
+    LSanitized: string;
+    LValue: TJSONValue;
+begin
+    LSanitized := Trim(ARawPayload);
+
+    if (Length(LSanitized) >= 3) and
+       (LSanitized[1] = #$EF) and
+       (LSanitized[2] = #$BB) and
+       (LSanitized[3] = #$BF) then
+        Delete(LSanitized, 1, 3);
+
+    LValue := TJSONObject.ParseJSONValue(LSanitized);
+    if not (LValue is TJSONObject) then
+    begin
+        LValue.Free;
+        raise EGSDAFailure.Create(fcProtocolFailure, 'Payload is not a JSON object');
+    end;
+
+    Result := TJSONObject(LValue);
+end;
+
+function TGSDAKernel31.ComputeContentID(const APayload: TJSONObject): string;
+var
+    LContentProjection: TJSONObject;
+begin
+    LContentProjection := APayload.Clone as TJSONObject;
+    try
+        LContentProjection.RemovePair('message_id').Free;
+        LContentProjection.RemovePair('hmac').Free;
+        LContentProjection.RemovePair('peer_id').Free;
+        LContentProjection.RemovePair('run_id').Free;
+        LContentProjection.RemovePair('round_id').Free;
+        LContentProjection.RemovePair('logical_sequence').Free;
+
+        Result := 'content:' +
+            GSDA_SHA256Hex(
+                TGSDAJsonCanonical.Canonicalize(LContentProjection)
+            );
+    finally
+        LContentProjection.Free;
+    end;
+end;
+
+function TGSDAKernel31.VerifyPeerAuthentication(
+    const APeer: TGSDAPeerProfile;
+    const AFingerprint, ARoundID, AToken: string): Boolean;
+var
+    LFingerprint: string;
+    LExpected: string;
+begin
+    LFingerprint :=
+        APeer.TransportName + '|' +
+        APeer.AdapterID + '|' +
+        APeer.EndpointFingerprint;
+
+    if not GSDA_ConstantTimeEquals(LFingerprint, AFingerprint) then
+        Exit(False);
+
+    LExpected := GSDA_HMACSHA256Hex(
+        APeer.SharedSecret,
+        APeer.PeerID + '|' + AFingerprint + '|' + ARoundID
+    );
+
+    Result := GSDA_ConstantTimeEquals(LExpected, AToken);
+end;
+
+function TGSDAKernel31.CanonicalArrayOfIds(
+    const AIds: TArray<string>): TJSONArray;
+var
+    LList: TList<string>;
+    LValue: string;
+begin
+    LList := TList<string>.Create;
+    try
+        for LValue in AIds do
+            LList.Add(LValue);
+
+        LList.Sort;
+
+        Result := TJSONArray.Create;
+        for LValue in LList do
+            Result.Add(LValue);
+    finally
+        LList.Free;
+    end;
+end;
+
+function TGSDAKernel31.AcceptPeerMessage(
+    const APeerID, ARunID, ATaskID, ARoundID, AToken, AFingerprint: string;
+    AKind: TGSDAMessageKind;
+    AConfidence: Integer;
+    const ARawPayload: string): TGSDAIngressResult;
+var
+    LPeer: TGSDAPeerProfile;
+    LRunTask: TGSDAResearchTask;
+    LPayload: TJSONObject;
+    LCanonical: string;
+    LContentID: string;
+    LPayloadSchema: string;
+    LMessageID: string;
+    LSequence: Int64;
+    LMessage: TGSDAReasoningMessage;
+    LIdentityPreimage: TJSONObject;
+begin
+    FillChar(Result, SizeOf(Result), 0);
+
+    ValidatePeer(APeerID);
+
+    if not FPeers.TryGetValue(APeerID, LPeer) then
+        raise EGSDAFailure.Create(fcImpersonationAttempt, 'Peer not found');
+
+    if AConfidence < 1 then
+        raise EGSDAFailure.Create(fcProtocolFailure, 'Confidence 0 is not permitted');
+
+    if AConfidence > 1000 then
+        raise EGSDAFailure.Create(fcProtocolFailure, 'Confidence above 1000');
+
+    LRunTask := FState.FindTask(ATaskID);
+    if LRunTask = nil then
+        raise EGSDAFailure.Create(fcCrossReferenceUnresolved, 'Task not found');
+
+    if not VerifyPeerAuthentication(LPeer, AFingerprint, ARoundID, AToken) then
+        raise EGSDAFailure.Create(fcImpersonationAttempt, 'Peer authentication failed');
+
+    LPayload := ParsePayload(ARawPayload);
+    try
+        LPayloadSchema := LPayload.GetValue<string>('schema', '');
+        if LPayloadSchema <> 'gsp/3.1' then
+            raise EGSDAFailure.Create(fcSchemaFailure, 'Expected gsp/3.1 payload');
+
+        LContentID := ComputeContentID(LPayload);
+        if LPayload.GetValue<string>('content_id', '') <> LContentID then
+            raise EGSDAFailure.Create(fcContentIdentityMismatch, 'content_id mismatch');
+
+        LCanonical := TGSDAJsonCanonical.Canonicalize(LPayload);
+        LSequence := FState.NextLogicalSequence(ARunID);
+
+        LMessageID := TGSDAIdentityService.MessageID(
+            ARunID,
+            APeerID,
+            LPayloadSchema,
+            LContentID
+        );
+
+        if FState.FindMessage(LMessageID) <> nil then
+            raise EGSDAFailure.Create(fcIdentityMismatch, 'Duplicate message identity');
+
+        LMessage := TGSDAReasoningMessage.Create;
+        LMessage.PeerID := APeerID;
+        LMessage.RunID := ARunID;
+        LMessage.TaskID := ATaskID;
+        LMessage.RoundID := ARoundID;
+        LMessage.LogicalSequence := LSequence;
+        LMessage.Kind := AKind;
+        LMessage.Confidence := AConfidence;
+        LMessage.RawPayload := ARawPayload;
+        LMessage.CanonicalPayload := LCanonical;
+        LMessage.Payload := LPayload.Clone as TJSONObject;
+        LMessage.ContentID := LContentID;
+        LMessage.MessageID := LMessageID;
+
+        LIdentityPreimage := TJSONObject.Create;
+        try
+            LIdentityPreimage.AddPair('run_id', ARunID);
+            LIdentityPreimage.AddPair('peer_id', APeerID);
+            LIdentityPreimage.AddPair('round_id', ARoundID);
+            LIdentityPreimage.AddPair('content_id', LContentID);
+            LIdentityPreimage.AddPair('payload_schema', LPayloadSchema);
+
+            FState.AddIdentity(
+                TGSDAIdentityRecord.Create(
+                    LMessageID,
+                    'message',
+                    'message_identity/3.1',
+                    TGSDAJsonCanonical.Canonicalize(LIdentityPreimage),
+                    tzT4Kernel
+                )
+            );
+        finally
+            LIdentityPreimage.Free;
+        end;
+
+        FState.AddMessage(LMessage);
+
+        Result.Accepted := True;
+        Result.MessageID := LMessageID;
+        Result.ContentID := LContentID;
+        Result.ExecutionIdentity := LMessageID;
+    finally
+        LPayload.Free;
+    end;
+end;
+
+function TGSDAKernel31.RegisterRequirement(
+    const AText, AKeyword: string;
+    const ASourceRefs: TArray<string>): TGSDARequirement;
+begin
+    Result := TGSDARequirement.Create;
+    Result.Text := AText;
+    Result.NormativeKeyword := AKeyword;
+    Result.SourceRefs := Copy(ASourceRefs);
+    Result.RequirementID :=
+        TGSDAIdentityService.RequirementID(
+            AText,
+            AKeyword,
+            ASourceRefs
+        );
+
+    FState.AddRequirement(Result);
+    FState.AddIdentity(
+        TGSDAIdentityRecord.Create(
+            Result.RequirementID,
+            'requirement',
+            'requirement/3.1',
+            AText,
+            tzT4Kernel
+        )
+    );
+end;
+
+function TGSDAKernel31.RegisterArtifact(
+    const ATaskID, ARunID, APeerID, ARoundID: string;
+    const AKind, AContent: string;
+    const AParentArtifactIDs, ARequirementIDs, ASourceRefs: TArray<string>;
+    const AMessageID: string): TGSDAArtifact;
+var
+    LContentID: string;
+    LPreimage: TJSONObject;
+begin
+    if FState.FindTask(ATaskID) = nil then
+        raise EGSDAFailure.Create(fcCrossReferenceUnresolved, 'Task missing');
+
+    for var LParentID in AParentArtifactIDs do
+        if FState.FindArtifact(LParentID) = nil then
+            raise EGSDAFailure.Create(
+                fcCrossReferenceUnresolved,
+                'Parent artifact missing: ' + LParentID
+            );
+
+    LContentID := 'content:' + GSDA_SHA256Hex(AContent);
+
+    Result := TGSDAArtifact.Create;
+    Result.TaskID := ATaskID;
+    Result.RunID := ARunID;
+    Result.PeerID := APeerID;
+    Result.RoundID := ARoundID;
+    Result.LogicalSequence := FState.NextLogicalSequence(ARunID);
+    Result.Kind := AKind;
+    Result.Content := AContent;
+    Result.ContentID := LContentID;
+    Result.ParentArtifactIDs := Copy(AParentArtifactIDs);
+    Result.RequirementIDs := Copy(ARequirementIDs);
+    Result.SourceRefs := Copy(ASourceRefs);
+    Result.ArtifactID :=
+        TGSDAIdentityService.ArtifactID(Result, AMessageID);
+
+    FState.AddArtifact(Result);
+
+    LPreimage := TJSONObject.Create;
+    try
+        LPreimage.AddPair('task_id', ATaskID);
+        LPreimage.AddPair('run_id', ARunID);
+        LPreimage.AddPair('artifact_kind', AKind);
+        LPreimage.AddPair('content_id', LContentID);
+        LPreimage.AddPair('author_peer_id', APeerID);
+        LPreimage.AddPair('round_id', ARoundID);
+        LPreimage.AddPair('parent_artifact_ids',
+            CanonicalArrayOfIds(AParentArtifactIDs)
+        );
+        LPreimage.AddPair('message_id', AMessageID);
+
+        FState.AddIdentity(
+            TGSDAIdentityRecord.Create(
+                Result.ArtifactID,
+                'artifact',
+                'artifact_identity/3.1',
+                TGSDAJsonCanonical.Canonicalize(LPreimage),
+                tzT4Kernel
+            )
+        );
+    finally
+        LPreimage.Free;
+    end;
+end;
+
+function TGSDAKernel31.RegisterEvidence(
+    const ARunID, AKind: string;
+    const ASubjectIDs: TArray<string>;
+    const ACanonicalContent, AProducedBy: string): TGSDAEvidence;
+var
+    LSubjectID: string;
+    LContentID: string;
+    LPreimage: TJSONObject;
+begin
+    for LSubjectID in ASubjectIDs do
+        if FState.FindIdentity(LSubjectID) = nil then
+            raise EGSDAFailure.Create(
+                fcCrossReferenceUnresolved,
+                'Evidence subject missing: ' + LSubjectID
+            );
+
+    LContentID := 'content:' + GSDA_SHA256Hex(ACanonicalContent);
+
+    Result := TGSDAEvidence.Create;
+    Result.RunID := ARunID;
+    Result.Kind := AKind;
+    Result.SubjectIDs := Copy(ASubjectIDs);
+    Result.CanonicalContent := ACanonicalContent;
+    Result.ContentID := LContentID;
+    Result.ProducedBy := AProducedBy;
+    Result.EvidenceID :=
+        TGSDAIdentityService.EvidenceID(
+            ARunID,
+            AKind,
+            ASubjectIDs,
+            LContentID,
+            AProducedBy
+        );
+
+    FState.AddEvidence(Result);
+
+    LPreimage := TJSONObject.Create;
+    try
+        LPreimage.AddPair('run_id', ARunID);
+        LPreimage.AddPair('evidence_kind', AKind);
+        LPreimage.AddPair('subject_ids', CanonicalArrayOfIds(ASubjectIDs));
+        LPreimage.AddPair('content_id', LContentID);
+        LPreimage.AddPair('produced_by', AProducedBy);
+
+        FState.AddIdentity(
+            TGSDAIdentityRecord.Create(
+                Result.EvidenceID,
+                'evidence',
+                'evidence_identity/3.1',
+                TGSDAJsonCanonical.Canonicalize(LPreimage),
+                tzT4Kernel
+            )
+        );
+    finally
+        LPreimage.Free;
+    end;
+end;
+
+function TGSDAKernel31.ComputeCoverage(
+    const ATaskID: string): TGSDACoverageResult;
+var
+    LTask: TGSDAResearchTask;
+    LElement: TGSDAIntentElement;
+    LArtifactID: string;
+    LHasArtifact: Boolean;
+    LUncovered: TList<Int64>;
+begin
+    LTask := FState.FindTask(ATaskID);
+    if LTask = nil then
+        raise EGSDAFailure.Create(fcCrossReferenceUnresolved, 'Task missing');
+
+    FillChar(Result, SizeOf(Result), 0);
+    LUncovered := TList<Int64>.Create;
+    try
+        for LElement in LTask.Intent.Elements do
+        begin
+            Inc(Result.TotalIntentElements);
+
+            if LElement.Critical then
+            begin
+                Inc(Result.CriticalIntentElements);
+                LHasArtifact := False;
+
+                for LArtifactID in LElement.LinkedArtifactIDs do
+                    if FState.FindArtifact(LArtifactID) <> nil then
+                    begin
+                        LHasArtifact := True;
+                        Break;
+                    end;
+
+                if LHasArtifact then
+                    Inc(Result.CoveredCriticalIntentElements)
+                else
+                    LUncovered.Add(LElement.ByteStart);
+            end;
+        end;
+
+        if Result.CriticalIntentElements = 0 then
+        begin
+            Result.CriticalCoverageNumerator := 1;
+            Result.CriticalCoverageDenominator := 1;
+        end
+        else
+        begin
+            Result.CriticalCoverageNumerator :=
+                Result.CoveredCriticalIntentElements;
+            Result.CriticalCoverageDenominator :=
+                Result.CriticalIntentElements;
+        end;
+
+        Result.UncoveredOffsets := LUncovered.ToArray;
+    finally
+        LUncovered.Free;
+    end;
+end;
+
+function TGSDAKernel31.BuildRequirementsJson: string;
+var
+    LRoot: TJSONObject;
+    LArray: TJSONArray;
+    LRequirement: TGSDARequirement;
+    LObject: TJSONObject;
+begin
+    LRoot := TJSONObject.Create;
+    try
+        LArray := TJSONArray.Create;
+
+        for LRequirement in FState.Requirements.Values do
+        begin
+            LObject := TJSONObject.Create;
+            LObject.AddPair('requirement_id', LRequirement.RequirementID);
+            LObject.AddPair('text', LRequirement.Text);
+            LObject.AddPair('normative_keyword', LRequirement.NormativeKeyword);
+            LArray.Add(LObject);
+        end;
+
+        LRoot.AddPair('schema', 'requirements/3.1');
+        LRoot.AddPair('items', LArray);
+
+        Result := TGSDAJsonCanonical.Canonicalize(LRoot);
+    finally
+        LRoot.Free;
+    end;
+end;
+
+function TGSDAKernel31.BuildTraceabilityJson: string;
+var
+    LRoot: TJSONObject;
+    LArtifacts: TJSONArray;
+    LEvidence: TJSONArray;
+    LArtifact: TGSDAArtifact;
+    LEvidenceItem: TGSDAEvidence;
+    LObject: TJSONObject;
+begin
+    LRoot := TJSONObject.Create;
+    try
+        LArtifacts := TJSONArray.Create;
+        for LArtifact in FState.Artifacts.Values do
+        begin
+            LObject := TJSONObject.Create;
+            LObject.AddPair('artifact_id', LArtifact.ArtifactID);
+            LObject.AddPair('requirement_ids',
+                CanonicalArrayOfIds(LArtifact.RequirementIDs)
+            );
+            LObject.AddPair('source_refs',
+                CanonicalArrayOfIds(LArtifact.SourceRefs)
+            );
+            LArtifacts.Add(LObject);
+        end;
+
+        LEvidence := TJSONArray.Create;
+        for LEvidenceItem in FState.Evidence.Values do
+        begin
+            LObject := TJSONObject.Create;
+            LObject.AddPair('evidence_id', LEvidenceItem.EvidenceID);
+            LObject.AddPair('subject_ids',
+                CanonicalArrayOfIds(LEvidenceItem.SubjectIDs)
+            );
+            LObject.AddPair('kind', LEvidenceItem.Kind);
+            LEvidence.Add(LObject);
+        end;
+
+        LRoot.AddPair('schema', 'traceability/3.1');
+        LRoot.AddPair('artifacts', LArtifacts);
+        LRoot.AddPair('evidence', LEvidence);
+
+        Result := TGSDAJsonCanonical.Canonicalize(LRoot);
+    finally
+        LRoot.Free;
+    end;
+end;
+
+function TGSDAKernel31.ComputeSpecContentID(
+    const ARequirementsJson, AGlossaryJson,
+          AAssumptionsJson, AQuestionsJson,
+          ATraceabilityJson: string): string;
+begin
+    Result := TGSDAIdentityService.SpecContentID(
+        ARequirementsJson,
+        AGlossaryJson,
+        AAssumptionsJson,
+        AQuestionsJson,
+        ATraceabilityJson
+    );
+end;
+
+function TGSDAKernel31.ValidatePublication(
+    const ASpecContentID: string;
+    const ARequirementsJson, AGlossaryJson,
+          AAssumptionsJson, AQuestionsJson,
+          ATraceabilityJson: string;
+    const AHumanDecision: TGSDAHumanDecision): Boolean;
+var
+    LExpectedID: string;
+    LDecision: Boolean;
+begin
+    Result := False;
+
+    LExpectedID := ComputeSpecContentID(
+        ARequirementsJson,
+        AGlossaryJson,
+        AAssumptionsJson,
+        AQuestionsJson,
+        ATraceabilityJson
+    );
+
+    if LExpectedID <> ASpecContentID then
+        Exit(False);
+
+    if AHumanDecision = nil then
+        Exit(False);
+
+    if AHumanDecision.SpecContentID <> ASpecContentID then
+        Exit(False);
+
+    if not AHumanDecision.Accepted then
+        Exit(False);
+
+    if AHumanDecision.ActorID = '' then
+        Exit(False);
+
+    if AHumanDecision.Rationale = '' then
+        Exit(False);
+
+    if not IsHexString(AHumanDecision.SignatureHex) then
+        Exit(False);
+
+    if Length(AHumanDecision.SignatureHex) < 16 then
+        Exit(False);
+
+    for var LRequirement in FState.Requirements.Values do
+        for var LSourceRef in LRequirement.SourceRefs do
+            if FState.FindIdentity(LSourceRef) = nil then
+                Exit(False);
+
+    LDecision := AHumanDecision.Accepted;
+    Result := LDecision;
+end;
+
+function TGSDAKernel31.CommitRevision(
+    const ASpecContentID: string;
+    const APackageFiles: TDictionary<string, string>;
+    const ACanonicalManifest, APackageHash: string;
+    const AHumanDecision: TGSDAHumanDecision): TGSDARevisionSnapshot;
+var
+    LPrevious: TGSDARevisionSnapshot;
+begin
+    if AHumanDecision = nil then
+        raise EGSDAFailure.Create(fcGovernanceFailure, 'Human decision required');
+
+    if not AHumanDecision.Accepted then
+        raise EGSDAFailure.Create(fcGovernanceFailure, 'Human decision rejected');
+
+    LPrevious := FState.RevisionStore.Latest;
+
+    Result := TGSDARevisionSnapshot.Create;
+    Result.SpecContentID := ASpecContentID;
+    Result.PreviousRevisionID := '';
+    Result.PackageHash := APackageHash;
+    Result.CanonicalPackageManifest := ACanonicalManifest;
+    Result.CreatedAtUtc := GSDA_UtcNowIso;
+
+    if LPrevious <> nil then
+        Result.PreviousRevisionID := LPrevious.RevisionID;
+
+    Result.RevisionID :=
+        TGSDAIdentityService.RevisionID(
+            [Result.PreviousRevisionID],
+            ASpecContentID,
+            ACanonicalManifest
+        );
+
+    for var LPair in APackageFiles do
+        Result.PackageFiles.Add(LPair.Key, LPair.Value);
+
+    FState.RevisionStore.Add(Result);
+end;
+
+end.
+'''
+
+files["GSDA31.Publication.pas"] = r'''unit GSDA31.Publication;
+
+interface
+
+uses
+    System.SysUtils,
+    System.JSON,
+    System.Generics.Collections,
+    GSDA31.Types,
+    GSDA31.Crypto,
+    GSDA31.Canonical,
+    GSDA31.Identity,
+    GSDA31.Kernel,
+    GSDA31.State;
+
+type
+    TGSDAPublication31 = class
+    private
+        FKernel: TGSDAKernel31;
+
+        procedure CheckNormativeKeywordLeaks(
+            const ARequirementsJson, AGlossaryJson,
+                  AAssumptionsJson, AQuestionsJson,
+                  ATraceabilityJson: string
+        );
+        procedure CheckNoCriticalFindings;
+        procedure CheckTraceability;
+        procedure CheckCoverage(const ATaskID: string);
+        procedure CheckReferences;
+        procedure CheckPackage(
+            const APackageFiles: TDictionary<string, string>
+        );
+    public
+        constructor Create(AKernel: TGSDAKernel31);
+
+        function BuildPackageFiles(
+            const ARequirementsJson, AGlossaryJson,
+                  AAssumptionsJson, AQuestionsJson,
+                  ATraceabilityJson: string
+        ): TDictionary<string, string>;
+
+        function ComputePackageHash(
+            const APackageFiles: TDictionary<string, string>
+        ): string;
+
+        function Publish(
+            const ATaskID: string;
+            const ARequirementsJson, AGlossaryJson,
+                  AAssumptionsJson, AQuestionsJson,
+                  ATraceabilityJson: string;
+            const AHumanDecision: TGSDAHumanDecision
+        ): TGSDARevisionSnapshot;
+    end;
+
+implementation
+
+constructor TGSDAPublication31.Create(AKernel: TGSDAKernel31);
+begin
+    if AKernel = nil then
+        raise EArgumentNilException.Create('Kernel');
+
+    FKernel := AKernel;
+end;
+
+procedure TGSDAPublication31.CheckNormativeKeywordLeaks(
+    const ARequirementsJson, AGlossaryJson,
+          AAssumptionsJson, AQuestionsJson,
+          ATraceabilityJson: string);
+const
+    LKeywords: array[0..10] of string = (
+        'MUST', 'MUST NOT', 'SHALL', 'SHALL NOT',
+        'SHOULD', 'SHOULD NOT', 'MAY', 'REQUIRED',
+        'RECOMMENDED', 'NOT RECOMMENDED', 'OPTIONAL'
+    );
+var
+    LText: string;
+    LKeyword: string;
+begin
+    LText :=
+        UpperCase(
+            ARequirementsJson + #10 +
+            AGlossaryJson + #10 +
+            AAssumptionsJson + #10 +
+            AQuestionsJson + #10 +
+            ATraceabilityJson
+        );
+
+    { Structured requirement data is allowed to carry the normative keyword
+      in its dedicated field. This linter therefore only guards raw free-form
+      serialized regions in this first implementation. }
+    for LKeyword in LKeywords do
+    begin
+        if (Pos('"' + LKeyword + '"', LText) > 0) and
+           (Pos('"normative_keyword":"' + LKeyword + '"', LText) = 0) then
+            raise EGSDAFailure.Create(
+                fcNormativeKeywordLeak,
+                'Possible unmarked normative keyword: ' + LKeyword
+            );
+    end;
+end;
+
+procedure TGSDAPublication31.CheckNoCriticalFindings;
+begin
+    { No finding store exists in the authoritative kernel yet.
+      Absence of a finding store is safe only because publication cannot
+      synthesize a "pass"; this hook intentionally remains empty until
+      a finding record is introduced. }
+end;
+
+procedure TGSDAPublication31.CheckTraceability;
+var
+    LRequirement: TGSDARequirement;
+    LArtifactID: string;
+    LSourceRef: string;
+begin
+    for LRequirement in FKernel.State.Requirements.Values do
+    begin
+        for LSourceRef in LRequirement.SourceRefs do
+            if FKernel.State.FindIdentity(LSourceRef) = nil then
+                raise EGSDAFailure.Create(
+                    fcSourceReferenceUnresolved,
+                    'Unresolved requirement source reference'
+                );
+
+        for LArtifactID in LRequirement.ArtifactIDs do
+            if FKernel.State.FindArtifact(LArtifactID) = nil then
+                raise EGSDAFailure.Create(
+                    fcCrossReferenceUnresolved,
+                    'Requirement artifact reference unresolved'
+                );
+    end;
+end;
+
+procedure TGSDAPublication31.CheckCoverage(const ATaskID: string);
+var
+    LCoverage: TGSDACoverageResult;
+    LLeft, LRight: Int64;
+begin
+    LCoverage := FKernel.ComputeCoverage(ATaskID);
+
+    LLeft :=
+        LCoverage.CriticalCoverageNumerator *
+        FKernel.Config.MinCriticalCoverageDenominator;
+
+    LRight :=
+        FKernel.Config.MinCriticalCoverageNumerator *
+        LCoverage.CriticalCoverageDenominator;
+
+    if LLeft < LRight then
+        raise EGSDAFailure.Create(
+            fcPublicationFailure,
+            'Critical intent coverage threshold not satisfied'
+        );
+end;
+
+procedure TGSDAPublication31.CheckReferences;
+var
+    LMessage: TGSDAReasoningMessage;
+    LParentValue: TJSONValue;
+    LParentID: string;
+begin
+    for LMessage in FKernel.State.Messages.Values do
+    begin
+        LParentValue := LMessage.Payload.GetValue('parent_ids');
+        if LParentValue is TJSONArray then
+            for var LI := 0 to TJSONArray(LParentValue).Count - 1 do
+            begin
+                LParentID := TJSONArray(LParentValue).Items[LI].Value;
+                if (FKernel.State.FindMessage(LParentID) = nil) and
+                   (FKernel.State.FindArtifact(LParentID) = nil) and
+                   (FKernel.State.FindRequirement(LParentID) = nil) then
+                    raise EGSDAFailure.Create(
+                        fcCrossReferenceUnresolved,
+                        'Unresolved parent reference'
+                    );
+            end;
+    end;
+end;
+
+procedure TGSDAPublication31.CheckPackage(
+    const APackageFiles: TDictionary<string, string>);
+const
+    LRequired: array[0..5] of string = (
+        'spec.requirements.json',
+        'spec.glossary.json',
+        'spec.assumptions.json',
+        'spec.open_questions.json',
+        'spec.traceability.json',
+        'registry.json'
+    );
+var
+    LName: string;
+begin
+    for LName in LRequired do
+        if not APackageFiles.ContainsKey(LName) then
+            raise EGSDAFailure.Create(
+                fcPublicationFailure,
+                'Required package file missing: ' + LName
+            );
+
+    for LName in APackageFiles.Keys do
+        if (Pos('..', LName) > 0) or
+           LName.StartsWith('/') or
+           LName.StartsWith('\') then
+            raise EGSDAFailure.Create(
+                fcPublicationFailure,
+                'Unsafe package path: ' + LName
+            );
+end;
+
+function TGSDAPublication31.BuildPackageFiles(
+    const ARequirementsJson, AGlossaryJson,
+          AAssumptionsJson, AQuestionsJson,
+          ATraceabilityJson: string): TDictionary<string, string>;
+var
+    LRegistry: TJSONObject;
+begin
+    Result := TDictionary<string, string>.Create;
+    try
+        LRegistry := TJSONObject.Create;
+        try
+            LRegistry.AddPair('schema', 'registry/3.1');
+            LRegistry.AddPair('kernel_version', FKernel.KernelVersion);
+            LRegistry.AddPair('canonicalization', 'GSDA-UTF8-BYTEWISE-3.1');
+            Result.Add(
+                'registry.json',
+                TGSDAJsonCanonical.Canonicalize(LRegistry)
+            );
+        finally
+            LRegistry.Free;
+        end;
+
+        Result.Add('spec.requirements.json', ARequirementsJson);
+        Result.Add('spec.glossary.json', AGlossaryJson);
+        Result.Add('spec.assumptions.json', AAssumptionsJson);
+        Result.Add('spec.open_questions.json', AQuestionsJson);
+        Result.Add('spec.traceability.json', ATraceabilityJson);
+
+        CheckPackage(Result);
+    except
+        Result.Free;
+        raise;
+    end;
+end;
+
+function TGSDAPublication31.ComputePackageHash(
+    const APackageFiles: TDictionary<string, string>): string;
+var
+    LNames: TList<string>;
+    LName: string;
+    LManifest: TStringBuilder;
+    LBytes: TBytes;
+begin
+    LNames := TList<string>.Create;
+    try
+        for LName in APackageFiles.Keys do
+            LNames.Add(LName);
+
+        LNames.Sort;
+
+        LManifest := TStringBuilder.Create;
+        try
+            for LName in LNames do
+            begin
+                LBytes := TEncoding.UTF8.GetBytes(APackageFiles[LName]);
+                LManifest.Append(LName);
+                LManifest.Append(':');
+                LManifest.Append(TGSDAIdentityService.FileContentID(LBytes));
+                LManifest.Append(#10);
+            end;
+
+            Result := GSDA_SHA256Hex(LManifest.ToString);
+        finally
+            LManifest.Free;
+        end;
+    finally
+        LNames.Free;
+    end;
+end;
+
+function TGSDAPublication31.Publish(
+    const ATaskID: string;
+    const ARequirementsJson, AGlossaryJson,
+          AAssumptionsJson, AQuestionsJson,
+          ATraceabilityJson: string;
+    const AHumanDecision: TGSDAHumanDecision): TGSDARevisionSnapshot;
+var
+    LSpecContentID: string;
+    LPackage: TDictionary<string, string>;
+    LPackageHash: string;
+    LManifest: TStringBuilder;
+    LNames: TList<string>;
+    LName: string;
+    LHumanDecision: TGSDAHumanDecision;
+begin
+    LSpecContentID := FKernel.ComputeSpecContentID(
+        ARequirementsJson,
+        AGlossaryJson,
+        AAssumptionsJson,
+        AQuestionsJson,
+        ATraceabilityJson
+    );
+
+    CheckNormativeKeywordLeaks(
+        ARequirementsJson,
+        AGlossaryJson,
+        AAssumptionsJson,
+        AQuestionsJson,
+        ATraceabilityJson
+    );
+
+    CheckCoverage(ATaskID);
+    CheckTraceability;
+    CheckReferences;
+    CheckNoCriticalFindings;
+
+    if (AHumanDecision = nil) or
+       (not AHumanDecision.Accepted) or
+       (AHumanDecision.SpecContentID <> LSpecContentID) then
+        raise EGSDAFailure.Create(
+            fcGovernanceFailure,
+            'Authenticated human acceptance required for exact SpecContentID'
+        );
+
+    LHumanDecision := AHumanDecision;
+
+    if not FKernel.ValidatePublication(
+        LSpecContentID,
+        ARequirementsJson,
+        AGlossaryJson,
+        AAssumptionsJson,
+        AQuestionsJson,
+        ATraceabilityJson,
+        LHumanDecision
+    ) then
+        raise EGSDAFailure.Create(
+            fcPublicationFailure,
+            'Publication predicate failed'
+        );
+
+    LPackage := BuildPackageFiles(
+        ARequirementsJson,
+        AGlossaryJson,
+        AAssumptionsJson,
+        AQuestionsJson,
+        ATraceabilityJson
+    );
+    try
+        LPackageHash := ComputePackageHash(LPackage);
+
+        LNames := TList<string>.Create;
+        try
+            for LName in LPackage.Keys do
+                LNames.Add(LName);
+            LNames.Sort;
+
+            LManifest := TStringBuilder.Create;
+            try
+                for LName in LNames do
+                    LManifest.Append(LName)
+                        .Append('=')
+                        .Append(TGSDAIdentityService.FileContentID(
+                            TEncoding.UTF8.GetBytes(LPackage[LName])))
+                        .Append(#10);
+
+                Result := FKernel.CommitRevision(
+                    LSpecContentID,
+                    LPackage,
+                    LManifest.ToString,
+                    LPackageHash,
+                    LHumanDecision
+                );
+            finally
+                LManifest.Free;
+            end;
+        finally
+            LNames.Free;
+        end;
+    finally
+        LPackage.Free;
+    end;
+end;
+
+end.
+'''
+
+files["GSDA31.Engine.pas"] = r'''unit GSDA31.Engine;
+
+interface
+
+uses
+    System.SysUtils,
+    System.JSON,
+    GSDA31.Types,
+    GSDA31.Kernel,
+    GSDA31.Publication;
+
+type
+    TGSDAEngine31 = class
+    private
+        FKernel: TGSDAKernel31;
+        FPublication: TGSDAPublication31;
+    public
+        constructor Create(const AConfig: TGSDAConfig);
+        destructor Destroy; override;
+
+        property Kernel: TGSDAKernel31 read FKernel;
+        property Publication: TGSDAPublication31 read FPublication;
+
+        function NewTask(
+            const AUserPrompt, AUserIntent, ADomain: string
+        ): TGSDAResearchTask;
+    end;
+
+implementation
+
+constructor TGSDAEngine31.Create(const AConfig: TGSDAConfig);
+begin
+    FKernel := TGSDAKernel31.Create(AConfig);
+    FPublication := TGSDAPublication31.Create(FKernel);
+end;
+
+destructor TGSDAEngine31.Destroy;
+begin
+    FPublication.Free;
+    FKernel.Free;
+    inherited Destroy;
+end;
+
+function TGSDAEngine31.NewTask(
+    const AUserPrompt, AUserIntent, ADomain: string): TGSDAResearchTask;
+begin
+    Result := FKernel.CreateTask(
+        AUserPrompt,
+        AUserIntent,
+        ADomain,
+        FKernel.Config.TargetAudience,
+        FKernel.Config.Constraints,
+        FKernel.Config.RequestedOutputs
+    );
+end;
+
+end.
+'''
+
+files["GSDA31.Conformance.dpr"] = r'''program GSDA31.Conformance;
+
+{$APPTYPE CONSOLE}
+
+uses
+    System.SysUtils,
+    System.JSON,
+    GSDA31.Types,
+    GSDA31.Canonical,
+    GSDA31.Crypto,
+    GSDA31.Identity,
+    GSDA31.Engine,
+    GSDA31.Kernel;
+
+procedure AssertTrue(const ACondition: Boolean; const AMessage: string);
+begin
+    if not ACondition then
+        raise Exception.Create('CONFORMANCE FAILURE: ' + AMessage);
+end;
+
+procedure TestCanonicalOrdering;
+var
+    LObject: TJSONObject;
+begin
+    LObject := TJSONObject.Create;
+    try
+        LObject.AddPair('b', 1);
+        LObject.AddPair('a', 2);
+        AssertTrue(
+            TGSDAJsonCanonical.Canonicalize(LObject) = '{"a":2,"b":1}',
+            'UTF-8 bytewise object ordering'
+        );
+    finally
+        LObject.Free;
+    end;
+end;
+
+procedure TestTaskIdentity;
+var
+    LConfig: TGSDAConfig;
+    LEngine: TGSDAEngine31;
+    LTaskA, LTaskB: TGSDAResearchTask;
+begin
+    LConfig := TGSDAConfig.Create;
+    try
+        LConfig.Namespace := 'gsda';
+        LConfig.TargetLanguage := 'Delphi';
+        LConfig.PriorityProfile := 'default';
+        LConfig.TargetAudience := ['engineers'];
+        LConfig.Constraints := ['deterministic'];
+        LConfig.RequestedOutputs := ['spec'];
+        LConfig.HmacSecret := TEncoding.UTF8.GetBytes('test-secret');
+
+        LEngine := TGSDAEngine31.Create(LConfig);
+        try
+            LTaskA := LEngine.NewTask(
+                'Create a specification',
+                'Preserve deterministic semantics',
+                'specification'
+            );
+
+            LTaskB := LEngine.Kernel.CreateTask(
+                'Create a specification',
+                'Preserve deterministic semantics',
+                'other-domain',
+                ['engineers'],
+                ['deterministic'],
+                ['spec']
+            );
+
+            AssertTrue(LTaskA.TaskID <> LTaskB.TaskID,
+                'Domain must participate in task identity');
+            AssertTrue(LTaskA.TargetContextID <> '',
+                'TargetContextID must exist');
+        finally
+            LEngine.Free;
+        end;
+    finally
+        LConfig.Free;
+    end;
+end;
+
+procedure TestRoundIdentity;
+begin
+    AssertTrue(
+        TGSDAIdentityService.RoundID('run:abc', 3) = 'round:run:abc:3',
+        'Exact round_id format'
+    );
+end;
+
+begin
+    try
+        Writeln('GSDA/3.1 conformance harness');
+        TestCanonicalOrdering;
+        TestTaskIdentity;
+        TestRoundIdentity;
+        Writeln('PASS');
+    except
+        on E: Exception do
+        begin
+            Writeln(E.Message);
+            ExitCode := 1;
+        end;
+    end;
+end.
+'''
+
+# Fix use of ResearchTask visibility in Types by making it a forward reference:
+# Instead, put TGSDAResearchTask in Types and remove duplicate in State via simple textual adjustment.
+files["GSDA31.Types.pas"] = files["GSDA31.Types.pas"].replace(
+'''    TGSDARequirement = class
+''',
+'''    TGSDAResearchTask = class
+    public
+        TaskID: TGSDAId;
+        TargetContextID: TGSDAId;
+        UserPrompt: string;
+        UserIntent: string;
+        Domain: string;
+        Namespace: string;
+        TargetLanguage: string;
+        TargetAudience: TArray<string>;
+        Constraints: TArray<string>;
+        RequestedOutputs: TArray<string>;
+        PriorityProfile: string;
+        Intent: TGSDAIntent;
+        CreatedAtUtc: string;
+        constructor Create;
+        destructor Destroy; override;
+    end;
+
+    TGSDARequirement = class
+''')
+files["GSDA31.Types.pas"] = files["GSDA31.Types.pas"].replace(
+'''constructor TGSDAIntent.Create;
+begin
+    Elements := TObjectList<TGSDAIntentElement>.Create(True);
+end;
+
+destructor TGSDAIntent.Destroy;
+begin
+    Elements.Free;
+    inherited Destroy;
+end;
+''',
+'''constructor TGSDAIntent.Create;
+begin
+    Elements := TObjectList<TGSDAIntentElement>.Create(True);
+end;
+
+destructor TGSDAIntent.Destroy;
+begin
+    Elements.Free;
+    inherited Destroy;
+end;
+
+constructor TGSDAResearchTask.Create;
+begin
+    Intent := TGSDAIntent.Create;
+end;
+
+destructor TGSDAResearchTask.Destroy;
+begin
+    Intent.Free;
+    inherited Destroy;
+end;
+''')
+
+# Remove duplicate task declaration from State.
+state = files["GSDA31.State.pas"]
+start = state.index('    TGSDAResearchTask = class')
+end = state.index('    TGSDAIdentityRecord = class')
+state = state[:start] + state[end:]
+# State no longer needs some duplicated types but retains TGSDAReasoningMessage etc from Types.
+files["GSDA31.State.pas"] = state
+
+# Fix Crypto HMAC API to a Delphi-compatible static call if possible.
+# Use THashSHA2.GetHMACAsString static overload.
+files["GSDA31.Crypto.pas"] = files["GSDA31.Crypto.pas"].replace(
+'''function GSDA_HMACSHA256Hex(const ASecret: TBytes; const AValue: string): string;
+var
+    LHmac: THashSHA2;
+    LMessage: TBytes;
+begin
+    LMessage := TEncoding.UTF8.GetBytes(AValue);
+    LHmac := THashSHA2.Create;
+    try
+        Result := LHmac.GetHMACAsString(LMessage, ASecret, SHA256);
+    finally
+        LHmac.Free;
+    end;
+end;
+''',
+'''function GSDA_HMACSHA256Hex(const ASecret: TBytes; const AValue: string): string;
+begin
+    Result := THashSHA2.GetHMACAsString(
+        TEncoding.UTF8.GetBytes(AValue),
+        ASecret,
+        SHA256
+    );
+end;
+''')
+
+# Fix ComputeContentID RemovePair nil dereference risks.
+files["GSDA31.Kernel.pas"] = files["GSDA31.Kernel.pas"].replace(
+'''        LContentProjection.RemovePair('message_id').Free;
+        LContentProjection.RemovePair('hmac').Free;
+        LContentProjection.RemovePair('peer_id').Free;
+        LContentProjection.RemovePair('run_id').Free;
+        LContentProjection.RemovePair('round_id').Free;
+        LContentProjection.RemovePair('logical_sequence').Free;
+''',
+'''        var LPair := LContentProjection.RemovePair('message_id');
+        LPair.Free;
+        LPair := LContentProjection.RemovePair('hmac');
+        LPair.Free;
+        LPair := LContentProjection.RemovePair('peer_id');
+        LPair.Free;
+        LPair := LContentProjection.RemovePair('run_id');
+        LPair.Free;
+        LPair := LContentProjection.RemovePair('round_id');
+        LPair.Free;
+        LPair := LContentProjection.RemovePair('logical_sequence');
+        LPair.Free;
+''')
+
+# Add conformance project file
+files["GSDA31.dproj.notes.txt"] = r'''Create a Delphi Console Application and add:
+GSDA31.Types.pas
+GSDA31.Canonical.pas
+GSDA31.Crypto.pas
+GSDA31.BigInt.pas
+GSDA31.Identity.pas
+GSDA31.State.pas
+GSDA31.Kernel.pas
+GSDA31.Publication.pas
+GSDA31.Engine.pas
+
+Then use GSDA31.Conformance.dpr as the program source.
+'''
+
+for name, content in files.items():
+    (root / name).write_text(content, encoding="utf-8", newline="\n")
+
+zip_path = Path("/mnt/data/GSDA31_Delphi_Implementation.zip")
+with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    for path in sorted(root.iterdir()):
+        zf.write(path, arcname=path.name)
+
+print(f"Created {len(files)} files in {root}")
+print(f"ZIP: {zip_path}")
