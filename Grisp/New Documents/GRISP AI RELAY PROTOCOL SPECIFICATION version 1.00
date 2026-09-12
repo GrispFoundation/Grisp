@@ -1,0 +1,1315 @@
+GRISP AI RELAY PROTOCOL SPECIFICATION
+
+GARP/1.0
+
+Status: NORMATIVE
+Version: GARP/1.0
+Parent specifications: GRISP Agent Specification v1.0; GRISP v1.0 Implementation Contract, Revision 2
+Transport: TCP localhost, UTF-8, length-framed binary envelope
+Payload serialization: UTF-8 JSON
+Semantic AI exchange: GAI/1.0, separate contract
+Default mode: fail-closed
+
+1. PURPOSE
+
+GARP is the GRISP <-> Firefox AI Gateway transport and browser-session protocol.
+
+GARP exists to make Firefox a reliable, stateful AI-provider transport/adapter endpoint, rather than a loose JSON command socket or a collection of ad-hoc DOM scripts.
+
+GARP defines:
+- connection handshake and feature negotiation;
+- request, session, tab, message, and sequence identity;
+- browser AI session lifecycle;
+- prompt submission and cancellation;
+- streaming response events;
+- provider adapter boundaries;
+- structured errors;
+- heartbeat and reconnection behavior;
+- security constraints for the local browser gateway.
+
+GARP does NOT define:
+- artifact acceptance;
+- compile semantics;
+- runtime verification semantics;
+- GRISP policy semantics;
+- AI quality scoring;
+- final acceptance decisions;
+- artifact identity or hashing;
+- GAI structured artifact semantics.
+
+Those belong to GRISP core, GAI/1.0, or the GRISP implementation contract.
+
+The architectural boundary is:
+
+Firefox = observe and transport
+GRISP   = interpret and verify
+AI      = reason
+tools   = measure
+policy  = authorize
+
+2. DESIGN GOALS
+
+GARP/1.0 SHALL provide:
+1. stable request identity;
+2. stable session identity;
+3. stable tab identity;
+4. provider-independent request correlation;
+5. event-driven streaming;
+6. explicit cancellation;
+7. duplicate request suppression;
+8. connection resilience;
+9. page-generation tracking;
+10. structured provider errors;
+11. isolated provider adapters;
+12. no semantic mutation by transport;
+13. fail-closed behavior when state is unknown.
+
+The protocol SHALL NOT rely on newline-delimited JSON. Newline framing is vulnerable to embedded framing, oversized messages, lack of message identity, lack of cancellation, ambiguous async ordering, no streaming event model, and no version negotiation.
+
+3. TERMINOLOGY
+
+Client
+  The GRISP Agent.
+
+Gateway
+  The Firefox AI Gateway implementing GARP.
+
+Provider
+  An external AI service such as ChatGPT, Gemini, Claude, DeepSeek, Grok, Copilot, Perplexity, or Inception.
+
+Adapter
+  A provider-specific Firefox module that knows how to discover, submit, observe, continue, cancel, and diagnose interaction with one provider.
+
+Session
+  A logical AI conversation controlled through the gateway. A session is identified by session_id and is bound to a provider, tab, and conversation identity where available.
+
+Tab
+  A browser tab with stable identity tab_id. tab_index is informational only.
+
+Request
+  One AI operation associated with a unique request_id.
+
+Message
+  One AI response identity within a session, identified by message_id.
+
+Event
+  An asynchronous GARP message describing browser/provider/session state or generation progress.
+
+Page generation
+  A monotonically incremented value that changes on significant navigation or SPA actor replacement.
+
+Sequence
+  A monotonically increasing integer for a stream identified by (request_id, message_id).
+
+GARP SHALL distinguish:
+
+provider
+model
+session
+browser_tab
+conversation
+worker_instance
+
+Two providers are not assumed independent merely because their names differ.
+
+4. ARCHITECTURE
+
+GRISP Agent
+    |
+    | GARP/1.0
+    v
+Firefox AI Gateway
+    |
+    +-- ChatGPT adapter
+    +-- Gemini adapter
+    +-- Claude adapter
+    +-- DeepSeek adapter
+    +-- Grok adapter
+    +-- Copilot adapter
+    +-- Perplexity adapter
+    +-- Other providers
+
+Firefox is the AI communications and interaction substrate. It is not the intelligence layer.
+
+4.1 Parent/Child Split
+
+The gateway SHALL preserve a parent/child actor separation.
+
+Parent actor owns:
+connection
+sessions
+requests
+timeouts
+cancellation
+routing
+event ordering
+stream aggregation
+browser-level state
+
+Child actor owns:
+DOM discovery
+input interaction
+submission
+provider-specific observation
+provider-specific state extraction
+
+The parent/child boundary SHALL be structured and request-correlated.
+
+Conceptual internal parent/child protocol:
+
+Parent:
+    PrepareSession
+    InspectReady
+    InjectPrompt
+    SubmitPrompt
+    ObserveGeneration
+    ContinueGeneration
+    CancelGeneration
+
+Child:
+    ReadyState
+    InputState
+    SubmissionState
+    GenerationEvent
+    ProviderError
+
+This preserves the useful existing design where response polling is kept in the parent to survive SPA navigation, but formalizes it into explicit sessions, events, and identities.
+
+5. TRANSPORT
+
+5.1 Base Transport
+
+GARP/1.0 SHALL use:
+TCP localhost
+UTF-8
+length-framed binary envelope
+
+JSON MAY be used as the payload serialization, but message framing SHALL NOT depend on newline termination.
+
+5.2 Canonical Frame
+
+Recommended canonical v1 frame:
+
+magic[4]
+version[1]
+flags[1]
+header_length[2]
+payload_length[4]
+message_type[2]
+reserved[2]
+request_id[16]
+session_id[16]
+payload[...]
+
+All integers SHALL use big-endian encoding.
+
+magic SHALL be:
+"GARP"
+
+The payload SHALL be UTF-8 JSON.
+
+header_length allows future extension. reserved fields SHALL be zero unless defined by a later version or flag.
+
+5.3 Frame Constraints
+
+The gateway SHALL enforce:
+maximum frame size
+header validity
+payload length validity
+protocol version
+message type
+reserved-field rules
+
+Recommended initial limits:
+control frame = 1 MiB
+prompt        = 4 MiB
+artifact      = 16 MiB
+stream chunk  = 256 KiB
+
+These values SHALL be configurable.
+
+5.4 Required Transport Properties
+
+Required:
+UTF-8
+binary length framing
+request IDs
+session IDs
+sequence IDs
+version negotiation
+structured errors
+timeouts
+cancellation
+heartbeat
+
+Recommended:
+compression for large streams
+message acknowledgements
+connection authentication
+diagnostic subscriptions
+
+5.5 No Semantic Mutation
+
+The transport layer SHALL never:
+alter prompts
+insert debug comments
+rewrite code
+remove Markdown
+fix filenames
+
+Transport transports data. Normalization belongs to GRISP.
+
+6. HANDSHAKE
+
+First client message:
+
+{
+  "type": "hello",
+  "protocol": "GARP/1.0",
+  "client_id": "GRISP-Agent-...",
+  "client_version": "1.0.0"
+}
+
+Gateway response:
+
+{
+  "type": "hello_ack",
+  "protocol": "GARP/1.0",
+  "server_id": "...",
+  "server_version": "...",
+  "browser": {
+    "name": "Firefox",
+    "version": "..."
+  },
+  "features": [
+    "streaming",
+    "cancel",
+    "sessions",
+    "stable_tabs",
+    "response_events"
+  ]
+}
+
+Client and server SHALL negotiate features.
+
+The gateway SHOULD also expose CAPABILITIES and BROWSER_STATUS.
+
+7. MESSAGE CLASSES AND REGISTRY
+
+GARP message classes:
+HELLO
+COMMAND
+RESPONSE
+EVENT
+ERROR
+CONTROL
+
+The protocol registry SHALL assign a numeric message_type to each supported message.
+
+The JSON type field remains the human-readable semantic name.
+
+8. IDENTITY MODEL
+
+8.1 Core Identifiers
+
+Every request SHALL have:
+request_id
+
+Every browser AI session SHALL have:
+session_id
+
+Every browser tab SHALL have a stable:
+tab_id
+
+Every AI response within a session SHOULD have:
+message_id
+
+Every stream event SHALL have:
+sequence
+timestamp
+
+8.2 Message Identity Matrix
+
+Fields are required according to message type:
+
+Message              | request_id      | session_id      | tab_id          | message_id | sequence
+HELLO                | no              | no              | no              | no         | no
+HELLO_ACK            | no              | no              | no              | no         | no
+PING                 | no              | no              | no              | no         | no
+PONG                 | no              | no              | no              | no         | no
+CREATE_SESSION       | yes             | returned        | optional        | no         | no
+PROMPT               | yes             | yes             | yes             | no         | no
+PROMPT_ACK           | yes             | yes             | yes             | no         | no
+GENERATION_STARTED   | yes             | yes             | yes             | yes        | yes
+GENERATION_DELTA     | yes             | yes             | yes             | yes        | yes
+GENERATION_COMPLETED | yes             | yes             | yes             | yes        | final
+CANCEL_PROMPT        | yes             | yes             | yes             | no         | no
+CANCEL_ACK           | yes             | yes             | yes             | optional   | no
+ERROR                | when applicable | when applicable | when applicable | optional   | optional
+
+This avoids incorrectly making every identifier mandatory on every protocol message.
+
+8.3 Tab Identity
+
+The current implementation identifies tabs primarily by numeric index. That is unsuitable as persistent identity because tab indexes can change.
+
+New rule:
+tab_id = GUID
+tab_index = informational metadata only
+
+A changing index SHALL NOT change identity.
+
+8.4 Page Generation
+
+Every significant navigation or SPA actor replacement SHALL increment:
+page_generation
+
+Example:
+tab_id = A
+page_generation = 17
+
+A response event from page generation 16 SHALL NOT silently overwrite generation 17 state.
+
+This directly addresses actor reacquisition after navigation.
+
+9. SESSION MODEL
+
+Opening a site SHALL create or attach to an AI session.
+
+Example:
+session_id = 84F1...
+provider = deepseek
+tab_id = 91AA...
+conversation_id = optional provider-specific identity
+state = READY
+
+A session SHALL maintain:
+provider
+tab
+conversation
+input_state
+generation_state
+last_request_id
+last_message_id
+
+A session is bound to:
+provider
+tab_id
+conversation identity
+
+The session survives actor replacement.
+
+9.1 Session Commands
+
+Required:
+CREATE_SESSION
+ATTACH_SESSION
+DETACH_SESSION
+CLOSE_SESSION
+RESET_SESSION
+
+9.2 Session Concurrency
+
+A Firefox AI session SHALL have a single active prompt by default.
+
+Attempting:
+PROMPT request A
+PROMPT request B
+against the same session while A is generating SHALL yield:
+SESSION_BUSY
+
+unless concurrent conversations are explicitly supported.
+
+This eliminates accidental double-submit problems.
+
+9.3 Session Recovery
+
+If Firefox reloads or SPA navigation recreates an actor:
+session_id remains stable
+tab_id remains stable
+page_generation increments
+
+Firefox rebinds the child actor automatically. GRISP need not know about the actor lifecycle.
+
+10. TAB MODEL
+
+OPEN_TAB SHALL return:
+{
+  "tab_id": "...",
+  "index": 5,
+  "url": "..."
+}
+
+GET_TABS / LIST_TABS SHALL expose:
+tab_id
+index
+title
+url
+selected
+provider
+session_id
+state
+
+Required commands:
+LIST_TABS
+OPEN_TAB
+CLOSE_TAB
+SELECT_TAB
+
+A changing index SHALL not change identity.
+
+11. CORE COMMANDS
+
+Required:
+HELLO
+CAPABILITIES
+BROWSER_STATUS
+
+LIST_TABS
+OPEN_TAB
+CLOSE_TAB
+SELECT_TAB
+
+CREATE_SESSION
+ATTACH_SESSION
+DETACH_SESSION
+CLOSE_SESSION
+
+PROMPT
+CANCEL_PROMPT
+GET_PROMPT_STATUS
+GET_RESPONSE
+SUBSCRIBE_RESPONSE
+
+PING
+RESET_SESSION
+
+Optional:
+SCREENSHOT
+DOM_DIAGNOSTICS
+PROVIDER_DIAGNOSTICS
+
+12. PROMPT LIFECYCLE
+
+Exact state machine:
+
+IDLE
+ v
+PREPARING
+ v
+INPUT_READY
+ v
+INJECTING
+ v
+SUBMITTING
+ v
+GENERATION_STARTED
+ v
+STREAMING
+ v
+CONTINUATION_REQUIRED
+ v
+STREAMING
+ v
+COMPLETE
+
+Failure branches:
+AUTH_REQUIRED
+RATE_LIMIT
+PROVIDER_ERROR
+DOM_ERROR
+NAVIGATION_ERROR
+TIMEOUT
+CANCELLED
+
+No state may silently fall through to another state.
+
+A readiness timeout must never be interpreted as:
+READY
+
+If readiness cannot be established:
+NOT_READY
+or an explicit failure state SHALL be returned.
+
+13. PROMPT REQUEST AND ACKNOWLEDGEMENT
+
+Canonical request:
+
+{
+  "protocol": "GARP/1.0",
+  "type": "prompt",
+  "request_id": "uuid",
+  "session_id": "uuid",
+  "tab_id": "uuid",
+  "payload": {
+    "prompt": {
+      "format": "text",
+      "text": "..."
+    },
+    "options": {
+      "stream": true,
+      "timeout_ms": 180000,
+      "auto_continue": true
+    }
+  }
+}
+
+The gateway immediately returns:
+
+{
+  "protocol": "GARP/1.0",
+  "type": "prompt_ack",
+  "request_id": "uuid",
+  "session_id": "uuid",
+  "tab_id": "uuid",
+  "payload": {
+    "state": "accepted"
+  }
+}
+
+The actual AI response SHALL arrive asynchronously as events.
+
+14. STREAMING RESPONSE EVENTS
+
+Recommended event types:
+prompt_started
+input_injected
+input_submitted
+generation_started
+generation_delta
+generation_progress
+continuation_required
+continuation_submitted
+generation_completed
+generation_failed
+session_changed
+navigation
+provider_error
+auth_required
+rate_limited
+diagnostic
+
+Additional required or strongly supported events:
+SESSION_READY
+SESSION_CHANGED
+INPUT_SUBMITTED
+GENERATION_STARTED
+GENERATION_DELTA
+GENERATION_PROGRESS
+CONTINUATION_REQUIRED
+CONTINUATION_SUBMITTED
+GENERATION_COMPLETED
+GENERATION_FAILED
+NAVIGATION
+PROVIDER_ERROR
+AUTH_REQUIRED
+RATE_LIMITED
+DIAGNOSTIC
+
+Example delta:
+
+{
+  "protocol": "GARP/1.0",
+  "type": "generation_delta",
+  "request_id": "uuid",
+  "session_id": "uuid",
+  "tab_id": "uuid",
+  "message_id": "uuid",
+  "sequence": 17,
+  "payload": {
+    "text_delta": "program HelloWorld;"
+  }
+}
+
+Deltas are transport observations. They are not individually accepted artifacts.
+
+14.1 Final Response Event
+
+{
+  "protocol": "GARP/1.0",
+  "type": "generation_completed",
+  "request_id": "uuid",
+  "session_id": "uuid",
+  "tab_id": "uuid",
+  "message_id": "uuid",
+  "sequence": 99,
+  "payload": {
+    "content": "...",
+    "format": "text",
+    "finish_reason": "stop",
+    "provider_state": "idle"
+  }
+}
+
+This becomes authoritative.
+
+Polling MAY remain as a fallback, but event-driven streaming SHALL be preferred.
+
+14.2 Event Ordering
+
+Each event SHALL contain:
+request_id
+sequence
+timestamp
+
+For one (request_id, message_id) stream, sequence must monotonically increase.
+
+The receiver shall detect:
+duplicate
+out-of-order
+gap
+unexpected reset
+
+A gap SHALL NOT be silently treated as complete response data.
+
+If events arrive out of order, the receiver can reorder deterministically using sequence numbers.
+
+15. RESPONSE IDENTITY
+
+Firefox SHALL associate a prompt with a response using:
+request_id
+message_id
+submission_generation
+
+Never infer the new response merely by asking:
+what is the newest markdown node?
+
+The new protocol must establish:
+before submission:
+  last assistant message = X
+
+after submission:
+  new assistant message = Y
+
+therefore:
+  Y belongs to this request
+
+Before submitting, Firefox SHALL send:
+SESSION_SNAPSHOT
+containing:
+provider
+tab_id
+url
+page_generation
+input_ready
+conversation_identity
+last_message_id
+ui_state
+
+This gives GRISP a deterministic starting point.
+
+16. CONTINUATION HANDLING
+
+The existing implementation automatically looks for "Continue" buttons and clicks them.
+
+The redesign SHALL preserve this capability but make it stateful.
+
+Firefox SHALL emit:
+
+{
+  "type": "continuation_required",
+  "request_id": "...",
+  "session_id": "...",
+  "message_id": "...",
+  "payload": {
+    "reason": "provider_length_limit"
+  }
+}
+
+GRISP can then decide:
+continue automatically
+or
+do not continue
+
+The browser SHALL not silently add content without recording the event.
+
+17. CANCELLATION
+
+GRISP:
+
+{
+  "type": "cancel_prompt",
+  "request_id": "...",
+  "reason": "task_timeout"
+}
+
+Firefox:
+
+{
+  "type": "prompt_cancelled",
+  "request_id": "...",
+  "state": "cancelled"
+}
+
+Cancellation SHALL propagate to:
+task
+worker request
+GARP request
+Firefox session
+provider interaction
+
+Provider-specific cancellation mechanisms SHALL be used where possible.
+
+Otherwise the adapter SHALL terminate observation and mark the request cancelled.
+
+Terminal state:
+CANCELLED
+means cancellation has been acknowledged. It does not mean:
+SUCCESS
+
+18. IDEMPOTENCY AND DUPLICATE SUPPRESSION
+
+Requests SHALL support an idempotency key.
+
+For example:
+request_id = UUID
+
+A duplicate PROMPT with the same request ID SHALL NOT submit the same prompt twice.
+
+Possible result:
+existing request state
+or:
+IDEMPOTENT_REPLAY
+but never another prompt submission.
+
+This is particularly important for Firefox automation, where retries may otherwise cause duplicate messages.
+
+19. BACKPRESSURE
+
+Streaming responses can be large.
+
+GARP SHALL support:
+sequence numbers
+chunk sizes
+maximum in-flight bytes
+acknowledgements where necessary
+
+The server SHALL not require GRISP to poll rapidly to avoid losing response information.
+
+20. CONNECTION RESILIENCE AND HEARTBEAT
+
+A broken TCP connection SHALL NOT automatically mean that the AI task is lost.
+
+Firefox SHALL maintain session state independently.
+
+On reconnect:
+CONNECT
+ v
+HELLO
+ v
+CAPABILITIES
+ v
+GET_PROMPT_STATUS
+
+GRISP may reconnect and issue GET_PROMPT_STATUS using:
+request_id
+session_id
+
+Firefox responds:
+SUBMITTING
+STREAMING
+COMPLETE
+FAILED
+UNKNOWN
+
+Both sides SHALL support:
+PING
+PONG
+
+Suggested interval:
+10-30 seconds
+
+A connection that disappears should be detected independently of an active prompt.
+
+A heartbeat failure does not automatically destroy persistent session identity.
+
+21. ERROR MODEL
+
+Errors SHALL be structured.
+
+Example:
+
+{
+  "type": "error",
+  "request_id": "...",
+  "code": "AUTH_REQUIRED",
+  "message": "Provider authentication required",
+  "retryable": false,
+  "provider": "gemini",
+  "state": "AUTH_REQUIRED"
+}
+
+Errors shall contain:
+protocol
+type = error
+request_id where applicable
+session_id where applicable
+code
+retryable
+message
+provider
+state
+
+Suggested codes:
+PROTOCOL_ERROR
+BAD_REQUEST
+UNAUTHORIZED
+SESSION_NOT_FOUND
+TAB_NOT_FOUND
+PROVIDER_NOT_FOUND
+AUTH_REQUIRED
+INPUT_NOT_READY
+SUBMIT_FAILED
+GENERATION_TIMEOUT
+GENERATION_FAILED
+CONTINUATION_FAILED
+NAVIGATION_CHANGED
+PROVIDER_RATE_LIMIT
+DOM_UNSUPPORTED
+SESSION_BUSY
+DUPLICATE_REQUEST
+SEQUENCE_GAP
+INTERNAL_ERROR
+
+22. PROVIDER ADAPTER ARCHITECTURE
+
+Each provider SHALL implement:
+
+ProviderAdapter
+    discoverInput()
+    inspectReadyState()
+    submitPrompt()
+    inspectGeneration()
+    inspectConversation()
+    detectContinuation()
+    continueGeneration()
+    detectAuthentication()
+    detectRateLimit()
+    detectError()
+    resetSession()
+
+Each adapter also reports:
+provider
+adapter_version
+supported_features
+selector_strategy_version
+
+Provider-specific DOM selectors SHALL remain isolated.
+
+The generic engine SHALL NOT contain provider-specific selectors.
+
+Provider modules SHOULD be separate:
+
+providers/
+    DeepSeekAdapter.sys.mjs
+    GeminiAdapter.sys.mjs
+    ChatGPTAdapter.sys.mjs
+    ClaudeAdapter.sys.mjs
+    GrokAdapter.sys.mjs
+    CopilotAdapter.sys.mjs
+    PerplexityAdapter.sys.mjs
+
+When a site changes, only that adapter should need modification.
+
+23. PROVIDER HEALTH
+
+Firefox SHALL expose:
+
+{
+  "provider": "deepseek",
+  "state": "READY",
+  "input": "ready",
+  "authenticated": true,
+  "generation": "idle",
+  "adapter_version": "..."
+}
+
+Possible states:
+UNKNOWN
+LOADING
+READY
+BUSY
+AUTH_REQUIRED
+RATE_LIMITED
+ERROR
+UNSUPPORTED
+
+This is significantly stronger than a waitForReady() behavior where timeout can resolve readiness without an explicit failure result.
+
+In GARP:
+READY
+or
+NOT_READY
+or
+AUTH_REQUIRED
+or
+ERROR
+must be explicit.
+
+23.1 Rate Limiting
+
+Provider adapters SHALL detect rate limits where possible.
+
+GARP response:
+RATE_LIMITED
+retry_after_ms
+
+GRISP can then choose:
+wait
+alternate provider
+reduce concurrency
+abort
+
+23.2 Authentication
+
+Firefox SHALL explicitly detect:
+AUTH_REQUIRED
+
+GRISP shall treat that as a deterministic state.
+
+Adapters should detect provider-specific authenticated and unauthenticated UI states, not merely login-like URLs.
+
+24. DOM ADAPTER RULES
+
+Provider adapters SHALL avoid broad selectors wherever possible.
+
+Preferred selector order:
+preferred stable selector
+ v
+semantic attribute
+ v
+provider-specific structural selector
+ v
+strict diagnostic fallback
+
+A fallback SHALL identify why it believes an element is the correct element.
+
+The current code contains wide fallback selectors and broad message selection. New rules SHALL reduce accidental UI matches.
+
+24.1 Deep DOM Search
+
+The existing child actor recursively walks shadow roots and DOM nodes. The redesign SHOULD cache discovered roots where possible.
+
+Do not recursively traverse the entire DOM on every poll.
+
+Instead:
+page mutation
+ v
+invalidate provider cache
+ v
+rediscover only when necessary
+
+This reduces CPU cost and accidental UI matches.
+
+24.2 Injection Strategy
+
+Provider adapters SHALL provide explicit input methods:
+set_value
+dispatch_input
+submit_button
+keyboard_fallback
+
+The adapter SHALL report exactly which mechanism succeeded.
+
+Example:
+{
+  "input_method": "contenteditable",
+  "submit_method": "button_click"
+}
+
+Keyboard simulation SHALL remain a last resort.
+
+The current implementation already deliberately avoids unsafe keyboard events because they caused Firefox IPC instability. That principle should remain.
+
+25. BROWSER DIAGNOSTICS
+
+GARP SHALL expose diagnostics without requiring GRISP to scrape raw logs.
+
+Example:
+
+{
+  "type": "diagnostic",
+  "request_id": "...",
+  "provider": "copilot",
+  "stage": "submit",
+  "state": "button_not_ready",
+  "details": {
+    "input_found": true,
+    "button_found": true,
+    "button_enabled": false
+  }
+}
+
+This is more useful than generic:
+Send button unavailable
+
+25.1 Automatic Adapter Health Test
+
+At startup, Firefox SHALL test each configured provider adapter.
+
+Example checks:
+input discovery
+button discovery
+response discovery
+continuation discovery
+authentication detection
+
+The system should report:
+DeepSeek adapter: PASS
+Gemini adapter: PASS
+ChatGPT adapter: PASS
+...
+
+This is preferable to finding adapter breakage in the middle of an AI task.
+
+26. POLLING VS EVENT OBSERVATION
+
+The present design repeatedly polls every 500 ms and considers text "done" after stable observations.
+
+Polling can remain as a fallback, but the preferred order should be:
+
+provider DOM mutation/events
+ v
+adapter state transition
+ v
+parent event
+ v
+GARP event
+
+Fallback:
+polling
+
+This substantially reduces latency and stale-state problems.
+
+26.1 Stable Response Detection
+
+If polling must be used, the state machine should track:
+response_message_id
+text_revision
+dom_revision
+streaming_state
+provider_busy_state
+
+not merely:
+same text 2/6 times
+
+Stability is a heuristic. Message identity plus provider state should be authoritative.
+
+27. RECOMMENDED GARP EVENT FLOW
+
+GRISP                         Firefox
+  |                              |
+  | HELLO ---------------------->|
+  |<---------------- HELLO_ACK   |
+  |                              |
+  | CREATE_SESSION ------------->|
+  |<-------- SESSION_READY       |
+  |                              |
+  | PROMPT --------------------->|
+  |<-------- PROMPT_ACK          |
+  |<-------- INPUT_SUBMITTED     |
+  |<-------- GENERATION_STARTED  |
+  |<-------- DELTA               |
+  |<-------- DELTA               |
+  |<-------- DELTA               |
+  |<-------- CONTINUATION_REQ    |
+  |<-------- CONTINUATION_SENT   |
+  |<-------- DELTA               |
+  |<-------- GENERATION_COMPLETE |
+  |                              |
+
+This is much more suitable for an AI agent than request/response polling.
+
+28. SECURITY
+
+The server currently listens on localhost port 9999.
+
+The redesigned service SHALL additionally provide:
+authentication token
+session secret
+origin/client identification
+maximum frame size
+connection limits
+request rate limits
+
+At minimum:
+bind = localhost only
+random startup secret
+HELLO authentication
+
+No unauthenticated local process should automatically gain AI browser-control capability.
+
+29. LOGGING AND DEBUG
+
+Both GRISP and Firefox SHALL log structured events.
+
+Every log record SHOULD contain:
+timestamp
+component
+task_id
+request_id
+session_id
+tab_id
+provider
+event
+severity
+
+Plain text logs MAY be generated additionally for humans.
+
+29.1 Debug Mode
+
+Debug mode SHALL never modify prompts.
+
+The current system uses injected HTML comments such as:
+<!-- DEBUG: ... -->
+inside prompts. This is undesirable because the debugging mechanism modifies the actual input seen by the external AI.
+
+New rule:
+Debug metadata SHALL travel in the transport envelope, never inside the semantic prompt.
+
+Example:
+
+{
+  "type": "prompt",
+  "request_id": "...",
+  "debug": {
+    "phase": "candidate_generation"
+  },
+  "prompt": {
+    "text": "actual user task"
+  }
+}
+
+This makes debugging non-invasive.
+
+30. RELATIONSHIP TO GAI/1.0 AND GRISP CORE
+
+GARP is exclusively the transport and browser-session protocol.
+
+GAI/1.0 is the semantic contract between GRISP and an AI worker. It defines structured AI requests and responses, including artifact outputs.
+
+GRISP core defines task, artifact, evidence, policy, state machine, acceptance, and commit semantics.
+
+GARP does not define:
+artifact acceptance
+compile semantics
+policy semantics
+AI quality scoring
+
+The AI response carried over GARP is untrusted. GRISP performs:
+decode
+ v
+schema validation
+ v
+artifact extraction
+ v
+artifact validation
+ v
+hash verification
+
+GARP does not grant authority to an AI model.
+
+31. RECOMMENDED FIREFOX SOURCE STRUCTURE
+
+The Firefox automation should be refactored from:
+AIAutomationService
+AIAutomationConnection
+AIAutomationUtils
+AIAutomationChild
+
+into:
+AIAutomationService
+    +-- GarpConnection
+
+AIAutomationSessionManager
+    +-- AIAutomationSession
+
+AIAutomationProviderRegistry
+    +-- DeepSeekAdapter
+    +-- GeminiAdapter
+    +-- ChatGPTAdapter
+    +-- ...
+
+AIAutomationChild
+    +-- provider adapter bridge
+
+The generic child actor should not contain enormous provider-specific selector tables.
+
+32. GARP CONFORMANCE TESTS
+
+Required:
+HELLO
+version mismatch
+malformed frame
+oversized frame
+duplicate request
+sequence gap
+out-of-order events
+stale page generation
+SESSION_BUSY
+cancellation
+reconnect
+heartbeat
+provider error
+authentication required
+rate limiting
+
+33. DEFINITION OF DONE FOR GARP
+
+GARP is complete only when it can demonstrate:
+HELLO negotiation
+stable session IDs
+stable tab IDs
+request correlation
+message correlation
+ordered streaming
+duplicate suppression
+cancellation
+heartbeat
+reconnection
+structured errors
+provider state
+page generation
+
+34. GARP-SPECIFIC INVARIANTS
+
+These are derived from the GRISP invariants and specialized for GARP:
+
+I7  EVERY AI REQUEST MUST HAVE A UNIQUE REQUEST ID.
+I8  EVERY AI SESSION MUST HAVE A STABLE SESSION ID.
+I9  TAB INDEX IS NOT TAB IDENTITY.
+I10 TRANSPORT MUST NOT MODIFY SEMANTIC CONTENT.
+
+Additional GARP invariants:
+A duplicate PROMPT with the same request_id SHALL NOT submit twice.
+A readiness timeout SHALL NOT become READY.
+A stale page_generation event SHALL NOT overwrite current session state.
+A continuation SHALL NOT be performed silently without a recorded event.
+A sequence gap SHALL NOT be treated as complete response data.
+A broken TCP connection SHALL NOT automatically destroy persistent session identity.
+
+35. SUMMARY
+
+GARP/1.0 makes Firefox a reliable, stateful, provider-independent AI transport endpoint.
+
+It provides:
+- length-framed binary transport over localhost TCP;
+- explicit handshake and feature negotiation;
+- stable request, session, tab, message, and sequence identity;
+- session and tab lifecycle;
+- event-driven streaming responses;
+- cancellation, continuation, heartbeat, and reconnection;
+- structured errors and diagnostics;
+- isolated provider adapters;
+- no semantic mutation by transport;
+- fail-closed behavior when state is unknown.
+
+The correct architectural boundary is:
+
+Firefox = observe and transport
+GRISP   = interpret and verify
+AI      = reason
+tools   = measure
+policy  = authorize
+
+GARP is the protocol that enforces the Firefox side of that boundary.
