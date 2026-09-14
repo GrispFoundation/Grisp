@@ -205,6 +205,7 @@ AIAutomation: {
     esModuleURI: "resource:///modules/aistarter/actors/AIAutomationChild.sys.mjs",
   },
   allFrames: true,
+  safeForUntrustedWebProcess: true,    
 },
 ```
 

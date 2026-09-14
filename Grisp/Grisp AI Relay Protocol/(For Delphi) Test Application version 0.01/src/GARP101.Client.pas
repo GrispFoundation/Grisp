@@ -34,7 +34,9 @@ type
             const ASessionID: string = ''
         );
 
-        function ReceiveFrame(out AFrame: TGARPFrame): Boolean;
+        function ReceiveFrame(
+            out AFrame: TGARPFrame
+        ): Boolean;
 
         function ReceiveUntil(
             const ARequestID: string;
@@ -46,6 +48,8 @@ type
             const ATypeName: string;
             const APayload: TJSONValue
         ): TJSONObject;
+
+        procedure CloseConnection;
     public
         constructor Create(
             const AHost: string;
@@ -89,6 +93,7 @@ type
         property SessionID: string read FSessionID;
         property TabID: string read FTabID;
         property RequestID: string read FRequestID;
+        property Authenticated: Boolean read FAuthenticated;
     end;
 
 implementation
@@ -107,9 +112,9 @@ begin
     FClient.ConnectTimeout := 5000;
     FClient.ReadTimeout := GARP_READ_TIMEOUT;
 
-    FSecret := ASecret;
     FClientID := 'GARP101-Delphi-Test-' + GARPNewUUID;
     FClientVersion := '1.0.0';
+    FSecret := ASecret;
 
     FClientNonce := '';
     FAuthenticated := False;
@@ -120,6 +125,15 @@ end;
 
 destructor TGARPClient101.Destroy;
 begin
+    CloseConnection;
+    FClient.Free;
+    inherited Destroy;
+end;
+
+procedure TGARPClient101.CloseConnection;
+begin
+    FAuthenticated := False;
+
     if FClient <> nil then
     begin
         if FClient.Connected then
@@ -127,23 +141,23 @@ begin
             try
                 FClient.Disconnect;
             except
-                // Destruction must not fail because of connection state.
+                { Ignore disconnect errors during destruction. }
             end;
         end;
-
-        FClient.Free;
     end;
-
-    inherited Destroy;
 end;
 
 procedure TGARPClient101.EnsureConnected;
 begin
     if not FClient.Connected then
-        raise Exception.Create('GARP client is not connected');
+        raise Exception.Create(
+            'GARP client is not connected'
+        );
 
     if not FAuthenticated then
-        raise Exception.Create('GARP client is not authenticated');
+        raise Exception.Create(
+            'GARP client is not authenticated'
+        );
 end;
 
 function TGARPClient101.NextRequestID: string;
@@ -237,7 +251,7 @@ begin
         begin
             LPong := BuildMessage(
                 'pong',
-                TJSONObject.Create
+                nil
             );
 
             try
@@ -258,18 +272,22 @@ begin
         LTypeMatches :=
             Length(AAcceptedTypes) = 0;
 
-        for LIndex := Low(AAcceptedTypes) to High(AAcceptedTypes) do
+        if not LTypeMatches then
         begin
-            LAcceptedType :=
-                AAcceptedTypes[LIndex];
-
-            if AFrame.MessageType = LAcceptedType then
+            for LIndex := Low(AAcceptedTypes) to High(AAcceptedTypes) do
             begin
-                LTypeMatches := True;
-                Break;
+                LAcceptedType :=
+                    AAcceptedTypes[LIndex];
+
+                if AFrame.MessageType = LAcceptedType then
+                begin
+                    LTypeMatches := True;
+                    Break;
+                end;
             end;
         end;
 
+        { A different request must never satisfy this request. }
         if (ARequestID <> '') and
            (AFrame.RequestID <> '') and
            (not SameText(
@@ -278,7 +296,7 @@ begin
            )) then
         begin
             Writeln(
-                '[event ',
+                '[async ',
                 GARPMessageTypeToName(
                     AFrame.MessageType
                 ),
@@ -292,8 +310,18 @@ begin
             Continue;
         end;
 
+        { The message belongs to this request but is not expected yet. }
         if not LTypeMatches then
         begin
+            Writeln(
+                '[ignored ',
+                GARPMessageTypeToName(
+                    AFrame.MessageType
+                ),
+                '] ',
+                AFrame.MessageJSON.ToJSON
+            );
+
             AFrame.MessageJSON.Free;
             AFrame.MessageJSON := nil;
 
@@ -314,19 +342,27 @@ var
     LAuth: TJSONObject;
     LAuthMessage: TJSONObject;
     LReplyPayload: TJSONObject;
+    LErrorPayload: TJSONObject;
+    LErrorCode: string;
+    LErrorMessage: string;
 begin
     if FClient.Connected then
     begin
         if FAuthenticated then
             Exit;
 
-        FClient.Disconnect;
+        CloseConnection;
     end;
 
     if FSecret = '' then
         raise Exception.Create(
             'GARP secret is empty. Use --secret or GARP_SECRET.'
         );
+
+    FSessionID := '';
+    FTabID := '';
+    FRequestID := '';
+    FAuthenticated := False;
 
     FClient.Connect;
 
@@ -335,6 +371,8 @@ begin
 
     FClientNonce :=
         GARPCreateNonce;
+
+    { HELLO }
 
     LPayload :=
         TJSONObject.Create;
@@ -375,20 +413,63 @@ begin
         LPayload.Free;
     end;
 
+    { HELLO_CHALLENGE }
+
     ReceiveFrame(
         LFrame
     );
 
     try
+        if LFrame.MessageType = GARP_ERROR then
+        begin
+            LErrorPayload :=
+                LFrame.MessageJSON.GetValue<TJSONObject>(
+                    'payload'
+                );
+
+            LErrorCode := '';
+            LErrorMessage :=
+                LFrame.MessageJSON.ToJSON;
+
+            if LErrorPayload <> nil then
+            begin
+                LErrorCode :=
+                    LErrorPayload.GetValue<string>(
+                        'code',
+                        ''
+                    );
+
+                LErrorMessage :=
+                    LErrorPayload.GetValue<string>(
+                        'message',
+                        LErrorMessage
+                    );
+            end;
+
+            if LErrorCode <> '' then
+                raise Exception.Create(
+                    'GARP HELLO rejected [' +
+                    LErrorCode +
+                    ']: ' +
+                    LErrorMessage
+                )
+            else
+                raise Exception.Create(
+                    'GARP HELLO rejected: ' +
+                    LErrorMessage
+                );
+        end;
+
         if LFrame.MessageType <>
            GARP_HELLO_CHALLENGE then
         begin
             raise Exception.CreateFmt(
-                'Expected hello_challenge, received %s',
+                'Expected hello_challenge, received %s: %s',
                 [
                     GARPMessageTypeToName(
                         LFrame.MessageType
-                    )
+                    ),
+                    LFrame.MessageJSON.ToJSON
                 ]
             );
         end;
@@ -407,6 +488,8 @@ begin
         LFrame.MessageJSON.Free;
         LFrame.MessageJSON := nil;
     end;
+
+    { HELLO_AUTH }
 
     LProof :=
         GARPMakeHMACProof(
@@ -460,20 +543,67 @@ begin
         LAuth.Free;
     end;
 
+    { HELLO_ACK }
+
     ReceiveFrame(
         LFrame
     );
 
     try
+        if LFrame.MessageType = GARP_ERROR then
+        begin
+            LErrorPayload :=
+                LFrame.MessageJSON.GetValue<TJSONObject>(
+                    'payload'
+                );
+
+            LErrorCode := '';
+            LErrorMessage :=
+                LFrame.MessageJSON.ToJSON;
+
+            if LErrorPayload <> nil then
+            begin
+                LErrorCode :=
+                    LErrorPayload.GetValue<string>(
+                        'code',
+                        ''
+                    );
+
+                LErrorMessage :=
+                    LErrorPayload.GetValue<string>(
+                        'message',
+                        LErrorMessage
+                    );
+            end;
+
+            FAuthenticated := False;
+
+            if LErrorCode <> '' then
+                raise Exception.Create(
+                    'GARP authentication failed [' +
+                    LErrorCode +
+                    ']: ' +
+                    LErrorMessage
+                )
+            else
+                raise Exception.Create(
+                    'GARP authentication failed: ' +
+                    LErrorMessage
+                );
+        end;
+
         if LFrame.MessageType <>
            GARP_HELLO_ACK then
         begin
+            FAuthenticated := False;
+
             raise Exception.CreateFmt(
-                'Expected hello_ack, received %s',
+                'Expected hello_ack, received %s: %s',
                 [
                     GARPMessageTypeToName(
                         LFrame.MessageType
-                    )
+                    ),
+                    LFrame.MessageJSON.ToJSON
                 ]
             );
         end;
@@ -484,9 +614,13 @@ begin
             );
 
         if LReplyPayload = nil then
+        begin
+            FAuthenticated := False;
+
             raise Exception.Create(
                 'hello_ack has no payload'
             );
+        end;
 
         FAuthenticated := True;
     finally
@@ -509,7 +643,7 @@ begin
     LMessage :=
         BuildMessage(
             'capabilities',
-            TJSONObject.Create
+            nil
         );
 
     try
@@ -527,7 +661,8 @@ begin
         LRequestID,
         [
             GARP_CAPABILITIES,
-            GARP_RESPONSE
+            GARP_RESPONSE,
+            GARP_ERROR
         ],
         LFrame
     );
@@ -552,7 +687,7 @@ begin
     LMessage :=
         BuildMessage(
             'browser_status',
-            TJSONObject.Create
+            nil
         );
 
     try
@@ -570,7 +705,8 @@ begin
         LRequestID,
         [
             GARP_BROWSER_STATUS,
-            GARP_RESPONSE
+            GARP_RESPONSE,
+            GARP_ERROR
         ],
         LFrame
     );
@@ -595,7 +731,7 @@ begin
     LMessage :=
         BuildMessage(
             'list_tabs',
-            TJSONObject.Create
+            nil
         );
 
     try
@@ -613,7 +749,8 @@ begin
         LRequestID,
         [
             GARP_RESPONSE,
-            GARP_LIST_TABS
+            GARP_LIST_TABS,
+            GARP_ERROR
         ],
         LFrame
     );
@@ -687,7 +824,8 @@ begin
         LRequestID,
         [
             GARP_RESPONSE,
-            GARP_SESSION_READY
+            GARP_SESSION_READY,
+            GARP_ERROR
         ],
         LFrame
     );
@@ -865,6 +1003,7 @@ var
     LFrame: TGARPFrame;
     LPayload: TJSONObject;
     LStatus: string;
+    LPong: TJSONObject;
 begin
     EnsureConnected;
 
@@ -892,10 +1031,7 @@ begin
         end;
 
         try
-            if not ReceiveFrame(LFrame) then
-                raise Exception.Create(
-                    'No GARP event received'
-                );
+            ReceiveFrame(LFrame);
 
             Writeln(
                 '[',
@@ -971,7 +1107,20 @@ begin
 
                 GARP_PING:
                     begin
-                        // Keep the connection alive if Firefox sends a ping.
+                        LPong :=
+                            BuildMessage(
+                                'pong',
+                                nil
+                            );
+
+                        try
+                            SendFrame(
+                                GARP_PONG,
+                                LPong
+                            );
+                        finally
+                            LPong.Free;
+                        end;
                     end;
             end;
 
@@ -980,7 +1129,8 @@ begin
             LFrame.MessageJSON := nil;
         end;
 
-    until TThread.GetTickCount64 - LStart >= ATimeoutMS;
+    until
+        TThread.GetTickCount64 - LStart >= ATimeoutMS;
 
     LPayload :=
         TJSONObject.Create;
@@ -1087,7 +1237,7 @@ begin
     LMessage :=
         BuildMessage(
             'ping',
-            TJSONObject.Create
+            nil
         );
 
     try
@@ -1101,7 +1251,10 @@ begin
 
     ReceiveUntil(
         '',
-        [GARP_PONG],
+        [
+            GARP_PONG,
+            GARP_ERROR
+        ],
         LFrame
     );
 
@@ -1173,5 +1326,4 @@ begin
 end;
 
 end.
-
 
