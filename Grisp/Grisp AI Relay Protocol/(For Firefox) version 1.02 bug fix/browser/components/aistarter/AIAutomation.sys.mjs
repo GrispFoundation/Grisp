@@ -1,4 +1,3 @@
-import { Services } from "resource://gre/modules/Services.sys.mjs";
 import { GarpConnection } from "./garp/GarpConnection.sys.mjs";
 import { GarpFeature, GarpMessageType } from "./garp/GarpRegistry.sys.mjs";
 import { GarpError, GarpErrorCode } from "./garp/GarpErrors.sys.mjs";
