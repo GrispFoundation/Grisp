@@ -1,0 +1,3624 @@
+# GRISP AI RELAY PROTOCOL SPECIFICATION
+
+## GARP/1.02
+
+**Status:** NORMATIVE
+**Version:** GARP/1.02
+**Parent specifications:** GRISP Agent Specification v1.0; GRISP v1.0 Implementation Contract, Revision 2
+**Semantic AI contract:** GAI/1.0
+**Transport:** TCP localhost, UTF-8, length-framed binary envelope
+**Default mode:** FAIL-CLOSED
+
+---
+
+# PART I — PROTOCOL SPECIFICATION
+
+# 1. PURPOSE
+
+GARP is the GRISP ↔ Firefox AI Gateway transport and browser-session protocol.
+
+GARP makes Firefox a reliable, stateful, provider-independent AI transport and interaction endpoint rather than a loose JSON command socket or collection of ad-hoc DOM scripts.
+
+GARP defines:
+
+* connection handshake and feature negotiation;
+* request identity;
+* session identity;
+* tab identity;
+* response/message identity;
+* sequence identity;
+* browser AI session lifecycle;
+* provider-input readiness;
+* prompt injection;
+* prompt injection verification;
+* provider submission;
+* provider submission verification;
+* cancellation;
+* continuation;
+* streaming response events;
+* provider adapter boundaries;
+* structured errors;
+* heartbeat;
+* reconnection;
+* page-generation tracking;
+* Firefox actor replacement;
+* stale-actor protection;
+* local gateway security;
+* deterministic transport state transitions;
+* centralized AI automation diagnostics;
+* operator-controlled AI automation debugging.
+
+GARP does **not** define:
+
+* artifact acceptance;
+* compile semantics;
+* runtime verification;
+* GRISP policy;
+* AI quality scoring;
+* final acceptance;
+* artifact identity or hashing;
+* GAI semantic artifact structure.
+
+Those belong to GRISP core, GAI/1.0, or the GRISP implementation contract.
+
+The architectural boundary is:
+
+```text
+Firefox = provider interaction, observation, and transport
+GRISP   = interpretation and verification
+AI      = reasoning
+tools   = measurement
+policy  = authorization
+```
+
+The AI response transported by GARP is untrusted.
+
+Diagnostic information is transport and implementation metadata. It SHALL NEVER alter semantic AI prompts or semantic AI responses.
+
+---
+
+# 2. DESIGN GOALS
+
+GARP/1.02 SHALL provide:
+
+1. stable request identity;
+2. stable session identity;
+3. stable tab identity;
+4. provider-independent request correlation;
+5. event-driven streaming;
+6. explicit cancellation;
+7. duplicate request suppression;
+8. connection resilience;
+9. page-generation tracking;
+10. structured provider errors;
+11. isolated provider adapters;
+12. no semantic mutation by transport;
+13. fail-closed behavior when state is unknown;
+14. explicit session concurrency rules;
+15. deterministic event ordering;
+16. deterministic stale-state rejection;
+17. explicit provider-input readiness;
+18. verified prompt injection;
+19. verified provider submission;
+20. browser actor replacement resilience;
+21. centralized structured AI automation diagnostics;
+22. operator-controlled AI automation trace mode;
+23. normative bidirectional message-type registry;
+24. explicit separation between request acceptance and provider submission;
+25. explicit separation between provider submission and generation start.
+
+GARP SHALL NOT rely on newline-delimited JSON for message framing.
+
+---
+
+# 3. TERMINOLOGY
+
+## 3.1 Client
+
+The GRISP Agent or another trusted GRISP-side GARP client.
+
+## 3.2 Gateway
+
+The Firefox-side component implementing GARP.
+
+## 3.3 Provider
+
+An external AI service such as:
+
+* ChatGPT;
+* Gemini;
+* Claude;
+* DeepSeek;
+* Grok;
+* Copilot;
+* Perplexity;
+* Inception.
+
+## 3.4 Adapter
+
+A provider-specific Firefox module that knows how to:
+
+* discover input;
+* determine readiness;
+* inject prompt text;
+* verify injected prompt text;
+* discover a submission mechanism;
+* submit prompts;
+* verify provider submission;
+* observe generation;
+* identify responses;
+* detect continuation;
+* perform continuation;
+* cancel where supported;
+* detect authentication;
+* detect rate limits;
+* detect provider errors;
+* reset provider state.
+
+## 3.5 Session
+
+A logical AI conversation controlled through GARP.
+
+A session is identified by `session_id`.
+
+A session is associated with:
+
+* provider;
+* tab;
+* conversation identity where available;
+* session state;
+* current page generation;
+* current actor binding.
+
+## 3.6 Tab
+
+A Firefox browser tab with a stable `tab_id`.
+
+`tab_index` is informational only.
+
+## 3.7 Request
+
+One AI operation identified by `request_id`.
+
+## 3.8 Message
+
+One AI response generation identified by `message_id`.
+
+## 3.9 Event
+
+An asynchronous GARP message describing state or generation progress.
+
+## 3.10 Page Generation
+
+A monotonically increasing integer associated with a session's current provider-page context.
+
+It changes when the provider application context is significantly replaced, including navigation and JSWindowActor replacement.
+
+## 3.11 Actor Instance
+
+One concrete Firefox `JSWindowActorChild` instance associated with one page generation.
+
+An actor instance SHALL NOT be assumed to survive navigation.
+
+## 3.12 Sequence
+
+A monotonically increasing integer associated with one event stream.
+
+A stream is identified by:
+
+```text
+(request_id, message_id)
+```
+
+## 3.13 Provider Input
+
+The concrete DOM element used by the provider to accept user prompt text.
+
+## 3.14 Input Verification
+
+Evidence that the requested prompt was actually accepted by the current provider input element and remained observable after the provider framework had an opportunity to process the input event.
+
+## 3.15 Submission
+
+The provider-side action that causes the entered prompt to be sent to the AI service.
+
+Submission is distinct from input injection.
+
+## 3.16 Submission Verification
+
+Evidence that a provider submission method was actually invoked successfully according to the adapter contract.
+
+## 3.17 Diagnostic Event
+
+Structured internal or GARP-visible information describing AI automation execution.
+
+Diagnostic information is non-semantic metadata.
+
+---
+
+# 4. IDENTITY MODEL
+
+GARP SHALL distinguish:
+
+```text
+provider
+model
+session
+browser_tab
+conversation
+worker_instance
+actor_instance
+request
+message
+page_generation
+sequence
+```
+
+The following identities have independent meanings.
+
+## 4.1 Provider Identity
+
+Identifies the external AI provider.
+
+Example:
+
+```text
+deepseek
+```
+
+## 4.2 Model Identity
+
+Identifies the model used by the provider where the provider exposes one.
+
+Model identity SHALL NOT be assumed equivalent to provider identity.
+
+## 4.3 Session Identity
+
+`session_id` identifies the logical browser AI conversation controlled by GARP.
+
+It SHALL remain stable across:
+
+* actor replacement;
+* SPA navigation;
+* ordinary reconnects.
+
+## 4.4 Tab Identity
+
+`tab_id` identifies a Firefox tab.
+
+`tab_id` MUST NOT be derived from tab index.
+
+`tab_index` MAY change without changing `tab_id`.
+
+## 4.5 Request Identity
+
+Every prompt operation SHALL have exactly one `request_id`.
+
+## 4.6 Message Identity
+
+Every response generation SHOULD have exactly one `message_id`.
+
+Once established, `message_id` MUST NOT change during that generation.
+
+## 4.7 Page Generation
+
+Every session has an associated:
+
+```text
+page_generation : uint64
+```
+
+The initial value SHALL be nonzero.
+
+Page generation SHALL strictly increase.
+
+A stale event from an older page generation SHALL NOT overwrite state belonging to a newer page generation.
+
+## 4.8 Actor Instance Identity
+
+The gateway SHALL track the current actor instance associated with the session.
+
+When the current actor instance changes:
+
+```text
+old actor
+    ↓
+new actor
+    ↓
+page_generation increases
+```
+
+A stale actor response SHALL NOT mutate authoritative session state.
+
+## 4.9 Sequence
+
+For one `(request_id, message_id)` stream:
+
+```text
+1, 2, 3, 4, ...
+```
+
+Sequence SHALL begin at `1`.
+
+Sequence SHALL never silently reset within a stream.
+
+---
+
+# 5. TRANSPORT
+
+## 5.1 Base Transport
+
+GARP/1.02 SHALL use:
+
+```text
+TCP
+localhost only
+binary framing
+UTF-8 JSON payload
+```
+
+The TCP connection SHALL NOT use newline termination as protocol framing.
+
+---
+
+# 6. GARP BINARY FRAME
+
+Every frame SHALL begin with the following fixed header:
+
+```text
+magic[4]
+version[1]
+reserved[1]
+header_length[2]
+payload_length[4]
+message_type[2]
+reserved2[2]
+request_id[16]
+session_id[16]
+payload[...]
+```
+
+The fixed header portion SHALL therefore be **48 bytes**.
+
+All integer fields SHALL use unsigned big-endian encoding.
+
+## 6.1 Magic
+
+The first four bytes SHALL be:
+
+```text
+47 41 52 50
+```
+
+ASCII:
+
+```text
+GARP
+```
+
+## 6.2 Version
+
+For GARP/1.02:
+
+```text
+version = 0x12
+```
+
+The wire version byte is authoritative.
+
+## 6.3 Reserved Byte
+
+The byte immediately following the version SHALL be zero unless a future explicitly negotiated extension assigns meaning to it.
+
+## 6.4 Header Length
+
+`header_length` SHALL be at least 48.
+
+An implementation MAY support extended headers only when explicitly negotiated.
+
+An implementation that does not support extended headers SHALL reject:
+
+```text
+header_length != 48
+```
+
+with:
+
+```text
+PROTOCOL_ERROR
+```
+
+## 6.5 Payload Length
+
+`payload_length` is the exact number of payload bytes following the header.
+
+It SHALL never include the header.
+
+## 6.6 Message Type
+
+`message_type` is a numeric registry identifier.
+
+The JSON payload SHALL contain the corresponding human-readable `type`.
+
+## 6.7 UUID Wire Encoding
+
+`request_id` and `session_id` SHALL use raw 128-bit RFC 4122 UUID bytes.
+
+The JSON representation SHALL use:
+
+```text
+xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+## 6.8 Zero UUID
+
+Messages without an applicable request or session identity SHALL encode all-zero bytes:
+
+```text
+00000000-0000-0000-0000-000000000000
+```
+
+in the binary header.
+
+The JSON representation MAY omit the corresponding field where permitted by the message registry.
+
+---
+
+# 7. FRAME VALIDATION
+
+The receiver SHALL reject a frame if:
+
+* magic is invalid;
+* protocol version is unsupported;
+* header length is invalid;
+* reserved fields are nonzero without negotiated meaning;
+* payload length exceeds configured limits;
+* message type is unknown;
+* the frame is truncated;
+* UTF-8 payload is invalid;
+* JSON payload is invalid;
+* JSON `protocol` is incompatible;
+* JSON `type` does not match the numeric message type;
+* required identity fields are missing.
+
+Failure MUST be fail-closed.
+
+A malformed frame SHALL NOT be partially processed.
+
+---
+
+# 8. FRAME SIZE LIMITS
+
+GARP SHALL maintain configurable limits.
+
+Recommended defaults:
+
+```text
+ordinary control payload     1 MiB
+prompt payload              4 MiB
+artifact/document payload  16 MiB
+stream chunk               256 KiB
+```
+
+The implementation SHALL define one absolute maximum frame size that is at least 16 MiB.
+
+A payload exceeding the applicable limit SHALL yield:
+
+```text
+FRAME_TOO_LARGE
+```
+
+and SHALL NOT be partially processed.
+
+---
+
+# 9. MESSAGE REGISTRY
+
+The following numeric registry is **normative and authoritative** for GARP/1.02.
+
+```text
+0001 HELLO
+0002 HELLO_ACK
+0003 CAPABILITIES
+0004 BROWSER_STATUS
+0005 HELLO_CHALLENGE
+0006 RESPONSE
+0007 HELLO_AUTH
+
+0010 LIST_TABS
+0011 OPEN_TAB
+0012 CLOSE_TAB
+0013 SELECT_TAB
+
+0020 CREATE_SESSION
+0021 ATTACH_SESSION
+0022 DETACH_SESSION
+0023 CLOSE_SESSION
+0024 RESET_SESSION
+
+0030 PROMPT
+0031 PROMPT_ACK
+0032 CANCEL_PROMPT
+0033 CANCEL_ACK
+0034 GET_PROMPT_STATUS
+0035 GET_RESPONSE
+0036 SUBSCRIBE_RESPONSE
+
+0040 SESSION_READY
+0041 SESSION_CHANGED
+0042 INPUT_SUBMITTED
+0043 GENERATION_STARTED
+0044 GENERATION_DELTA
+0045 GENERATION_PROGRESS
+0046 CONTINUATION_REQUIRED
+0047 CONTINUATION_SUBMITTED
+0048 GENERATION_COMPLETED
+0049 GENERATION_FAILED
+
+0050 NAVIGATION
+0051 PROVIDER_ERROR
+0052 AUTH_REQUIRED
+0053 RATE_LIMITED
+0054 DIAGNOSTIC
+
+0060 PING
+0061 PONG
+
+00F0 ERROR
+```
+
+`HELLO_AUTH` is a first-class GARP/1.02 wire message.
+
+It SHALL use:
+
+```text
+message_type = 0x0007
+```
+
+on the binary wire.
+
+The corresponding JSON semantic type SHALL be:
+
+```text
+"hello_auth"
+```
+
+The mapping:
+
+```text
+0x0007 ↔ "hello_auth"
+```
+
+MUST exist in both directions in every conforming implementation:
+
+```text
+numeric message type → semantic message name
+semantic message name → numeric message type
+```
+
+A conforming implementation SHALL support:
+
+```text
+encode("hello_auth") → 0x0007
+decode(0x0007) → "hello_auth"
+```
+
+A missing mapping is a GARP/1.02 protocol implementation defect.
+
+The implementation SHALL NOT require a compatibility patch, post-build modification, or provider-specific workaround to obtain a normative message mapping.
+
+Unknown numeric message types SHALL result in:
+
+```text
+PROTOCOL_ERROR
+```
+
+unless a future negotiated extension explicitly permits them.
+
+---
+
+# 10. MESSAGE CLASSES
+
+GARP defines:
+
+```text
+HELLO
+COMMAND
+RESPONSE
+EVENT
+ERROR
+CONTROL
+```
+
+The numeric registry is authoritative for wire encoding.
+
+The JSON `"type"` is authoritative for semantic interpretation.
+
+Both MUST agree.
+
+---
+
+# 11. HANDSHAKE
+
+The client SHALL initiate a connection with:
+
+```json
+{
+  "protocol": "GARP/1.02",
+  "type": "hello",
+  "payload": {
+    "client_id": "GRISP-Agent-...",
+    "client_version": "1.0.0",
+    "nonce": "..."
+  }
+}
+```
+
+The gateway SHALL respond with:
+
+```text
+HELLO_CHALLENGE
+```
+
+when authentication is enabled, followed by:
+
+```text
+HELLO_AUTH
+HELLO_ACK
+```
+
+A gateway operating without authentication MAY respond directly with `HELLO_ACK`.
+
+---
+
+# 12. AUTHENTICATION
+
+When authentication is enabled, the gateway SHALL perform challenge-response authentication.
+
+The authenticated handshake consists of:
+
+```text
+HELLO
+HELLO_CHALLENGE
+HELLO_AUTH
+HELLO_ACK
+```
+
+The mandatory numeric assignments are:
+
+```text
+HELLO           = 0x0001
+HELLO_CHALLENGE = 0x0005
+HELLO_AUTH      = 0x0007
+HELLO_ACK       = 0x0002
+```
+
+`HELLO_AUTH` is a distinct wire message.
+
+## 12.1 Challenge
+
+Gateway:
+
+```json
+{
+  "protocol": "GARP/1.02",
+  "type": "hello_challenge",
+  "payload": {
+    "server_id": "...",
+    "server_version": "...",
+    "server_nonce": "...",
+    "auth": {
+      "algorithm": "HMAC-SHA256"
+    }
+  }
+}
+```
+
+The binary frame SHALL contain:
+
+```text
+message_type = 0x0005
+```
+
+## 12.2 Authentication
+
+Client:
+
+```json
+{
+  "protocol": "GARP/1.02",
+  "type": "hello_auth",
+  "payload": {
+    "client_id": "...",
+    "client_nonce": "...",
+    "server_nonce": "...",
+    "proof": "hex..."
+  }
+}
+```
+
+The binary frame SHALL contain:
+
+```text
+message_type = 0x0007
+```
+
+The proof SHALL be:
+
+```text
+HMAC-SHA256(
+    shared_secret,
+    "GARP/1.02" |
+    client_id |
+    client_nonce |
+    server_nonce
+)
+```
+
+No page script SHALL have access to the shared secret.
+
+## 12.3 Successful Handshake
+
+The gateway returns:
+
+```json
+{
+  "protocol": "GARP/1.02",
+  "type": "hello_ack",
+  "payload": {
+    "server_id": "...",
+    "server_version": "...",
+    "browser": {
+      "name": "Firefox",
+      "version": "..."
+    },
+    "features": [
+      "streaming",
+      "cancel",
+      "sessions",
+      "stable_tabs",
+      "response_events",
+      "page_generation",
+      "diagnostics"
+    ]
+  }
+}
+```
+
+The binary frame SHALL contain:
+
+```text
+message_type = 0x0002
+```
+
+The connection enters:
+
+```text
+AUTHENTICATED
+```
+
+only after successful verification.
+
+Failed authentication SHALL terminate the connection.
+
+---
+
+# 13. CONNECTION STATE MACHINE
+
+```text
+CONNECTED
+    |
+    v
+HELLO_RECEIVED
+    |
+    v
+AUTHENTICATING
+    |
+    v
+AUTHENTICATED
+    |
+    v
+READY
+    |
+    +----> CLOSING
+```
+
+Terminal connection states:
+
+```text
+CLOSING
+CLOSED
+```
+
+A connection that has not successfully reached `READY` SHALL NOT accept normal commands.
+
+---
+
+# 14. HEARTBEAT
+
+Both endpoints SHALL support:
+
+```text
+PING
+PONG
+```
+
+Recommended heartbeat interval:
+
+```text
+10–30 seconds
+```
+
+Heartbeat timeout SHALL be configurable.
+
+A heartbeat failure SHALL invalidate the TCP connection but SHALL NOT automatically destroy session identity.
+
+---
+
+# 15. RECONNECTION
+
+A disconnected client MAY reconnect.
+
+After reconnect:
+
+```text
+CONNECT
+  ↓
+HELLO
+  ↓
+AUTHENTICATE
+  ↓
+CAPABILITIES
+  ↓
+GET_PROMPT_STATUS
+```
+
+A request MAY remain associated with its session across reconnect.
+
+Possible recovered request states:
+
+```text
+SUBMITTING
+GENERATION_STARTED
+STREAMING
+CONTINUATION_REQUIRED
+COMPLETE
+FAILED
+CANCELLED
+UNKNOWN
+```
+
+`UNKNOWN` MUST remain distinct from `COMPLETE`.
+
+A broken connection SHALL NEVER be interpreted as successful completion.
+
+---
+
+# 16. TAB MODEL
+
+Every Firefox tab controlled by GARP SHALL have a stable GUID:
+
+```text
+tab_id
+```
+
+`tab_index` is informational.
+
+`LIST_TABS` returns:
+
+```json
+{
+  "tab_id": "...",
+  "index": 5,
+  "title": "...",
+  "url": "...",
+  "selected": true,
+  "provider": "deepseek",
+  "session_id": "...",
+  "state": "READY"
+}
+```
+
+Required commands:
+
+```text
+LIST_TABS
+OPEN_TAB
+CLOSE_TAB
+SELECT_TAB
+```
+
+---
+
+# 17. SESSION MODEL
+
+A session contains:
+
+```text
+session_id
+provider
+model
+tab_id
+conversation_id
+page_generation
+actor_instance
+input_state
+generation_state
+last_request_id
+last_message_id
+state
+```
+
+Possible session states:
+
+```text
+NEW
+PREPARING
+READY
+BUSY
+AUTH_REQUIRED
+RATE_LIMITED
+ERROR
+CLOSED
+```
+
+Session state SHALL always be explicit.
+
+---
+
+# 18. SESSION LIFECYCLE
+
+Required commands:
+
+```text
+CREATE_SESSION
+ATTACH_SESSION
+DETACH_SESSION
+CLOSE_SESSION
+RESET_SESSION
+```
+
+Creating a session SHALL return:
+
+```text
+session_id
+tab_id
+provider
+page_generation
+state
+```
+
+A newly created session SHALL normally begin in:
+
+```text
+PREPARING
+```
+
+and SHALL NOT be considered ready merely because its tab exists.
+
+A session SHALL survive JSWindowActor replacement.
+
+---
+
+# 19. SESSION READINESS
+
+Session readiness SHALL be based on current provider state, not elapsed time.
+
+The following are mandatory readiness conditions:
+
+```text
+current tab exists
+current actor exists
+current page generation is known
+provider page is sufficiently loaded
+provider authentication state is known
+rate-limit state is known
+provider input is discoverable
+provider input is visible
+provider input is enabled
+```
+
+A session SHALL enter:
+
+```text
+READY
+```
+
+only when the provider adapter reports:
+
+```text
+input_ready = true
+```
+
+and no blocking authentication or rate-limit condition exists.
+
+A fixed client-side sleep SHALL NOT constitute readiness proof.
+
+Waiting for readiness SHOULD be performed by the gateway.
+
+A client MAY also receive `SESSION_READY` events and then submit a prompt.
+
+A prompt received while the session is `PREPARING` SHALL either:
+
+1. remain pending until readiness is established; or
+2. be rejected with `SESSION_NOT_READY` / `INPUT_NOT_READY`.
+
+It SHALL NOT be treated as successfully submitted merely because the request was syntactically valid.
+
+---
+
+# 20. SESSION CONCURRENCY
+
+A session SHALL permit at most one active generation by default.
+
+Submitting a second prompt while a generation is active SHALL yield:
+
+```text
+SESSION_BUSY
+```
+
+unless explicit concurrent-session support has been negotiated.
+
+The gateway SHALL never silently double-submit a prompt.
+
+---
+
+# 21. PROMPT LIFECYCLE
+
+The canonical state machine is:
+
+```text
+IDLE
+  ↓
+PREPARING
+  ↓
+INPUT_READY
+  ↓
+INJECTING
+  ↓
+INJECTION_VERIFIED
+  ↓
+SUBMITTING
+  ↓
+SUBMISSION_VERIFIED
+  ↓
+GENERATION_STARTED
+  ↓
+STREAMING
+  ↓
+CONTINUATION_REQUIRED
+  ↓
+STREAMING
+  ↓
+COMPLETE
+```
+
+Failure states include:
+
+```text
+AUTH_REQUIRED
+RATE_LIMIT
+PROVIDER_ERROR
+DOM_ERROR
+NAVIGATION_ERROR
+TIMEOUT
+CANCELLED
+INPUT_NOT_READY
+INPUT_INJECTION_FAILED
+SUBMIT_FAILED
+SUBMISSION_NOT_VERIFIED
+RESPONSE_IDENTITY_UNKNOWN
+STALE_ACTOR
+STALE_PAGE_GENERATION
+```
+
+No state may silently transition to another state.
+
+A timeout while looking for input SHALL NOT become `READY`.
+
+A failed injection SHALL NOT become `SUBMISSION_VERIFIED`.
+
+A failed submission SHALL NOT become `GENERATION_STARTED`.
+
+---
+
+# 22. PROMPT REQUEST
+
+Canonical form:
+
+```json
+{
+  "protocol": "GARP/1.02",
+  "type": "prompt",
+  "request_id": "...",
+  "session_id": "...",
+  "payload": {
+    "prompt": {
+      "format": "text",
+      "text": "..."
+    },
+    "options": {
+      "stream": true,
+      "timeout_ms": 180000,
+      "auto_continue": true
+    }
+  }
+}
+```
+
+A prompt SHALL preserve the supplied semantic text exactly.
+
+GARP transport SHALL NOT:
+
+* trim semantic prompt text;
+* alter whitespace;
+* normalize line endings inside the semantic payload;
+* inject debugging comments;
+* remove Markdown;
+* modify filenames;
+* rewrite code;
+* append instructions.
+
+Logging SHALL be independent of semantic prompt transport.
+
+---
+
+# 23. PROMPT ACKNOWLEDGEMENT
+
+The gateway SHALL acknowledge an accepted request:
+
+```json
+{
+  "protocol": "GARP/1.02",
+  "type": "prompt_ack",
+  "request_id": "...",
+  "session_id": "...",
+  "payload": {
+    "state": "accepted"
+  }
+}
+```
+
+`PROMPT_ACK` means only:
+
+```text
+request accepted by the GARP gateway
+```
+
+It does NOT mean:
+
+```text
+prompt injected
+prompt injection verified
+prompt submitted
+submission verified
+AI generation started
+AI generation succeeded
+```
+
+The gateway SHALL NOT use `PROMPT_ACK` as evidence that provider submission succeeded.
+
+---
+
+# 24. INPUT DISCOVERY
+
+A provider adapter SHALL discover the current provider input from the current document.
+
+Discovery SHALL report:
+
+```text
+FOUND
+NOT_FOUND
+AMBIGUOUS
+ERROR
+```
+
+An input candidate SHOULD expose diagnostic metadata including:
+
+```text
+selector
+tag_name
+id
+class_name
+role
+placeholder
+contenteditable
+visible
+enabled
+owner_document
+```
+
+Broad generic selectors SHALL NOT silently override a more specific provider selector without diagnostic evidence.
+
+The implementation SHALL NOT silently claim that a provider input exists when all provider-specific and permitted fallback discovery methods failed.
+
+---
+
+# 25. INPUT INJECTION
+
+The adapter SHALL distinguish:
+
+```text
+input discovery
+input injection
+input verification
+```
+
+Supported strategies MAY include:
+
+```text
+native_value_setter
+framework-aware_value_update
+contenteditable_selection
+input_event
+keyboard_fallback
+```
+
+For ordinary HTML `<textarea>` or `<input>` elements, the implementation SHOULD prefer a native value setter over deprecated or unreliable `execCommand()` insertion.
+
+After injection, the adapter SHALL dispatch the required input/change events for the provider framework.
+
+The adapter SHALL verify the result.
+
+For a textarea-like control, minimum verification SHALL establish:
+
+```text
+current value equals requested prompt
+```
+
+and SHOULD additionally verify after at least one event-loop turn or equivalent provider-framework processing opportunity.
+
+For contenteditable controls, verification SHALL establish that the rendered/editor text corresponds to the requested prompt.
+
+If verification fails:
+
+```text
+INPUT_INJECTION_FAILED
+```
+
+SHALL be raised.
+
+A provider adapter SHALL NOT report successful input injection merely because a DOM mutation was attempted.
+
+---
+
+# 26. DOM RERENDER DETECTION
+
+Provider frameworks MAY replace the input element immediately after an input event.
+
+Therefore the adapter SHOULD re-query the provider input after injection.
+
+The adapter SHOULD report:
+
+```text
+same_node
+replacement_detected
+verified_value_length
+```
+
+A prompt that was present only in an obsolete DOM node SHALL NOT be treated as successfully injected into the current provider editor.
+
+If the current input has become a different node and the prompt is no longer present, the adapter SHALL re-inject or fail closed.
+
+---
+
+# 27. PROMPT SUBMISSION
+
+Submission SHALL be a distinct operation after successful injection verification.
+
+The adapter SHOULD support, in priority order:
+
+```text
+provider-specific send control
+stable semantic send control
+form submission where valid
+keyboard fallback where safe
+```
+
+The adapter SHALL NOT silently return success when no valid submission mechanism was found.
+
+If no supported submission method exists:
+
+```text
+SUBMIT_FAILED
+```
+
+SHALL be raised.
+
+The result SHALL identify the method used:
+
+```text
+submit_method
+```
+
+Examples:
+
+```text
+button_click
+form_submit
+keyboard_enter
+provider_specific
+```
+
+---
+
+# 28. SUBMISSION VERIFICATION
+
+After submission, the gateway SHALL establish evidence that submission actually occurred.
+
+Acceptable provider-specific evidence MAY include:
+
+```text
+input cleared by provider
+user message count increased
+user message node appeared
+conversation state changed
+provider generation state changed
+provider-specific submission acknowledgment
+```
+
+A click invocation alone is insufficient proof where the provider UI allows a disabled or inert control.
+
+The adapter SHOULD report:
+
+```text
+submit_method
+submission_verified
+```
+
+The gateway SHALL emit:
+
+```text
+INPUT_SUBMITTED
+```
+
+only after the adapter reports successful submission.
+
+---
+
+# 29. REQUEST EXECUTION ORDER
+
+For a normal prompt, the gateway SHALL follow this logical order:
+
+```text
+PROMPT received
+    ↓
+request created
+    ↓
+session readiness verified
+    ↓
+current actor verified
+    ↓
+current page generation captured
+    ↓
+pre-submission snapshot captured
+    ↓
+prompt injected
+    ↓
+injection verified
+    ↓
+provider submission performed
+    ↓
+submission verified
+    ↓
+INPUT_SUBMITTED
+    ↓
+GENERATION_STARTED
+    ↓
+generation observation
+```
+
+`GENERATION_STARTED` SHALL NOT be emitted merely because `PROMPT` was received.
+
+`GENERATION_STARTED` SHALL NOT be emitted before successful provider submission.
+
+---
+
+# 30. DUPLICATE REQUEST SUPPRESSION
+
+`request_id` is an idempotency key.
+
+A duplicate `PROMPT` with an already known `request_id` SHALL NOT cause another provider submission.
+
+The gateway SHALL return the existing request state.
+
+A duplicate request with different semantic prompt content SHALL be rejected as:
+
+```text
+REQUEST_ID_REUSE
+```
+
+---
+
+# 31. RESPONSE IDENTITY
+
+The gateway SHALL determine response ownership using:
+
+```text
+request_id
+message_id
+submission_generation
+```
+
+It SHALL NOT simply assume that:
+
+```text
+latest markdown element = current response
+```
+
+Before submission, the gateway SHALL capture a session snapshot.
+
+After submission, a new response SHALL be associated with the request only when the provider-specific adapter establishes that the response belongs to that submission.
+
+---
+
+# 32. SESSION SNAPSHOT
+
+Before submitting a prompt, Firefox SHALL establish:
+
+```text
+provider
+tab_id
+url
+page_generation
+actor_instance
+input_ready
+conversation_identity
+last_message_id
+last_message_count
+last_message_text
+```
+
+The snapshot is the deterministic baseline for response association.
+
+---
+
+# 33. STREAMING EVENTS
+
+Required supported events:
+
+```text
+SESSION_READY
+SESSION_CHANGED
+INPUT_SUBMITTED
+GENERATION_STARTED
+GENERATION_DELTA
+GENERATION_PROGRESS
+CONTINUATION_REQUIRED
+CONTINUATION_SUBMITTED
+GENERATION_COMPLETED
+GENERATION_FAILED
+NAVIGATION
+PROVIDER_ERROR
+AUTH_REQUIRED
+RATE_LIMITED
+DIAGNOSTIC
+```
+
+Every generation event SHALL contain, where applicable:
+
+```text
+request_id
+session_id
+message_id
+sequence
+page_generation
+timestamp
+```
+
+`tab_id` SHALL be included where defined by the message schema.
+
+---
+
+# 34. INPUT SUBMITTED EVENT
+
+Example:
+
+```json
+{
+  "protocol": "GARP/1.02",
+  "type": "input_submitted",
+  "request_id": "...",
+  "session_id": "...",
+  "message_id": "...",
+  "sequence": 1,
+  "page_generation": 2,
+  "payload": {
+    "state": "SUBMITTED",
+    "input_method": "native_value_setter",
+    "submit_method": "button_click",
+    "input_verified": true,
+    "submission_verified": true
+  }
+}
+```
+
+`INPUT_SUBMITTED` is evidence that the provider-side prompt submission path has succeeded.
+
+It is stronger evidence than `PROMPT_ACK`.
+
+---
+
+# 35. GENERATION STARTED EVENT
+
+`GENERATION_STARTED` SHALL be emitted only after:
+
+```text
+provider input accepted
+submission verified
+```
+
+Its `page_generation` SHALL identify the current submission generation.
+
+Example:
+
+```json
+{
+  "protocol": "GARP/1.02",
+  "type": "generation_started",
+  "request_id": "...",
+  "session_id": "...",
+  "message_id": "...",
+  "sequence": 2,
+  "page_generation": 2,
+  "payload": {
+    "state": "STARTING",
+    "submission_snapshot": {
+      "provider": "deepseek",
+      "page_generation": 2,
+      "input_ready": true,
+      "authenticated": true,
+      "rate_limited": false
+    }
+  }
+}
+```
+
+A `generation_started` event carrying a stale page generation SHALL be considered invalid.
+
+---
+
+# 36. GENERATION DELTA
+
+Example:
+
+```json
+{
+  "protocol": "GARP/1.02",
+  "type": "generation_delta",
+  "request_id": "...",
+  "session_id": "...",
+  "message_id": "...",
+  "sequence": 17,
+  "page_generation": 2,
+  "payload": {
+    "text_delta": "program HelloWorld;"
+  }
+}
+```
+
+Deltas are transport observations.
+
+They are NOT accepted GRISP artifacts.
+
+---
+
+# 37. GENERATION COMPLETED
+
+The authoritative generation result SHALL be:
+
+```json
+{
+  "protocol": "GARP/1.02",
+  "type": "generation_completed",
+  "request_id": "...",
+  "session_id": "...",
+  "message_id": "...",
+  "sequence": 99,
+  "page_generation": 2,
+  "payload": {
+    "content": "...",
+    "format": "text",
+    "finish_reason": "stop",
+    "provider_state": "idle",
+    "page_generation": 2
+  }
+}
+```
+
+This is the final transport observation.
+
+GRISP remains responsible for semantic validation.
+
+---
+
+# 38. EVENT ORDERING
+
+For one `(request_id, message_id)` stream:
+
+```text
+sequence 1
+sequence 2
+sequence 3
+...
+```
+
+The receiver SHALL detect:
+
+```text
+duplicate sequence
+out-of-order event
+sequence gap
+unexpected sequence reset
+```
+
+## 38.1 Duplicate Event
+
+Same sequence and identical event content:
+
+```text
+replay
+```
+
+Same sequence with different event content:
+
+```text
+SEQUENCE_CONFLICT
+```
+
+## 38.2 Sequence Gap
+
+A sequence gap SHALL NOT be silently treated as complete data.
+
+The request becomes:
+
+```text
+DEGRADED
+```
+
+or:
+
+```text
+SEQUENCE_GAP
+```
+
+according to implementation policy.
+
+---
+
+# 39. PAGE GENERATION
+
+`page_generation` SHALL increment when:
+
+* top-level navigation occurs;
+* provider application state is replaced;
+* relevant same-document navigation replaces conversation state;
+* browser reload occurs;
+* JSWindowActorChild is replaced;
+* conversation identity changes.
+
+Ordinary DOM mutation SHALL NOT increment page generation.
+
+A stale event from generation N SHALL NOT overwrite state from generation N+1.
+
+Every operation requiring DOM access SHALL resolve against the current actor/page generation.
+
+A previously acquired actor SHALL NOT be reused across an actor replacement unless the implementation has positively established that the actor remains current.
+
+---
+
+# 40. ACTOR REPLACEMENT
+
+The Firefox actor architecture consists conceptually of:
+
+```text
+AIAutomationParent
+AIAutomationChild
+```
+
+The parent process SHALL treat actor replacement as normal browser lifecycle behavior.
+
+When actor replacement is detected:
+
+```text
+old actor invalid
+    ↓
+page_generation++
+    ↓
+current actor acquired
+    ↓
+session remains alive
+    ↓
+provider state re-inspected
+```
+
+The following identities SHALL survive actor replacement:
+
+```text
+session_id
+tab_id
+request_id
+```
+
+An actor response associated with an obsolete actor instance SHALL NOT mutate authoritative session state.
+
+A new actor SHALL NOT inherit readiness merely because an old actor reported readiness.
+
+The new actor SHALL re-establish current provider state.
+
+---
+
+# 41. NAVIGATION
+
+Navigation events SHALL identify:
+
+```text
+session_id
+page_generation
+reason
+```
+
+Example:
+
+```json
+{
+  "protocol": "GARP/1.02",
+  "type": "navigation",
+  "session_id": "...",
+  "page_generation": 2,
+  "payload": {
+    "reason": "actor_replaced"
+  }
+}
+```
+
+Typical reasons include:
+
+```text
+top_level_navigation
+reload
+actor_replaced
+url_changed
+conversation_changed
+```
+
+Navigation SHALL invalidate provider DOM assumptions from the preceding generation.
+
+---
+
+# 42. CONTINUATION
+
+Provider continuation SHALL never be silent.
+
+Firefox SHALL emit:
+
+```json
+{
+  "protocol": "GARP/1.02",
+  "type": "continuation_required",
+  "request_id": "...",
+  "session_id": "...",
+  "message_id": "...",
+  "payload": {
+    "reason": "provider_length_limit"
+  }
+}
+```
+
+The gateway MAY automatically continue when configured.
+
+Every automatic continuation SHALL produce:
+
+```text
+CONTINUATION_REQUIRED
+CONTINUATION_SUBMITTED
+```
+
+---
+
+# 43. CANCELLATION
+
+Client:
+
+```json
+{
+  "protocol": "GARP/1.02",
+  "type": "cancel_prompt",
+  "request_id": "...",
+  "session_id": "...",
+  "payload": {
+    "reason": "task_timeout"
+  }
+}
+```
+
+Gateway:
+
+```text
+CANCEL_ACK
+```
+
+The final request state SHALL be:
+
+```text
+CANCELLED
+```
+
+Cancellation SHALL never be interpreted as success.
+
+Provider-specific cancellation SHALL be used where supported.
+
+Otherwise the adapter SHALL stop observation and record that provider-side cancellation is unavailable.
+
+---
+
+# 44. ERROR MODEL
+
+Errors SHALL be structured:
+
+```json
+{
+  "protocol": "GARP/1.02",
+  "type": "error",
+  "request_id": "...",
+  "session_id": "...",
+  "payload": {
+    "code": "AUTH_REQUIRED",
+    "message": "Provider authentication required",
+    "retryable": false,
+    "provider": "gemini",
+    "state": "AUTH_REQUIRED"
+  }
+}
+```
+
+Required fields:
+
+```text
+protocol
+type
+code
+message
+retryable
+state
+```
+
+Optional:
+
+```text
+request_id
+session_id
+tab_id
+provider
+details
+```
+
+Required/recommended error codes include:
+
+```text
+PROTOCOL_ERROR
+BAD_REQUEST
+UNAUTHORIZED
+FRAME_TOO_LARGE
+SESSION_NOT_FOUND
+SESSION_NOT_READY
+TAB_NOT_FOUND
+PROVIDER_NOT_FOUND
+SESSION_BUSY
+REQUEST_ID_REUSE
+DUPLICATE_REQUEST
+SEQUENCE_GAP
+SEQUENCE_CONFLICT
+AUTH_REQUIRED
+INPUT_NOT_READY
+INPUT_INJECTION_FAILED
+SUBMIT_FAILED
+SUBMISSION_NOT_VERIFIED
+GENERATION_TIMEOUT
+GENERATION_FAILED
+CONTINUATION_FAILED
+NAVIGATION_CHANGED
+STALE_ACTOR
+STALE_PAGE_GENERATION
+PROVIDER_RATE_LIMIT
+DOM_UNSUPPORTED
+RESPONSE_IDENTITY_UNKNOWN
+CANCELLED
+INTERNAL_ERROR
+```
+
+---
+
+# 45. PROVIDER ADAPTER ARCHITECTURE
+
+Each provider SHALL implement the conceptual interface:
+
+```text
+ProviderAdapter
+
+    discoverInput()
+    inspectReadyState()
+    injectPrompt()
+    verifyInput()
+    discoverSubmitMethod()
+    submitPrompt()
+    verifySubmission()
+    inspectGeneration()
+    inspectConversation()
+    detectContinuation()
+    continueGeneration()
+    cancelGeneration()
+    detectAuthentication()
+    detectRateLimit()
+    detectError()
+    resetSession()
+```
+
+The adapter SHALL expose:
+
+```text
+provider
+adapter_version
+supported_features
+selector_strategy_version
+```
+
+Provider-specific DOM selectors SHALL remain isolated from generic GARP code.
+
+---
+
+# 46. FIREFOX PROVIDER DIRECTORY
+
+The preferred structure is:
+
+```text
+browser/components/aistarter/
+
+    AIAutomation.sys.mjs
+
+    actors/
+        AIAutomationChild.sys.mjs
+        AIAutomationParent.sys.mjs
+
+    garp/
+        GarpConnection.sys.mjs
+        GarpFrame.sys.mjs
+        GarpProtocol.sys.mjs
+        GarpRegistry.sys.mjs
+        GarpErrors.sys.mjs
+
+    sessions/
+        AIAutomationSession.sys.mjs
+        AIAutomationSessionManager.sys.mjs
+
+    requests/
+        GarpRequest.sys.mjs
+        GarpRequestManager.sys.mjs
+
+    providers/
+        ProviderAdapter.sys.mjs
+        ProviderRegistry.sys.mjs
+        DeepSeekAdapter.sys.mjs
+        GeminiAdapter.sys.mjs
+        ChatGPTAdapter.sys.mjs
+        ClaudeAdapter.sys.mjs
+        GrokAdapter.sys.mjs
+        CopilotAdapter.sys.mjs
+        PerplexityAdapter.sys.mjs
+        InceptionAdapter.sys.mjs
+
+    diagnostics/
+        AIAutomationDiagnostics.sys.mjs
+```
+
+The generic child actor SHALL NOT contain a giant provider-specific selector table.
+
+---
+
+# 47. PARENT / CHILD RESPONSIBILITIES
+
+## Parent
+
+The parent process SHALL own:
+
+```text
+TCP connections
+GARP handshake
+sessions
+requests
+tab lifecycle
+routing
+timeouts
+cancellation
+event ordering
+stream aggregation
+page generation
+actor binding
+reconnect state
+diagnostic coordination
+```
+
+## Child
+
+The child actor SHALL own:
+
+```text
+DOM discovery
+input interaction
+submission
+provider observation
+provider-specific state extraction
+DOM diagnostics
+```
+
+The child SHALL NOT own authoritative session state.
+
+---
+
+# 48. EXISTING FIREFOX ACTOR COMPATIBILITY
+
+The current Firefox architecture uses:
+
+```text
+AIAutomationParent
+AIAutomationChild
+```
+
+The implementation SHALL preserve the property that a child actor may disappear during navigation.
+
+When an actor disappears:
+
+```text
+parent session remains
+    ↓
+page_generation increments
+    ↓
+new actor is acquired
+    ↓
+session rebinds
+    ↓
+provider readiness is re-evaluated
+```
+
+The loss of a child actor SHALL NOT destroy:
+
+```text
+session_id
+request_id
+tab_id
+```
+
+---
+
+# 49. DOM SEARCH RULES
+
+Provider adapters SHOULD prefer:
+
+```text
+stable selector
+    ↓
+semantic attribute
+    ↓
+provider-specific structural selector
+    ↓
+strict diagnostic fallback
+```
+
+Broad generic selectors SHOULD be avoided.
+
+Fallback discovery SHALL provide diagnostic information describing:
+
+* selectors attempted;
+* number of candidates;
+* visibility;
+* enabled state;
+* selected candidate;
+* reason for rejection of other candidates.
+
+The implementation SHALL NOT silently claim that a provider control exists when every candidate selector failed.
+
+---
+
+# 50. DEEP DOM SEARCH
+
+Shadow DOM support MAY be implemented by recursively searching shadow roots.
+
+A provider adapter SHOULD cache discovered roots and invalidate its cache after relevant DOM mutation or navigation.
+
+The adapter SHOULD NOT recursively traverse the entire page on every polling tick.
+
+---
+
+# 51. PROVIDER HEALTH
+
+The gateway SHALL expose provider state.
+
+Example:
+
+```json
+{
+  "provider": "deepseek",
+  "state": "READY",
+  "input": "ready",
+  "authenticated": true,
+  "generation": "idle",
+  "adapter_version": "1.0.0"
+}
+```
+
+Possible states:
+
+```text
+UNKNOWN
+LOADING
+READY
+BUSY
+AUTH_REQUIRED
+RATE_LIMITED
+ERROR
+UNSUPPORTED
+```
+
+---
+
+# 52. RATE LIMITING
+
+Provider adapters SHOULD detect provider rate limits.
+
+The gateway SHALL expose:
+
+```text
+RATE_LIMITED
+retry_after_ms
+```
+
+The GRISP Agent MAY:
+
+```text
+wait
+select another provider
+reduce concurrency
+abort
+```
+
+Firefox SHALL NOT independently change the GRISP task policy.
+
+---
+
+# 53. DIAGNOSTICS ARCHITECTURE
+
+GARP/1.02 SHALL provide a centralized AI Automation diagnostics architecture.
+
+Diagnostics SHALL be implemented through the equivalent of:
+
+```text
+AIAutomationDiagnostics
+```
+
+rather than independent ad-hoc logging mechanisms scattered across modules.
+
+The diagnostic subsystem SHALL support at least:
+
+```text
+OFF
+ERROR
+BASIC
+VERBOSE
+TRACE
+```
+
+The default mode SHALL be:
+
+```text
+OFF
+```
+
+unless the operator enables AI Automation debugging.
+
+Diagnostics SHALL be usable by:
+
+```text
+gateway
+session manager
+request manager
+provider adapters
+browser actors
+GARP transport
+```
+
+---
+
+# 54. FIREFOX DEBUG MODE
+
+Firefox SHALL support:
+
+```text
+--debug-ai-automation
+```
+
+This flag SHALL enable detailed AI Automation tracing for the current Firefox process.
+
+The flag SHALL NOT:
+
+* alter semantic provider prompts;
+* alter GARP request content;
+* modify provider behavior;
+* bypass authentication;
+* simulate provider responses;
+* make failed operations appear successful.
+
+The debug mode SHALL be diagnostic-only.
+
+Implementations MAY additionally support:
+
+```text
+--debug-ai-automation=verbose
+--debug-ai-automation=trace
+```
+
+but:
+
+```text
+--debug-ai-automation
+```
+
+SHALL be the canonical operator-facing switch.
+
+---
+
+# 55. DIAGNOSTIC CORRELATION
+
+Every diagnostic event SHOULD carry:
+
+```text
+timestamp
+session_id
+tab_id
+request_id
+provider
+page_generation
+actor_instance
+operation
+stage
+severity
+```
+
+The purpose is to permit deterministic reconstruction of an automation failure.
+
+Example conceptual trace:
+
+```text
+CREATE_SESSION
+    ↓
+PREPARING
+    ↓
+ACTOR_BOUND generation=1
+    ↓
+NAVIGATION generation=2
+    ↓
+INPUT_DISCOVERY
+    ↓
+INPUT_FOUND
+    ↓
+INPUT_INJECTION
+    ↓
+INPUT_VERIFIED
+    ↓
+SUBMIT_DISCOVERY
+    ↓
+SUBMIT_METHOD_FOUND
+    ↓
+SUBMISSION_VERIFIED
+    ↓
+INPUT_SUBMITTED
+    ↓
+GENERATION_STARTED
+```
+
+A failure SHALL identify the stage at which it occurred whenever that stage is known.
+
+---
+
+# 56. DIAGNOSTIC CONTENT
+
+Provider DOM diagnostics SHOULD expose information such as:
+
+```text
+selector attempted
+candidate count
+candidate tag name
+candidate id
+candidate class
+candidate role
+candidate placeholder
+visible
+enabled
+contenteditable
+value length
+text length
+same-node status
+replacement detection
+send-control selector
+send-control candidates
+submit method
+verification result
+```
+
+Diagnostic information SHALL NOT contain secrets unnecessarily.
+
+Authentication secrets, shared GARP secrets, cookies and credentials SHALL NOT be emitted.
+
+Prompt content SHOULD NOT be logged by default.
+
+Trace mode SHOULD prefer prompt length, encoding length, and content-hash metadata over raw semantic prompt content.
+
+Raw prompt logging MAY be supported only through an explicit additional operator opt-in and SHALL NOT be enabled merely by `--debug-ai-automation`.
+
+---
+
+# 57. DIAGNOSTIC GARP EVENTS
+
+The `DIAGNOSTIC` event MAY be emitted to an authenticated GARP client.
+
+Example:
+
+```json
+{
+  "protocol": "GARP/1.02",
+  "type": "diagnostic",
+  "request_id": "...",
+  "session_id": "...",
+  "page_generation": 2,
+  "payload": {
+    "provider": "deepseek",
+    "stage": "submit",
+    "state": "button_not_found",
+    "details": {
+      "input_found": true,
+      "input_verified": true,
+      "selectors_tried": 4,
+      "submit_candidates": 0
+    }
+  }
+}
+```
+
+Diagnostic events SHALL remain subordinate to authoritative protocol state.
+
+A diagnostic event SHALL never itself imply successful submission or generation.
+
+---
+
+# 58. DIAGNOSTIC STAGES
+
+Implementations SHOULD expose a standard stage vocabulary:
+
+```text
+startup
+connection
+handshake
+session_create
+navigation
+actor_bind
+readiness
+input_discovery
+input_injection
+input_verification
+submit_discovery
+submission
+submission_verification
+generation_start
+generation_observation
+generation_delta
+generation_completion
+continuation
+cancellation
+reconnect
+shutdown
+```
+
+This permits cross-provider diagnostic tooling without requiring provider-specific log parsers.
+
+---
+
+# 59. POLLING VS EVENT OBSERVATION
+
+Preferred architecture:
+
+```text
+provider DOM/event observation
+    ↓
+provider adapter state transition
+    ↓
+parent event
+    ↓
+GARP event
+```
+
+Polling MAY be used as a fallback.
+
+Polling SHALL NOT be the only source of truth where provider events or deterministic state transitions are available.
+
+Polling SHALL re-resolve the current actor/page generation when required.
+
+---
+
+# 60. RESPONSE STABILITY
+
+If polling is required, completion detection SHALL consider:
+
+```text
+response_message_id
+text_revision
+DOM revision
+streaming state
+provider busy state
+continuation state
+page_generation
+```
+
+Text stability alone SHALL NOT be treated as authoritative completion.
+
+---
+
+# 61. SECURITY
+
+The gateway SHALL:
+
+* bind to localhost by default;
+* authenticate clients;
+* enforce connection limits;
+* enforce frame limits;
+* enforce request limits;
+* protect the authentication secret from page scripts;
+* fail closed on unknown protocol state;
+* prevent diagnostic logs from exposing authentication secrets.
+
+The gateway SHALL NOT grant AI semantic authority.
+
+---
+
+# PART II — GARP/1.02 IMPLEMENTATION CONTRACT
+
+# 62. IMPLEMENTATION CONTRACT PURPOSE
+
+The Implementation Contract makes the normative requirements executable by defining:
+
+* exact internal modules;
+* exact state ownership;
+* exact binary encoding;
+* exact message registry;
+* exact sequence behavior;
+* exact authentication;
+* exact failure semantics;
+* exact Firefox integration boundaries;
+* exact actor lifecycle;
+* exact provider readiness lifecycle;
+* exact prompt submission lifecycle;
+* exact diagnostic responsibilities;
+* conformance test obligations.
+
+An implementation SHALL NOT claim GARP/1.02 conformance merely because it exchanges compatible JSON.
+
+It SHALL implement the normative wire, identity, state, interaction, and failure rules.
+
+---
+
+# 63. REQUIRED MODULES
+
+The Firefox implementation SHALL provide the equivalent of:
+
+```text
+GarpConnection
+GarpFrame
+GarpProtocol
+GarpRegistry
+GarpErrors
+AIAutomationSession
+AIAutomationSessionManager
+GarpRequest
+GarpRequestManager
+ProviderAdapter
+ProviderRegistry
+AIAutomationDiagnostics
+```
+
+Names MAY vary, but responsibilities MUST remain equivalent.
+
+---
+
+# 64. CONNECTION OWNERSHIP
+
+One TCP connection SHALL have exactly one:
+
+```text
+connection_id
+```
+
+Connection state SHALL belong to the GARP connection object.
+
+Session state SHALL NOT be stored only inside a TCP connection object.
+
+This is required for reconnect.
+
+---
+
+# 65. SESSION OWNERSHIP
+
+Session state SHALL belong to the session manager.
+
+A session SHALL remain addressable independently of:
+
+```text
+TCP connection
+JSWindowActor instance
+tab index
+DOM instance
+```
+
+---
+
+# 66. REQUEST OWNERSHIP
+
+Request state SHALL belong to the request manager.
+
+A request SHALL remain addressable by `request_id` until the configured retention period expires.
+
+Completed requests SHALL remain available long enough to support idempotent replay and reconnect.
+
+---
+
+# 67. TAB OWNERSHIP
+
+The tab manager SHALL associate:
+
+```text
+tab_id → current Firefox tab
+```
+
+and SHALL update:
+
+```text
+tab_index
+url
+title
+selected
+```
+
+without changing `tab_id`.
+
+A closed tab SHALL invalidate its session state unless the session is explicitly detached.
+
+---
+
+# 68. PAGE-GENERATION IMPLEMENTATION
+
+Every actor bind SHALL record:
+
+```text
+tab_id
+page_generation
+actor_instance
+```
+
+A newly bound actor MUST be associated with the current page generation.
+
+A stale actor response SHALL be rejected.
+
+A change in actor instance SHALL be treated as a generation boundary.
+
+The externally observable invariant is:
+
+```text
+old actor ≠ current actor
+    =>
+stale actor
+    =>
+new current actor
+    =>
+new page generation
+```
+
+---
+
+# 69. CHILD ACTOR COMMAND CONTRACT
+
+The internal parent/child contract SHALL use explicit operations equivalent to:
+
+```text
+PrepareSession
+InspectReady
+CaptureSnapshot
+InjectPrompt
+SubmitPrompt
+ObserveGeneration
+ContinueGeneration
+CancelGeneration
+InspectProviderState
+```
+
+Results SHALL contain explicit states.
+
+A successful result SHALL NOT encode failure as:
+
+```text
+READY
+SUBMITTED
+STARTED
+```
+
+when the corresponding operation was not actually completed.
+
+---
+
+# 70. PROVIDER ADAPTER CONTRACT
+
+Each provider adapter SHALL return structured results.
+
+For readiness:
+
+```text
+READY
+NOT_READY
+AUTH_REQUIRED
+RATE_LIMITED
+ERROR
+UNSUPPORTED
+```
+
+For input discovery:
+
+```text
+FOUND
+NOT_FOUND
+AMBIGUOUS
+ERROR
+```
+
+For input injection:
+
+```text
+INJECTED
+VERIFIED
+NOT_VERIFIED
+ERROR
+```
+
+For submission:
+
+```text
+SUBMITTED
+NOT_SUBMITTED
+ERROR
+```
+
+For generation:
+
+```text
+IDLE
+STARTING
+STREAMING
+CONTINUATION_REQUIRED
+COMPLETE
+FAILED
+CANCELLED
+```
+
+---
+
+# 71. RESPONSE ASSOCIATION CONTRACT
+
+The provider adapter SHALL establish:
+
+```text
+pre_submission_last_message
+post_submission_message
+```
+
+The resulting message identity SHALL be assigned to:
+
+```text
+request_id
+session_id
+message_id
+submission_generation
+```
+
+If the adapter cannot reliably associate the response:
+
+```text
+RESPONSE_IDENTITY_UNKNOWN
+```
+
+SHALL be raised.
+
+The gateway SHALL NOT guess.
+
+---
+
+# 72. RECONNECT CONTRACT
+
+Upon reconnect, the server SHALL retain:
+
+```text
+session_id
+request_id
+message_id
+page_generation
+request_state
+```
+
+where retention limits permit.
+
+`GET_PROMPT_STATUS` SHALL return the latest known authoritative gateway state.
+
+The state:
+
+```text
+UNKNOWN
+```
+
+is mandatory when the gateway cannot safely establish the current provider state.
+
+---
+
+# 73. EVENT RETENTION
+
+The gateway SHOULD retain enough events to reconstruct the current request state after a brief disconnect.
+
+At minimum, it SHALL retain:
+
+```text
+PROMPT_ACK
+INPUT_SUBMITTED
+GENERATION_STARTED
+latest GENERATION_DELTA state
+CONTINUATION_REQUIRED
+CONTINUATION_SUBMITTED
+GENERATION_COMPLETED
+GENERATION_FAILED
+CANCEL_ACK
+```
+
+Retention limits SHALL be explicit.
+
+---
+
+# 74. STREAM AGGREGATION
+
+The parent MAY aggregate generation deltas internally.
+
+The final content SHALL be derived from the ordered event stream.
+
+The gateway SHALL NOT silently discard a detected sequence gap.
+
+If reconstruction is incomplete:
+
+```text
+GENERATION_FAILED
+code = SEQUENCE_GAP
+```
+
+or an explicit degraded state SHALL be emitted.
+
+---
+
+# 75. LEGACY COMPATIBILITY
+
+Existing newline-delimited automation commands MAY remain available during migration.
+
+Legacy commands SHALL be explicitly classified as:
+
+```text
+LEGACY
+```
+
+They SHALL NOT be represented as GARP/1.02 messages.
+
+The implementation SHALL provide a separate compatibility path:
+
+```text
+legacy automation
+        |
+        +---- existing tools
+        |
+        +---- GARP/1.02
+```
+
+The GARP path SHALL remain normative.
+
+---
+
+# 76. NO SEMANTIC BRIDGING
+
+The gateway SHALL NOT convert arbitrary website output into a GRISP artifact.
+
+The correct flow is:
+
+```text
+provider response
+    ↓
+GARP
+    ↓
+GAI
+    ↓
+GRISP validation
+    ↓
+artifact
+```
+
+The browser MUST NOT perform:
+
+```text
+artifact acceptance
+policy evaluation
+hash acceptance
+specification publication
+```
+
+---
+
+# 77. GARP CONFORMANCE TESTS
+
+A conforming implementation SHALL test at minimum:
+
+```text
+HELLO success
+HELLO_CHALLENGE encoding
+HELLO_AUTH encoding
+HELLO_AUTH numeric type = 0x0007
+HELLO_AUTH semantic type = "hello_auth"
+HELLO_AUTH encode/decode round-trip
+authentication failure
+version mismatch
+malformed frame
+truncated frame
+oversized frame
+unknown message type
+reserved-field violation
+
+stable tab IDs
+tab index change
+session creation
+session readiness
+session not ready
+session attach
+session detach
+session close
+session busy
+
+duplicate request
+request ID reuse
+sequence gap
+duplicate sequence
+sequence conflict
+out-of-order event
+
+page generation change
+actor replacement
+stale actor response
+stale event
+navigation during generation
+
+input discovery
+input injection
+input verification
+DOM input replacement
+submit-method discovery
+submission verification
+prompt submission
+input submitted
+generation started
+generation delta
+generation completed
+continuation
+cancellation
+
+provider authentication
+provider rate limit
+provider error
+DOM unsupported
+timeout
+
+heartbeat
+disconnect
+reconnect
+GET_PROMPT_STATUS
+
+diagnostic mode
+diagnostic correlation
+diagnostic secret protection
+diagnostic prompt isolation
+```
+
+The registry conformance test SHALL explicitly verify:
+
+```text
+GarpMessageNameToType("hello_auth") = 0x0007
+GarpMessageTypeToName(0x0007) = "hello_auth"
+```
+
+A conforming implementation SHALL reject any state in which the binary and semantic mappings disagree.
+
+---
+
+# 78. LIVE PROVIDER SMOKE TEST
+
+A live smoke test SHOULD exercise the following end-to-end sequence:
+
+```text
+HELLO
+AUTHENTICATE
+PING/PONG
+CAPABILITIES
+BROWSER_STATUS
+LIST_TABS
+CREATE_SESSION
+WAIT_FOR_READY
+PROMPT
+PROMPT_ACK
+INPUT_SUBMITTED
+GENERATION_STARTED
+GENERATION_DELTA
+GENERATION_COMPLETED
+CLOSE_SESSION
+```
+
+The smoke test SHALL NOT regard:
+
+```text
+PROMPT_ACK
+```
+
+as evidence that provider interaction succeeded.
+
+The smoke test SHALL regard:
+
+```text
+INPUT_SUBMITTED
+```
+
+as the first explicit provider-submission success checkpoint.
+
+The smoke test SHALL regard:
+
+```text
+GENERATION_COMPLETED
+```
+
+as successful transport completion.
+
+A provider that reaches `PROMPT_ACK` but never reaches `INPUT_SUBMITTED` SHALL be classified as:
+
+```text
+PROMPT_ACCEPTED_BUT_NOT_SUBMITTED
+```
+
+A provider that reports `INPUT_SUBMITTED` but never produces a valid generation result SHALL be classified according to the resulting error state.
+
+---
+
+# 79. AI AUTOMATION DIAGNOSTIC TESTS
+
+The diagnostic subsystem SHALL be tested independently.
+
+At minimum:
+
+```text
+debug off produces no verbose trace
+debug on produces correlated trace
+session ID correlation
+request ID correlation
+tab ID correlation
+page-generation correlation
+actor replacement diagnostics
+input selector diagnostics
+input verification diagnostics
+DOM replacement diagnostics
+submit selector diagnostics
+submission verification diagnostics
+generation diagnostics
+timeout diagnostics
+error diagnostics
+diagnostic secret suppression
+semantic prompt isolation
+```
+
+A diagnostic trace SHOULD permit an operator to identify the first failed automation stage without attaching a debugger in ordinary cases.
+
+---
+
+# 80. DIAGNOSTIC ACCEPTANCE CRITERIA
+
+For a failed provider operation, the diagnostic system SHOULD be capable of distinguishing at least:
+
+```text
+INPUT_NOT_READY
+INPUT_SELECTOR_MISS
+INPUT_AMBIGUOUS
+INPUT_INJECTION_FAILED
+INPUT_REPLACED_AFTER_INJECTION
+SUBMIT_SELECTOR_MISS
+SUBMIT_CONTROL_DISABLED
+SUBMIT_METHOD_UNAVAILABLE
+SUBMISSION_NOT_VERIFIED
+STALE_ACTOR
+STALE_PAGE_GENERATION
+PROVIDER_AUTH_REQUIRED
+PROVIDER_RATE_LIMITED
+PROVIDER_GENERATION_FAILED
+RESPONSE_IDENTITY_UNKNOWN
+GENERATION_TIMEOUT
+```
+
+A generic:
+
+```text
+INTERNAL_ERROR
+```
+
+SHOULD NOT replace a more specific diagnostic classification when the specific cause is known.
+
+---
+
+# 81. FAILURE SEMANTICS
+
+The following transformations are forbidden:
+
+```text
+PREPARING → READY without readiness evidence
+
+input injection attempted
+    →
+INPUT_SUBMITTED without verification
+
+submission attempted
+    →
+GENERATION_STARTED without submission evidence
+
+broken TCP
+    →
+COMPLETE
+
+unknown provider state
+    →
+READY
+
+stale actor
+    →
+current actor
+
+stale page generation
+    →
+current page generation
+
+unknown response identity
+    →
+valid response
+
+diagnostic output
+    →
+semantic prompt modification
+```
+
+The implementation MUST fail closed instead.
+
+---
+
+# 82. GARP INVARIANTS
+
+The following invariants are mandatory.
+
+```text
+I1
+Every GARP connection has explicit connection state.
+
+I2
+Every AI request has a unique request_id.
+
+I3
+Every AI session has a stable session_id.
+
+I4
+tab_index is never tab identity.
+
+I5
+Transport never modifies semantic content.
+
+I6
+Duplicate PROMPT with the same request_id never submits twice.
+
+I7
+Readiness timeout never becomes READY.
+
+I8
+A fixed client sleep is never readiness proof.
+
+I9
+A session is READY only when the current provider input is verified usable.
+
+I10
+Input injection failure never becomes successful submission.
+
+I11
+A stale DOM node never constitutes successful current-input injection.
+
+I12
+A prompt is not considered submitted merely because PROMPT_ACK was emitted.
+
+I13
+INPUT_SUBMITTED requires provider submission evidence.
+
+I14
+GENERATION_STARTED requires successful provider submission.
+
+I15
+Stale page_generation state never overwrites current state.
+
+I16
+A stale actor cannot mutate authoritative session state.
+
+I17
+A session survives actor replacement.
+
+I18
+A tab index change never changes tab identity.
+
+I19
+Continuation is never performed silently.
+
+I20
+Sequence gaps never become successful completion.
+
+I21
+Broken TCP connection never implies successful generation.
+
+I22
+Unknown provider state never becomes READY.
+
+I23
+Unknown response identity never becomes a valid response association.
+
+I24
+A failed authentication handshake never enters READY.
+
+I25
+Debugging never modifies the semantic prompt.
+
+I26
+Diagnostic logs never expose authentication secrets.
+
+I27
+PROMPT_ACK never implies provider generation success.
+
+I28
+Generation events use the current page generation.
+
+I29
+A page-generation transition invalidates stale DOM assumptions.
+
+I30
+Provider-specific selectors remain isolated inside provider adapters.
+
+I31
+A provider adapter never reports successful submission when no supported submission mechanism exists.
+
+I32
+A diagnostic system SHOULD identify the earliest known failing automation stage.
+
+I33
+HELLO_AUTH has the mandatory numeric wire type 0x0007.
+
+I34
+Every normative GARP message has a bidirectional numeric/semantic registry mapping.
+
+I35
+A conforming implementation does not require a compatibility patch to obtain a normative GARP message mapping.
+
+I36
+A binary message type and its JSON semantic type MUST agree according to the normative registry.
+
+I37
+A session SHALL NOT become READY merely because a browser tab or actor exists.
+
+I38
+A generation SHALL NOT be reported as started before successful provider submission.
+
+I39
+A provider submission SHALL NOT be reported successful merely because a DOM click was attempted.
+
+I40
+A provider input SHALL NOT be considered injected unless injection is verified.
+
+I41
+A current actor SHALL be reacquired after actor replacement.
+
+I42
+A stale actor SHALL NOT mutate authoritative state.
+
+I43
+Page generation SHALL increase on actor replacement.
+
+I44
+Diagnostic mode SHALL be observational only.
+
+I45
+Raw semantic prompt contents SHALL not be logged by default.
+
+I46
+Provider-specific DOM failures SHALL be diagnostically distinguishable from transport failures.
+
+I47
+PROMPT_ACK, INPUT_SUBMITTED, GENERATION_STARTED, and GENERATION_COMPLETED represent distinct semantic milestones.
+
+I48
+Unknown state SHALL remain unknown until sufficient evidence exists to establish a stronger state.
+```
+
+---
+
+# 83. RECOMMENDED IMPLEMENTATION MIGRATION
+
+The existing Firefox automation SHOULD be migrated in this order:
+
+```text
+Existing AIAutomationService
+        ↓
+add GARP transport
+        ↓
+add GARP frame encoder/decoder
+        ↓
+add normative message registry
+        ↓
+add handshake/authentication
+        ↓
+add SessionManager
+        ↓
+add RequestManager
+        ↓
+add stable tab_id
+        ↓
+add page_generation
+        ↓
+add actor binding/rebinding
+        ↓
+add provider readiness contract
+        ↓
+add verified input injection
+        ↓
+add verified submission
+        ↓
+extract provider adapters
+        ↓
+add provider DOM diagnostics
+        ↓
+add centralized AIAutomationDiagnostics
+        ↓
+add --debug-ai-automation
+        ↓
+convert polling to event/state observation
+        ↓
+add reconnect
+        ↓
+remove provider-specific logic from generic child actor
+```
+
+Existing provider automation behavior SHOULD be preserved during each stage where possible.
+
+---
+
+# 84. IMPLEMENTATION LESSONS INCORPORATED INTO GARP/1.02
+
+The following failures were identified during live implementation testing and are now explicit normative requirements.
+
+## 84.1 Asynchronous Session Preparation
+
+`CREATE_SESSION` may return before the provider page is ready.
+
+Therefore:
+
+```text
+CREATE_SESSION
+```
+
+does not imply:
+
+```text
+READY
+```
+
+## 84.2 Client Sleep Is Not Readiness
+
+A fixed delay such as:
+
+```text
+1500 ms
+```
+
+does not constitute evidence that provider input is ready.
+
+Readiness SHALL be determined by actual provider inspection.
+
+## 84.3 Actor Replacement During Navigation
+
+Provider navigation may replace the `JSWindowActorChild`.
+
+Therefore:
+
+```text
+session identity != actor identity
+```
+
+and the gateway SHALL reacquire the current actor.
+
+## 84.4 Stale Page Generation
+
+A generation event SHALL NOT report an obsolete page generation after an actor replacement.
+
+Current page generation SHALL be attached to provider operations and generation events.
+
+## 84.5 Early Generation Event
+
+A generation event emitted before provider submission is not valid evidence that generation started.
+
+Therefore:
+
+```text
+INPUT_SUBMITTED
+    ↓
+GENERATION_STARTED
+```
+
+is mandatory ordering.
+
+## 84.6 DOM Injection Is Not Automatically Provider State
+
+Changing the DOM value of a textarea is not necessarily sufficient to update the provider framework.
+
+Therefore prompt injection SHALL include:
+
+```text
+DOM/framework-compatible change
++
+input event
++
+verification
+```
+
+## 84.7 DOM Node Replacement
+
+The provider may rerender its editor after an input event.
+
+Therefore the current provider input MUST be rechecked after injection.
+
+## 84.8 Submit Control Discovery
+
+A provider-specific send control may change without GARP semantics changing.
+
+Therefore provider adapters SHALL isolate selectors and report discovery failures explicitly.
+
+## 84.9 Submission Is a Separate State
+
+A successful DOM click attempt is not sufficient evidence that the provider accepted the prompt.
+
+Therefore submission SHALL have an explicit verification stage.
+
+## 84.10 Centralized Diagnostics
+
+Without centralized diagnostics, DOM automation failures require indirect inference.
+
+Therefore AI Automation SHALL expose structured diagnostics that permit an operator to determine:
+
+```text
+what was attempted
+which actor was active
+which page generation was active
+which selector matched
+which input was selected
+whether input injection was verified
+whether the DOM node was replaced
+which submit mechanism was found
+whether submission was verified
+where execution failed
+```
+
+---
+
+# 85. FINAL ARCHITECTURE
+
+The final architecture is:
+
+```text
+                      GRISP AGENT
+                           |
+                           | GARP/1.02
+                           |
+                           v
+                 +--------------------+
+                 | Firefox GARP       |
+                 | Gateway            |
+                 +---------+----------+
+                           |
+                  +--------+---------+
+                  |                  |
+                  v                  v
+          Session Manager      Request Manager
+                  |                  |
+                  +--------+---------+
+                           |
+                   Provider Registry
+                           |
+        +------------------+------------------+
+        |                  |                  |
+        v                  v                  v
+   DeepSeek            Gemini             ChatGPT
+    Adapter             Adapter            Adapter
+        |                  |                  |
+        +------------------+------------------+
+                           |
+                           v
+                  Firefox JS Actors
+                           |
+                           v
+                       AI website
+```
+
+The diagnostics architecture crosses all layers:
+
+```text
+                  +---------------------------+
+                  | AIAutomationDiagnostics   |
+                  +-------------+-------------+
+                                |
+              +-----------------+-----------------+
+              |        |        |        |        |
+              v        v        v        v        v
+          Gateway   Session   Request   Adapter   Actor
+```
+
+The semantic pipeline remains:
+
+```text
+Firefox/provider
+      ↓
+GARP/1.02
+      ↓
+GAI/1.0
+      ↓
+GRISP validation
+      ↓
+GRISP artifact/evidence/state
+```
+
+GARP is therefore strictly the **browser/AI transport boundary**.
+
+It does not become another GRISP kernel.
+
+---
+
+# 86. CONFORMANCE DEFINITION
+
+An implementation conforms to GARP/1.02 only when it demonstrates:
+
+```text
+HELLO negotiation
+authentication
+normative HELLO_AUTH mapping
+stable session IDs
+stable tab IDs
+request correlation
+message correlation
+page-generation tracking
+actor replacement handling
+provider readiness
+verified prompt injection
+verified provider submission
+ordered streaming
+duplicate suppression
+explicit cancellation
+heartbeat
+reconnection
+structured errors
+provider state
+fail-closed unknown state
+centralized diagnostics
+debug-mode isolation
+semantic prompt preservation
+```
+
+Compatibility with earlier GARP versions SHALL NOT by itself constitute GARP/1.02 conformance.
+
+An implementation SHALL use:
+
+```text
+version = 0x12
+protocol = "GARP/1.02"
+```
+
+for GARP/1.02 operation.
+
+---
+
+# 87. VERSION MIGRATION
+
+GARP/1.02 supersedes GARP/1.01.
+
+An implementation MAY support both versions during migration.
+
+When both versions are supported:
+
+```text
+GARP/1.01
+```
+
+and:
+
+```text
+GARP/1.02
+```
+
+SHALL be treated as distinct protocol versions.
+
+The implementation SHALL NOT silently reinterpret a GARP/1.01 frame as GARP/1.02.
+
+The following GARP/1.02 additions are especially significant:
+
+```text
+verified provider readiness
+verified input injection
+verified provider submission
+explicit actor-generation synchronization
+centralized AI Automation diagnostics
+--debug-ai-automation
+normative bidirectional message registry
+explicit HELLO_AUTH registry requirement
+```
+
+---
+
+# 88. REGISTRY MIGRATION REQUIREMENT
+
+A GARP/1.02 implementation SHALL contain the complete normative registry, including:
+
+```text
+HELLO_AUTH = 0x0007
+```
+
+The following is a conformance failure:
+
+```text
+HELLO_CHALLENGE = 0x0005
+RESPONSE        = 0x0006
+HELLO_AUTH      = undefined
+```
+
+The following is conformant:
+
+```text
+HELLO_CHALLENGE = 0x0005
+RESPONSE        = 0x0006
+HELLO_AUTH      = 0x0007
+```
+
+Both registry directions MUST be available:
+
+```text
+0x0007       → hello_auth
+"hello_auth" → 0x0007
+```
+
+No separate Firefox compatibility patch SHALL be required.
+
+---
+
+# 89. STATUS
+
+This document supersedes the earlier GARP/1.01 specification and associated informal compatibility patch notes once adopted.
+
+The protocol specification and implementation contract SHALL be treated as one normative specification.
+
+Any ambiguity between an implementation and the protocol SHALL be resolved by the normative rules in this document, not by observed behavior of an existing implementation.
+
+Observed implementation behavior SHALL be treated as evidence for debugging and conformance testing, not as a replacement for the normative contract.
+
+GARP/1.02 SHALL therefore be considered the authoritative protocol baseline for subsequent Firefox gateway, Delphi client, provider adapter, diagnostics, and conformance-suite implementation work.

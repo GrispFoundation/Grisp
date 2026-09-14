@@ -1,0 +1,9 @@
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class ClaudeAdapter extends ProviderAdapter {
+  constructor() { super("claude", "https://claude.ai/"); }
+  input(doc) { return this.findBySelectors(doc, ['div[contenteditable="true"]', 'textarea', '[aria-label*="Claude"]']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label*="Send"]', 'button[style*="background-color"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, [".font-claude-message", ".markdown"]); }
+  isStreaming(doc) { return !!doc.querySelector('.loading-indicator, [class*="streaming"]'); }
+  isAuthenticated(doc) { return !/(login|signin)/i.test(doc.location?.href || ""); }
+}
