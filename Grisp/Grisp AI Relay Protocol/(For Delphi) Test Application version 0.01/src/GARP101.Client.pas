@@ -4,8 +4,11 @@ interface
 
 uses
     System.SysUtils,
+    System.Classes,
     System.JSON,
     IdTCPClient,
+    IdGlobal,
+    IdException,
     GARP101.Protocol;
 
 type
@@ -20,28 +23,69 @@ type
         FSessionID: string;
         FTabID: string;
         FRequestID: string;
+
         procedure EnsureConnected;
         function NextRequestID: string;
-        procedure SendFrame(const AMessageType: TGARPMessageType; const AMessage: TJSONObject;
-            const ARequestID: string = ''; const ASessionID: string = '');
+
+        procedure SendFrame(
+            const AMessageType: TGARPMessageType;
+            const AMessage: TJSONObject;
+            const ARequestID: string = '';
+            const ASessionID: string = ''
+        );
+
         function ReceiveFrame(out AFrame: TGARPFrame): Boolean;
-        function ReceiveUntil(const ARequestID: string; const AAcceptedTypes: array of TGARPMessageType;
-            out AFrame: TGARPFrame): Boolean;
-        function BuildMessage(const ATypeName: string; const APayload: TJSONValue): TJSONObject;
+
+        function ReceiveUntil(
+            const ARequestID: string;
+            const AAcceptedTypes: array of TGARPMessageType;
+            out AFrame: TGARPFrame
+        ): Boolean;
+
+        function BuildMessage(
+            const ATypeName: string;
+            const APayload: TJSONValue
+        ): TJSONObject;
     public
-        constructor Create(const AHost: string; const APort: Integer; const ASecret: string);
+        constructor Create(
+            const AHost: string;
+            const APort: Integer;
+            const ASecret: string
+        );
+
         destructor Destroy; override;
+
         procedure ConnectAndAuthenticate;
+
         function GetCapabilities: TJSONObject;
         function GetBrowserStatus: TJSONObject;
         function ListTabs: TJSONObject;
-        function CreateSession(const AProvider: string; const ATabID: string = ''): TJSONObject;
-        function Prompt(const APrompt: string; const AStream: Boolean = True;
-            const ATimeoutMS: Integer = 180000; const AAutoContinue: Boolean = True): TJSONObject;
-        function WaitForCompletion(const ARequestID: string; const ATimeoutMS: Cardinal = 180000): TJSONObject;
-        function CancelPrompt(const ARequestID, AReason: string): TJSONObject;
+
+        function CreateSession(
+            const AProvider: string;
+            const ATabID: string = ''
+        ): TJSONObject;
+
+        function Prompt(
+            const APrompt: string;
+            const AStream: Boolean = True;
+            const ATimeoutMS: Integer = 180000;
+            const AAutoContinue: Boolean = True
+        ): TJSONObject;
+
+        function WaitForCompletion(
+            const ARequestID: string;
+            const ATimeoutMS: Cardinal = 180000
+        ): TJSONObject;
+
+        function CancelPrompt(
+            const ARequestID: string;
+            const AReason: string
+        ): TJSONObject;
+
         procedure Ping;
         procedure CloseSession;
+
         property SessionID: string read FSessionID;
         property TabID: string read FTabID;
         property RequestID: string read FRequestID;
@@ -49,22 +93,47 @@ type
 
 implementation
 
-constructor TGARPClient101.Create(const AHost: string; const APort: Integer; const ASecret: string);
+constructor TGARPClient101.Create(
+    const AHost: string;
+    const APort: Integer;
+    const ASecret: string
+);
 begin
     inherited Create;
+
     FClient := TIdTCPClient.Create(nil);
     FClient.Host := AHost;
     FClient.Port := APort;
     FClient.ConnectTimeout := 5000;
-    FClient.ReadTimeout := 5000;
+    FClient.ReadTimeout := GARP_READ_TIMEOUT;
+
     FSecret := ASecret;
     FClientID := 'GARP101-Delphi-Test-' + GARPNewUUID;
     FClientVersion := '1.0.0';
+
+    FClientNonce := '';
+    FAuthenticated := False;
+    FSessionID := '';
+    FTabID := '';
+    FRequestID := '';
 end;
 
 destructor TGARPClient101.Destroy;
 begin
-    FClient.Free;
+    if FClient <> nil then
+    begin
+        if FClient.Connected then
+        begin
+            try
+                FClient.Disconnect;
+            except
+                // Destruction must not fail because of connection state.
+            end;
+        end;
+
+        FClient.Free;
+    end;
+
     inherited Destroy;
 end;
 
@@ -72,6 +141,9 @@ procedure TGARPClient101.EnsureConnected;
 begin
     if not FClient.Connected then
         raise Exception.Create('GARP client is not connected');
+
+    if not FAuthenticated then
+        raise Exception.Create('GARP client is not authenticated');
 end;
 
 function TGARPClient101.NextRequestID: string;
@@ -80,69 +152,143 @@ begin
     FRequestID := Result;
 end;
 
-function TGARPClient101.BuildMessage(const ATypeName: string; const APayload: TJSONValue): TJSONObject;
+function TGARPClient101.BuildMessage(
+    const ATypeName: string;
+    const APayload: TJSONValue
+): TJSONObject;
 begin
-    Result := GARPBuildJSON(ATypeName, APayload);
+    Result := GARPBuildJSON(
+        ATypeName,
+        APayload
+    );
 end;
 
-procedure TGARPClient101.SendFrame(const AMessageType: TGARPMessageType; const AMessage: TJSONObject;
-    const ARequestID: string; const ASessionID: string);
+procedure TGARPClient101.SendFrame(
+    const AMessageType: TGARPMessageType;
+    const AMessage: TJSONObject;
+    const ARequestID: string;
+    const ASessionID: string
+);
 var
     LFrame: TBytes;
 begin
-    LFrame := GARPEncodeFrame(AMessageType, AMessage, ARequestID, ASessionID);
-    GARPWriteFrame(FClient, LFrame);
+    if AMessage = nil then
+        raise Exception.Create(
+            'Cannot send a nil GARP message'
+        );
+
+    LFrame := GARPEncodeFrame(
+        AMessageType,
+        AMessage,
+        ARequestID,
+        ASessionID
+    );
+
+    GARPWriteFrame(
+        FClient,
+        LFrame
+    );
 end;
 
-function TGARPClient101.ReceiveFrame(out AFrame: TGARPFrame): Boolean;
+function TGARPClient101.ReceiveFrame(
+    out AFrame: TGARPFrame
+): Boolean;
 var
     LBytes: TBytes;
 begin
-    LBytes := GARPReadFrame(FClient);
-    AFrame := GARPDecodeFrame(LBytes);
+    FillChar(
+        AFrame,
+        SizeOf(AFrame),
+        0
+    );
+
+    LBytes := GARPReadFrame(
+        FClient
+    );
+
+    AFrame := GARPDecodeFrame(
+        LBytes
+    );
+
     Result := True;
 end;
 
-function TGARPClient101.ReceiveUntil(const ARequestID: string; const AAcceptedTypes: array of TGARPMessageType;
-    out AFrame: TGARPFrame): Boolean;
+function TGARPClient101.ReceiveUntil(
+    const ARequestID: string;
+    const AAcceptedTypes: array of TGARPMessageType;
+    out AFrame: TGARPFrame
+): Boolean;
 var
     LTypeMatches: Boolean;
     LIndex: Integer;
     LAcceptedType: TGARPMessageType;
+    LPong: TJSONObject;
 begin
+    FillChar(
+        AFrame,
+        SizeOf(AFrame),
+        0
+    );
+
     repeat
         ReceiveFrame(AFrame);
-        if (AFrame.MessageType = GARP_PING) then
+
+        if AFrame.MessageType = GARP_PING then
         begin
-            var LPong := BuildMessage('pong', TJSONObject.Create);
+            LPong := BuildMessage(
+                'pong',
+                TJSONObject.Create
+            );
+
             try
-                SendFrame(GARP_PONG, LPong);
+                SendFrame(
+                    GARP_PONG,
+                    LPong
+                );
             finally
                 LPong.Free;
             end;
+
             AFrame.MessageJSON.Free;
             AFrame.MessageJSON := nil;
+
             Continue;
         end;
 
-        LTypeMatches := Length(AAcceptedTypes) = 0;
+        LTypeMatches :=
+            Length(AAcceptedTypes) = 0;
+
         for LIndex := Low(AAcceptedTypes) to High(AAcceptedTypes) do
         begin
-            LAcceptedType := AAcceptedTypes[LIndex];
+            LAcceptedType :=
+                AAcceptedTypes[LIndex];
+
             if AFrame.MessageType = LAcceptedType then
+            begin
                 LTypeMatches := True;
+                Break;
+            end;
         end;
 
-        if (ARequestID <> '') and (AFrame.RequestID <> '') and
-           (not SameText(ARequestID, AFrame.RequestID)) then
+        if (ARequestID <> '') and
+           (AFrame.RequestID <> '') and
+           (not SameText(
+                ARequestID,
+                AFrame.RequestID
+           )) then
         begin
-            if LTypeMatches then
-            begin
-                // Asynchronous event for another request/session: surface it to the console caller.
-                Writeln('[event ', GARPMessageTypeToName(AFrame.MessageType), '] ', AFrame.MessageJSON.ToJSON);
-            end;
+            Writeln(
+                '[event ',
+                GARPMessageTypeToName(
+                    AFrame.MessageType
+                ),
+                '] ',
+                AFrame.MessageJSON.ToJSON
+            );
+
             AFrame.MessageJSON.Free;
             AFrame.MessageJSON := nil;
+
             Continue;
         end;
 
@@ -150,6 +296,7 @@ begin
         begin
             AFrame.MessageJSON.Free;
             AFrame.MessageJSON := nil;
+
             Continue;
         end;
 
@@ -159,59 +306,153 @@ end;
 
 procedure TGARPClient101.ConnectAndAuthenticate;
 var
-    LHello: TJSONObject;
     LPayload: TJSONObject;
+    LHello: TJSONObject;
     LFrame: TGARPFrame;
     LServerNonce: string;
     LProof: string;
     LAuth: TJSONObject;
+    LAuthMessage: TJSONObject;
+    LReplyPayload: TJSONObject;
 begin
     if FClient.Connected then
-        Exit;
+    begin
+        if FAuthenticated then
+            Exit;
+
+        FClient.Disconnect;
+    end;
+
     if FSecret = '' then
-        raise Exception.Create('GARP secret is empty. Use --secret or GARP_SECRET.');
+        raise Exception.Create(
+            'GARP secret is empty. Use --secret or GARP_SECRET.'
+        );
 
     FClient.Connect;
-    FClient.IOHandler.ReadTimeout := 10000;
 
-    FClientNonce := GARPCreateNonce;
-    LPayload := TJSONObject.Create;
+    FClient.IOHandler.ReadTimeout :=
+        GARP_READ_TIMEOUT;
+
+    FClientNonce :=
+        GARPCreateNonce;
+
+    LPayload :=
+        TJSONObject.Create;
+
     try
-        LPayload.AddPair('client_id', FClientID);
-        LPayload.AddPair('client_version', FClientVersion);
-        LPayload.AddPair('nonce', FClientNonce);
-        LHello := BuildMessage('hello', LPayload);
+        LPayload.AddPair(
+            'client_id',
+            FClientID
+        );
+
+        LPayload.AddPair(
+            'client_version',
+            FClientVersion
+        );
+
+        LPayload.AddPair(
+            'nonce',
+            FClientNonce
+        );
+
+        LHello :=
+            BuildMessage(
+                'hello',
+                LPayload
+            );
+
         try
-            SendFrame(GARP_HELLO, LHello, '', '');
+            LPayload := nil;
+
+            SendFrame(
+                GARP_HELLO,
+                LHello
+            );
         finally
             LHello.Free;
         end;
-    except
-        raise;
+    finally
+        LPayload.Free;
     end;
 
-    ReceiveFrame(LFrame);
+    ReceiveFrame(
+        LFrame
+    );
+
     try
-        if LFrame.MessageType <> GARP_HELLO_CHALLENGE then
-            raise Exception.CreateFmt('Expected hello_challenge, received %s', [GARPMessageTypeToName(LFrame.MessageType)]);
-        LServerNonce := LFrame.MessageJSON.GetValue<string>('payload.server_nonce', '');
+        if LFrame.MessageType <>
+           GARP_HELLO_CHALLENGE then
+        begin
+            raise Exception.CreateFmt(
+                'Expected hello_challenge, received %s',
+                [
+                    GARPMessageTypeToName(
+                        LFrame.MessageType
+                    )
+                ]
+            );
+        end;
+
+        LServerNonce :=
+            LFrame.MessageJSON.GetValue<string>(
+                'payload.server_nonce',
+                ''
+            );
+
         if LServerNonce = '' then
-            raise Exception.Create('hello_challenge does not contain server_nonce');
+            raise Exception.Create(
+                'hello_challenge does not contain server_nonce'
+            );
     finally
         LFrame.MessageJSON.Free;
+        LFrame.MessageJSON := nil;
     end;
 
-    LAuth := TJSONObject.Create;
-    try
-        LAuth.AddPair('client_id', FClientID);
-        LAuth.AddPair('client_nonce', FClientNonce);
-        LAuth.AddPair('server_nonce', LServerNonce);
-        LProof := GARPMakeHMACProof(FSecret, FClientID, FClientNonce, LServerNonce);
-        LAuth.AddPair('proof', LProof);
+    LProof :=
+        GARPMakeHMACProof(
+            FSecret,
+            FClientID,
+            FClientNonce,
+            LServerNonce
+        );
 
-        var LAuthMessage := BuildMessage('hello_auth', LAuth);
+    LAuth :=
+        TJSONObject.Create;
+
+    try
+        LAuth.AddPair(
+            'client_id',
+            FClientID
+        );
+
+        LAuth.AddPair(
+            'client_nonce',
+            FClientNonce
+        );
+
+        LAuth.AddPair(
+            'server_nonce',
+            LServerNonce
+        );
+
+        LAuth.AddPair(
+            'proof',
+            LProof
+        );
+
+        LAuthMessage :=
+            BuildMessage(
+                'hello_auth',
+                LAuth
+            );
+
         try
-            SendFrame(GARP_HELLO_AUTH, LAuthMessage);
+            LAuth := nil;
+
+            SendFrame(
+                GARP_HELLO_AUTH,
+                LAuthMessage
+            );
         finally
             LAuthMessage.Free;
         end;
@@ -219,16 +460,38 @@ begin
         LAuth.Free;
     end;
 
-    ReceiveFrame(LFrame);
+    ReceiveFrame(
+        LFrame
+    );
+
     try
-        if LFrame.MessageType <> GARP_HELLO_ACK then
-            raise Exception.CreateFmt('Expected hello_ack, received %s', [GARPMessageTypeToName(LFrame.MessageType)]);
-        LPayload := LFrame.MessageJSON.GetValue<TJSONObject>('payload');
-        if LPayload = nil then
-            raise Exception.Create('hello_ack has no payload');
+        if LFrame.MessageType <>
+           GARP_HELLO_ACK then
+        begin
+            raise Exception.CreateFmt(
+                'Expected hello_ack, received %s',
+                [
+                    GARPMessageTypeToName(
+                        LFrame.MessageType
+                    )
+                ]
+            );
+        end;
+
+        LReplyPayload :=
+            LFrame.MessageJSON.GetValue<TJSONObject>(
+                'payload'
+            );
+
+        if LReplyPayload = nil then
+            raise Exception.Create(
+                'hello_ack has no payload'
+            );
+
         FAuthenticated := True;
     finally
         LFrame.MessageJSON.Free;
+        LFrame.MessageJSON := nil;
     end;
 end;
 
@@ -239,15 +502,40 @@ var
     LRequestID: string;
 begin
     EnsureConnected;
-    LRequestID := NextRequestID;
-    LMessage := BuildMessage('capabilities', TJSONObject.Create);
+
+    LRequestID :=
+        NextRequestID;
+
+    LMessage :=
+        BuildMessage(
+            'capabilities',
+            TJSONObject.Create
+        );
+
     try
-        SendFrame(GARP_CAPABILITIES, LMessage, LRequestID, '');
+        SendFrame(
+            GARP_CAPABILITIES,
+            LMessage,
+            LRequestID,
+            ''
+        );
     finally
         LMessage.Free;
     end;
-    ReceiveUntil(LRequestID, [GARP_CAPABILITIES, GARP_RESPONSE], LFrame);
-    Result := LFrame.MessageJSON;
+
+    ReceiveUntil(
+        LRequestID,
+        [
+            GARP_CAPABILITIES,
+            GARP_RESPONSE
+        ],
+        LFrame
+    );
+
+    Result :=
+        LFrame.MessageJSON;
+
+    LFrame.MessageJSON := nil;
 end;
 
 function TGARPClient101.GetBrowserStatus: TJSONObject;
@@ -257,15 +545,40 @@ var
     LRequestID: string;
 begin
     EnsureConnected;
-    LRequestID := NextRequestID;
-    LMessage := BuildMessage('browser_status', TJSONObject.Create);
+
+    LRequestID :=
+        NextRequestID;
+
+    LMessage :=
+        BuildMessage(
+            'browser_status',
+            TJSONObject.Create
+        );
+
     try
-        SendFrame(GARP_BROWSER_STATUS, LMessage, LRequestID, '');
+        SendFrame(
+            GARP_BROWSER_STATUS,
+            LMessage,
+            LRequestID,
+            ''
+        );
     finally
         LMessage.Free;
     end;
-    ReceiveUntil(LRequestID, [GARP_BROWSER_STATUS, GARP_RESPONSE], LFrame);
-    Result := LFrame.MessageJSON;
+
+    ReceiveUntil(
+        LRequestID,
+        [
+            GARP_BROWSER_STATUS,
+            GARP_RESPONSE
+        ],
+        LFrame
+    );
+
+    Result :=
+        LFrame.MessageJSON;
+
+    LFrame.MessageJSON := nil;
 end;
 
 function TGARPClient101.ListTabs: TJSONObject;
@@ -275,52 +588,154 @@ var
     LRequestID: string;
 begin
     EnsureConnected;
-    LRequestID := NextRequestID;
-    LMessage := BuildMessage('list_tabs', TJSONObject.Create);
+
+    LRequestID :=
+        NextRequestID;
+
+    LMessage :=
+        BuildMessage(
+            'list_tabs',
+            TJSONObject.Create
+        );
+
     try
-        SendFrame(GARP_LIST_TABS, LMessage, LRequestID, '');
+        SendFrame(
+            GARP_LIST_TABS,
+            LMessage,
+            LRequestID,
+            ''
+        );
     finally
         LMessage.Free;
     end;
-    ReceiveUntil(LRequestID, [GARP_RESPONSE, GARP_LIST_TABS], LFrame);
-    Result := LFrame.MessageJSON;
+
+    ReceiveUntil(
+        LRequestID,
+        [
+            GARP_RESPONSE,
+            GARP_LIST_TABS
+        ],
+        LFrame
+    );
+
+    Result :=
+        LFrame.MessageJSON;
+
+    LFrame.MessageJSON := nil;
 end;
 
-function TGARPClient101.CreateSession(const AProvider: string; const ATabID: string): TJSONObject;
+function TGARPClient101.CreateSession(
+    const AProvider: string;
+    const ATabID: string
+): TJSONObject;
 var
     LPayload: TJSONObject;
     LMessage: TJSONObject;
     LFrame: TGARPFrame;
     LRequestID: string;
     LSessionID: string;
-    LTabID: string;
+    LReturnedTabID: string;
 begin
     EnsureConnected;
-    LRequestID := NextRequestID;
-    LPayload := TJSONObject.Create;
-    LPayload.AddPair('provider', AProvider);
-    if ATabID <> '' then
-        LPayload.AddPair('tab_id', ATabID);
-    LMessage := BuildMessage('create_session', LPayload);
+
+    if Trim(AProvider) = '' then
+        raise Exception.Create(
+            'Provider is empty'
+        );
+
+    LRequestID :=
+        NextRequestID;
+
+    LPayload :=
+        TJSONObject.Create;
+
     try
-        SendFrame(GARP_CREATE_SESSION, LMessage, LRequestID, '');
+        LPayload.AddPair(
+            'provider',
+            AProvider
+        );
+
+        if ATabID <> '' then
+            LPayload.AddPair(
+                'tab_id',
+                ATabID
+            );
+
+        LMessage :=
+            BuildMessage(
+                'create_session',
+                LPayload
+            );
+
+        try
+            LPayload := nil;
+
+            SendFrame(
+                GARP_CREATE_SESSION,
+                LMessage,
+                LRequestID,
+                ''
+            );
+        finally
+            LMessage.Free;
+        end;
     finally
-        LMessage.Free;
+        LPayload.Free;
     end;
-    ReceiveUntil(LRequestID, [GARP_RESPONSE, GARP_SESSION_READY], LFrame);
-    Result := LFrame.MessageJSON;
-    LSessionID := Result.GetValue<string>('payload.session_id', '');
+
+    ReceiveUntil(
+        LRequestID,
+        [
+            GARP_RESPONSE,
+            GARP_SESSION_READY
+        ],
+        LFrame
+    );
+
+    Result :=
+        LFrame.MessageJSON;
+
+    LFrame.MessageJSON := nil;
+
+    LSessionID :=
+        Result.GetValue<string>(
+            'payload.session_id',
+            ''
+        );
+
     if LSessionID = '' then
-        LSessionID := Result.GetValue<string>('session_id', '');
-    LTabID := Result.GetValue<string>('payload.tab_id', '');
-    if LTabID = '' then
-        LTabID := Result.GetValue<string>('tab_id', '');
-    if LSessionID <> '' then FSessionID := LSessionID;
-    if LTabID <> '' then FTabID := LTabID;
+        LSessionID :=
+            Result.GetValue<string>(
+                'session_id',
+                ''
+            );
+
+    LReturnedTabID :=
+        Result.GetValue<string>(
+            'payload.tab_id',
+            ''
+        );
+
+    if LReturnedTabID = '' then
+        LReturnedTabID :=
+            Result.GetValue<string>(
+                'tab_id',
+                ''
+            );
+
+    if LSessionID <> '' then
+        FSessionID := LSessionID;
+
+    if LReturnedTabID <> '' then
+        FTabID := LReturnedTabID;
 end;
 
-function TGARPClient101.Prompt(const APrompt: string; const AStream: Boolean;
-    const ATimeoutMS: Integer; const AAutoContinue: Boolean): TJSONObject;
+function TGARPClient101.Prompt(
+    const APrompt: string;
+    const AStream: Boolean;
+    const ATimeoutMS: Integer;
+    const AAutoContinue: Boolean
+): TJSONObject;
 var
     LOptions: TJSONObject;
     LPrompt: TJSONObject;
@@ -329,124 +744,337 @@ var
     LFrame: TGARPFrame;
 begin
     EnsureConnected;
+
     if FSessionID = '' then
-        raise Exception.Create('No GARP session is active');
+        raise Exception.Create(
+            'No GARP session is active'
+        );
+
+    if APrompt = '' then
+        raise Exception.Create(
+            'Prompt text is empty'
+        );
+
+    if ATimeoutMS <= 0 then
+        raise Exception.Create(
+            'Prompt timeout must be greater than zero'
+        );
 
     NextRequestID;
-    LPrompt := TJSONObject.Create;
-    LPrompt.AddPair('format', 'text');
-    LPrompt.AddPair('text', APrompt);
-    LOptions := TJSONObject.Create;
-    LOptions.AddPair('stream', TJSONBool.Create(AStream));
-    LOptions.AddPair('timeout_ms', TJSONNumber.Create(ATimeoutMS));
-    LOptions.AddPair('auto_continue', TJSONBool.Create(AAutoContinue));
-    LPayload := TJSONObject.Create;
-    LPayload.AddPair('prompt', LPrompt);
-    LPayload.AddPair('options', LOptions);
-    LMessage := BuildMessage('prompt', LPayload);
+
+    LPrompt :=
+        TJSONObject.Create;
+
     try
-        SendFrame(GARP_PROMPT, LMessage, FRequestID, FSessionID);
+        LPrompt.AddPair(
+            'format',
+            'text'
+        );
+
+        LPrompt.AddPair(
+            'text',
+            APrompt
+        );
+
+        LOptions :=
+            TJSONObject.Create;
+
+        try
+            LOptions.AddPair(
+                'stream',
+                TJSONBool.Create(AStream)
+            );
+
+            LOptions.AddPair(
+                'timeout_ms',
+                TJSONNumber.Create(ATimeoutMS)
+            );
+
+            LOptions.AddPair(
+                'auto_continue',
+                TJSONBool.Create(AAutoContinue)
+            );
+
+            LPayload :=
+                TJSONObject.Create;
+
+            try
+                LPayload.AddPair(
+                    'prompt',
+                    LPrompt
+                );
+
+                LPrompt := nil;
+
+                LPayload.AddPair(
+                    'options',
+                    LOptions
+                );
+
+                LOptions := nil;
+
+                LMessage :=
+                    BuildMessage(
+                        'prompt',
+                        LPayload
+                    );
+
+                try
+                    LPayload := nil;
+
+                    SendFrame(
+                        GARP_PROMPT,
+                        LMessage,
+                        FRequestID,
+                        FSessionID
+                    );
+                finally
+                    LMessage.Free;
+                end;
+            finally
+                LPayload.Free;
+            end;
+        finally
+            LOptions.Free;
+        end;
     finally
-        LMessage.Free;
+        LPrompt.Free;
     end;
 
-    ReceiveUntil(FRequestID, [GARP_PROMPT_ACK], LFrame);
-    Result := LFrame.MessageJSON;
+    ReceiveUntil(
+        FRequestID,
+        [
+            GARP_PROMPT_ACK,
+            GARP_ERROR
+        ],
+        LFrame
+    );
+
+    Result :=
+        LFrame.MessageJSON;
+
+    LFrame.MessageJSON := nil;
 end;
 
-function TGARPClient101.WaitForCompletion(const ARequestID: string; const ATimeoutMS: Cardinal): TJSONObject;
+function TGARPClient101.WaitForCompletion(
+    const ARequestID: string;
+    const ATimeoutMS: Cardinal
+): TJSONObject;
 var
-    LOriginalTimeout: Integer;
     LStart: UInt64;
     LFrame: TGARPFrame;
-    LContent: string;
     LPayload: TJSONObject;
     LStatus: string;
 begin
     EnsureConnected;
-    LOriginalTimeout := FClient.IOHandler.ReadTimeout;
-    FClient.IOHandler.ReadTimeout := 1000;
-    try
-        LStart := TThread.GetTickCount64;
-        repeat
-            LFrame.MessageJSON := nil;
-            try
-                if not ReceiveFrame(LFrame) then
-                    raise Exception.Create('No GARP event received');
 
-                Writeln('[', GARPMessageTypeToName(LFrame.MessageType), '] ', LFrame.MessageJSON.ToJSON);
-                if (ARequestID <> '') and (LFrame.RequestID <> '') and not SameText(ARequestID, LFrame.RequestID) then
-                begin
-                    Continue;
-                end;
+    if ARequestID = '' then
+        raise Exception.Create(
+            'Request ID is empty'
+        );
 
-                case LFrame.MessageType of
-                    GARP_GENERATION_COMPLETED:
+    LStart :=
+        TThread.GetTickCount64;
+
+    repeat
+        FillChar(
+            LFrame,
+            SizeOf(LFrame),
+            0
+        );
+
+        if not FClient.IOHandler.Readable(1000) then
+        begin
+            if TThread.GetTickCount64 - LStart >= ATimeoutMS then
+                Break;
+
+            Continue;
+        end;
+
+        try
+            if not ReceiveFrame(LFrame) then
+                raise Exception.Create(
+                    'No GARP event received'
+                );
+
+            Writeln(
+                '[',
+                GARPMessageTypeToName(
+                    LFrame.MessageType
+                ),
+                '] ',
+                LFrame.MessageJSON.ToJSON
+            );
+
+            if (ARequestID <> '') and
+               (LFrame.RequestID <> '') and
+               (not SameText(
+                    ARequestID,
+                    LFrame.RequestID
+               )) then
+            begin
+                Continue;
+            end;
+
+            case LFrame.MessageType of
+
+                GARP_GENERATION_COMPLETED:
+                    begin
+                        Result :=
+                            LFrame.MessageJSON;
+
+                        LFrame.MessageJSON := nil;
+
+                        Exit;
+                    end;
+
+                GARP_GENERATION_FAILED,
+                GARP_ERROR:
+                    begin
+                        Result :=
+                            LFrame.MessageJSON;
+
+                        LFrame.MessageJSON := nil;
+
+                        Exit;
+                    end;
+
+                GARP_GENERATION_PROGRESS:
+                    begin
+                        LPayload :=
+                            LFrame.MessageJSON.GetValue<TJSONObject>(
+                                'payload'
+                            );
+
+                        if LPayload <> nil then
                         begin
-                            Result := LFrame.MessageJSON;
-                            LFrame.MessageJSON := nil;
-                            Exit;
-                        end;
-                    GARP_GENERATION_FAILED, GARP_ERROR:
-                        begin
-                            Result := LFrame.MessageJSON;
-                            LFrame.MessageJSON := nil;
-                            Exit;
-                        end;
-                    GARP_GENERATION_PROGRESS:
-                        begin
-                            LPayload := LFrame.MessageJSON.GetValue<TJSONObject>('payload');
-                            if LPayload <> nil then
+                            LStatus :=
+                                LPayload.GetValue<string>(
+                                    'state',
+                                    ''
+                                );
+
+                            if SameText(
+                                LStatus,
+                                'complete'
+                            ) then
                             begin
-                                LStatus := LPayload.GetValue<string>('state', '');
-                                if SameText(LStatus, 'complete') then
-                                begin
-                                    Result := LFrame.MessageJSON;
-                                    LFrame.MessageJSON := nil;
-                                    Exit;
-                                end;
+                                Result :=
+                                    LFrame.MessageJSON;
+
+                                LFrame.MessageJSON := nil;
+
+                                Exit;
                             end;
                         end;
-                end;
-            except
-                on E: EIdConnClosedGracefully do
-                    raise Exception.Create('GARP connection closed while waiting for completion: ' + E.Message);
-                on E: EIdReadTimeout do
-                begin
-                    // Continue until the overall deadline.
-                end;
-            finally
-                LFrame.MessageJSON.Free;
-            end;
-        until TThread.GetTickCount64 - LStart >= ATimeoutMS;
-    finally
-        FClient.IOHandler.ReadTimeout := LOriginalTimeout;
-    end;
+                    end;
 
-    LPayload := TJSONObject.Create;
-    LPayload.AddPair('code', 'GENERATION_TIMEOUT');
-    LPayload.AddPair('message', 'Timed out waiting for generation_completed');
-    LPayload.AddPair('request_id', ARequestID);
-    Result := GARPBuildJSON('error', LPayload, ARequestID, FSessionID);
+                GARP_PING:
+                    begin
+                        // Keep the connection alive if Firefox sends a ping.
+                    end;
+            end;
+
+        finally
+            LFrame.MessageJSON.Free;
+            LFrame.MessageJSON := nil;
+        end;
+
+    until TThread.GetTickCount64 - LStart >= ATimeoutMS;
+
+    LPayload :=
+        TJSONObject.Create;
+
+    try
+        LPayload.AddPair(
+            'code',
+            'GENERATION_TIMEOUT'
+        );
+
+        LPayload.AddPair(
+            'message',
+            'Timed out waiting for generation_completed'
+        );
+
+        LPayload.AddPair(
+            'request_id',
+            ARequestID
+        );
+
+        Result :=
+            GARPBuildJSON(
+                'error',
+                LPayload,
+                ARequestID,
+                FSessionID
+            );
+
+        LPayload := nil;
+    finally
+        LPayload.Free;
+    end;
 end;
 
-function TGARPClient101.CancelPrompt(const ARequestID, AReason: string): TJSONObject;
+function TGARPClient101.CancelPrompt(
+    const ARequestID: string;
+    const AReason: string
+): TJSONObject;
 var
     LPayload: TJSONObject;
     LMessage: TJSONObject;
     LFrame: TGARPFrame;
 begin
     EnsureConnected;
-    LPayload := TJSONObject.Create;
-    LPayload.AddPair('reason', AReason);
-    LMessage := BuildMessage('cancel_prompt', LPayload);
+
+    if ARequestID = '' then
+        raise Exception.Create(
+            'Request ID is empty'
+        );
+
+    LPayload :=
+        TJSONObject.Create;
+
     try
-        SendFrame(GARP_CANCEL_PROMPT, LMessage, ARequestID, FSessionID);
+        LPayload.AddPair(
+            'reason',
+            AReason
+        );
+
+        LMessage :=
+            BuildMessage(
+                'cancel_prompt',
+                LPayload
+            );
+
+        try
+            LPayload := nil;
+
+            SendFrame(
+                GARP_CANCEL_PROMPT,
+                LMessage,
+                ARequestID,
+                FSessionID
+            );
+        finally
+            LMessage.Free;
+        end;
     finally
-        LMessage.Free;
+        LPayload.Free;
     end;
-    ReceiveUntil(ARequestID, [GARP_CANCEL_ACK, GARP_ERROR], LFrame);
-    Result := LFrame.MessageJSON;
+
+    ReceiveUntil(
+        ARequestID,
+        [
+            GARP_CANCEL_ACK,
+            GARP_ERROR
+        ],
+        LFrame
+    );
+
+    Result :=
+        LFrame.MessageJSON;
+
+    LFrame.MessageJSON := nil;
 end;
 
 procedure TGARPClient101.Ping;
@@ -455,14 +1083,30 @@ var
     LFrame: TGARPFrame;
 begin
     EnsureConnected;
-    LMessage := BuildMessage('ping', TJSONObject.Create);
+
+    LMessage :=
+        BuildMessage(
+            'ping',
+            TJSONObject.Create
+        );
+
     try
-        SendFrame(GARP_PING, LMessage);
+        SendFrame(
+            GARP_PING,
+            LMessage
+        );
     finally
         LMessage.Free;
     end;
-    ReceiveUntil('', [GARP_PONG], LFrame);
+
+    ReceiveUntil(
+        '',
+        [GARP_PONG],
+        LFrame
+    );
+
     LFrame.MessageJSON.Free;
+    LFrame.MessageJSON := nil;
 end;
 
 procedure TGARPClient101.CloseSession;
@@ -474,20 +1118,60 @@ var
 begin
     if FSessionID = '' then
         Exit;
+
     EnsureConnected;
-    LRequestID := NextRequestID;
-    LPayload := TJSONObject.Create;
-    LPayload.AddPair('session_id', FSessionID);
-    LMessage := BuildMessage('close_session', LPayload);
+
+    LRequestID :=
+        NextRequestID;
+
+    LPayload :=
+        TJSONObject.Create;
+
     try
-        SendFrame(GARP_CLOSE_SESSION, LMessage, LRequestID, FSessionID);
+        LPayload.AddPair(
+            'session_id',
+            FSessionID
+        );
+
+        LMessage :=
+            BuildMessage(
+                'close_session',
+                LPayload
+            );
+
+        try
+            LPayload := nil;
+
+            SendFrame(
+                GARP_CLOSE_SESSION,
+                LMessage,
+                LRequestID,
+                FSessionID
+            );
+        finally
+            LMessage.Free;
+        end;
     finally
-        LMessage.Free;
+        LPayload.Free;
     end;
-    ReceiveUntil(LRequestID, [GARP_RESPONSE, GARP_CLOSE_SESSION], LFrame);
+
+    ReceiveUntil(
+        LRequestID,
+        [
+            GARP_RESPONSE,
+            GARP_CLOSE_SESSION,
+            GARP_ERROR
+        ],
+        LFrame
+    );
+
     LFrame.MessageJSON.Free;
+    LFrame.MessageJSON := nil;
+
     FSessionID := '';
     FTabID := '';
 end;
 
 end.
+
+

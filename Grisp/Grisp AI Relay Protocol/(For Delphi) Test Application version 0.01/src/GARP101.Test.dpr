@@ -1,4 +1,4 @@
-program GARP101.Test;
+﻿program GARP101.Test;
 
 {$APPTYPE CONSOLE}
 

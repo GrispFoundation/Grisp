@@ -115,15 +115,18 @@ begin
         GARP_HELLO_CHALLENGE: Result := 'hello_challenge';
         GARP_RESPONSE: Result := 'response';
         GARP_HELLO_AUTH: Result := 'hello_auth';
+
         GARP_LIST_TABS: Result := 'list_tabs';
         GARP_OPEN_TAB: Result := 'open_tab';
         GARP_CLOSE_TAB: Result := 'close_tab';
         GARP_SELECT_TAB: Result := 'select_tab';
+
         GARP_CREATE_SESSION: Result := 'create_session';
         GARP_ATTACH_SESSION: Result := 'attach_session';
         GARP_DETACH_SESSION: Result := 'detach_session';
         GARP_CLOSE_SESSION: Result := 'close_session';
         GARP_RESET_SESSION: Result := 'reset_session';
+
         GARP_PROMPT: Result := 'prompt';
         GARP_PROMPT_ACK: Result := 'prompt_ack';
         GARP_CANCEL_PROMPT: Result := 'cancel_prompt';
@@ -131,6 +134,7 @@ begin
         GARP_GET_PROMPT_STATUS: Result := 'get_prompt_status';
         GARP_GET_RESPONSE: Result := 'get_response';
         GARP_SUBSCRIBE_RESPONSE: Result := 'subscribe_response';
+
         GARP_SESSION_READY: Result := 'session_ready';
         GARP_SESSION_CHANGED: Result := 'session_changed';
         GARP_INPUT_SUBMITTED: Result := 'input_submitted';
@@ -141,13 +145,16 @@ begin
         GARP_CONTINUATION_SUBMITTED: Result := 'continuation_submitted';
         GARP_GENERATION_COMPLETED: Result := 'generation_completed';
         GARP_GENERATION_FAILED: Result := 'generation_failed';
+
         GARP_NAVIGATION: Result := 'navigation';
         GARP_PROVIDER_ERROR: Result := 'provider_error';
         GARP_AUTH_REQUIRED: Result := 'auth_required';
         GARP_RATE_LIMITED: Result := 'rate_limited';
         GARP_DIAGNOSTIC: Result := 'diagnostic';
+
         GARP_PING: Result := 'ping';
         GARP_PONG: Result := 'pong';
+
         GARP_ERROR: Result := 'error';
     else
         Result := '';
@@ -155,21 +162,66 @@ begin
 end;
 
 function GARPMessageNameToType(const AName: string): TGARPMessageType;
+const
+    CMessageTypes: array[0..39] of TGARPMessageType = (
+        GARP_HELLO,
+        GARP_HELLO_ACK,
+        GARP_CAPABILITIES,
+        GARP_BROWSER_STATUS,
+        GARP_HELLO_CHALLENGE,
+        GARP_RESPONSE,
+        GARP_HELLO_AUTH,
+        GARP_LIST_TABS,
+        GARP_OPEN_TAB,
+        GARP_CLOSE_TAB,
+        GARP_SELECT_TAB,
+        GARP_CREATE_SESSION,
+        GARP_ATTACH_SESSION,
+        GARP_DETACH_SESSION,
+        GARP_CLOSE_SESSION,
+        GARP_RESET_SESSION,
+        GARP_PROMPT,
+        GARP_PROMPT_ACK,
+        GARP_CANCEL_PROMPT,
+        GARP_CANCEL_ACK,
+        GARP_GET_PROMPT_STATUS,
+        GARP_GET_RESPONSE,
+        GARP_SUBSCRIBE_RESPONSE,
+        GARP_SESSION_READY,
+        GARP_SESSION_CHANGED,
+        GARP_INPUT_SUBMITTED,
+        GARP_GENERATION_STARTED,
+        GARP_GENERATION_DELTA,
+        GARP_GENERATION_PROGRESS,
+        GARP_CONTINUATION_REQUIRED,
+        GARP_CONTINUATION_SUBMITTED,
+        GARP_GENERATION_COMPLETED,
+        GARP_GENERATION_FAILED,
+        GARP_NAVIGATION,
+        GARP_PROVIDER_ERROR,
+        GARP_AUTH_REQUIRED,
+        GARP_RATE_LIMITED,
+        GARP_DIAGNOSTIC,
+        GARP_PING,
+        GARP_PONG
+    );
 var
     LName: string;
+    LIndex: Integer;
     LMessageType: TGARPMessageType;
 begin
     LName := LowerCase(Trim(AName));
-    for LMessageType := 1 to $00FF do
+
+    for LIndex := Low(CMessageTypes) to High(CMessageTypes) do
     begin
+        LMessageType := CMessageTypes[LIndex];
         if SameText(GARPMessageTypeToName(LMessageType), LName) then
             Exit(LMessageType);
     end;
-    for LMessageType := $0010 to $0054 do
-    begin
-        if SameText(GARPMessageTypeToName(LMessageType), LName) then
-            Exit(LMessageType);
-    end;
+
+    if SameText(GARPMessageTypeToName(GARP_ERROR), LName) then
+        Exit(GARP_ERROR);
+
     Result := 0;
 end;
 
@@ -196,24 +248,33 @@ var
     LValue: Integer;
 begin
     SetLength(Result, 16);
+
     if AValue = '' then
         Exit;
-    if AValue = GARP_ZERO_UUID then
+
+    if SameText(AValue, GARP_ZERO_UUID) then
         Exit;
 
     LText := LowerCase(StringReplace(AValue, '-', '', [rfReplaceAll]));
+
     if Length(LText) <> 32 then
         raise EGARPProtocolError.Create('Invalid UUID length: ' + AValue);
 
     for LIndex := 1 to Length(LText) do
+    begin
         if not CharInSet(LText[LIndex], ['0'..'9', 'a'..'f']) then
-            raise EGARPProtocolError.Create('Invalid UUID hexadecimal data: ' + AValue);
+            raise EGARPProtocolError.Create(
+                'Invalid UUID hexadecimal data: ' + AValue);
+    end;
 
     for LIndex := 0 to 15 do
     begin
         LHex := Copy(LText, LIndex * 2 + 1, 2);
+
         if not TryStrToInt('$' + LHex, LValue) then
-            raise EGARPProtocolError.Create('Invalid UUID byte: ' + AValue);
+            raise EGARPProtocolError.Create(
+                'Invalid UUID byte: ' + AValue);
+
         Result[LIndex] := Byte(LValue);
     end;
 end;
@@ -226,21 +287,28 @@ var
 begin
     if (AOffset < 0) or (Length(ABytes) < AOffset + 16) then
         raise EGARPProtocolError.Create('UUID field is truncated');
+
     LText := '';
     LZero := True;
+
     for LIndex := 0 to 15 do
     begin
         LText := LText + IntToHex(ABytes[AOffset + LIndex], 2);
+
         if ABytes[AOffset + LIndex] <> 0 then
             LZero := False;
     end;
+
     if LZero then
         Exit('');
-    Result := Copy(LText, 1, 8) + '-' +
+
+    Result :=
+        Copy(LText, 1, 8) + '-' +
         Copy(LText, 9, 4) + '-' +
         Copy(LText, 13, 4) + '-' +
         Copy(LText, 17, 4) + '-' +
         Copy(LText, 21, 12);
+
     Result := LowerCase(Result);
 end;
 
@@ -250,18 +318,22 @@ begin
     Result := TJSONObject.Create;
     Result.AddPair('protocol', GARP_PROTOCOL);
     Result.AddPair('type', LowerCase(ATypeName));
+
     if ARequestID <> '' then
         Result.AddPair('request_id', ARequestID);
+
     if ASessionID <> '' then
         Result.AddPair('session_id', ASessionID);
+
     if APayload <> nil then
         Result.AddPair('payload', APayload)
     else
         Result.AddPair('payload', TJSONObject.Create);
 end;
 
-function GARPEncodeFrame(const AMessageType: TGARPMessageType; const AJSON: TJSONObject;
-    const ARequestID: string; const ASessionID: string): TBytes;
+function GARPEncodeFrame(const AMessageType: TGARPMessageType;
+    const AJSON: TJSONObject; const ARequestID: string;
+    const ASessionID: string): TBytes;
 var
     LPayload: UTF8String;
     LPayloadLength: Cardinal;
@@ -272,7 +344,9 @@ var
     LIndex: Integer;
 begin
     if GARPMessageTypeToName(AMessageType) = '' then
-        raise EGARPProtocolError.CreateFmt('Unknown message type: %d', [AMessageType]);
+        raise EGARPProtocolError.CreateFmt(
+            'Unknown message type: %d', [AMessageType]);
+
     if AJSON = nil then
         raise EGARPProtocolError.Create('JSON message is nil');
 
@@ -280,36 +354,52 @@ begin
     LPayloadBytes := TBytes(LPayload);
     LPayloadLength := Length(LPayloadBytes);
     LHeaderLength := GARP_FIXED_HEADER_LENGTH;
+
     if LPayloadLength > GARP_MAX_FRAME_SIZE then
-        raise EGARPProtocolError.Create('GARP payload exceeds configured maximum');
+        raise EGARPProtocolError.Create(
+            'GARP payload exceeds configured maximum');
 
     SetLength(Result, GARP_FIXED_HEADER_LENGTH + LPayloadLength);
+
     Result[0] := GARP_MAGIC_0;
     Result[1] := GARP_MAGIC_1;
     Result[2] := GARP_MAGIC_2;
     Result[3] := GARP_MAGIC_3;
+
     Result[4] := GARP_VERSION_BYTE;
     Result[5] := 0;
+
     Result[6] := Byte(LHeaderLength shr 8);
     Result[7] := Byte(LHeaderLength and $FF);
+
     Result[8] := Byte(LPayloadLength shr 24);
     Result[9] := Byte(LPayloadLength shr 16);
     Result[10] := Byte(LPayloadLength shr 8);
     Result[11] := Byte(LPayloadLength);
+
     Result[12] := Byte(AMessageType shr 8);
     Result[13] := Byte(AMessageType and $FF);
+
     Result[14] := 0;
     Result[15] := 0;
 
     LRequestBytes := GARPUUIDToBytes(ARequestID);
     LSessionBytes := GARPUUIDToBytes(ASessionID);
+
     for LIndex := 0 to 15 do
     begin
         Result[16 + LIndex] := LRequestBytes[LIndex];
         Result[32 + LIndex] := LSessionBytes[LIndex];
     end;
+
     if LPayloadLength > 0 then
-        Move(LPayloadBytes[0], Result[GARP_FIXED_HEADER_LENGTH], LPayloadLength);
+    begin
+        Move(
+            LPayloadBytes[0],
+            Result[GARP_FIXED_HEADER_LENGTH],
+            LPayloadLength
+        );
+    end;
 end;
 
 function GARPDecodeFrame(const AFrame: TBytes): TGARPFrame;
@@ -321,57 +411,106 @@ var
     LValue: TJSONValue;
     LMessageName: string;
     LExpectedName: string;
+    LPayloadBytes: TBytes;
 begin
     FillChar(Result, SizeOf(Result), 0);
     Result.MessageJSON := nil;
 
     if Length(AFrame) < GARP_FIXED_HEADER_LENGTH then
-        raise EGARPProtocolError.Create('GARP frame is shorter than the fixed header');
-    if (AFrame[0] <> GARP_MAGIC_0) or (AFrame[1] <> GARP_MAGIC_1) or
-       (AFrame[2] <> GARP_MAGIC_2) or (AFrame[3] <> GARP_MAGIC_3) then
+        raise EGARPProtocolError.Create(
+            'GARP frame is shorter than the fixed header');
+
+    if (AFrame[0] <> GARP_MAGIC_0) or
+       (AFrame[1] <> GARP_MAGIC_1) or
+       (AFrame[2] <> GARP_MAGIC_2) or
+       (AFrame[3] <> GARP_MAGIC_3) then
+    begin
         raise EGARPProtocolError.Create('Invalid GARP magic');
+    end;
+
     if AFrame[4] <> GARP_VERSION_BYTE then
-        raise EGARPProtocolError.CreateFmt('Unsupported GARP version byte: %.2x', [AFrame[4]]);
+        raise EGARPProtocolError.CreateFmt(
+            'Unsupported GARP version byte: %.2x', [AFrame[4]]);
+
     if AFrame[14] <> 0 then
-        raise EGARPProtocolError.Create('GARP reserved field is nonzero');
+        raise EGARPProtocolError.Create(
+            'GARP reserved field is nonzero');
+
     if AFrame[15] <> 0 then
-        raise EGARPProtocolError.Create('GARP reserved field is nonzero');
+        raise EGARPProtocolError.Create(
+            'GARP reserved field is nonzero');
 
-    LHeaderLength := (Cardinal(AFrame[6]) shl 8) or AFrame[7];
-    LPayloadLength := (Cardinal(AFrame[8]) shl 24) or
-                      (Cardinal(AFrame[9]) shl 16) or
-                      (Cardinal(AFrame[10]) shl 8) or
-                      Cardinal(AFrame[11]);
+    LHeaderLength :=
+        (Cardinal(AFrame[6]) shl 8) or
+        Cardinal(AFrame[7]);
+
+    LPayloadLength :=
+        (Cardinal(AFrame[8]) shl 24) or
+        (Cardinal(AFrame[9]) shl 16) or
+        (Cardinal(AFrame[10]) shl 8) or
+        Cardinal(AFrame[11]);
+
     if LHeaderLength < GARP_FIXED_HEADER_LENGTH then
-        raise EGARPProtocolError.Create('Invalid GARP header length');
+        raise EGARPProtocolError.Create(
+            'Invalid GARP header length');
+
     if LHeaderLength + LPayloadLength <> Cardinal(Length(AFrame)) then
-        raise EGARPProtocolError.Create('GARP payload length mismatch');
+        raise EGARPProtocolError.Create(
+            'GARP payload length mismatch');
+
     if LPayloadLength > GARP_MAX_FRAME_SIZE then
-        raise EGARPProtocolError.Create('GARP payload exceeds configured maximum');
+        raise EGARPProtocolError.Create(
+            'GARP payload exceeds configured maximum');
 
-    LMessageType := (Word(AFrame[12]) shl 8) or AFrame[13];
+    LMessageType :=
+        (Word(AFrame[12]) shl 8) or
+        Word(AFrame[13]);
+
     LExpectedName := GARPMessageTypeToName(LMessageType);
-    if LExpectedName = '' then
-        raise EGARPProtocolError.CreateFmt('Unknown GARP message type: %.4x', [LMessageType]);
 
-    SetLength(LPayload, LPayloadLength);
+    if LExpectedName = '' then
+        raise EGARPProtocolError.CreateFmt(
+            'Unknown GARP message type: %.4x',
+            [LMessageType]);
+
+    LPayload := '';
+
     if LPayloadLength > 0 then
-        LPayload := TEncoding.UTF8.GetString(TBytes(Copy(AFrame, LHeaderLength, LPayloadLength)));
+    begin
+        SetLength(LPayloadBytes, LPayloadLength);
+
+        Move(
+            AFrame[LHeaderLength],
+            LPayloadBytes[0],
+            LPayloadLength
+        );
+
+        LPayload := TEncoding.UTF8.GetString(LPayloadBytes);
+    end;
+
     LValue := TJSONObject.ParseJSONValue(LPayload);
+
     if not (LValue is TJSONObject) then
     begin
         LValue.Free;
-        raise EGARPProtocolError.Create('GARP payload is not a JSON object');
+        raise EGARPProtocolError.Create(
+            'GARP payload is not a JSON object');
     end;
+
     Result.MessageJSON := TJSONObject(LValue);
 
-    LMessageName := Result.MessageJSON.GetValue<string>('type', '');
-    if (Result.MessageJSON.GetValue<string>('protocol', '') <> GARP_PROTOCOL) or
+    LMessageName :=
+        Result.MessageJSON.GetValue<string>('type', '');
+
+    if (Result.MessageJSON.GetValue<string>('protocol', '') <>
+            GARP_PROTOCOL) or
        (not SameText(LMessageName, LExpectedName)) then
     begin
         Result.MessageJSON.Free;
         Result.MessageJSON := nil;
-        raise EGARPProtocolError.Create('GARP JSON protocol/type does not match the binary header');
+
+        raise EGARPProtocolError.Create(
+            'GARP JSON protocol/type does not match the binary header');
     end;
 
     Result.MessageType := LMessageType;
@@ -386,61 +525,146 @@ var
     LIndex: Integer;
 begin
     LData := TEncoding.UTF8.GetBytes(AText);
-    LDigest := THashSHA2.GetHMACAsBytes(LData, ASecret, SHA256);
+
+    LDigest :=
+        THashSHA2.GetHMACAsBytes(
+            LData,
+            ASecret,
+            SHA256
+        );
+
     Result := '';
+
     for LIndex := 0 to High(LDigest) do
         Result := Result + IntToHex(LDigest[LIndex], 2);
+
     Result := LowerCase(Result);
 end;
 
-function GARPMakeHMACProof(const ASecret, AClientID, AClientNonce, AServerNonce: string): string;
+function GARPMakeHMACProof(const ASecret, AClientID, AClientNonce,
+    AServerNonce: string): string;
 begin
-    Result := GARPHMACSHA256Hex(ASecret,
-        GARP_PROTOCOL + '|' + AClientID + '|' + AClientNonce + '|' + AServerNonce);
+    Result :=
+        GARPHMACSHA256Hex(
+            ASecret,
+            GARP_PROTOCOL + '|' +
+            AClientID + '|' +
+            AClientNonce + '|' +
+            AServerNonce
+        );
 end;
 
 function GARPReadFrame(AClient: TIdTCPClient): TBytes;
 var
-    LHeader: TBytes;
+    LHeader: TIdBytes;
+    LPayload: TIdBytes;
     LPayloadLength: Cardinal;
     LHeaderLength: Cardinal;
-    LRemaining: Integer;
-    LPart: TBytes;
 begin
     SetLength(LHeader, GARP_FIXED_HEADER_LENGTH);
-    AClient.IOHandler.ReadBytes(LHeader, GARP_FIXED_HEADER_LENGTH, False);
 
-    LHeaderLength := (Cardinal(LHeader[6]) shl 8) or LHeader[7];
-    LPayloadLength := (Cardinal(LHeader[8]) shl 24) or
-                      (Cardinal(LHeader[9]) shl 16) or
-                      (Cardinal(LHeader[10]) shl 8) or
-                      Cardinal(LHeader[11]);
+    AClient.IOHandler.ReadBytes(
+        LHeader,
+        GARP_FIXED_HEADER_LENGTH,
+        False
+    );
+
+    if Length(LHeader) < GARP_FIXED_HEADER_LENGTH then
+        raise EGARPProtocolError.Create(
+            'GARP header read was incomplete');
+
+    if (LHeader[0] <> GARP_MAGIC_0) or
+       (LHeader[1] <> GARP_MAGIC_1) or
+       (LHeader[2] <> GARP_MAGIC_2) or
+       (LHeader[3] <> GARP_MAGIC_3) then
+    begin
+        raise EGARPProtocolError.Create(
+            'Invalid GARP magic received');
+    end;
+
+    if LHeader[4] <> GARP_VERSION_BYTE then
+        raise EGARPProtocolError.CreateFmt(
+            'Unsupported GARP version byte received: %.2x',
+            [LHeader[4]]);
+
+    LHeaderLength :=
+        (Cardinal(LHeader[6]) shl 8) or
+        Cardinal(LHeader[7]);
+
+    LPayloadLength :=
+        (Cardinal(LHeader[8]) shl 24) or
+        (Cardinal(LHeader[9]) shl 16) or
+        (Cardinal(LHeader[10]) shl 8) or
+        Cardinal(LHeader[11]);
+
     if LHeaderLength < GARP_FIXED_HEADER_LENGTH then
-        raise EGARPProtocolError.Create('Invalid GARP header length received');
+        raise EGARPProtocolError.Create(
+            'Invalid GARP header length received');
+
     if LHeaderLength <> GARP_FIXED_HEADER_LENGTH then
-        raise EGARPProtocolError.Create('Extended GARP headers are not supported by this tester yet');
+        raise EGARPProtocolError.Create(
+            'Extended GARP headers are not supported by this tester yet');
+
     if LPayloadLength > GARP_MAX_FRAME_SIZE then
-        raise EGARPProtocolError.Create('Received GARP payload exceeds configured maximum');
+        raise EGARPProtocolError.Create(
+            'Received GARP payload exceeds configured maximum');
 
     SetLength(Result, GARP_FIXED_HEADER_LENGTH + LPayloadLength);
-    Move(LHeader[0], Result[0], GARP_FIXED_HEADER_LENGTH);
-    LRemaining := Integer(LPayloadLength);
-    if LRemaining > 0 then
+
+    Move(
+        LHeader[0],
+        Result[0],
+        GARP_FIXED_HEADER_LENGTH
+    );
+
+    if LPayloadLength > 0 then
     begin
-        SetLength(LPart, LRemaining);
-        AClient.IOHandler.ReadBytes(LPart, LRemaining, False);
-        Move(LPart[0], Result[GARP_FIXED_HEADER_LENGTH], LRemaining);
+        SetLength(LPayload, LPayloadLength);
+
+        AClient.IOHandler.ReadBytes(
+            LPayload,
+            LPayloadLength,
+            False
+        );
+
+        if Length(LPayload) <> Integer(LPayloadLength) then
+            raise EGARPProtocolError.Create(
+                'GARP payload read was incomplete');
+
+        Move(
+            LPayload[0],
+            Result[GARP_FIXED_HEADER_LENGTH],
+            LPayloadLength
+        );
     end;
 end;
 
 procedure GARPWriteFrame(AClient: TIdTCPClient; const AFrame: TBytes);
+var
+    LIdBytes: TIdBytes;
 begin
     if Length(AFrame) < GARP_FIXED_HEADER_LENGTH then
-        raise EGARPProtocolError.Create('Cannot send an undersized GARP frame');
-    AClient.IOHandler.Write(TIdBytes(AFrame));
+        raise EGARPProtocolError.Create(
+            'Cannot send an undersized GARP frame');
+
+    if Length(AFrame) > GARP_FIXED_HEADER_LENGTH + GARP_MAX_FRAME_SIZE then
+        raise EGARPProtocolError.Create(
+            'Cannot send a GARP frame exceeding configured maximum');
+
+    SetLength(LIdBytes, Length(AFrame));
+
+    if Length(AFrame) > 0 then
+        Move(
+            AFrame[0],
+            LIdBytes[0],
+            Length(AFrame)
+        );
+
+    AClient.IOHandler.Write(LIdBytes);
 end;
 
-function GARPWriteRead(AClient: TIdTCPClient; const AFrame: TBytes): TBytes;
+function GARPWriteRead(AClient: TIdTCPClient;
+    const AFrame: TBytes): TBytes;
 begin
     GARPWriteFrame(AClient, AFrame);
     Result := GARPReadFrame(AClient);
