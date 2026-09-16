@@ -1,0 +1,177 @@
+import { GARP_UINT64_MAX } from "./GarpRegistry.sys.mjs";
+import { GarpError, GarpErrorCode } from "./GarpErrors.sys.mjs";
+export const textEncoder = new TextEncoder();
+export const textDecoder = new TextDecoder("utf-8", { fatal: true });
+export function monotonicNow() {
+    return globalThis.performance?.now?.() ?? Date.now();
+}
+export function byteLength(value) {
+    return textEncoder.encode(String(value ?? "")).length;
+}
+export function utf8ByteCompare(left, right) {
+    const a = textEncoder.encode(String(left));
+    const b = textEncoder.encode(String(right));
+    const n = Math.min(a.length, b.length);
+    for (let i = 0; i < n; i++) {
+        if (a[i] !== b[i])
+            return a[i] - b[i];
+    }
+    return a.length - b.length;
+}
+export function sortedUtf8(values) {
+    return [...values].sort(utf8ByteCompare);
+}
+export function isUuid(value) {
+    return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+export function isNilUuid(value) {
+    return value === null || value === "00000000-0000-0000-0000-000000000000";
+}
+export function uuid() {
+    return crypto.randomUUID();
+}
+export function uuidToBytes(value) {
+    if (value == null)
+        return new Uint8Array(16);
+    if (!isUuid(value))
+        throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `Invalid UUID: ${value}`);
+    const hex = value.replaceAll("-", "").toLowerCase();
+    const bytes = new Uint8Array(16);
+    for (let i = 0; i < 16; i++)
+        bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    return bytes;
+}
+export function bytesToUuid(bytes, offset = 0) {
+    let zero = true;
+    for (let i = 0; i < 16; i++) {
+        if (bytes[offset + i] !== 0) {
+            zero = false;
+            break;
+        }
+    }
+    if (zero)
+        return null;
+    const hex = [];
+    for (let i = 0; i < 16; i++)
+        hex.push(bytes[offset + i].toString(16).padStart(2, "0"));
+    const s = hex.join("");
+    return `${s.slice(0, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}-${s.slice(16, 20)}-${s.slice(20)}`;
+}
+export function uint64(value, fieldName = "uint64") {
+    const text = String(value);
+    if (!/^(0|[1-9][0-9]{0,19})$/.test(text))
+        throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `${fieldName} must be uint64-string`);
+    const n = BigInt(text);
+    if (n > GARP_UINT64_MAX)
+        throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `${fieldName} exceeds uint64`);
+    return n;
+}
+export function u32(value, fieldName = "uint32") {
+    if (!Number.isInteger(value) || value < 0 || value > 0xffffffff)
+        throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `${fieldName} must be uint32`);
+    return value;
+}
+export function durationMs(value, fieldName, max = 864000000n) {
+    const n = uint64(value, fieldName);
+    if (n > max)
+        throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `${fieldName} exceeds allowed duration`);
+    return n;
+}
+export function base64UrlEncode(bytes) {
+    let b = "";
+    for (const x of bytes)
+        b += String.fromCharCode(x);
+    return btoa(b).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+}
+export function base64UrlDecode(text, expectedLength = null) {
+    if (typeof text !== "string" || !/^[A-Za-z0-9_-]*$/.test(text) || text.length % 4 === 1)
+        throw new GarpError(GarpErrorCode.AUTH_FAILED, "Invalid Base64URL encoding");
+    const padded = text.replaceAll("-", "+").replaceAll("_", "/") + "===".slice((text.length + 3) % 4);
+    let bin;
+    try {
+        bin = atob(padded);
+    }
+    catch (_) {
+        throw new GarpError(GarpErrorCode.AUTH_FAILED, "Invalid Base64URL encoding");
+    }
+    const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
+    if (expectedLength !== null && bytes.length !== expectedLength)
+        throw new GarpError(GarpErrorCode.AUTH_FAILED, "Decoded value has invalid length");
+    return bytes;
+}
+export function constantTimeEqualBytes(a, b) {
+    if (!(a instanceof Uint8Array) || !(b instanceof Uint8Array) || a.length !== b.length)
+        return false;
+    let d = 0;
+    for (let i = 0; i < a.length; i++)
+        d |= a[i] ^ b[i];
+    return d === 0;
+}
+export async function sha256(bytes) {
+    return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+}
+export async function hmacSha256(keyBytes, dataBytes) {
+    const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    return new Uint8Array(await crypto.subtle.sign("HMAC", key, dataBytes));
+}
+function appendU32(list, value) {
+    const out = new Uint8Array(4);
+    new DataView(out.buffer).setUint32(0, value, false);
+    list.push(...out);
+}
+function appendBytes(list, bytes) {
+    appendU32(list, bytes.length);
+    list.push(...bytes);
+}
+export function encodeTranscript(domain, clientNonce, serverNonce, selectedVersion, selectedWireVersion, offeredFeatures, finalFeatures, clientName, clientVersion, serverName, serverVersion) {
+    const l = [];
+    appendBytes(l, textEncoder.encode(domain));
+    appendBytes(l, clientNonce);
+    appendBytes(l, serverNonce);
+    appendBytes(l, textEncoder.encode(selectedVersion));
+    appendBytes(l, textEncoder.encode(selectedWireVersion));
+    appendU32(l, offeredFeatures.length);
+    for (const f of offeredFeatures)
+        appendBytes(l, textEncoder.encode(f));
+    appendU32(l, finalFeatures.length);
+    for (const f of finalFeatures)
+        appendBytes(l, textEncoder.encode(f));
+    appendBytes(l, textEncoder.encode(clientName));
+    appendBytes(l, textEncoder.encode(clientVersion));
+    appendBytes(l, textEncoder.encode(serverName));
+    appendBytes(l, textEncoder.encode(serverVersion));
+    return new Uint8Array(l);
+}
+export function encodeTranscriptCore(clientNonce, serverNonce, selectedVersion, selectedWireVersion, offeredFeatures, finalFeatures, clientName, clientVersion, serverName, serverVersion) {
+    return encodeTranscript("", clientNonce, serverNonce, selectedVersion, selectedWireVersion, offeredFeatures, finalFeatures, clientName, clientVersion, serverName, serverVersion).slice(4);
+}
+export function createOneShotTimer(callback, delayMs) {
+    const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+    timer.initWithCallback({
+        notify() {
+            callback();
+        },
+    }, Math.max(0, Number(delayMs)), Ci.nsITimer.TYPE_ONE_SHOT);
+    return timer;
+}
+export function createRepeatingTimer(callback, intervalMs) {
+    const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+    timer.initWithCallback({
+        notify() {
+            callback();
+        },
+    }, Math.max(1, Number(intervalMs)), Ci.nsITimer.TYPE_REPEATING_SLACK);
+    return timer;
+}
+export function delayMs(milliseconds) {
+    return new Promise(resolve => {
+        let timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+        timer.initWithCallback({
+            notify() {
+                timer = null;
+                resolve();
+            },
+        }, Math.max(0, Number(milliseconds)), Ci.nsITimer.TYPE_ONE_SHOT);
+    });
+}
+

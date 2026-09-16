@@ -1,0 +1,23 @@
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+
+export class GrokAdapter extends ProviderAdapter {
+    constructor() {
+        super("grok", "https://grok.com/");
+    }
+
+    input(doc) {
+        return this.findBySelectors(doc, ['.tiptap.ProseMirror', 'textarea[placeholder*="know"]', 'textarea[placeholder*="What"]', 'textarea']);
+    }
+
+    sendButton(doc) {
+        return this.findBySelectors(doc, ['button[aria-label="Submit"]', 'button[data-testid*="send"]']);
+    }
+
+    responseNodes(doc) {
+        return this.findAllBySelectors(doc, [".items-start .response-content-markdown"]);
+    }
+
+    isStreaming(doc) {
+        return !!doc.querySelector('[data-streaming="true"],.loading-indicator,.spinner');
+    }
+}

@@ -1,0 +1,2622 @@
+﻿// File 1: README extensive.md
+# Firefox AI Automation + GARP/1.24
+
+**Firefox-side integration and build instructions**
+
+This repository contains the Firefox-side implementation of **GARP/1.24 — Gateway AI Runtime Protocol**.
+
+The implementation is deliberately **Selenium-free**. Firefox itself provides the browser automation substrate through Firefox chrome/parent code, JSWindowActors, and provider-specific adapters.
+
+This README is intentionally focused on:
+
+* Windows 11 development storage
+* VHDX creation and mounting
+* MozillaBuild installation
+* Build tools and environment variables
+* Firefox source checkout
+* Firefox bootstrap
+* Integrating GARP/1.24 into the Firefox source tree
+* Firefox source integration
+* Building Firefox
+* Running Firefox
+* Basic troubleshooting
+
+The GARP/1.24 protocol specification remains the authoritative document for protocol behavior. This README does not reproduce the protocol specification.
+
+---
+
+# 1. Prerequisites
+
+Before installing this project, make sure the required host environment is available.
+
+## 1.1 Operating system
+
+The primary documented environment is:
+
+```text
+Windows 11
+64-bit
+```
+
+The instructions below assume a normal Windows 11 desktop development machine.
+
+The Firefox source tree and build commands described here are intended for a supported Firefox source-build environment.
+
+---
+
+## 1.2 MozillaBuild
+
+Install a current MozillaBuild release appropriate for the Firefox checkout.
+
+This project expects MozillaBuild at:
+
+```text
+G:\Tools\MozillaBuild
+```
+
+Start the build environment with:
+
+```text
+G:\Tools\MozillaBuild\start-shell.bat
+```
+
+Firefox build commands should normally be run from that shell.
+
+---
+
+## 1.3 Dedicated development storage
+
+This project assumes a dedicated Firefox development VHDX:
+
+```text
+G:\FileDiskImages\FireFoxDevelopmentV1.vhdx
+```
+
+with:
+
+```text
+50 GB
+VHDX
+Fixed size
+GPT
+NTFS
+4096-byte / 4 KB allocation unit
+```
+
+The VHDX is mounted as:
+
+```text
+R:
+```
+
+The Firefox source and Firefox object/build output are both placed on this volume:
+
+```text
+R:\firefox
+R:\firefox-obj
+```
+
+The same-volume arrangement is intentional and is part of the recommended project setup.
+
+---
+
+## 1.4 Git
+
+Git is required to obtain and update the Firefox source tree.
+
+The Firefox repository used by these instructions is:
+
+```text
+https://github.com/mozilla-firefox/firefox.git
+```
+
+MozillaBuild provides Git tooling for the standard Windows Firefox development workflow.
+
+---
+
+## 1.5 Firefox source-build dependencies
+
+Firefox has a substantial build toolchain.
+
+The Firefox bootstrap system is responsible for obtaining/configuring the versions required by the Firefox checkout.
+
+Run:
+
+```bash
+./mach bootstrap
+```
+
+before the first full build.
+
+Do not assume that an independently installed compiler, Rust version, Python version, Node.js version, or other development tool is automatically compatible with the Firefox checkout.
+
+---
+
+## 1.6 Python
+
+Firefox's build system uses Python extensively.
+
+Python is therefore a genuine Firefox build dependency.
+
+However, this project does **not** require a manually selected global Python installation.
+
+Use the Python environment provided by MozillaBuild/Firefox's bootstrap and build tooling.
+
+Do not create a global:
+
+```text
+PYTHON=...
+```
+
+environment variable to force Firefox to use an arbitrary Python installation.
+
+A separate Python installation may exist on the machine for unrelated development work, but it is not necessary to configure one specifically for this project.
+
+---
+
+## 1.7 Node.js
+
+Firefox uses Node.js for parts of its build and tooling infrastructure.
+
+The Firefox bootstrap/build system determines the required version for the checkout.
+
+If Node.js is separately managed with nvm, it may be stored on `G:`:
+
+```text
+G:\Tools\nvm
+G:\Tools\nvmmodejs
+```
+
+but this is optional.
+
+---
+
+## 1.8 Rust
+
+Firefox requires Rust for several components.
+
+The Firefox bootstrap/build system determines and installs the Rust toolchain required by the particular Firefox checkout.
+
+A user-managed Rust installation can also be stored on `G:`:
+
+```text
+G:\Tools\Rust
+```
+
+but it should not be used to override the Firefox checkout's required toolchain arbitrarily.
+
+---
+
+## 1.9 Network access
+
+The initial setup requires network access to obtain:
+
+* Firefox source code
+* Firefox build dependencies
+* Rust/toolchain components
+* Mozilla build tooling as required
+* other source dependencies
+
+A normal Internet connection is therefore required during initial bootstrap.
+
+---
+
+## 1.10 Disk space
+
+The VHDX used by this project is:
+
+```text
+50 GB
+```
+
+This is the development-volume size used by the documented setup.
+
+A Firefox source checkout plus a full object directory can consume substantial space, especially during builds.
+
+Monitor free space on:
+
+```text
+R:
+```
+
+during development.
+
+The VHDX should not be allowed to fill completely.
+
+---
+
+## 1.11 GARP client
+
+The Firefox component is the **GARP server/gateway side**.
+
+A separate GARP/GRISP client is required for end-to-end protocol testing.
+
+That client may be written in Delphi or another language capable of implementing the GARP/1.24 wire protocol.
+
+It is outside the scope of this repository.
+
+---
+
+# 2. Scope
+
+This repository covers the **Firefox-side browser gateway implementation**.
+
+It includes:
+
+```text
+Firefox chrome/parent integration
+JSWindowActors
+GARP connection handling
+GARP authentication
+GARP framing
+GARP JSON validation
+GARP session management
+GARP request management
+provider registry
+provider adapters
+persistent authentication replay protection
+diagnostics
+protocol-level tests
+```
+
+The repository's primary purpose is to provide the Firefox implementation required for an AI runtime to communicate with AI provider websites through the GARP/1.24 gateway.
+
+---
+
+## 2.1 In scope
+
+The following are part of this project:
+
+```text
+Firefox integration
+    ↓
+AIAutomationService
+    ↓
+GARP transport/authentication
+    ↓
+session/request management
+    ↓
+JSWindowActor communication
+    ↓
+provider-specific browser automation
+```
+
+The provider adapters are responsible for interacting with provider websites through Firefox.
+
+---
+
+## 2.2 Installation scope
+
+This project is **not installed as a normal Firefox WebExtension**.
+
+There is no normal:
+
+```text
+Firefox Add-ons Manager
+.xpi installation
+WebExtension installation
+```
+
+step.
+
+The GARP implementation runs inside Firefox's privileged browser/chrome environment and therefore has to be integrated into the **Firefox source tree** and compiled as part of Firefox.
+
+The installation process is:
+
+```text
+GARP repository
+        |
+        | copy source files
+        v
+Firefox source checkout
+        |
+        +-- browser/components/aistarter/
+        |
+        +-- moz.build integration
+        +-- JSWindowActor registration
+        +-- Firefox startup integration
+        |
+        v
+./mach build
+        |
+        v
+Custom Firefox build containing GARP/1.24
+```
+
+The actual installation therefore occurs at the **Firefox source/build level**, not through Firefox's normal add-on system.
+
+---
+
+## 2.3 What is installed where?
+
+### Physical build/storage disk
+
+```text
+G:\
+├── FileDiskImages\
+│   └── FireFoxDevelopmentV1.vhdx
+│
+├── Tools\
+│   └── MozillaBuild\
+│
+└── mozbuild\
+    └── sccache\
+```
+
+### Firefox development VHDX
+
+Mounted as:
+
+```text
+R:
+```
+
+Firefox source:
+
+```text
+R:\firefox
+```
+
+Firefox object/build output:
+
+```text
+R:\firefox-obj
+```
+
+GARP source integration:
+
+```text
+R:\firefox\browser\components\aistarter\
+```
+
+---
+
+## 2.4 What the GARP package changes
+
+The package adds Firefox-side source files such as:
+
+```text
+AIAutomation.sys.mjs
+AIAutomationParent.sys.mjs
+AIAutomationChild.sys.mjs
+
+GarpAuth.sys.mjs
+GarpConnection.sys.mjs
+GarpErrors.sys.mjs
+GarpFrame.sys.mjs
+GarpJson.sys.mjs
+GarpRegistry.sys.mjs
+GarpReplayStore.sys.mjs
+GarpSchema.sys.mjs
+GarpUtil.sys.mjs
+
+Provider adapters
+Request/session modules
+Diagnostics
+```
+
+It also requires a small number of changes to the Firefox source tree outside `aistarter`, notably:
+
+```text
+browser/components/moz.build
+```
+
+and the Firefox startup / JSWindowActor registration locations appropriate to the Firefox revision being built.
+
+The package does **not** replace the Firefox source tree.
+
+It adds the GARP component and the minimum Firefox integration required to compile and start it.
+
+---
+
+## 2.5 Runtime scope
+
+After compilation, GARP runs as part of the custom Firefox process.
+
+The runtime relationship is:
+
+```text
+Custom Firefox
+    |
+    +-- AIAutomationService
+    |
+    +-- GARP server
+    |
+    +-- JSWindowActors
+    |
+    +-- provider adapters
+    |
+    +-- AI provider websites
+```
+
+The external AI runtime/GARP client connects to Firefox over the configured GARP transport.
+
+Provider websites do not receive or install the GARP component.
+
+---
+
+## 2.6 Firefox user profile
+
+A normal Firefox profile is still used at runtime.
+
+The profile contains Firefox runtime state such as:
+
+```text
+cookies
+login sessions
+provider authentication
+Firefox preferences
+GARP authentication replay state
+```
+
+The GARP source code itself is **not** installed into the Firefox profile.
+
+Do not copy the `.mjs` source files into a Firefox profile directory.
+
+The GARP source belongs in the Firefox source tree and is compiled into the custom Firefox build.
+
+---
+
+## 2.7 Out of scope
+
+The following are intentionally outside this repository.
+
+### GRISP semantic processing
+
+This implementation does not decide whether an AI result is a valid GRISP artifact.
+
+GRISP artifact semantics belong to the AI runtime/client layer.
+
+### AI quality evaluation
+
+This project does not judge:
+
+```text
+answer quality
+reasoning quality
+factual quality
+model intelligence
+```
+
+It provides the browser gateway through which the AI runtime can interact with a provider.
+
+### Provider accounts
+
+The repository does not create or manage:
+
+```text
+Google accounts
+OpenAI accounts
+Anthropic accounts
+Microsoft accounts
+xAI accounts
+Perplexity accounts
+DeepSeek accounts
+other provider accounts
+```
+
+The Firefox profile must already have whatever provider authentication is required.
+
+### Provider website stability
+
+Provider websites can change independently of this project.
+
+Changes to:
+
+```text
+DOM structure
+selectors
+accessibility tree
+contenteditable implementation
+button layout
+streaming behavior
+login flow
+```
+
+can require updates to the corresponding provider adapter.
+
+### GARP client implementation
+
+This repository provides the Firefox gateway side.
+
+It does not provide the external AI runtime/GARP client.
+
+### Production deployment infrastructure
+
+The repository does not define:
+
+```text
+service managers
+Windows services
+enterprise secret management
+remote deployment
+fleet management
+production monitoring infrastructure
+```
+
+The GARP shared secret must be provisioned by the deployment environment.
+
+---
+
+## 2.8 Security boundary
+
+Firefox chrome/parent code is part of the trusted browser-side GARP implementation.
+
+Provider websites are treated as external systems.
+
+Provider DOM observations therefore pass through the project's:
+
+```text
+validation
+evidence checks
+session fencing
+page-generation fencing
+actor fencing
+provider-context fencing
+```
+
+before they become authoritative GARP state.
+
+The implementation must not treat an arbitrary provider DOM response as inherently trustworthy.
+
+---
+
+# 3. Recommended Windows 11 architecture
+
+The recommended development layout uses a dedicated **50 GB fixed-size VHDX** for the Firefox source tree and Firefox build/object output.
+
+The VHDX is stored on the physical `G:` drive.
+
+The VHDX is mounted as `R:`.
+
+The recommended layout is:
+
+```text
+G:\
+├── FileDiskImages\
+│   └── FireFoxDevelopmentV1.vhdx
+│
+├── Tools\
+│   ├── MozillaBuild\
+│   ├── Rust\
+│   ├── nvm\
+│   └── ...
+│
+├── mozbuild\
+│   └── sccache\
+│
+└── Temp\
+```
+
+The VHDX is mounted by Windows as:
+
+```text
+R:
+```
+
+The Firefox development volume then contains:
+
+```text
+R:\
+├── firefox\
+│   ├── mach
+│   ├── mozconfig
+│   ├── browser\
+│   ├── dom\
+│   ├── toolkit\
+│   └── ...
+│
+└── firefox-obj\
+```
+
+The critical rule is:
+
+> **Firefox source and Firefox object/build output must remain on the same mounted volume.**
+
+For this project:
+
+```text
+R:\firefox
+R:\firefox-obj
+```
+
+are deliberately on the same VHDX.
+
+The VHDX itself resides physically on:
+
+```text
+G:\FileDiskImages\FireFoxDevelopmentV1.vhdx
+```
+
+---
+
+# 4. Create the Firefox development VHDX
+
+The project uses:
+
+```text
+VHDX
+50 GB
+Fixed size
+GPT
+NTFS
+4096-byte / 4 KB allocation unit
+Drive letter R:
+```
+
+The VHDX file is:
+
+```text
+G:\FileDiskImages\FireFoxDevelopmentV1.vhdx
+```
+
+## 4.1 Create the host directory
+
+Create:
+
+```text
+G:\FileDiskImages
+```
+
+The final VHDX path is:
+
+```text
+G:\FileDiskImages\FireFoxDevelopmentV1.vhdx
+```
+
+## 4.2 Open Disk Management
+
+Press:
+
+```text
+Win + X
+```
+
+and select:
+
+```text
+Disk Management
+```
+
+or run:
+
+```text
+diskmgmt.msc
+```
+
+## 4.3 Create the VHDX
+
+Select:
+
+```text
+Action
+    ->
+Create VHD
+```
+
+Use:
+
+```text
+Location:
+    G:\FileDiskImages\FireFoxDevelopmentV1.vhdx
+
+Virtual hard disk size:
+    50 GB
+
+Virtual hard disk format:
+    VHDX
+
+Virtual hard disk type:
+    Fixed size
+```
+
+## 4.4 Initialize as GPT
+
+When Windows asks for the partition style, select:
+
+```text
+GPT (GUID Partition Table)
+```
+
+Do not select:
+
+```text
+MBR
+```
+
+## 4.5 Create the NTFS volume
+
+Create a New Simple Volume.
+
+Use:
+
+```text
+Drive letter:
+    R:
+
+Filesystem:
+    NTFS
+
+Allocation unit size:
+    4096 bytes
+
+Volume label:
+    FirefoxDevelopmentV1
+```
+
+The completed relationship is:
+
+```text
+G:\FileDiskImages\FireFoxDevelopmentV1.vhdx
+                    |
+                    | mounted
+                    v
+                   R:\
+```
+
+---
+
+# 5. MozillaBuild installation
+
+Install MozillaBuild on:
+
+```text
+G:\Tools\MozillaBuild
+```
+
+Start it with:
+
+```text
+G:\Tools\MozillaBuild\start-shell.bat
+```
+
+For this project, Firefox build commands should be run from the MozillaBuild shell.
+
+MozillaBuild's startup script establishes its required environment.
+
+---
+
+# 6. Windows 11 environment variables
+
+The core environment variables are:
+
+```text
+MOZBUILD_STATE_PATH=G:\mozbuild
+
+MOZILLABUILD=G:\Tools\MozillaBuild
+
+SCCACHE_DIR=G:\mozbuild\sccache
+```
+
+Create:
+
+```text
+G:\mozbuild
+G:\mozbuild\sccache
+```
+
+as required.
+
+## Optional tool locations
+
+When these tools are user-managed outside Firefox bootstrap:
+
+```text
+CARGO_HOME=G:\Tools\Rust\Cargo
+
+RUSTUP_HOME=G:\Tools\Rust\Rustup
+
+NVM_HOME=G:\Tools\nvm
+
+NVM_SYMLINK=G:\Tools\nvmmodejs
+
+TEMP=G:\Temp
+
+TMP=G:\Temp
+```
+
+Optional:
+
+```text
+UV_CACHE_DIR=G:\Tools\uv-cache
+```
+
+Do not globally configure:
+
+```text
+MOZ_OBJDIR
+PYTHON
+```
+
+`MOZ_OBJDIR` belongs in the Firefox checkout's `mozconfig`.
+
+`PYTHON` should not be used to force an arbitrary Python installation into the Firefox build.
+
+---
+
+# 7. PATH and MozillaBuild
+
+Do not manually add:
+
+```text
+G:\Tools\MozillaBuild\bin
+```
+
+to the Windows PATH merely for Firefox builds.
+
+Start MozillaBuild with:
+
+```text
+G:\Tools\MozillaBuild\start-shell.bat
+```
+
+The startup script prepares the appropriate environment.
+
+Other user-managed tools may require PATH entries.
+
+For example:
+
+```text
+G:\Tools\Rust\Cargo\bin
+G:\Tools\nvmmodejs
+```
+
+may be placed in PATH if those tools are intentionally managed there.
+
+Do not replace the whole Windows PATH.
+
+Avoid unrelated Cygwin/MSYS installations taking precedence over MozillaBuild tools.
+
+Do not place quotation marks around individual PATH entries.
+
+Use:
+
+```text
+G:\Tools\Rust\Cargo\bin
+```
+
+not:
+
+```text
+"G:\Tools\Rust\Cargo\bin"
+```
+
+---
+
+# 8. Fresh Firefox checkout
+
+Start:
+
+```text
+G:\Tools\MozillaBuild\start-shell.bat
+```
+
+Then:
+
+```bash
+cd /r
+git clone https://github.com/mozilla-firefox/firefox.git firefox
+cd firefox
+```
+
+The source tree is:
+
+```text
+R:\firefox
+```
+
+Do not place the Firefox source on another volume.
+
+---
+
+# 9. Bootstrap Firefox
+
+From:
+
+```text
+R:\firefox
+```
+
+run:
+
+```bash
+./mach bootstrap
+```
+
+Follow the Firefox bootstrap prompts.
+
+The bootstrap process prepares the compiler and other dependencies required by the Firefox checkout.
+
+---
+
+# 10. Configure `mozconfig`
+
+Create:
+
+```text
+R:\firefox\mozconfig
+```
+
+Use:
+
+```bash
+mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/../firefox-obj
+ac_add_options --with-ccache=sccache
+```
+
+The resulting layout is:
+
+```text
+R:\firefox
+R:\firefox-obj
+```
+
+Both are on the same VHDX.
+
+---
+
+# 11. Install GARP into Firefox
+
+This is a **source-tree integration step**, not a normal Firefox add-on installation.
+
+Copy:
+
+```text
+browser/components/aistarter/
+```
+
+from this repository into:
+
+```text
+R:\firefox\browser\components\aistarter\
+```
+
+The package contains:
+
+```text
+aistarter\
+    AIAutomation.sys.mjs
+    moz.build
+
+    actors\
+    diagnostics\
+    garp\
+    providers\
+    requests\
+    sessions\
+```
+
+Do not flatten the directory structure.
+
+The GARP component becomes part of the Firefox source tree and is compiled into the resulting custom Firefox build.
+
+Do not attempt to install it through Firefox's Add-ons Manager.
+
+---
+
+# 12. Register the component
+
+Edit:
+
+```text
+R:\firefox\browser\components\moz.build
+```
+
+Add:
+
+```python
+'aistarter',
+```
+
+to the existing `DIRS` list.
+
+The supplied `aistarter\moz.build` handles its local subdirectories.
+
+Do not replace Firefox's complete `browser/components/moz.build`.
+
+---
+
+# 13. Start AIAutomationService
+
+Use:
+
+```text
+integration\BrowserGlue.integration.txt
+```
+
+from this repository as the integration reference.
+
+The intended startup sequence is:
+
+```text
+Firefox startup
+        |
+        +-- load AIAutomation.sys.mjs
+        |
+        +-- create exactly one AIAutomationService
+        |
+        +-- initialize/start GARP
+```
+
+Do not create multiple service instances.
+
+The exact BrowserGlue insertion point depends on the Firefox checkout.
+
+---
+
+# 14. Register the JSWindowActor
+
+Register:
+
+```text
+AIAutomation
+```
+
+with:
+
+```text
+AIAutomationParent.sys.mjs
+AIAutomationChild.sys.mjs
+```
+
+A typical registration is:
+
+```javascript
+AIAutomation: {
+  parent: {
+    esModuleURI: "resource:///modules/aistarter/actors/AIAutomationParent.sys.mjs",
+  },
+  child: {
+    esModuleURI: "resource:///modules/aistarter/actors/AIAutomationChild.sys.mjs",
+  },
+  allFrames: true,
+  safeForUntrustedWebProcess: true,
+},
+```
+
+The exact registration file depends on the Firefox revision.
+
+The actor name must match:
+
+```text
+AIAutomation
+```
+
+---
+
+# 15. Configure the GARP shared secret
+
+Set:
+
+```text
+GARP_SECRET
+```
+
+to a deployment-provisioned secret containing at least 32 raw bytes.
+
+For protocol testing:
+
+```text
+0123456789abcdef0123456789abcdef
+```
+
+From MozillaBuild:
+
+```bash
+export GARP_SECRET="0123456789abcdef0123456789abcdef"
+```
+
+Never commit production secrets to the source tree.
+
+---
+
+# 16. Build Firefox
+
+From:
+
+```text
+R:\firefox
+```
+
+run:
+
+```bash
+./mach build -j8
+```
+
+The object/build output should appear under:
+
+```text
+R:\firefox-obj
+```
+
+---
+
+# 17. Low-heat builds with `-j8`
+
+The recommended build command is:
+
+```bash
+./mach build -j8
+```
+
+The `-j` option controls build parallelism.
+
+`-j8` allows approximately eight normal build jobs to run concurrently.
+
+It does not guarantee that only eight operating-system threads will ever exist because individual compiler and helper processes may create additional threads.
+
+The purpose is to reduce sustained build load.
+
+Typical settings:
+
+```text
+-j2
+    coolest
+    slowest
+
+-j4
+    low load
+    slower
+
+-j8
+    moderate load
+    recommended
+
+-j16
+    higher throughput
+    higher sustained load
+```
+
+The project's recommended setting is:
+
+```text
+-j8
+```
+
+because it is a practical compromise between build time and sustained CPU heat/noise.
+
+---
+
+# 18. Run Firefox
+
+After a successful build:
+
+```bash
+export GARP_SECRET="0123456789abcdef0123456789abcdef"
+./mach run
+```
+
+Firefox will launch from the locally built object directory.
+
+The GARP service will be part of that custom Firefox build once the required source integration has been completed.
+
+---
+
+# 19. Test the GARP component
+
+The protocol-level test does not require the complete Firefox runtime.
+
+From the GARP repository:
+
+```bash
+node tests/Garp124Conformance.mjs
+```
+
+Expected:
+
+```text
+GARP/1.24 conformance unit vectors: PASS
+```
+
+For an end-to-end test, use a GARP client to connect to the Firefox gateway.
+
+The default listener is:
+
+```text
+127.0.0.1:9999
+```
+
+---
+
+# 20. Incremental development
+
+After modifying GARP source files:
+
+```bash
+cd /r/firefox
+./mach build -j8
+```
+
+Restart Firefox:
+
+```bash
+./mach run
+```
+
+Do not automatically delete the object directory after every change.
+
+If Firefox explicitly requires a clean build:
+
+```bash
+./mach clobber
+./mach build -j8
+```
+
+---
+
+# 21. Updating Firefox
+
+Before updating the checkout:
+
+```bash
+cd /r/firefox
+git status
+git diff
+```
+
+Preserve local GARP changes.
+
+Then:
+
+```bash
+git pull origin main
+```
+
+Rebuild:
+
+```bash
+./mach build -j8
+```
+
+Avoid destructive commands such as:
+
+```bash
+git reset --hard
+git clean -fdx
+```
+
+unless you deliberately intend to discard local work.
+
+---
+
+# 22. VHDX backup
+
+The Firefox source and Firefox object directory are contained in:
+
+```text
+G:\FileDiskImages\FireFoxDevelopmentV1.vhdx
+```
+
+When the VHDX is mounted as:
+
+```text
+R:
+```
+
+the corresponding directories are:
+
+```text
+R:\firefox
+R:\firefox-obj
+```
+
+Backing up the VHDX therefore captures the Firefox source and object/build tree contained inside it.
+
+The separate physical `G:` directories:
+
+```text
+G:\Tools\MozillaBuild
+G:\mozbuild
+G:\mozbuild\sccache
+```
+
+are outside the VHDX and need separate backup if they are important.
+
+---
+
+# 23. Troubleshooting
+
+## VHDX is not available
+
+Verify that:
+
+```text
+G:\FileDiskImages\FireFoxDevelopmentV1.vhdx
+```
+
+exists and is mounted as:
+
+```text
+R:
+```
+
+---
+
+## Firefox source is on the wrong drive
+
+The intended source location is:
+
+```text
+R:\firefox
+```
+
+The intended object location is:
+
+```text
+R:\firefox-obj
+```
+
+Both must be on the Firefox development VHDX.
+
+---
+
+## Object directory is on the wrong drive
+
+Check:
+
+```text
+R:\firefox\mozconfig
+```
+
+for:
+
+```bash
+mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/../firefox-obj
+```
+
+Also check that `MOZ_OBJDIR` is not globally defined in Windows.
+
+---
+
+## MozillaBuild commands are unavailable
+
+Start:
+
+```text
+G:\Tools\MozillaBuild\start-shell.bat
+```
+
+Do not rely on a normal Windows command prompt having MozillaBuild's internal tools configured.
+
+Do not add:
+
+```text
+G:\Tools\MozillaBuild\bin
+```
+
+to PATH merely to compensate.
+
+---
+
+## Python is unavailable
+
+Firefox uses Python during the build.
+
+First verify that MozillaBuild was started through:
+
+```text
+G:\Tools\MozillaBuild\start-shell.bat
+```
+
+Then:
+
+```bash
+which python
+```
+
+Do not force a different Python installation with a global `PYTHON` variable.
+
+---
+
+## sccache is unavailable
+
+Verify:
+
+```text
+SCCACHE_DIR=G:\mozbuild\sccache
+```
+
+Then:
+
+```bash
+which sccache
+```
+
+Also verify that `mozconfig` contains:
+
+```bash
+ac_add_options --with-ccache=sccache
+```
+
+---
+
+## Build is too hot
+
+Use:
+
+```bash
+./mach build -j4
+```
+
+or:
+
+```bash
+./mach build -j2
+```
+
+Lower `-j` values reduce parallelism at the cost of build speed.
+
+---
+
+## Build is unexpectedly slow
+
+Check that:
+
+```text
+R:\firefox
+R:\firefox-obj
+```
+
+are on the intended VHDX.
+
+Check:
+
+```text
+G:\mozbuild\sccache
+```
+
+is available.
+
+Also check antivirus activity on the Firefox source/object directories and build-tool directories.
+
+---
+
+## JavaScript actor cannot be found
+
+Verify:
+
+```text
+AIAutomationParent.sys.mjs
+AIAutomationChild.sys.mjs
+```
+
+are installed and that the actor is registered using the exact name:
+
+```text
+AIAutomation
+```
+
+---
+
+## GARP authentication fails
+
+Verify:
+
+```text
+GARP_SECRET
+```
+
+is set in the environment from which Firefox was launched.
+
+Also verify that the configured secret is at least 32 raw bytes and that the client is using the same deployment secret.
+
+---
+
+# 24. Recommended final environment
+
+The physical `G:` drive:
+
+```text
+G:\
+├── FileDiskImages\
+│   └── FireFoxDevelopmentV1.vhdx
+│
+├── Tools\
+│   ├── MozillaBuild\
+│   ├── Rust\
+│   └── nvm\
+│
+├── mozbuild\
+│   └── sccache\
+│
+└── Temp\
+```
+
+The mounted VHDX:
+
+```text
+R:\
+├── firefox\
+│   ├── mozconfig
+│   ├── mach
+│   ├── browser\
+│   ├── dom\
+│   └── ...
+│
+└── firefox-obj\
+```
+
+Environment:
+
+```text
+MOZBUILD_STATE_PATH=G:\mozbuild
+MOZILLABUILD=G:\Tools\MozillaBuild
+SCCACHE_DIR=G:\mozbuild\sccache
+```
+
+Optional:
+
+```text
+CARGO_HOME=G:\Tools\Rust\Cargo
+RUSTUP_HOME=G:\Tools\Rust\Rustup
+
+NVM_HOME=G:\Tools\nvm
+NVM_SYMLINK=G:\Tools\nvmmodejs
+
+TEMP=G:\Temp
+TMP=G:\Temp
+
+UV_CACHE_DIR=G:\Tools\uv-cache
+```
+
+Do not globally configure:
+
+```text
+MOZ_OBJDIR
+PYTHON
+```
+
+Firefox `mozconfig`:
+
+```bash
+mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/../firefox-obj
+ac_add_options --with-ccache=sccache
+```
+
+Start MozillaBuild:
+
+```text
+G:\Tools\MozillaBuild\start-shell.bat
+```
+
+Build:
+
+```bash
+cd /r/firefox
+./mach build -j8
+```
+
+Run:
+
+```bash
+export GARP_SECRET="0123456789abcdef0123456789abcdef"
+./mach run
+```
+
+---
+
+# 25. Official references
+
+Firefox Windows build:
+
+https://firefox-source-docs.mozilla.org/setup/windows_build.html
+
+Firefox build configuration:
+
+https://firefox-source-docs.mozilla.org/setup/configuring_build_options.html
+
+Firefox JSWindowActors:
+
+https://firefox-source-docs.mozilla.org/dom/ipc/jsactors.html
+
+Firefox sccache:
+
+https://firefox-source-docs.mozilla.org/build/buildsystem/sccache-dist.html
+
+Windows VHD/VHDX management:
+
+https://learn.microsoft.com/en-us/windows-server/storage/disk-management/manage-virtual-hard-disks
+
+Windows disk initialization:
+
+https://learn.microsoft.com/en-us/windows-server/storage/disk-management/initialize-new-disks
+
+---
+
+# 26. Final rules
+
+```text
+1. VHDX:
+   G:\FileDiskImages\FireFoxDevelopmentV1.vhdx
+
+2. Mount VHDX as:
+   R:
+
+3. Firefox source:
+   R:\firefox
+
+4. Firefox object/build output:
+   R:\firefox-obj
+
+5. Keep source and object output on the same volume.
+
+6. MozillaBuild:
+   G:\Tools\MozillaBuild
+
+7. Start MozillaBuild with:
+   G:\Tools\MozillaBuild\start-shell.bat
+
+8. Do not manually add:
+   G:\Tools\MozillaBuild\bin
+   to PATH merely for Firefox builds.
+
+9. Mozilla build state:
+   G:\mozbuild
+
+10. sccache:
+    G:\mozbuild\sccache
+
+11. Do not globally set:
+    MOZ_OBJDIR
+
+12. Do not globally set:
+    PYTHON
+
+13. Configure MOZ_OBJDIR locally in:
+    R:\firefox\mozconfig
+
+14. Use:
+    ./mach build -j8
+
+    for the normal low-heat build.
+
+15. GARP is integrated into the Firefox source tree.
+    It is not installed as a normal Firefox WebExtension.
+
+16. Keep production GARP secrets outside the source tree.
+
+17. The GARP/1.24 specification remains authoritative
+    for protocol behavior.
+```
+
+
+// File 2: README.md
+# GARP/1.24 Firefox Browser Gateway Integration
+
+This directory contains the GARP/1.24 browser gateway implementation for Firefox.
+
+## 1. What is included
+
+Runtime modules are split by responsibility:
+
+- `AIAutomation.sys.mjs` — connection listener and gateway service.
+- `garp/` — framing, envelope/schema validation, authentication, replay protection, errors, and protocol registry.
+- `sessions/` — session identity, state, tab binding, event sequencing, and arbitration.
+- `requests/` — prompt lifecycle, generation revisions, cancellation, continuation, terminal arbitration, and replay/subscription handling.
+- `providers/` — provider-independent adapter base plus provider-specific browser adapters.
+- `actors/` — JSWindowActor parent/child bridge between Firefox chrome code and provider pages.
+- `diagnostics/` — diagnostic payload helpers.
+
+The conformance test is in `tests/Garp124Conformance.mjs`.
+
+## 2. Build integration
+
+The JavaScript modules must be installed by `moz.build` files. Mozilla's build documentation requires a `moz.build` to live in the same directory as the files it installs; do not list files from a subdirectory in a parent directory. The supplied package therefore uses one root `moz.build` plus one `moz.build` in each module subdirectory.
+
+The runtime actor modules are installed from `actors/`, and the test module is installed with `TESTING_JS_MODULES` from `tests/`.
+
+## 3. JSWindowActor registration — REQUIRED
+
+Adding the actor files to `moz.build` is not sufficient. `AIAutomationParent.sys.mjs` and `AIAutomationChild.sys.mjs` must also be registered as a `JSWindowActor` pair.
+
+The service calls:
+
+```js
+const actor = windowGlobal.getActor("AIAutomation");
+```
+
+Therefore the registration name MUST be exactly `AIAutomation`.
+
+Firefox's JSWindowActor registration is normally placed in the Firefox Desktop `BrowserGlue.sys.mjs` `JSWINDOWACTORS` table, or in `ActorManagerParent.sys.mjs` when the actor belongs there. Use the registration location appropriate for the Firefox tree being built.
+
+Add an entry equivalent to:
+
+```js
+AIAutomation: {
+  parent: {
+    esModuleURI: "resource:///actors/AIAutomationParent.sys.mjs",
+  },
+  child: {
+    esModuleURI: "resource:///actors/AIAutomationChild.sys.mjs",
+  },
+  allFrames: false,
+},
+```
+
+`allFrames: false` is intentional: GARP sessions are bound to the top-level browser tab/document and the gateway does not need a separate actor instance for arbitrary subframes.
+
+Do not add `messages` entries for this JSWindowActor. The implementation uses `sendQuery()` / `receiveMessage()` directly through the actor pair.
+
+After registration, the parent side can obtain the actor with:
+
+```js
+const windowGlobal = browser?.browsingContext?.currentWindowGlobal;
+const actor = windowGlobal?.getActor("AIAutomation");
+```
+
+and the child side receives operations such as:
+
+```text
+GARP:PrepareSession
+GARP:InspectReady
+GARP:CaptureSnapshot
+GARP:InjectPrompt
+GARP:ObserveGeneration
+GARP:ContinueGeneration
+GARP:CancelGeneration
+GARP:InspectProviderState
+```
+
+## 4. Resource paths
+
+When the actor is registered with the paths above, Firefox resolves the modules as:
+
+```text
+resource:///actors/AIAutomationParent.sys.mjs
+resource:///actors/AIAutomationChild.sys.mjs
+```
+
+This depends on the `actors/moz.build` installation mapping. Do not change the registration URI to the source-tree path `browser/components/aistarter/actors/...`.
+
+## 5. Authentication configuration
+
+Set the deployment-provisioned `GARP_SECRET` environment variable before starting Firefox.
+
+The implementation interprets the configured value as raw UTF-8 bytes and requires at least 32 bytes. It does not generate a fallback deployment secret.
+
+The authentication replay state is persisted in the Firefox profile. If the replay store cannot be trusted or durably updated, the configured secret is disabled and must be rotated before authentication is resumed.
+
+## 6. Runtime startup
+
+The gateway listens on loopback TCP port `9999` by default.
+
+Expected startup sequence:
+
+```text
+HELLO
+HELLO_CHALLENGE
+HELLO_AUTH
+HELLO_ACK
+CAPABILITIES
+BROWSER_STATUS
+```
+
+Only after authentication has completed are application commands accepted.
+
+## 7. Provider adapters
+
+Provider-specific selectors and DOM behavior belong only in `providers/*.sys.mjs`.
+
+The provider registry advertises actual adapter capabilities through GARP `CAPABILITIES`. The provider-independent protocol layer must not contain provider-specific CSS selectors or DOM assumptions.
+
+## 8. Conformance test
+
+Run the JavaScript conformance test using the Node/test environment appropriate for the Firefox tree. The test covers the published GARP/1.24 authentication transcript and PING vectors, strict duplicate-key rejection, header checks, prompt opacity, and selected schema rules.
+
+The live Firefox integration still needs to be exercised separately because JSWindowActor registration, provider pages, and browser-process behavior cannot be fully validated by the standalone protocol vectors.
+
+## 9. Registration verification
+
+A successful build is not enough to prove actor registration is correct. Verify all of the following in a live Firefox run:
+
+1. Firefox starts without a JS module registration error.
+2. `windowGlobal.getActor("AIAutomation")` returns an actor.
+3. `PrepareSession` reaches `AIAutomationChild.sys.mjs`.
+4. A provider adapter can inspect the current document.
+5. A GARP client can complete the HELLO/HELLO_AUTH/HELLO_ACK exchange.
+6. `CAPABILITIES` and `BROWSER_STATUS` are emitted after `HELLO_ACK`.
+
+If `getActor("AIAutomation")` fails, check the `JSWINDOWACTORS` registration first, then the `actors/moz.build` installation.
+
+## 10. Security boundary
+
+GARP is a transport/browser-session protocol. It does not automate provider credential entry, approve generated artifacts, or define AI-quality or policy decisions.
+
+The browser gateway must remain fail-closed on malformed protocol input, stale actors, stale provider observations, ambiguous cancellation, and lost authentication replay state.
+
+
+// File 3: README_INSTALLATION.md
+# Firefox AI Automation + GARP/1.24
+
+This package is the Firefox-side implementation of the **GARP/1.24 Gateway AI Runtime Protocol** freeze candidate supplied with the implementation task.
+
+It replaces the earlier GARP/1.01 wire contract. Firefox remains the browser automation substrate and provider-specific DOM logic remains isolated in provider adapters.
+
+## Architecture
+
+```text
+GRISP / AI Runtime
+        |
+        | GARP/1.24 over localhost TCP
+        v
+Firefox AIAutomationService
+        |
+        +-- GarpConnection
+        +-- AIAutomationSessionManager
+        +-- GarpRequestManager
+        +-- ProviderRegistry
+        +-- GarpReplayStore
+        |
+        v
+AIAutomationParent / AIAutomationChild
+        |
+        +-- DeepSeekAdapter
+        +-- GeminiAdapter
+        +-- ChatGPTAdapter
+        +-- ClaudeAdapter
+        +-- GrokAdapter
+        +-- CopilotAdapter
+        +-- PerplexityAdapter
+        +-- InceptionAdapter
+        |
+        v
+AI provider website DOM
+```
+
+GARP is the transport and browser/session boundary. It does not decide GRISP artifact validity or semantic AI quality.
+
+## Providers
+
+The supplied provider adapters are retained from the input implementation and wrapped in the GARP/1.24 fencing/evidence model:
+
+`gemini`, `grok`, `chatgpt`, `copilot`, `claude`, `perplexity`, `deepseek`, `inception`.
+
+Provider DOM selectors are inherently maintenance-sensitive; no claim is made that the current provider websites still expose exactly these selectors.
+
+## GARP/1.24 changes implemented
+
+* Protocol identifier is `GARP/1.24` and semantic envelope version is `1.24`.
+* Wire version is exactly `0x00`.
+* Fixed binary header is exactly 48 bytes and all integers are big-endian.
+* JSON envelope is the 1.24 Common Envelope with mandatory `garp`, `type`, `request_id`, `session_id`, `timestamp`, `sequence`, and `payload`.
+* Envelope/header identities are cross-checked.
+* Duplicate JSON object members are rejected before JSON parsing semantics can choose first/last values.
+* Base objects are closed; `_extensions` is only permitted in `PROMPT.options`.
+* `uint64` JSON values use decimal strings and are represented internally with `BigInt`.
+* Handshake receive limits are 1 MiB until the receiver has validated peer CAPABILITIES; application receive/send limits then follow the peer's advertised `max_payload_bytes`.
+* Base message registry is replaced with the exact GARP/1.24 registry, plus optional `GET_EVENTS` extension code `0x0100`.
+* HELLO authentication uses 16-byte raw nonces, unpadded Base64URL, and the exact transcript construction from §16.6.
+* Authentication supports the required-feature `!` modifier and binds both offered and final feature sets into the HMAC transcript.
+* `GARP_SECRET` is deployment-provisioned and must provide at least 32 raw UTF-8 bytes; no startup fallback secret is generated.
+* Authentication replay state is persisted in the Firefox profile for at least 24 hours. Loss/corruption/persistence failure disables the configured credential context until secret rotation.
+* Handshake timeout is 10 seconds using a monotonic clock.
+* CAPABILITIES is emitted after HELLO_ACK, followed by the initial BROWSER_STATUS event.
+* PING receives a normal correlated RESPONSE. Unsolicited PONG is emitted only when `ext-pong` is negotiated.
+* BROWSER_STATUS tracks `active_tab_id` and is emitted only when its committed status changes, plus the required initial handshake emission.
+* Stable tab IDs are used; tab indexes are not identity.
+* Sessions have serialized per-session arbiter queues, stable session IDs, monotonic `page_generation`, and monotonic session event sequences.
+* Prompt states match the 1.24 lifecycle, including `CANCELLING` and `WAITING_CONTINUATION`.
+* Prompt admission reserves at most one active prompt per session.
+* Prompt timeout starts at acceptance commit and uses monotonic time.
+* INPUT_SUBMITTED is emitted only after positive provider submission verification.
+* GENERATION_STARTED establishes message identity at revision 0; accepted generation deltas use explicit APPEND/REPLACE revisions starting at 1.
+* Partial-result state is historical: once authoritative response content has been committed, later empty REPLACE snapshots cannot clear `partial`.
+* Completion, failure, cancellation, timeout, navigation drift, provider invalidation, continuation limit failures, and recovery failures converge through one terminal arbitration path; the first valid terminal candidate committed by the session arbiter wins.
+* Cancellation is fenced and requires positive provider cessation evidence.
+* In-flight continuation work is fenced by a continuation epoch and is discarded after accepted cancellation.
+* Page-generation and actor-instance fencing rejects stale browser results.
+* Provider-context results are additionally fenced by authoritative provider identity.
+* Recovery has a finite deadline and an explicit `RECOVERING -> FAILED` terminal transition on deadline expiry.
+* Event history is retained in complete committed Common Envelopes and supports atomic `GET_EVENTS` snapshots when `ext-replay-store` is negotiated.
+* Replay returns a contiguous sequence only and reports `EVENT_HISTORY_EXPIRED` rather than skipping unavailable history.
+
+## Firefox integration
+
+1. Copy `browser/components/aistarter` into the Firefox tree.
+2. Add `aistarter` to `browser/components/moz.build`.
+3. Add the module getter and single `AIAutomationService` startup call described in `integration/BrowserGlue.integration.txt`.
+4. Add the `AIAutomation` JSWindowActor entry from `integration/DesktopActorRegistry.integration.txt`.
+5. Launch Firefox with a deployment-provisioned `GARP_SECRET` containing at least 32 UTF-8 bytes.
+6. Build and run Firefox using the normal source-build flow.
+
+The supplied package intentionally does not modify a real Firefox checkout automatically because the integration locations are source-tree dependent.
+
+## Authentication test vector
+
+The package's test suite verifies the published GARP/1.20, 1.22 and 1.23 transcript anchors indirectly through the transcript construction used by the implementation, and verifies the computed GARP/1.24 proof values:
+
+```text
+client hex:
+e11893ab64943f5e603a9d5a96a21174c05433b42fe02319a9110c5d7e1e7d0b
+
+client Base64URL:
+4RiTq2SUP15gOp1alqIRdMBUM7Qv4CMZqREMXX4efQs
+
+server hex:
+88569356861b9ffa5be720821ce4e9014c9fcc56829175ca80b01ba4c5fa71f2
+
+server Base64URL:
+iFaTVoYbn_pb5yCCHOTpAUyfzFaCkXXKgLAbpMX6cfI
+```
+
+## PING vector
+
+The conformance test verifies the exact 167-byte JSON payload from §102 and the first 16 bytes of its binary header:
+
+```text
+47 41 52 50 00 00 00 30 00 00 00 A7 00 70 00 00
+```
+
+## Test
+
+The protocol-level tests require a Node.js runtime only; they do not require Firefox:
+
+```bash
+node tests/Garp124Conformance.mjs
+```
+
+Expected result:
+
+```text
+GARP/1.24 conformance unit vectors: PASS
+```
+
+## Validation status
+
+The package has been syntax-checked with `node --check` for every `.mjs` file and the protocol-level conformance test passes.
+
+A complete `./mach build` has **not** been run here because that requires a full Firefox source checkout and Mozilla build environment. Firefox integration should therefore be treated as source-level prepared but not as a completed full-browser build verification.
+
+
+// File 4: browser\components\aistarter\AIAutomation.sys.mjs
+import {GarpConnectionScopedTypes,GarpFeature,GARP_APPLICATION_LIMIT_DEFAULT,GARP_DEFAULT_RECOVERY_DEADLINE_MS,GARP_HANDSHAKE_TIMEOUT_MS,GARP_SEMANTIC_VERSION,GARP_PROTOCOL,GARP_WIRE_VERSION} from "./garp/GarpRegistry.sys.mjs";
+import {GarpConnection} from "./garp/GarpConnection.sys.mjs";
+import {GarpReplayStore} from "./garp/GarpReplayStore.sys.mjs";
+import {GarpError,GarpErrorCode} from "./garp/GarpErrors.sys.mjs";
+import {base64UrlDecode,base64UrlEncode,constantTimeEqualBytes,encodeTranscript,encodeTranscriptCore,hmacSha256,monotonicNow,sha256,sortedUtf8,textEncoder,uuid} from "./garp/GarpUtil.sys.mjs";
+import {validateMessagePayload,capabilitiesObject} from "./garp/GarpSchema.sys.mjs";
+import {AIAutomationSessionManager} from "./sessions/AIAutomationSessionManager.sys.mjs";
+import {GarpRequestManager} from "./requests/GarpRequestManager.sys.mjs";
+import {ProviderRegistry} from "./providers/ProviderRegistry.sys.mjs";
+const PORT=9999;
+function readSecret(){const v=Services.env.get("GARP_SECRET");if(!v)throw new GarpError(GarpErrorCode.AUTH_FAILED,"GARP_SECRET is required");const b=textEncoder.encode(v);if(b.length<32)throw new GarpError(GarpErrorCode.AUTH_FAILED,"GARP_SECRET must encode to at least 32 raw bytes");return b}
+export class AIAutomationService{
+ constructor(){this.serverSocket=null;this.connections=new Set();this.providerRegistry=new ProviderRegistry();this.sessionManager=new AIAutomationSessionManager(this,this.providerRegistry);this.requestManager=new GarpRequestManager(this,this.sessionManager);this.replayStore=new GarpReplayStore();this.serverName="GarpGateway";this.serverVersion="1.24.0";this.authSecret=null;this.authDisabled=false;this.capabilities=capabilitiesObject(this.providerRegistry);this.browserStatus=null;this.pruneTimer=null;this.statusTimer=null;this.initializing=false}
+ async initializeSecurityState(){this.authSecret=readSecret();await this.replayStore.load();if(!this.replayStore.replayStateAvailable){this.authDisabled=true;dump("GARP/1.24: replay state unavailable; secret disabled until rotation.\n")}}
+ init(){if(this.serverSocket||this.initializing)return;this.initializing=true;this.initializeSecurityState().then(()=>{this.serverSocket=Cc["@mozilla.org/network/server-socket;1"].createInstance(Ci.nsIServerSocket);try{this.serverSocket.init(PORT,true,-1);this.serverSocket.asyncListen(this);this.pruneTimer=setInterval(()=>this.requestManager.prune(Number(this.capabilities.limits.response_retention_ms)),60000);this.statusTimer=setInterval(()=>this.updateBrowserStatus(),500);this.updateBrowserStatus(true)}catch(e){this.serverSocket=null;Cu.reportError(`GARP startup failed: ${e}`)}finally{this.initializing=false}}).catch(e=>{this.initializing=false;Cu.reportError(`GARP security initialization failed: ${e}`)})}
+ shutdown(){try{clearInterval(this.pruneTimer);clearInterval(this.statusTimer)}catch(_){}for(const c of [...this.connections])c.close();this.connections.clear();for(const s of this.sessionManager.sessions.values())s.state="CLOSED";if(this.serverSocket){try{this.serverSocket.close()}catch(_){}this.serverSocket=null}}
+ onSocketAccepted(_s,t){this.connections.add(new GarpConnection(t,this))}
+ onStopListening(){this.serverSocket=null}
+ removeConnection(c){this.connections.delete(c);this.requestManager.unsubscribeConnection(c);for(const s of this.sessionManager.sessions.values()){s.subscribers.delete(c);if(s.ownerConnection===c)s.ownerConnection=null}}
+ getTopWindow(){const{BrowserWindowTracker}=ChromeUtils.importESModule("resource:///modules/BrowserWindowTracker.sys.mjs");return BrowserWindowTracker.getTopWindow()}
+ updateBrowserStatus(force=false){const w=this.getTopWindow(),tab=w?.gBrowser?.selectedTab,next={state:w?"READY":"FAILED",active_tab_id:tab?this.sessionManager.getStableTabId(tab):null},changed=!this.browserStatus||JSON.stringify(next)!==JSON.stringify(this.browserStatus);this.browserStatus=next;if(!force&&!changed)return;for(const c of this.connections)if(c.authenticated)c.send("BROWSER_STATUS",next,{request_id:null,session_id:null,sequence:null})}
+ browserStatusPayload(){this.updateBrowserStatus(false);return this.browserStatus||{state:"FAILED",active_tab_id:null}}
+ localFeatures(){return sortedUtf8(GarpFeature)}
+ negotiateFeatures(offered){const supported=new Set(GarpFeature),final=[];for(const raw of offered){const required=raw.startsWith("!"),name=required?raw.slice(1):raw;if(supported.has(name))final.push(required?`!${name}`:name);else if(required)throw new GarpError(GarpErrorCode.UNSUPPORTED_FEATURE,`Required feature unsupported: ${name}`)}return sortedUtf8(final)}
+ async handleGarpMessage(c,d){const t=d.type;if(t==="HELLO")return this.handleHello(c,d);if(t==="HELLO_AUTH")return this.handleHelloAuth(c,d);if(t==="CAPABILITIES"){if(!c.authenticated)throw new GarpError(GarpErrorCode.AUTH_REQUIRED,"Authentication required");validateMessagePayload("CAPABILITIES",d.message.payload);c.setPeerCapabilities(d.message.payload);return}if(t==="PONG"){if(!c.negotiatedFeatures.includes("ext-pong"))throw new GarpError(GarpErrorCode.UNSUPPORTED_FEATURE,"PONG extension not negotiated");return}if(!c.authenticated)throw new GarpError(GarpErrorCode.AUTH_REQUIRED,"Authentication required");switch(t){case"PING":return c.sendResponse(d.request_id,null,{success:true});case"GET_CAPABILITIES":return c.sendResponse(d.request_id,null,{success:true,...this.capabilities});case"LIST_TABS":return c.sendResponse(d.request_id,null,{success:true,tabs:this.sessionManager.listTabs()});case"OPEN_TAB":return c.sendResponse(d.request_id,null,{success:true,...this.sessionManager.openTab(d.message.payload.url)});case"CLOSE_TAB":return c.sendResponse(d.request_id,null,this.sessionManager.closeTab(d.message.payload.tab_id));case"SELECT_TAB":return c.sendResponse(d.request_id,null,this.sessionManager.selectTab(d.message.payload.tab_id));case"CREATE_SESSION":return this.handleCreateSession(c,d);case"ATTACH_SESSION":return this.handleAttachSession(c,d);case"DETACH_SESSION":return this.handleSessionCommand(c,d,"detach");case"CLOSE_SESSION":return this.handleSessionCommand(c,d,"close");case"RESET_SESSION":return this.handleSessionCommand(c,d,"reset");case"GET_SESSION":return this.handleGetSession(c,d);case"PROMPT":return this.handlePrompt(c,d);case"CANCEL_PROMPT":await this.requestManager.cancel(c,d.session_id,d.message.payload.prompt_request_id);return c.sendResponse(d.request_id,d.session_id,{success:true,command_state:"ACCEPTED"});case"GET_PROMPT_STATUS":{const r=this.requestManager.getForSession(d.session_id,d.message.payload.prompt_request_id);return c.sendResponse(d.request_id,d.session_id,r.snapshot())}case"GET_RESPONSE":{const r=this.requestManager.getForSession(d.session_id,d.message.payload.prompt_request_id);return c.sendResponse(d.request_id,d.session_id,this.requestManager.getResponse(r))}case"SUBSCRIBE_RESPONSE":this.requestManager.subscribe(d.message.payload.prompt_request_id,c);return c.sendResponse(d.request_id,d.session_id,{success:true});case"CONTINUE_PROMPT":await this.requestManager.continuePrompt(c,d.session_id,d.message.payload.prompt_request_id);return c.sendResponse(d.request_id,d.session_id,{success:true,command_state:"ACCEPTED"});case"GET_EVENTS":return this.handleGetEvents(c,d);default:throw new GarpError(GarpErrorCode.UNKNOWN_MESSAGE_TYPE,`Unsupported GARP message type: ${t}`)}}
+ async handleHello(c,d){if(this.authDisabled)throw new GarpError(GarpErrorCode.AUTH_FAILED,"Authentication disabled because replay state cannot be trusted");if(c.authState!=="NEW")throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE,"HELLO received in invalid state");const p=d.message.payload;c.clientName=p.client_name;c.clientVersion=p.client_version;c.clientNonce=base64UrlDecode(p.client_nonce,16);c.offeredFeatures=sortedUtf8(p.features);c.negotiatedFeatures=this.negotiateFeatures(p.features);c.serverNonce=crypto.getRandomValues(new Uint8Array(16));c.handshakeRequestId=d.request_id;c.authState="CHALLENGE_SENT";c.send("HELLO_CHALLENGE",{server_name:this.serverName,server_version:this.serverVersion,selected_version:GARP_SEMANTIC_VERSION,selected_wire_version:GARP_WIRE_VERSION,features:c.negotiatedFeatures,server_nonce:base64UrlEncode(c.serverNonce)},{request_id:d.request_id,session_id:null,sequence:null})}
+ async handleHelloAuth(c,d){if(c.authState!=="CHALLENGE_SENT"||d.request_id!==c.handshakeRequestId)throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE,"HELLO_AUTH outside active handshake");c.authState="AUTH_VERIFYING";const proof=base64UrlDecode(d.message.payload.client_proof,32);const transcript=encodeTranscript(`${GARP_PROTOCOL}/client-proof`,c.clientNonce,c.serverNonce,GARP_SEMANTIC_VERSION,GARP_WIRE_VERSION,c.offeredFeatures,c.negotiatedFeatures,c.clientName,c.clientVersion,this.serverName,this.serverVersion);const expected=await hmacSha256(this.authSecret,transcript);if(!constantTimeEqualBytes(expected,proof))throw new GarpError(GarpErrorCode.AUTH_FAILED,"Client authentication proof failed");const replayDigest=await sha256(encodeTranscriptCore(c.clientNonce,c.serverNonce,GARP_SEMANTIC_VERSION,GARP_WIRE_VERSION,c.offeredFeatures,c.negotiatedFeatures,c.clientName,c.clientVersion,this.serverName,this.serverVersion));const replayKey=[...replayDigest].map(b=>b.toString(16).padStart(2,"0")).join("");if(this.replayStore.has(replayKey))throw new GarpError(GarpErrorCode.AUTH_REPLAY,"Authentication transcript has already been used");await this.replayStore.remember(replayKey);const serverTranscript=encodeTranscript(`${GARP_PROTOCOL}/server-proof`,c.clientNonce,c.serverNonce,GARP_SEMANTIC_VERSION,GARP_WIRE_VERSION,c.offeredFeatures,c.negotiatedFeatures,c.clientName,c.clientVersion,this.serverName,this.serverVersion);const serverProof=await hmacSha256(this.authSecret,serverTranscript);c.authState="AUTHENTICATED_PENDING_ACK";c.send("HELLO_ACK",{server_proof:base64UrlEncode(serverProof),selected_version:GARP_SEMANTIC_VERSION,selected_wire_version:GARP_WIRE_VERSION,features:c.negotiatedFeatures},{request_id:d.request_id,session_id:null,sequence:null,isCommandResponse:true});c.authenticated=true;c.authState="AUTHENTICATED";c.send("CAPABILITIES",this.capabilities,{request_id:null,session_id:null,sequence:null});c.send("BROWSER_STATUS",this.browserStatusPayload(),{request_id:null,session_id:null,sequence:null})}
+ async handleCreateSession(c,d){const s=this.sessionManager.createSession(d.message.payload.provider,d.message.payload.tab_id??null);s.ownerConnection=c;s.subscribers.add(c);c.sendResponse(d.request_id,null,{success:true,session_id:s.sessionId,state:"PREPARING"});this.prepareSession(s).catch(e=>this.failSessionPreparation(s,e))}
+ async handleAttachSession(c,d){const s=this.sessionManager.attach(d.session_id,c);c.sendResponse(d.request_id,s.sessionId,{success:true,...s.snapshot(),state:s.state});if(s.state==="PREPARING"||s.state==="AUTH_REQUIRED"||s.state==="RATE_LIMITED")this.prepareSession(s).catch(e=>this.failSessionPreparation(s,e))}
+ async handleSessionCommand(c,d,op){const s=this.sessionManager.get(d.session_id);if(s.ownerConnection&&s.ownerConnection!==c)throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE,"Connection does not own session");let out;if(op==="detach")out=this.sessionManager.detach(d.session_id,c);else if(op==="close"){await this.requestManager.abortForSessionReset(s,"SESSION_CLOSE");out=this.sessionManager.closeSession(s.sessionId)}else{await this.requestManager.abortForSessionReset(s,"SESSION_RESET");out=this.sessionManager.resetSession(s.sessionId,c);this.commitSessionEvent(s,"SESSION_CHANGED",{changed:["page_generation"],page_generation:String(s.pageGeneration)})}return c.sendResponse(d.request_id,op==="close"||op==="detach"?d.session_id: d.session_id,{success:true,...(op==="reset"?{session_id:out.sessionId,state:out.state}:{})})}
+ async handleGetSession(c,d){const s=this.sessionManager.get(d.session_id);return c.sendResponse(d.request_id,d.session_id,{success:true,...s.snapshot()})}
+ async handlePrompt(c,d){const s=this.sessionManager.get(d.session_id);if(s.ownerConnection&&s.ownerConnection!==c)throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE,"Connection does not own session");const r=this.requestManager.startPrompt(c,s.sessionId,d.request_id,d.message.payload.prompt,d.message.payload.options);return c.sendResponse(d.request_id,s.sessionId,{success:true,command_state:"ACCEPTED",prompt_state:r.state})}
+ async prepareSession(s){const r=await this.callChild(s,"PrepareSession",{provider:s.provider,prompt_request_id:null});if(r.error)throw this.errorFromChild(r);if(r.provider&&r.provider!==s.provider)await this.invalidateProviderContext(s,r.provider);s.inputState=r.input_state||(r.input_ready?"READY":"NOT_READY");if(r.authenticated===false){s.state="AUTH_REQUIRED";await this.commitSessionEvent(s,"PROVIDER_AUTH_REQUIRED",{provider:s.provider,reason:"LOGIN_REQUIRED",page_generation:String(s.pageGeneration)})}else if(r.rate_limited){s.state="RATE_LIMITED";await this.commitSessionEvent(s,"PROVIDER_RATE_LIMITED",{provider:s.provider,retry_after_ms:"0",page_generation:String(s.pageGeneration)})}else if(r.input_ready){s.state="READY";await this.commitSessionEvent(s,"SESSION_READY",{provider:s.provider,tab_id:s.tabId,url:r.url||s.pageURL,page_generation:String(s.pageGeneration)})}else{s.state="PREPARING"}}
+ failSessionPreparation(s,e){if(s.state==="CLOSED")return;s.state=e?.code===GarpErrorCode.PROVIDER_AUTH_REQUIRED?"AUTH_REQUIRED":e?.code===GarpErrorCode.PROVIDER_RATE_LIMITED?"RATE_LIMITED":"FAILED";this.commitSessionEvent(s,"DIAGNOSTIC",{level:"ERROR",stage:"SESSION",code:e?.code||GarpErrorCode.PROVIDER_ERROR,message:e?.message||String(e),details:{},actor_instance:s.actorInstance||uuid()})}
+ errorFromChild(r){return new GarpError(r.code||GarpErrorCode.PROVIDER_ERROR,r.error||"Provider operation failed",{retryable:!!r.retryable})}
+ async recoverSession(s,reason){if(s.state==="CLOSED")return;s.state="RECOVERING";const deadline=monotonicNow()+Number(GARP_DEFAULT_RECOVERY_DEADLINE_MS);await this.commitSessionEvent(s,"RECOVERY_STATE",{state:"RECOVERING",reason,deadline_remaining_ms:String(GARP_DEFAULT_RECOVERY_DEADLINE_MS)});while(monotonicNow()<deadline&&s.state==="RECOVERING"){try{const r=await this.callChild(s,"InspectReady",{provider:s.provider,prompt_request_id:null});if(r.input_ready&&r.authenticated!==false&&!r.rate_limited){s.inputState="READY";s.state=s.activeRequestId?"BUSY":"READY";await this.commitSessionEvent(s,"RECOVERY_STATE",{state:"RECOVERED",reason,deadline_remaining_ms:"0"});if(s.state==="READY")await this.commitSessionEvent(s,"SESSION_READY",{provider:s.provider,tab_id:s.tabId,url:s.pageURL||"https://",page_generation:String(s.pageGeneration)});return}}catch(_){ }await new Promise(r=>setTimeout(r,250))}const id=s.activeRequestId;if(id){const r=this.requestManager.requests.get(id);if(r&&!r.terminalCommitted)await this.requestManager.failCandidate(r,GarpErrorCode.RECOVERY_FAILED,"Recovery deadline expired")}s.state="FAILED";await this.commitSessionEvent(s,"RECOVERY_STATE",{state:"FAILED",reason,deadline_remaining_ms:"0"})}
+ async invalidateProviderContext(s,newProvider){return s.enqueue("provider-invalidation",async()=>{const old=s.provider;s.provider=newProvider;s.authoritativeProvider=newProvider;const r=s.activeRequestId?this.requestManager.requests.get(s.activeRequestId):null;await this.commitSessionEvent(s,"PROVIDER_CHANGED",{previous_provider:old,provider:newProvider,page_generation:String(s.pageGeneration)});if(r&&!r.terminalCommitted){const ceased=await this.providerCessationProof(s,r);if(ceased)s.transition("PREPARING");else s.transition("RECOVERING");await this.requestManager.failCandidate(r,GarpErrorCode.PROVIDER_UNAVAILABLE,"Authoritative provider context was invalidated")}})}
+ async providerCessationProof(s,r){try{const x=await this.callChild(s,"InspectProviderState",{provider:s.provider,prompt_request_id:r.requestId,previous_message_count:r.lastMessageCount,previous_message_text:r.baselineMessageText});return x.streaming===false&&x.authoritative_cessation===true}catch(_){return false}}
+ async callChild(s,operation,payload={}){const tab=this.sessionManager.getTabForSession(s),browser=tab.linkedBrowser,wg=browser?.browsingContext?.currentWindowGlobal;if(!wg)throw new GarpError(GarpErrorCode.TAB_UNAVAILABLE,"Browser content not ready",{retryable:true});const actor=wg.getActor("AIAutomation");if(!actor)throw new GarpError(GarpErrorCode.STALE_ACTOR,"AIAutomation actor unavailable",{retryable:true});if(s.actorObject&&s.actorObject!==actor){s.incrementPageGeneration(browser.currentURI.spec);await this.commitSessionEvent(s,"NAVIGATION",{page_generation:String(s.pageGeneration),url:browser.currentURI.spec})}else if(s.pageURL&&s.pageURL!==browser.currentURI.spec){s.incrementPageGeneration(browser.currentURI.spec);await this.commitSessionEvent(s,"NAVIGATION_DRIFT",{page_generation:String(s.pageGeneration),reason:"UNEXPECTED_URL"});if(s.activeRequestId)throw new GarpError(GarpErrorCode.NAVIGATION_DRIFT,"URL changed during active prompt",{reason:"UNEXPECTED_URL"})}s.actorObject=actor;if(!s.actorInstance)s.actorInstance=uuid();s.pageURL=browser.currentURI.spec;const fence={session_id:s.sessionId,page_generation:String(s.pageGeneration),provider:payload.provider??null,parent_actor_instance:s.actorInstance,prompt_request_id:payload.prompt_request_id??null};const result=await actor.sendQuery(`GARP:${operation}`,{...payload,...fence,actor_instance:s.actorInstance});if(s.actorObject!==actor||s.pageGeneration!==BigInt(fence.page_generation))throw new GarpError(GarpErrorCode.STALE_ACTOR,"Stale actor result");if(!result||typeof result!=="object")throw new GarpError(GarpErrorCode.PROVIDER_ERROR,"Invalid child result");if(result.fencing?.session_id&&result.fencing.session_id!==s.sessionId)throw new GarpError(GarpErrorCode.STALE_ACTOR,"Session fence mismatch");if(result.fencing?.page_generation!==null&&result.fencing?.page_generation!==undefined&&BigInt(result.fencing.page_generation)!==s.pageGeneration)throw new GarpError(GarpErrorCode.STALE_ACTOR,"Page generation fence mismatch");if(result.fencing?.child_actor_instance&&result.fencing.child_actor_instance!==actor.actorInstance)throw new GarpError(GarpErrorCode.STALE_ACTOR,"Child actor identity mismatch");if(result.fencing?.provider&&payload.provider&&result.fencing.provider!==s.provider)throw new GarpError(GarpErrorCode.STALE_ACTOR,"Provider fence mismatch");return result}
+ async handleGetEvents(c,d){if(!c.negotiatedFeatures.includes("ext-replay-store"))throw new GarpError(GarpErrorCode.UNSUPPORTED_FEATURE,"ext-replay-store not negotiated");const s=this.sessionManager.get(d.session_id),from=BigInt(d.message.payload.from_sequence),max=d.message.payload.max_events;const snapshot=structuredClone(s.eventHistory),last=s.lastSequence();if(from>last+1n)throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,"from_sequence beyond current sequence plus one");if(from<s.oldestSequence())throw new GarpError(GarpErrorCode.EVENT_HISTORY_EXPIRED,"Requested event history expired");const events=snapshot.filter(e=>BigInt(e.sequence)>=from&&BigInt(e.sequence)<=last).slice(0,max);const next=events.length?BigInt(events[events.length-1].sequence)+1n:from;const complete=events.length?BigInt(events[events.length-1].sequence)===last:from===last+1n;return c.sendResponse(d.request_id,s.sessionId,{success:true,events,complete,next_sequence:String(next)})}
+ commitSessionEvent(s,type,payload,{broadcast=true}={}){const envelope={garp:GARP_SEMANTIC_VERSION,type,request_id:null,session_id:s.sessionId,timestamp:new Date().toISOString(),sequence:null,payload};const committed=s.commitEvent(envelope);if(broadcast)for(const c of s.subscribers)if(c.authenticated)c.sendEnvelope(committed,false);return committed}
+}
+
+
+// File 5: browser\components\aistarter\actors\AIAutomationChild.sys.mjs
+import {ProviderRegistry} from "../providers/ProviderRegistry.sys.mjs";
+const providers=new ProviderRegistry();
+export class AIAutomationChild extends JSWindowActorChild{
+ constructor(){super();this.actorInstance=crypto.randomUUID();this.nodeMessageIds=new WeakMap();this.cancelContexts=new Map();this.lastInjectedPrompt=""}
+ fence(data){const f=data||{};return{session_id:f.session_id??null,provider:f.provider??null,page_generation:f.page_generation??null,prompt_request_id:f.prompt_request_id??null,parent_actor_instance:f.parent_actor_instance??null,child_actor_instance:this.actorInstance}}
+ async receiveMessage(message){const data=message.data||{};try{if(data.parent_actor_instance&&data.parent_actor_instance!==data.actor_instance&&data.actor_instance&&data.actor_instance!==this.actorInstance){return{error:"STALE_ACTOR",code:"STALE_ACTOR",fencing:this.fence(data)}};let result;switch(message.name){case"GARP:PrepareSession":result=this.prepareSession(data);break;case"GARP:InspectReady":result=this.inspectReady(data);break;case"GARP:CaptureSnapshot":result=this.captureSnapshot(data);break;case"GARP:InjectPrompt":result=await this.injectPrompt(data);break;case"GARP:ObserveGeneration":result=this.observeGeneration(data);break;case"GARP:ContinueGeneration":result=await this.continueGeneration(data);break;case"GARP:CancelGeneration":result=this.cancelGeneration(data);break;case"GARP:InspectProviderState":result=this.inspectProviderState(data);break;default:result={error:`Unknown child operation: ${message.name}`,code:"UNKNOWN_MESSAGE_TYPE"}};return{...result,fencing:this.fence(data)}}catch(e){return{error:e?.message||String(e),code:e?.code||"PROVIDER_ERROR",details:e?.details,fencing:this.fence(data)}}}
+ adapter(name){const a=providers.get(name);if(!a)throw Object.assign(new Error(`Provider unavailable: ${name}`),{code:"PROVIDER_UNAVAILABLE"});return a}
+ prepareSession(d){const a=this.adapter(d.provider),i=a.inspect(this.document);return{provider:a.name,adapter_version:a.adapter_version,selector_strategy_version:a.selector_strategy_version,supported_features:[...a.supported_features],input_strategies:a.inputStrategies(this.document),...i,url:this.document.location?.href||""}}
+ inspectReady(d){const a=this.adapter(d.provider),i=a.inspect(this.document);return{state:i.authenticated===false?"AUTH_REQUIRED":i.rate_limited?"RATE_LIMITED":i.input_ready?"READY":"NOT_READY",...i}}
+ nodes(a){return Array.from(a.responseNodes(this.document)||[]).filter(n=>n&&typeof n.textContent==="string")}
+ idForNode(n){let id=this.nodeMessageIds.get(n);if(!id){id=crypto.randomUUID();this.nodeMessageIds.set(n,id)}return id}
+ captureSnapshot(d){const a=this.adapter(d.provider),ns=this.nodes(a),messages=ns.map(n=>({message_id:this.idForNode(n),text:String(n.textContent||"")}));return{provider:a.name,url:this.document.location?.href||"",input_ready:!!a.input(this.document),authenticated:a.isAuthenticated(this.document),rate_limited:a.isRateLimited(this.document),message_count:ns.length,messages,last_message_count:ns.length,last_message_text:messages.length?messages[messages.length-1].text:""}}
+ async injectPrompt(d){const a=this.adapter(d.provider),input=a.input(this.document);if(!input)return{error:"Input not ready",code:"INPUT_VERIFICATION_FAILED",state:"PREPARING"};if(a.isAuthenticated(this.document)===false)return{error:"Provider authentication required",code:"PROVIDER_AUTH_REQUIRED",state:"AUTH_REQUIRED"};if(a.isRateLimited(this.document))return{error:"Provider rate limit detected",code:"PROVIDER_RATE_LIMITED",state:"RATE_LIMITED"};this.lastInjectedPrompt=String(d.prompt??"");if(!this.lastInjectedPrompt)return{error:"Prompt is empty",code:"INVALID_ARGUMENT",state:"FAILED"};const injected=await a.inject(input,this.lastInjectedPrompt,{forceFocus:!!d.forceFocus});if(injected?.error)return injected;const submit=await a.submitVerified(input,this.document,{simulateEnter:!!d.simulateEnter});if(submit?.error)return submit;return{...injected,...submit,provider_submission_verified:submit.provider_submission_verified===true,strategy:submit.strategy||"provider_native_send"}}
+ continuationButton(a){return a.findContinueButton(this.document)}
+ observeGeneration(d){const a=this.adapter(d.provider),i=a.inspect(this.document),ns=this.nodes(a),messages=ns.map(n=>({message_id:this.idForNode(n),text:String(n.textContent||"")}));const last=messages.length?messages[messages.length-1].text:"",button=this.continuationButton(a);if(i.authenticated===false)return{error:"Provider authentication required",code:"PROVIDER_AUTH_REQUIRED",state:"AUTH_REQUIRED"};if(i.rate_limited)return{error:"Provider rate limit detected",code:"PROVIDER_RATE_LIMITED",state:"RATE_LIMITED"};const previousCount=Number(d.previous_message_count||0),previousText=String(d.previous_message_text||"");const changed=messages.length>previousCount||last!==previousText;return{provider:a.name,messages,text:last,done:!i.streaming&&!button&&changed,continuation_required:!!button,continuation_supported:a.supportsContinuation(this.document),continuation_available:!!button,continuation_reason:button?"provider_length_limit":null,message_count:messages.length,message_changed:changed,authoritative_generation_started:changed,authoritative_completion:!i.streaming&&changed,provider_state:i.provider_state,streaming:i.streaming,page_url:this.document.location?.href||""}}
+ async continueGeneration(d){const a=this.adapter(d.provider);if(!a.supportsContinuation(this.document))return{error:"Continuation unavailable",code:"CONTINUATION_NOT_AVAILABLE"};const b=this.continuationButton(a);if(!b)return{error:"Continuation button not found",code:"CONTINUATION_NOT_AVAILABLE"};b.focus();b.click();const verified=await a.verifyContinuationSubmission(this.document);return{provider_submission_verified:verified,strategy:"provider_native_send"}}
+ cancelGeneration(d){const a=this.adapter(d.provider),stopped=a.cancel(this.document);const pid=d.prompt_request_id||"__session__";const ctx=this.cancelContexts.get(pid)||{};ctx.issuedAt=Date.now();ctx.epoch=d.provider_operation_epoch??ctx.epoch??0;this.cancelContexts.set(pid,ctx);return{cancel_requested:stopped,cancel_verified:false,state:stopped?"CANCEL_REQUESTED":"CANCEL_UNAVAILABLE"}}
+ inspectProviderState(d){const a=this.adapter(d.provider),i=a.inspect(this.document),pid=d.prompt_request_id||"__session__",ctx=this.cancelContexts.get(pid);return{...i,authoritative_cessation:!!ctx&&!i.streaming,authoritative_completion:!i.streaming&&i.message_count>Number(d.previous_message_count||0)}}
+}
+
+
+// File 6: browser\components\aistarter\actors\AIAutomationParent.sys.mjs
+export class AIAutomationParent extends JSWindowActorParent {
+  receiveMessage(_message) {}
+}
+
+
+// File 7: browser\components\aistarter\actors\moz.build
+EXTRA_JS_MODULES += [
+    'AIAutomationChild.sys.mjs',
+    'AIAutomationParent.sys.mjs',
+]
+
+
+// File 8: browser\components\aistarter\diagnostics\AIAutomationDiagnostics.sys.mjs
+export class AIAutomationDiagnostics {
+  static providerState(provider, state, details = {}, actorInstance = crypto.randomUUID()) {
+    return {
+      provider,
+      state,
+      timestamp: new Date().toISOString(),
+      details,
+      actor_instance: actorInstance,
+    };
+  }
+
+  static error(provider, stage, code, message, details = {}, actorInstance = crypto.randomUUID()) {
+    return {
+      provider,
+      stage,
+      code,
+      message,
+      details,
+      timestamp: new Date().toISOString(),
+      actor_instance: actorInstance,
+    };
+  }
+}
+
+
+// File 9: browser\components\aistarter\diagnostics\moz.build
+EXTRA_JS_MODULES += [
+    'AIAutomationDiagnostics.sys.mjs',
+]
+
+
+// File 10: browser\components\aistarter\garp\GarpAuth.sys.mjs
+import { GarpError, GarpErrorCode } from "./GarpErrors.sys.mjs";
+import { GARP_SEMANTIC_VERSION, GARP_WIRE_VERSION } from "./GarpRegistry.sys.mjs";
+import { base64UrlDecode, base64UrlEncode, constantTimeEqualBytes, encodeTranscript, sha256, hmacSha256, sortedUtf8 } from "./GarpUtil.sys.mjs";
+const FEATURE_RE=/^!?[a-z0-9][a-z0-9._-]{0,127}$/;
+export function validateAndCanonicaliseFeatures(list){if(!Array.isArray(list))throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,"features must be an array");const seen=new Set();const out=[];for(const raw of list){if(typeof raw!=="string"||!FEATURE_RE.test(raw))throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,"invalid feature token");const required=raw.startsWith("!");const canonical=required?raw.slice(1):raw;if(seen.has(canonical))throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,`duplicate feature: ${canonical}`);seen.add(canonical);out.push({raw,canonical,required});}const sorted=out.slice().sort((a,b)=>{const aa=new TextEncoder().encode(a.raw),bb=new TextEncoder().encode(b.raw);for(let i=0;i<Math.min(aa.length,bb.length);i++)if(aa[i]!==bb[i])return aa[i]-bb[i];return aa.length-bb.length;});for(let i=0;i<out.length;i++)if(out[i].raw!==sorted[i].raw)throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,"features must be UTF-8 byte sorted");return out;}
+export function negotiateFeatures(offered,supported){const set=new Set(supported);const out=[];for(const f of offered){if(set.has(f.canonical))out.push(f.required?`!${f.canonical}`:f.canonical);else if(f.required)throw new GarpError(GarpErrorCode.UNSUPPORTED_FEATURE,`Required feature unsupported: ${f.canonical}`);}return sortedUtf8(out);}
+export function buildTranscript(args){return encodeTranscript(args.domain,args.clientNonceBytes,args.serverNonceBytes,args.selectedSemanticVersion,args.selectedWireVersion,args.offeredFeatures,args.finalFeatures,args.clientName,args.clientVersion,args.serverName,args.serverVersion);}
+export async function proof(secret, transcript){return hmacSha256(secret,transcript);}
+export function decodeNonce(value){return base64UrlDecode(value,16);}
+export function encodeNonce(bytes){return base64UrlEncode(bytes);}
+export async function transcriptReplayKey(args){return sha256(buildTranscript({...args,domain:""}));}
+export function requireExactVersion(version,wire){if(version!==GARP_SEMANTIC_VERSION)throw new GarpError(GarpErrorCode.UNSUPPORTED_VERSION,"Unsupported semantic version");if(wire!==GARP_WIRE_VERSION)throw new GarpError(GarpErrorCode.UNSUPPORTED_WIRE_VERSION,"Unsupported wire version");}
+export function verifyProof(expected,presented){if(!constantTimeEqualBytes(expected,presented))throw new GarpError(GarpErrorCode.AUTH_FAILED,"Authentication proof failed");}
+
+
+// File 11: browser\components\aistarter\garp\GarpConnection.sys.mjs
+import {encodeGarpEnvelope,decodeGarpFrame,peekHeader} from "./GarpFrame.sys.mjs";
+import {GARP_HANDSHAKE_LIMIT,GARP_HANDSHAKE_TIMEOUT_MS,GARP_MAX_OUTSTANDING_REQUESTS} from "./GarpRegistry.sys.mjs";
+import {GarpError,GarpErrorCode} from "./GarpErrors.sys.mjs";
+import {monotonicNow} from "./GarpUtil.sys.mjs";
+const COMMANDS=new Set(["HELLO","HELLO_AUTH","LIST_TABS","OPEN_TAB","CLOSE_TAB","SELECT_TAB","GET_CAPABILITIES","CREATE_SESSION","ATTACH_SESSION","DETACH_SESSION","CLOSE_SESSION","RESET_SESSION","GET_SESSION","PROMPT","CANCEL_PROMPT","GET_PROMPT_STATUS","GET_RESPONSE","SUBSCRIBE_RESPONSE","CONTINUE_PROMPT","GET_EVENTS","PING"]);
+export class GarpConnection{
+ constructor(transport,service){this.transport=transport;this.service=service;this.outStream=transport.openOutputStream(0,0,0);this.inStream=transport.openInputStream(0,0,0);this.buffer=new Uint8Array(0);this.closed=false;this.authenticated=false;this.authState="NEW";this.peerCapabilitiesValidated=false;this.peerCapabilities=null;this.clientName=null;this.clientVersion=null;this.clientNonce=null;this.serverNonce=null;this.offeredFeatures=[];this.negotiatedFeatures=[];this.handshakeRequestId=null;this.outstanding=new Map();this.completedResponses=new Map();this.seenRequestIds=new Map();this.lastOutboundProtocolTime=monotonicNow();this.lastInboundAuthenticatedTime=monotonicNow();this.handshakeDeadline=monotonicNow()+GARP_HANDSHAKE_TIMEOUT_MS;this.dispatchQueue=Promise.resolve();this.pump=Cc["@mozilla.org/network/input-stream-pump;1"].createInstance(Ci.nsIInputStreamPump);this.pump.init(this.inStream,0,0,false);this.pump.asyncRead(this);this.timer=setInterval(()=>this.tick(),250)}
+ currentInboundLimit(){return this.peerCapabilitiesValidated?Math.min(this.peerCapabilities?.limits?.max_payload_bytes??GARP_HANDSHAKE_LIMIT,0xffffffff):GARP_HANDSHAKE_LIMIT}
+ tick(){if(this.closed)return;const now=monotonicNow();if(!this.authenticated&&now>=this.handshakeDeadline){this.fail(new GarpError(GarpErrorCode.HANDSHAKE_TIMEOUT,"GARP handshake timeout"));return;}for(const [id,e] of this.completedResponses){if(now-e.committedAt>Number(this.service.capabilities.limits.response_retention_ms))this.completedResponses.delete(id)}if(this.authenticated&&this.negotiatedFeatures.includes("ext-pong")){const k=this.service.capabilities.keepalive;if(k.enabled&&now-this.lastOutboundProtocolTime>=Number(k.interval_ms))this.send("PONG",{},{request_id:null,session_id:null,sequence:null});if(now-this.lastInboundAuthenticatedTime>=Number(k.idle_timeout_ms))this.close()}}
+ onStartRequest(){}
+ onDataAvailable(_request,stream,_offset,count){if(this.closed)return;const b=Cc["@mozilla.org/binaryinputstream;1"].createInstance(Ci.nsIBinaryInputStream);b.setInputStream(stream);const bytes=new Uint8Array(b.readByteArray(count));this.buffer=this.merge(this.buffer,bytes);this.processFrames()}
+ merge(a,b){const c=new Uint8Array(a.length+b.length);c.set(a);c.set(b,a.length);return c}
+ onStopRequest(){this.close()}
+ processFrames(){while(!this.closed){if(this.buffer.length<48)return;const h=peekHeader(this.buffer);if(!h)return;if(this.buffer[0]!==71||this.buffer[1]!==65||this.buffer[2]!==82||this.buffer[3]!==80){this.fail(new GarpError(GarpErrorCode.PROTOCOL_ERROR,"Invalid GARP magic"));return}if(h.wireVersion!==0){this.fail(new GarpError(GarpErrorCode.UNSUPPORTED_WIRE_VERSION,"Unsupported wire version"));return}if(h.headerLength!==48){this.fail(new GarpError(GarpErrorCode.INVALID_ARGUMENT,"Header length must be 48"));return}const limit=this.currentInboundLimit();if(h.payloadLength>limit){this.fail(new GarpError(GarpErrorCode.FRAME_TOO_LARGE,"Frame payload exceeds receive limit"));return}const length=48+h.payloadLength;if(this.buffer.length<length)return;const frame=this.buffer.slice(0,length);this.buffer=this.buffer.slice(length);let decoded;try{decoded=decodeGarpFrame(frame)}catch(e){this.fail(e);return}this.dispatchQueue=this.dispatchQueue.then(()=>this.dispatchDecoded(decoded)).catch(e=>this.handleDispatchError(e,decoded))}}
+ dispatchDecoded(decoded){const type=decoded.type; if(type==="CAPABILITIES"){if(!this.authenticated)throw new GarpError(GarpErrorCode.AUTH_REQUIRED,"Authentication required");this.service.handleGarpMessage(this,decoded);return;}if(type==="PONG") {if(!this.authenticated)throw new GarpError(GarpErrorCode.AUTH_REQUIRED,"Authentication required");this.lastInboundAuthenticatedTime=monotonicNow();return;}if(this.authenticated)this.lastInboundAuthenticatedTime=monotonicNow();if(type==="HELLO"){this.admitRequest(decoded.request_id,type,decoded.message);return this.service.handleGarpMessage(this,decoded);}if(type==="HELLO_AUTH"){if(decoded.request_id!==this.handshakeRequestId||!this.outstanding.has(decoded.request_id))throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE,"HELLO_AUTH does not match HELLO");return this.service.handleGarpMessage(this,decoded);}if(COMMANDS.has(type)){if(!this.authenticated)throw new GarpError(GarpErrorCode.AUTH_REQUIRED,"Authentication required");if(!this.admitRequest(decoded.request_id,type,decoded.message))return;}return this.service.handleGarpMessage(this,decoded)}
+ semanticFingerprint(message){const c=structuredClone(message);delete c.timestamp;return JSON.stringify(c)}
+ admitRequest(id,type,message){if(!id)throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,"Command request_id must be non-nil");const prior=this.completedResponses.get(id),seen=this.seenRequestIds.get(id);if(this.outstanding.has(id)||prior||seen){if(prior&&prior.fingerprint===this.semanticFingerprint(message)){this.sendEnvelope(prior.envelope,false);return false}throw new GarpError(GarpErrorCode.DUPLICATE_REQUEST,"Duplicate request_id")}if(this.outstanding.size>=GARP_MAX_OUTSTANDING_REQUESTS)throw new GarpError(GarpErrorCode.OUTSTANDING_REQUEST_LIMIT,"Maximum outstanding requests reached");const fingerprint=this.semanticFingerprint(message);this.seenRequestIds.set(id,{type,fingerprint,seenAt:monotonicNow()});this.outstanding.set(id,{type,fingerprint,acceptedAt:monotonicNow()});return true}
+ commitRequestResponse(id,envelope){if(!id)return;const p=this.outstanding.get(id),s=this.seenRequestIds.get(id);this.outstanding.delete(id);this.completedResponses.set(id,{fingerprint:p?.fingerprint||s?.fingerprint||null,envelope:structuredClone(envelope),committedAt:monotonicNow()})}
+ send(type,payload={},options={}){if(this.closed)return false;const envelope={garp:"1.24",type:typeof type==="number"?String(type):String(type).toUpperCase(),request_id:options.request_id??null,session_id:options.session_id??null,timestamp:options.timestamp||new Date().toISOString(),sequence:options.sequence??null,payload};try{return this.sendEnvelope(envelope,options.isCommandResponse===true)}catch(e){this.fail(e);return false}}
+ sendEnvelope(envelope,isCommandResponse=false){if(this.closed)return false;const limit=this.peerCapabilitiesValidated?Math.min(this.peerCapabilities?.limits?.max_payload_bytes??GARP_HANDSHAKE_LIMIT,0xffffffff):GARP_HANDSHAKE_LIMIT;const frame=encodeGarpEnvelope(envelope,{enforceMaxPayload:limit});if(isCommandResponse&&envelope.request_id)this.commitRequestResponse(envelope.request_id,envelope);const out=Cc["@mozilla.org/binaryoutputstream;1"].createInstance(Ci.nsIBinaryOutputStream);out.setOutputStream(this.outStream);out.writeByteArray(frame,frame.length);this.lastOutboundProtocolTime=monotonicNow();return true}
+ setPeerCapabilities(payload){this.peerCapabilities=structuredClone(payload);this.peerCapabilitiesValidated=true}
+ sendResponse(id,sid,payload){return this.send("RESPONSE",payload,{request_id:id,session_id:sid,sequence:null,isCommandResponse:true})}
+ sendError(error,requestId=null,sessionId=null,commandCorrelated=false){const payload={code:error?.code||GarpErrorCode.PROVIDER_ERROR,message:error?.message||String(error)};if(error?.details)payload.details=error.details;return this.send("ERROR",payload,{request_id:commandCorrelated?requestId:null,session_id:commandCorrelated?sessionId:null,sequence:null,isCommandResponse:commandCorrelated})}
+ handleDispatchError(error,decoded){this.lastError=error;const correlated=!!decoded?.request_id&&this.outstanding.has(decoded.request_id);this.sendError(error,correlated?decoded.request_id:null,correlated?decoded.session_id:null,correlated);if(!this.authenticated||[GarpErrorCode.UNSUPPORTED_WIRE_VERSION,GarpErrorCode.PROTOCOL_ERROR].includes(error?.code))this.close()}
+ fail(error){try{this.sendError(error,null,null,false)}catch(_){}this.close()}
+ close(){if(this.closed)return;this.closed=true;try{clearInterval(this.timer)}catch(_){}try{this.pump.cancel(0x804B0002)}catch(_){}try{this.inStream.close()}catch(_){}try{this.outStream.close()}catch(_){}this.service.removeConnection(this)}
+}
+
+
+// File 12: browser\components\aistarter\garp\GarpErrors.sys.mjs
+export class GarpError extends Error {
+  constructor(code, message, options = {}) {
+    super(String(message || code));
+    this.name = "GarpError";
+    this.code = code;
+    this.retryable = !!options.retryable;
+    this.state = options.state ?? "ERROR";
+    this.provider = options.provider ?? null;
+    this.details = options.details ?? null;
+    this.requestId = options.requestId ?? null;
+    this.sessionId = options.sessionId ?? null;
+    this.reason = options.reason ?? null;
+  }
+}
+
+export const GarpErrorCode = Object.freeze({
+  INVALID_ARGUMENT: "INVALID_ARGUMENT",
+  INVALID_ENVELOPE: "INVALID_ENVELOPE",
+  UNKNOWN_MESSAGE_TYPE: "UNKNOWN_MESSAGE_TYPE",
+  UNKNOWN_MESSAGE_ID: "UNKNOWN_MESSAGE_ID",
+  HEADER_JSON_MISMATCH: "HEADER_JSON_MISMATCH",
+  UNSUPPORTED_VERSION: "UNSUPPORTED_VERSION",
+  UNSUPPORTED_WIRE_VERSION: "UNSUPPORTED_WIRE_VERSION",
+  UNSUPPORTED_FEATURE: "UNSUPPORTED_FEATURE",
+  AUTH_REQUIRED: "AUTH_REQUIRED",
+  AUTH_FAILED: "AUTH_FAILED",
+  AUTH_REPLAY: "AUTH_REPLAY",
+  HANDSHAKE_TIMEOUT: "HANDSHAKE_TIMEOUT",
+  DUPLICATE_REQUEST: "DUPLICATE_REQUEST",
+  REVISION_GAP: "REVISION_GAP",
+  EVENT_SEQUENCE_GAP: "EVENT_SEQUENCE_GAP",
+  EVENT_SEQUENCE_OVERFLOW: "EVENT_SEQUENCE_OVERFLOW",
+  PAGE_GENERATION_OVERFLOW: "PAGE_GENERATION_OVERFLOW",
+  INVALID_MESSAGE_STATE: "INVALID_MESSAGE_STATE",
+  SESSION_NOT_FOUND: "SESSION_NOT_FOUND",
+  SESSION_CLOSED: "SESSION_CLOSED",
+  SESSION_BUSY: "SESSION_BUSY",
+  OUTSTANDING_REQUEST_LIMIT: "OUTSTANDING_REQUEST_LIMIT",
+  TAB_NOT_FOUND: "TAB_NOT_FOUND",
+  TAB_UNAVAILABLE: "TAB_UNAVAILABLE",
+  PROMPT_NOT_FOUND: "PROMPT_NOT_FOUND",
+  PROMPT_NOT_ACTIVE: "PROMPT_NOT_ACTIVE",
+  PROMPT_ALREADY_TERMINAL: "PROMPT_ALREADY_TERMINAL",
+  PROMPT_TIMEOUT: "PROMPT_TIMEOUT",
+  PROMPT_CANCELLED: "PROMPT_CANCELLED",
+  RESPONSE_NOT_READY: "RESPONSE_NOT_READY",
+  INPUT_VERIFICATION_FAILED: "INPUT_VERIFICATION_FAILED",
+  SUBMISSION_FAILED: "SUBMISSION_FAILED",
+  STALE_ACTOR: "STALE_ACTOR",
+  NAVIGATION_DRIFT: "NAVIGATION_DRIFT",
+  PROVIDER_UNAVAILABLE: "PROVIDER_UNAVAILABLE",
+  PROVIDER_AUTH_REQUIRED: "PROVIDER_AUTH_REQUIRED",
+  PROVIDER_RATE_LIMITED: "PROVIDER_RATE_LIMITED",
+  PROVIDER_ERROR: "PROVIDER_ERROR",
+  RESPONSE_TOO_LARGE: "RESPONSE_TOO_LARGE",
+  GENERATION_BUFFER_LIMIT: "GENERATION_BUFFER_LIMIT",
+  CONTINUATION_NOT_ALLOWED: "CONTINUATION_NOT_ALLOWED",
+  CONTINUATION_LIMIT_REACHED: "CONTINUATION_LIMIT_REACHED",
+  CONTINUATION_TIMEOUT: "CONTINUATION_TIMEOUT",
+  CONTINUATION_NOT_AVAILABLE: "CONTINUATION_NOT_AVAILABLE",
+  RECOVERY_FAILED: "RECOVERY_FAILED",
+  EVENT_QUEUE_OVERFLOW: "EVENT_QUEUE_OVERFLOW",
+  EVENT_HISTORY_EXPIRED: "EVENT_HISTORY_EXPIRED",
+  FRAME_TOO_LARGE: "FRAME_TOO_LARGE",
+  PROTOCOL_ERROR: "PROTOCOL_ERROR",
+});
+
+
+// File 13: browser\components\aistarter\garp\GarpFrame.sys.mjs
+import { GARP_FIXED_HEADER_LENGTH,GARP_SEMANTIC_VERSION,GARP_VERSION_BYTE,GARP_HANDSHAKE_LIMIT,messageTypeId,messageTypeName } from "./GarpRegistry.sys.mjs";
+import { GarpError,GarpErrorCode } from "./GarpErrors.sys.mjs";
+import { assertNoDuplicateObjectMembers } from "./GarpJson.sys.mjs";
+import { textEncoder,textDecoder,uuidToBytes,bytesToUuid } from "./GarpUtil.sys.mjs";
+import { validateEnvelope } from "./GarpSchema.sys.mjs";
+export function encodeGarpEnvelope(envelope,{enforceMaxPayload=0xffffffff}={}){const text=JSON.stringify(envelope);const bytes=textEncoder.encode(text);if(bytes.length>enforceMaxPayload)throw new GarpError(GarpErrorCode.FRAME_TOO_LARGE,"GARP payload exceeds negotiated limit");validateEnvelope(envelope,envelope.type);const id=messageTypeId(envelope.type);if(!id)throw new GarpError(GarpErrorCode.UNKNOWN_MESSAGE_TYPE,`Unknown message type ${envelope.type}`);const frame=new Uint8Array(48+bytes.length),v=new DataView(frame.buffer);frame.set([71,65,82,80],0);v.setUint8(4,GARP_VERSION_BYTE);v.setUint8(5,0);v.setUint16(6,48,false);v.setUint32(8,bytes.length,false);v.setUint16(12,id,false);v.setUint16(14,0,false);frame.set(uuidToBytes(envelope.request_id),16);frame.set(uuidToBytes(envelope.session_id),32);frame.set(bytes,48);return frame;}
+export function encodeGarpMessage(type,payload={},options={}){const envelope={garp:GARP_SEMANTIC_VERSION,type:typeof type==="number"?messageTypeName(type):String(type).toUpperCase(),request_id:options.request_id??null,session_id:options.session_id??null,timestamp:options.timestamp||new Date().toISOString(),sequence:options.sequence??null,payload};return encodeGarpEnvelope(envelope,{enforceMaxPayload:options.maxPayloadBytes??0xffffffff});}
+export function peekHeader(buffer){if(buffer.length<48)return null;const v=new DataView(buffer.buffer,buffer.byteOffset,buffer.byteLength);return{wireVersion:v.getUint8(4),flags:v.getUint8(5),headerLength:v.getUint16(6,false),payloadLength:v.getUint32(8,false),messageType:v.getUint16(12,false)};}
+export function decodeGarpFrame(frame){if(frame.length<48)throw new GarpError(GarpErrorCode.PROTOCOL_ERROR,"Frame shorter than fixed header");const h=peekHeader(frame);if(frame[0]!==71||frame[1]!==65||frame[2]!==82||frame[3]!==80)throw new GarpError(GarpErrorCode.PROTOCOL_ERROR,"Invalid GARP magic");if(h.wireVersion!==0)throw new GarpError(GarpErrorCode.UNSUPPORTED_WIRE_VERSION,"Unsupported wire version");if(h.headerLength!==48)throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,"Header length must be 48");if(h.flags!==0)throw new GarpError(GarpErrorCode.UNSUPPORTED_FEATURE,"Unknown or unnegotiated GARP flag bit");if(new DataView(frame.buffer,frame.byteOffset,frame.byteLength).getUint16(14,false)!==0)throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,"Reserved header field is nonzero");if(frame.length!==48+h.payloadLength)throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,"Payload length mismatch");const type=messageTypeName(h.messageType);if(!type)throw new GarpError(GarpErrorCode.UNKNOWN_MESSAGE_TYPE,`Unknown message type 0x${h.messageType.toString(16).padStart(4,"0")}`);let text;try{text=textDecoder.decode(frame.subarray(48));}catch(e){throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,`Invalid UTF-8 payload: ${e.message}`);}assertNoDuplicateObjectMembers(text);let json;try{json=JSON.parse(text);}catch(e){throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,`Invalid JSON payload: ${e.message}`);}const requestId=bytesToUuid(frame,16),sessionId=bytesToUuid(frame,32);if(!json||json.type!==type)throw new GarpError(GarpErrorCode.HEADER_JSON_MISMATCH,"Header/envelope type mismatch");validateEnvelope(json,type,{request_id:requestId,session_id:sessionId});return{numericType:h.messageType,type,request_id:requestId,session_id:sessionId,message:json,payloadLength:h.payloadLength};}
+
+
+// File 14: browser\components\aistarter\garp\GarpJson.sys.mjs
+import { GarpError, GarpErrorCode } from "./GarpErrors.sys.mjs";
+export function assertNoDuplicateObjectMembers(text){let i=0;const fail=m=>{throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,`Invalid JSON: ${m}`);};const ws=()=>{while(i<text.length&&/[\u0009\u000A\u000D\u0020]/.test(text[i]))i++;};const str=()=>{if(text[i]!==`"`)fail("string expected");const start=i++;while(i<text.length){const c=text[i++];if(c===`"`)return JSON.parse(text.slice(start,i));if(c===`\\`){if(i>=text.length)fail("unterminated escape");const e=text[i++];if(e===`u`){for(let j=0;j<4;j++){if(i>=text.length||!/[0-9A-Fa-f]/.test(text[i++]))fail("invalid unicode escape");}}else if(!`"\\/bfnrt`.includes(e))fail("invalid escape");}else if(c<` `)fail("control character in string");}fail("unterminated string");};const val=depth=>{if(depth>256)fail("JSON nesting too deep");ws();const c=text[i];if(c===`"`){str();return;}if(c===`{`){obj(depth+1);return;}if(c===`[`){arr(depth+1);return;}const start=i;while(i<text.length&&!/[\u0009\u000A\u000D\u0020,\]}]/.test(text[i]))i++;if(i===start)fail("value expected");};const arr=depth=>{i++;ws();if(text[i]===`]`){i++;return;}while(true){val(depth);ws();if(text[i]===`]`){i++;return;}if(text[i]!==`,`)fail("expected comma in array");i++;}};const obj=depth=>{i++;const keys=new Set();ws();if(text[i]===`}`){i++;return;}while(true){ws();const key=str();if(keys.has(key))fail(`duplicate object member ${key}`);keys.add(key);ws();if(text[i]!==`:`)fail("expected colon");i++;val(depth);ws();if(text[i]===`}`){i++;return;}if(text[i]!==`,`)fail("expected comma in object");i++;}};ws();val(0);ws();if(i!==text.length)fail("trailing data");}
+
+
+// File 15: browser\components\aistarter\garp\GarpRegistry.sys.mjs
+export const GARP_PROTOCOL = "GARP/1.24";
+export const GARP_SEMANTIC_VERSION = "1.24";
+export const GARP_WIRE_VERSION = "0x00";
+export const GARP_VERSION_BYTE = 0x00;
+export const GARP_FIXED_HEADER_LENGTH = 48;
+export const GARP_HANDSHAKE_LIMIT = 1024 * 1024;
+export const GARP_APPLICATION_LIMIT_DEFAULT = 16 * 1024 * 1024;
+export const GARP_UINT64_MAX = 18446744073709551615n;
+export const GARP_HANDSHAKE_TIMEOUT_MS = 10000;
+export const GARP_DEFAULT_RESPONSE_RETENTION_MS = 86400000n;
+export const GARP_DEFAULT_CONTINUATION_WAIT_MS = 300000n;
+export const GARP_DEFAULT_RECOVERY_DEADLINE_MS = 300000n;
+export const GARP_DEFAULT_IDLE_TIMEOUT_MS = 30000n;
+export const GARP_DEFAULT_INTERVAL_MS = 10000n;
+export const GARP_MAX_PROMPT_SIZE = 1048576;
+export const GARP_MAX_RESPONSE_SIZE = 16777216;
+export const GARP_MAX_OUTSTANDING_REQUESTS = 128;
+export const GARP_MAX_QUEUED_EVENTS = 8192;
+export const GARP_MAX_EVENT_HISTORY_MEMORY_MB = 64;
+export const GARP_MAX_GENERATION_BUFFER_MB = 32;
+export const GARP_MAX_ERROR_DETAILS_BYTES = 65536;
+export const GARP_MAX_DIAGNOSTIC_DETAILS_BYTES = 65536;
+
+export const GarpMessageType = Object.freeze({
+  HELLO: 0x0001, HELLO_CHALLENGE: 0x0002, HELLO_AUTH: 0x0003, HELLO_ACK: 0x0004, RESPONSE: 0x0005, ERROR: 0x0006,
+  CAPABILITIES: 0x0010, BROWSER_STATUS: 0x0011, LIST_TABS: 0x0012, OPEN_TAB: 0x0013, CLOSE_TAB: 0x0014, SELECT_TAB: 0x0015, GET_CAPABILITIES: 0x0016,
+  CREATE_SESSION: 0x0020, ATTACH_SESSION: 0x0021, DETACH_SESSION: 0x0022, CLOSE_SESSION: 0x0023, RESET_SESSION: 0x0024, GET_SESSION: 0x0025,
+  PROMPT: 0x0030, CANCEL_PROMPT: 0x0031, GET_PROMPT_STATUS: 0x0032, GET_RESPONSE: 0x0033, SUBSCRIBE_RESPONSE: 0x0034, CONTINUE_PROMPT: 0x0035,
+  SESSION_READY: 0x0040, SESSION_CHANGED: 0x0041, NAVIGATION: 0x0042, NAVIGATION_DRIFT: 0x0043, RECOVERY_STATE: 0x0044, PROVIDER_CHANGED: 0x0045,
+  INPUT_SUBMITTED: 0x0050, GENERATION_STARTED: 0x0051, GENERATION_DELTA: 0x0052, GENERATION_PROGRESS: 0x0053, CONTINUATION_REQUIRED: 0x0054, CONTINUATION_SUBMITTED: 0x0055, GENERATION_COMPLETED: 0x0056, GENERATION_FAILED: 0x0057, GENERATION_CANCELLED: 0x0058,
+  PROVIDER_ERROR: 0x0060, PROVIDER_AUTH_REQUIRED: 0x0061, PROVIDER_RATE_LIMITED: 0x0062, DIAGNOSTIC: 0x0063,
+  PING: 0x0070, PONG: 0x0071, GET_EVENTS: 0x0100,
+});
+const TYPE_NAME_BY_ID = new Map(Object.entries(GarpMessageType).map(([name, id]) => [id, name]));
+const TYPE_ID_BY_NAME = new Map(Object.entries(GarpMessageType).map(([name, id]) => [name, id]));
+export function messageTypeName(id) { return TYPE_NAME_BY_ID.get(id) || null; }
+export function messageTypeId(name) { return TYPE_ID_BY_NAME.get(String(name || "").toUpperCase()) || 0; }
+
+export const GarpFeature = Object.freeze(["ext-pong", "ext-replay-store"]);
+export const GarpSessionEventTypes = new Set(["SESSION_READY","SESSION_CHANGED","NAVIGATION","NAVIGATION_DRIFT","RECOVERY_STATE","PROVIDER_CHANGED","INPUT_SUBMITTED","GENERATION_STARTED","GENERATION_DELTA","GENERATION_PROGRESS","CONTINUATION_REQUIRED","CONTINUATION_SUBMITTED","GENERATION_COMPLETED","GENERATION_FAILED","GENERATION_CANCELLED","PROVIDER_ERROR","PROVIDER_AUTH_REQUIRED","PROVIDER_RATE_LIMITED","DIAGNOSTIC"]);
+export const GarpConnectionScopedTypes = new Set(["HELLO","HELLO_CHALLENGE","HELLO_AUTH","HELLO_ACK","CAPABILITIES","BROWSER_STATUS","LIST_TABS","OPEN_TAB","CLOSE_TAB","SELECT_TAB","GET_CAPABILITIES","CREATE_SESSION","PING","PONG"]);
+export const GarpSessionScopedCommandTypes = new Set(["ATTACH_SESSION","DETACH_SESSION","CLOSE_SESSION","RESET_SESSION","GET_SESSION","PROMPT","CANCEL_PROMPT","GET_PROMPT_STATUS","GET_RESPONSE","SUBSCRIBE_RESPONSE","CONTINUE_PROMPT","GET_EVENTS"]);
+
+
+// File 16: browser\components\aistarter\garp\GarpReplayStore.sys.mjs
+import { IOUtils } from "resource://gre/modules/IOUtils.sys.mjs";
+import { PathUtils } from "resource://gre/modules/PathUtils.sys.mjs";
+import { GarpError,GarpErrorCode } from "./GarpErrors.sys.mjs";
+const RETENTION_MS=24*60*60*1000;
+export class GarpReplayStore{
+  constructor(){this.path=PathUtils.join(PathUtils.profileDir,"garp-auth-replay.json");this.markerPath=PathUtils.join(PathUtils.profileDir,"garp-auth-replay.initialized");this.entries=new Map();this.loaded=false;this.replayStateAvailable=true;this.writePromise=Promise.resolve();}
+  async load(){if(this.loaded)return;try{const exists=await IOUtils.exists(this.path),marker=await IOUtils.exists(this.markerPath);if(!exists&&marker){this.replayStateAvailable=false;return;}if(exists){const text=await IOUtils.readUTF8(this.path),p=JSON.parse(text);if(!p||p.version!==1||!Array.isArray(p.entries))throw new Error("invalid replay state");for(const e of p.entries){if(typeof e.key!=="string"||!Number.isFinite(e.expiresAt))throw new Error("invalid replay entry");if(e.expiresAt>Date.now())this.entries.set(e.key,e.expiresAt);}}await IOUtils.writeUTF8(this.markerPath,"GARP/1.24 replay state initialized\n",{tmpPath:`${this.markerPath}.tmp`,backupFile:`${this.markerPath}.bak`});await this.persist();this.loaded=true;}catch(error){this.replayStateAvailable=false;Cu.reportError(`GARP replay store unavailable: ${error}`);}}
+  has(key){this.pruneExpired();return this.entries.has(key);}
+  async remember(key){if(!this.replayStateAvailable)throw new GarpError(GarpErrorCode.AUTH_REPLAY,"Authentication replay state is unavailable; secret must be rotated");this.pruneExpired();this.entries.set(key,Date.now()+RETENTION_MS);try{await this.persist();}catch(error){this.replayStateAvailable=false;throw new GarpError(GarpErrorCode.AUTH_REPLAY,"Replay state could not be durably persisted; secret must be rotated");}}
+  pruneExpired(){const now=Date.now();for(const [k,t] of this.entries)if(t<=now)this.entries.delete(k);}
+  async persist(){if(!this.replayStateAvailable)return;const data=JSON.stringify({version:1,entries:[...this.entries].map(([key,expiresAt])=>({key,expiresAt}))});this.writePromise=this.writePromise.then(()=>IOUtils.writeUTF8(this.path,data,{tmpPath:`${this.path}.tmp`,backupFile:`${this.path}.bak`}));return this.writePromise;}
+}
+
+
+// File 17: browser\components\aistarter\garp\GarpSchema.sys.mjs
+import {GarpConnectionScopedTypes,GarpSessionEventTypes,GarpSessionScopedCommandTypes,GARP_APPLICATION_LIMIT_DEFAULT,GARP_DEFAULT_CONTINUATION_WAIT_MS,GARP_DEFAULT_IDLE_TIMEOUT_MS,GARP_DEFAULT_INTERVAL_MS,GARP_DEFAULT_RECOVERY_DEADLINE_MS,GARP_DEFAULT_RESPONSE_RETENTION_MS,GARP_MAX_EVENT_HISTORY_MEMORY_MB,GARP_MAX_GENERATION_BUFFER_MB,GARP_MAX_OUTSTANDING_REQUESTS,GARP_MAX_PROMPT_SIZE,GARP_MAX_QUEUED_EVENTS,GARP_MAX_RESPONSE_SIZE,GARP_MAX_ERROR_DETAILS_BYTES,GARP_MAX_DIAGNOSTIC_DETAILS_BYTES,GARP_PROTOCOL,GARP_SEMANTIC_VERSION,GARP_WIRE_VERSION} from "./GarpRegistry.sys.mjs";
+import {GarpError,GarpErrorCode} from "./GarpErrors.sys.mjs";
+import {byteLength,durationMs,isUuid,sortedUtf8,u32,uint64,utf8ByteCompare} from "./GarpUtil.sys.mjs";
+const TOP_KEYS=["garp","type","request_id","session_id","timestamp","sequence","payload"];
+const FEATURE_RE=/^!?[a-z0-9][a-z0-9._-]{0,127}$/; const STRATEGY_RE=/^[a-z][a-z0-9_]{0,63}$/; const ISO_RE=/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const invalid=m=>{throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,m)};
+function obj(v,n){if(!v||typeof v!=="object"||Array.isArray(v))invalid(`${n} must be an object`)}
+function keys(v,required,allowed=required,n="object"){obj(v,n);for(const k of required)if(!Object.prototype.hasOwnProperty.call(v,k))throw new GarpError(GarpErrorCode.INVALID_ENVELOPE,`${n} missing required member ${k}`);for(const k of Object.keys(v))if(!allowed.includes(k))invalid(`${n} contains unknown member ${k}`)}
+function str(v,n,min,max){if(typeof v!=="string")invalid(`${n} must be string`);const l=byteLength(v);if(l<min||l>max)invalid(`${n} length outside ${min}..${max}`);return v}
+function bool(v,n){if(typeof v!=="boolean")invalid(`${n} must be boolean`)}
+function unique(a,n){if(new Set(a).size!==a.length)invalid(`${n} contains duplicates`)}
+function features(a,n){if(!Array.isArray(a))invalid(`${n} must be array`);const canonical=a.map(v=>{if(typeof v!=="string"||!FEATURE_RE.test(v))invalid(`${n} contains invalid feature`);return v.startsWith("!")?v.slice(1):v});unique(canonical,n);const s=sortedUtf8(a);for(let i=0;i<a.length;i++)if(a[i]!==s[i])invalid(`${n} must be UTF-8 byte sorted`);return a}
+function timestamp(v){if(typeof v!=="string"||!ISO_RE.test(v))invalid("timestamp must be RFC3339 UTC with millisecond precision")}
+function identity(v,n){if(v!==null&&!isUuid(v))invalid(`${n} must be UUID or null`)}
+function seq(v,event){if(event){if(typeof v!=="string")invalid("sequence must be uint64-string");uint64(v,"sequence")}else if(v!==null)invalid("sequence must be null")}
+function validateCapabilities(p){keys(p,["protocol","wire_version","limits","keepalive","providers","extensions"]);str(p.protocol,"protocol",4,16);if(p.protocol!==GARP_SEMANTIC_VERSION)invalid("CAPABILITIES.protocol mismatch");if(p.wire_version!==GARP_WIRE_VERSION)invalid("CAPABILITIES.wire_version mismatch");obj(p.limits,"limits");const u32s=["max_payload_bytes","max_prompt_size","max_response_size","max_outstanding_requests","max_queued_events","max_event_history_memory_mb","max_generation_buffer_mb","max_error_details_bytes","max_diagnostic_details_bytes"];const u64s=["handshake_timeout_ms","response_retention_ms","continuation_wait_ms","recovery_deadline_ms"];for(const n of u32s)u32(p.limits[n],`limits.${n}`);for(const n of u64s)durationMs(p.limits[n],`limits.${n}`);if(p.limits.handshake_timeout_ms!=="10000")invalid("handshake_timeout_ms must be 10000");obj(p.keepalive,"keepalive");keys(p.keepalive,["enabled","idle_timeout_ms","interval_ms"]);bool(p.keepalive.enabled,"keepalive.enabled");durationMs(p.keepalive.idle_timeout_ms,"idle_timeout_ms");durationMs(p.keepalive.interval_ms,"interval_ms");if(p.keepalive.enabled&&(BigInt(p.keepalive.interval_ms)<=0n||BigInt(p.keepalive.idle_timeout_ms)<=0n||BigInt(p.keepalive.interval_ms)>=BigInt(p.keepalive.idle_timeout_ms)))invalid("invalid keepalive intervals");if(!Array.isArray(p.providers))invalid("providers must be array");const ids=[];for(const e of p.providers){keys(e,["id","version","state","input_strategies","capabilities"]);str(e.id,"provider.id",1,64);str(e.version,"provider.version",1,64);if(!["AVAILABLE","UNAVAILABLE","AUTH_REQUIRED","RATE_LIMITED","DEGRADED"].includes(e.state))invalid("invalid provider state");if(!Array.isArray(e.input_strategies)||!e.input_strategies.length)invalid("provider.input_strategies must contain at least one strategy");for(const s of e.input_strategies)if(typeof s!=="string"||!STRATEGY_RE.test(s)||byteLength(s)>64)invalid("invalid provider input strategy");unique(e.input_strategies,"provider.input_strategies");const ss=sortedUtf8(e.input_strategies);for(let i=0;i<ss.length;i++)if(ss[i]!==e.input_strategies[i])invalid("input strategies must be UTF-8 sorted");keys(e.capabilities,["streaming","cancellation","continuation","diagnostics"]);for(const n of ["streaming","cancellation","continuation","diagnostics"])bool(e.capabilities[n],`provider.capabilities.${n}`);ids.push(e.id)}const si=sortedUtf8(ids);for(let i=0;i<si.length;i++)if(si[i]!==ids[i])invalid("providers must be UTF-8 sorted");unique(ids,"providers");if(!Array.isArray(p.extensions))invalid("extensions must be array");const en=[];for(const e of p.extensions){keys(e,["name","version"]);str(e.name,"extension.name",1,128);str(e.version,"extension.version",1,64);en.push(e.name)}const es=sortedUtf8(en);for(let i=0;i<es.length;i++)if(es[i]!==en[i])invalid("extensions must be UTF-8 sorted");unique(en,"extensions")}
+function validatePromptOptions(o){obj(o,"PROMPT.options");keys(o,[],["timeout_ms","auto_continue","max_continuations","force_focus","simulate_enter","_extensions"],"PROMPT.options");durationMs(o.timeout_ms??"0","timeout_ms",86400000n);bool(o.auto_continue??false,"auto_continue");u32(o.max_continuations??8,"max_continuations");if((o.max_continuations??8)>1024)invalid("max_continuations exceeds 1024");bool(o.force_focus??false,"force_focus");bool(o.simulate_enter??false,"simulate_enter");if(o._extensions!==undefined)obj(o._extensions,"PROMPT.options._extensions")}
+function validateErrorObject(e){keys(e,["code","message"]);str(e.code,"error.code",1,64);str(e.message,"error.message",0,1024)}
+function validateTerminal(p,failed){if(Array.isArray(p.messages)){keys(p,failed?["prompt_request_id","error","partial","messages","page_generation"]:["prompt_request_id","messages","page_generation"],failed?["prompt_request_id","error","partial","messages","page_generation"]:["prompt_request_id","messages","page_generation"]);if(!isUuid(p.prompt_request_id))invalid("prompt_request_id invalid");if(failed){validateErrorObject(p.error);bool(p.partial,"partial")}if(!Array.isArray(p.messages))invalid("messages must array");for(const m of p.messages){keys(m,["message_id","revision","response"]);if(!isUuid(m.message_id))invalid("message_id invalid");uint64(m.revision,"revision");if(typeof m.response!=="string")invalid("message.response invalid")}uint64(p.page_generation,"page_generation");return}if(failed){keys(p,["prompt_request_id","error","partial","response","page_generation"]);if(!isUuid(p.prompt_request_id))invalid("prompt_request_id invalid");validateErrorObject(p.error);bool(p.partial,"partial");if(p.response!==null&&typeof p.response!=="string")invalid("response invalid");if(p.response===null&&p.partial)invalid("partial cannot be true with null response");uint64(p.page_generation,"page_generation");return}keys(p,["prompt_request_id","message_id","revision","response","page_generation"]);if(!isUuid(p.prompt_request_id)||!isUuid(p.message_id))invalid("generation ids invalid");uint64(p.revision,"revision");if(typeof p.response!=="string")invalid("response invalid");uint64(p.page_generation,"page_generation")}
+function validateCancelled(p){if(Array.isArray(p.messages)){keys(p,["prompt_request_id","cancel_verified","partial","messages","page_generation"]);if(!isUuid(p.prompt_request_id))invalid("prompt_request_id invalid");bool(p.cancel_verified,"cancel_verified");if(!p.cancel_verified)invalid("cancel_verified must be true");bool(p.partial,"partial");for(const m of p.messages){keys(m,["message_id","revision","response"]);if(!isUuid(m.message_id))invalid("message_id invalid");uint64(m.revision,"revision");if(typeof m.response!=="string")invalid("message response invalid")}uint64(p.page_generation,"page_generation");return}keys(p,["prompt_request_id","message_id","revision","cancel_verified","partial","response","page_generation"]);if(!isUuid(p.prompt_request_id)||!isUuid(p.message_id))invalid("generation ids invalid");uint64(p.revision,"revision");bool(p.cancel_verified,"cancel_verified");if(!p.cancel_verified)invalid("cancel_verified must be true");bool(p.partial,"partial");if(typeof p.response!=="string")invalid("response invalid");uint64(p.page_generation,"page_generation")}
+export function validateEnvelope(json,expectedType=null,header=null){obj(json,"Common Envelope");keys(json,TOP_KEYS,TOP_KEYS,"Common Envelope");if(json.garp!==GARP_SEMANTIC_VERSION)throw new GarpError(GarpErrorCode.UNSUPPORTED_VERSION,`Unsupported semantic version: ${json.garp}`);if(typeof json.type!=="string"||!/^[A-Z][A-Z0-9_]{0,63}$/.test(json.type))throw new GarpError(GarpErrorCode.INVALID_ENVELOPE,"Envelope.type invalid");if(expectedType&&json.type!==expectedType)throw new GarpError(GarpErrorCode.HEADER_JSON_MISMATCH,"Envelope type mismatch");identity(json.request_id,"request_id");identity(json.session_id,"session_id");timestamp(json.timestamp);const ev=GarpSessionEventTypes.has(json.type),sc=GarpSessionScopedCommandTypes.has(json.type);seq(json.sequence,ev);obj(json.payload,"payload");if(ev&&(json.request_id!==null||json.session_id===null))throw new GarpError(GarpErrorCode.INVALID_ENVELOPE,"Invalid session event identity");if(GarpConnectionScopedTypes.has(json.type)&&json.session_id!==null)throw new GarpError(GarpErrorCode.INVALID_ENVELOPE,"Connection-scoped message must have null session_id");if(sc&&json.session_id===null)throw new GarpError(GarpErrorCode.INVALID_ENVELOPE,"Session-scoped command requires session_id");if(header&&((json.request_id??null)!==(header.request_id??null)||(json.session_id??null)!==(header.session_id??null)))throw new GarpError(GarpErrorCode.HEADER_JSON_MISMATCH,"Header/envelope UUID mismatch");validateMessagePayload(json.type,json.payload);return json}
+export function validateMessagePayload(type,p){switch(type){case"HELLO":keys(p,["client_name","client_version","versions","wire_versions","features","client_nonce"]);str(p.client_name,"client_name",1,64);str(p.client_version,"client_version",1,64);if(!Array.isArray(p.versions)||!p.versions.includes(GARP_SEMANTIC_VERSION))throw new GarpError(GarpErrorCode.UNSUPPORTED_VERSION,"HELLO does not offer GARP/1.24");if(!Array.isArray(p.wire_versions)||!p.wire_versions.includes(GARP_WIRE_VERSION))throw new GarpError(GarpErrorCode.UNSUPPORTED_WIRE_VERSION,"HELLO does not offer wire 0x00");features(p.features,"HELLO.features");str(p.client_nonce,"client_nonce",1,64);break;case"HELLO_CHALLENGE":keys(p,["server_name","server_version","selected_version","selected_wire_version","features","server_nonce"]);str(p.server_name,"server_name",1,64);str(p.server_version,"server_version",1,64);if(p.selected_version!==GARP_SEMANTIC_VERSION)throw new GarpError(GarpErrorCode.UNSUPPORTED_VERSION,"Unsupported selected version");if(p.selected_wire_version!==GARP_WIRE_VERSION)throw new GarpError(GarpErrorCode.UNSUPPORTED_WIRE_VERSION,"Unsupported selected wire version");features(p.features,"HELLO_CHALLENGE.features");str(p.server_nonce,"server_nonce",1,64);break;case"HELLO_AUTH":keys(p,["client_proof"]);str(p.client_proof,"client_proof",1,128);break;case"HELLO_ACK":keys(p,["server_proof","selected_version","selected_wire_version","features"]);str(p.server_proof,"server_proof",1,128);if(p.selected_version!==GARP_SEMANTIC_VERSION||p.selected_wire_version!==GARP_WIRE_VERSION)invalid("HELLO_ACK selection invalid");features(p.features,"HELLO_ACK.features");break;case"CAPABILITIES":validateCapabilities(p);break;case"BROWSER_STATUS":keys(p,["state","active_tab_id"]);if(!["STARTING","READY","DEGRADED","FAILED"].includes(p.state))invalid("invalid browser state");if(p.active_tab_id!==null)str(p.active_tab_id,"active_tab_id",1,64);break;case"LIST_TABS":case"GET_CAPABILITIES":case"PING":case"PONG":keys(p,[],[],`${type} payload`);break;case"OPEN_TAB":keys(p,["url"]);str(p.url,"url",1,4096);try{const u=new URL(p.url);if(!["http:","https:"].includes(u.protocol))invalid("OPEN_TAB only permits http/https")}catch(_){invalid("invalid URL")};break;case"CLOSE_TAB":case"SELECT_TAB":keys(p,["tab_id"]);str(p.tab_id,"tab_id",1,64);break;case"CREATE_SESSION":keys(p,["provider","options"],["provider","tab_id","options"]);str(p.provider,"provider",1,64);keys(p.options,[],[]);if(p.tab_id!==undefined)str(p.tab_id,"tab_id",1,64);break;case"ATTACH_SESSION":case"RESET_SESSION":keys(p,["options"],["options"]);keys(p.options,[],[]);break;case"DETACH_SESSION":case"CLOSE_SESSION":case"GET_SESSION":keys(p,[],[]);break;case"PROMPT":keys(p,["prompt","options"]);if(typeof p.prompt!=="string"||byteLength(p.prompt)>GARP_MAX_PROMPT_SIZE)invalid("prompt invalid or exceeds max_prompt_size");validatePromptOptions(p.options);break;case"CANCEL_PROMPT":case"GET_PROMPT_STATUS":case"GET_RESPONSE":case"SUBSCRIBE_RESPONSE":case"CONTINUE_PROMPT":keys(p,["prompt_request_id"]);if(!isUuid(p.prompt_request_id))invalid("prompt_request_id invalid");break;case"RESPONSE":obj(p,"RESPONSE payload");if(typeof p.success!=="boolean")invalid("RESPONSE.success must be boolean");break;case"ERROR":keys(p,["code","message"],["code","message","details"]);str(p.code,"error.code",1,64);str(p.message,"error.message",0,1024);if(p.details!==undefined){obj(p.details,"ERROR.details");if(byteLength(JSON.stringify(p.details))>GARP_MAX_ERROR_DETAILS_BYTES)invalid("ERROR.details too large")}break;case"SESSION_READY":keys(p,["provider","tab_id","url","page_generation"]);str(p.provider,"provider",1,64);str(p.tab_id,"tab_id",1,64);str(p.url,"url",1,4096);uint64(p.page_generation,"page_generation");break;case"SESSION_CHANGED":keys(p,["changed","page_generation"]);if(!Array.isArray(p.changed)||p.changed.length<1||p.changed.length>4)invalid("changed invalid");unique(p.changed,"changed");for(const x of p.changed)if(!["provider","tab_id","url","page_generation"].includes(x))invalid("invalid changed member");uint64(p.page_generation,"page_generation");break;case"NAVIGATION":keys(p,["page_generation","url"]);uint64(p.page_generation,"page_generation");str(p.url,"url",1,4096);break;case"NAVIGATION_DRIFT":keys(p,["page_generation","reason"]);uint64(p.page_generation,"page_generation");if(!["UNEXPECTED_URL","DOCUMENT_REPLACED","PROVIDER_CONTEXT_LOST","ACTOR_CONTEXT_STALE"].includes(p.reason))invalid("invalid navigation drift reason");break;case"RECOVERY_STATE":keys(p,["state","reason","deadline_remaining_ms"]);if(!["RECOVERING","RECOVERED","FAILED"].includes(p.state)||!["ACTOR_REPLACED","DOCUMENT_REPLACED","UNEXPECTED_URL","PROVIDER_CONTEXT_LOST","CANCELLATION_UNVERIFIED","PROVIDER_RECOVERY","INTERNAL_DESYNC"].includes(p.reason))invalid("invalid recovery state/reason");durationMs(p.deadline_remaining_ms,"deadline_remaining_ms");break;case"PROVIDER_CHANGED":keys(p,["previous_provider","provider","page_generation"]);if(p.previous_provider!==null)str(p.previous_provider,"previous_provider",1,64);str(p.provider,"provider",1,64);uint64(p.page_generation,"page_generation");break;case"INPUT_SUBMITTED":keys(p,["prompt_request_id","page_generation","strategy"]);if(!isUuid(p.prompt_request_id))invalid("prompt_request_id invalid");uint64(p.page_generation,"page_generation");str(p.strategy,"strategy",1,64);if(!STRATEGY_RE.test(p.strategy))invalid("strategy invalid");break;case"GENERATION_STARTED":keys(p,["prompt_request_id","message_id","revision","page_generation"]);if(!isUuid(p.prompt_request_id)||!isUuid(p.message_id))invalid("generation ids invalid");if(uint64(p.revision,"revision")!==0n)invalid("GENERATION_STARTED revision must be 0");uint64(p.page_generation,"page_generation");break;case"GENERATION_DELTA":keys(p,["prompt_request_id","message_id","revision","delta","mode","page_generation"]);if(!isUuid(p.prompt_request_id)||!isUuid(p.message_id))invalid("generation ids invalid");uint64(p.revision,"revision");if(typeof p.delta!=="string")invalid("delta invalid");if(!["APPEND","REPLACE"].includes(p.mode))invalid("mode invalid");uint64(p.page_generation,"page_generation");break;case"GENERATION_PROGRESS":keys(p,["prompt_request_id","message_count","page_generation"]);if(!isUuid(p.prompt_request_id))invalid("prompt_request_id invalid");u32(p.message_count,"message_count");uint64(p.page_generation,"page_generation");break;case"CONTINUATION_REQUIRED":keys(p,["prompt_request_id","continuation_count","max_continuations","page_generation"]);if(!isUuid(p.prompt_request_id))invalid("prompt_request_id invalid");u32(p.continuation_count,"continuation_count");u32(p.max_continuations,"max_continuations");uint64(p.page_generation,"page_generation");break;case"CONTINUATION_SUBMITTED":keys(p,["prompt_request_id","page_generation","continuation_count","strategy"]);if(!isUuid(p.prompt_request_id))invalid("prompt_request_id invalid");uint64(p.page_generation,"page_generation");u32(p.continuation_count,"continuation_count");str(p.strategy,"strategy",1,64);if(!STRATEGY_RE.test(p.strategy))invalid("strategy invalid");break;case"GENERATION_COMPLETED":validateTerminal(p,false);break;case"GENERATION_FAILED":validateTerminal(p,true);break;case"GENERATION_CANCELLED":validateCancelled(p);break;case"PROVIDER_ERROR":keys(p,["provider","code","message","retryable","prompt_request_id","page_generation"]);str(p.provider,"provider",1,64);str(p.code,"code",1,64);str(p.message,"message",0,1024);bool(p.retryable,"retryable");if(p.prompt_request_id!==null&&!isUuid(p.prompt_request_id))invalid("prompt_request_id invalid");uint64(p.page_generation,"page_generation");break;case"PROVIDER_AUTH_REQUIRED":keys(p,["provider","reason","page_generation"]);str(p.provider,"provider",1,64);str(p.reason,"reason",1,64);uint64(p.page_generation,"page_generation");break;case"PROVIDER_RATE_LIMITED":keys(p,["provider","retry_after_ms","page_generation"]);str(p.provider,"provider",1,64);durationMs(p.retry_after_ms,"retry_after_ms");uint64(p.page_generation,"page_generation");break;case"DIAGNOSTIC":keys(p,["level","stage","code","message","details","actor_instance"]);if(!["TRACE","DEBUG","INFO","WARN","ERROR"].includes(p.level)||!["TRANSPORT","AUTHENTICATION","SESSION","SUBMISSION","GENERATION","CONTINUATION","CANCELLATION","RECOVERY","PROVIDER"].includes(p.stage))invalid("invalid diagnostic level/stage");str(p.code,"diagnostic.code",1,64);str(p.message,"diagnostic.message",0,1024);obj(p.details,"diagnostic.details");if(byteLength(JSON.stringify(p.details))>GARP_MAX_DIAGNOSTIC_DETAILS_BYTES)invalid("diagnostic details too large");str(p.actor_instance,"diagnostic.actor_instance",1,64);break;case"GET_EVENTS":keys(p,["from_sequence","max_events"]);if(uint64(p.from_sequence,"from_sequence")<1n)invalid("from_sequence must be >= 1");u32(p.max_events,"max_events");if(p.max_events<1||p.max_events>4096)invalid("max_events out of range");break;default:break}}
+export function capabilitiesObject(registry){return{protocol:GARP_SEMANTIC_VERSION,wire_version:GARP_WIRE_VERSION,limits:{handshake_timeout_ms:"10000",max_payload_bytes:GARP_APPLICATION_LIMIT_DEFAULT,max_prompt_size:GARP_MAX_PROMPT_SIZE,max_response_size:GARP_MAX_RESPONSE_SIZE,max_outstanding_requests:GARP_MAX_OUTSTANDING_REQUESTS,max_queued_events:GARP_MAX_QUEUED_EVENTS,max_event_history_memory_mb:GARP_MAX_EVENT_HISTORY_MEMORY_MB,max_generation_buffer_mb:GARP_MAX_GENERATION_BUFFER_MB,response_retention_ms:String(GARP_DEFAULT_RESPONSE_RETENTION_MS),continuation_wait_ms:String(GARP_DEFAULT_CONTINUATION_WAIT_MS),recovery_deadline_ms:String(GARP_DEFAULT_RECOVERY_DEADLINE_MS),max_error_details_bytes:GARP_MAX_ERROR_DETAILS_BYTES,max_diagnostic_details_bytes:GARP_MAX_DIAGNOSTIC_DETAILS_BYTES},keepalive:{enabled:true,idle_timeout_ms:String(GARP_DEFAULT_IDLE_TIMEOUT_MS),interval_ms:String(GARP_DEFAULT_INTERVAL_MS)},providers:registry.getCapabilityEntries(),extensions:[{name:"ext-pong",version:"1.0"},{name:"ext-replay-store",version:"1.0"}]}}
+
+
+// File 18: browser\components\aistarter\garp\GarpUtil.sys.mjs
+import { GARP_UINT64_MAX } from "./GarpRegistry.sys.mjs";
+import { GarpError, GarpErrorCode } from "./GarpErrors.sys.mjs";
+export const textEncoder = new TextEncoder();
+export const textDecoder = new TextDecoder("utf-8", { fatal: true });
+export function monotonicNow() { return globalThis.performance?.now?.() ?? Date.now(); }
+export function byteLength(value) { return textEncoder.encode(String(value ?? "")).length; }
+export function utf8ByteCompare(left, right) { const a=textEncoder.encode(String(left)); const b=textEncoder.encode(String(right)); const n=Math.min(a.length,b.length); for(let i=0;i<n;i++){if(a[i]!==b[i]) return a[i]-b[i];} return a.length-b.length; }
+export function sortedUtf8(values){return [...values].sort(utf8ByteCompare);}
+export function isUuid(value){return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);}
+export function isNilUuid(value){return value===null || value==="00000000-0000-0000-0000-000000000000";}
+export function uuid(){return crypto.randomUUID();}
+export function uuidToBytes(value){if(value==null)return new Uint8Array(16); if(!isUuid(value))throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,`Invalid UUID: ${value}`); const hex=value.replaceAll("-","").toLowerCase(); const bytes=new Uint8Array(16); for(let i=0;i<16;i++)bytes[i]=Number.parseInt(hex.slice(i*2,i*2+2),16); return bytes;}
+export function bytesToUuid(bytes,offset=0){let zero=true;for(let i=0;i<16;i++){if(bytes[offset+i]!==0){zero=false;break;}} if(zero)return null; const hex=[];for(let i=0;i<16;i++)hex.push(bytes[offset+i].toString(16).padStart(2,"0"));const s=hex.join("");return `${s.slice(0,8)}-${s.slice(8,12)}-${s.slice(12,16)}-${s.slice(16,20)}-${s.slice(20)}`;}
+export function uint64(value, fieldName="uint64"){const text=String(value);if(!/^(0|[1-9][0-9]{0,19})$/.test(text))throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,`${fieldName} must be uint64-string`);const n=BigInt(text);if(n>GARP_UINT64_MAX)throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,`${fieldName} exceeds uint64`);return n;}
+export function u32(value,fieldName="uint32"){if(!Number.isInteger(value)||value<0||value>0xffffffff)throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,`${fieldName} must be uint32`);return value;}
+export function durationMs(value,fieldName,max=864000000n){const n=uint64(value,fieldName);if(n>max)throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,`${fieldName} exceeds allowed duration`);return n;}
+export function base64UrlEncode(bytes){let b="";for(const x of bytes)b+=String.fromCharCode(x);return btoa(b).replaceAll("+","-").replaceAll("/","_").replaceAll("=","");}
+export function base64UrlDecode(text,expectedLength=null){if(typeof text!=="string"||!/^[A-Za-z0-9_-]*$/.test(text)||text.length%4===1)throw new GarpError(GarpErrorCode.AUTH_FAILED,"Invalid Base64URL encoding");const padded=text.replaceAll("-","+").replaceAll("_","/")+"===".slice((text.length+3)%4);let bin;try{bin=atob(padded);}catch(_){throw new GarpError(GarpErrorCode.AUTH_FAILED,"Invalid Base64URL encoding");}const bytes=Uint8Array.from(bin,c=>c.charCodeAt(0));if(expectedLength!==null&&bytes.length!==expectedLength)throw new GarpError(GarpErrorCode.AUTH_FAILED,"Decoded value has invalid length");return bytes;}
+export function constantTimeEqualBytes(a,b){if(!(a instanceof Uint8Array)||!(b instanceof Uint8Array)||a.length!==b.length)return false;let d=0;for(let i=0;i<a.length;i++)d|=a[i]^b[i];return d===0;}
+export async function sha256(bytes){return new Uint8Array(await crypto.subtle.digest("SHA-256",bytes));}
+export async function hmacSha256(keyBytes,dataBytes){const key=await crypto.subtle.importKey("raw",keyBytes,{name:"HMAC",hash:"SHA-256"},false,["sign"]);return new Uint8Array(await crypto.subtle.sign("HMAC",key,dataBytes));}
+function appendU32(list,value){const out=new Uint8Array(4);new DataView(out.buffer).setUint32(0,value,false);list.push(...out);}
+function appendBytes(list,bytes){appendU32(list,bytes.length);list.push(...bytes);}
+export function encodeTranscript(domain,clientNonce,serverNonce,selectedVersion,selectedWireVersion,offeredFeatures,finalFeatures,clientName,clientVersion,serverName,serverVersion){const l=[];appendBytes(l,textEncoder.encode(domain));appendBytes(l,clientNonce);appendBytes(l,serverNonce);appendBytes(l,textEncoder.encode(selectedVersion));appendBytes(l,textEncoder.encode(selectedWireVersion));appendU32(l,offeredFeatures.length);for(const f of offeredFeatures)appendBytes(l,textEncoder.encode(f));appendU32(l,finalFeatures.length);for(const f of finalFeatures)appendBytes(l,textEncoder.encode(f));appendBytes(l,textEncoder.encode(clientName));appendBytes(l,textEncoder.encode(clientVersion));appendBytes(l,textEncoder.encode(serverName));appendBytes(l,textEncoder.encode(serverVersion));return new Uint8Array(l);}
+export function encodeTranscriptCore(clientNonce,serverNonce,selectedVersion,selectedWireVersion,offeredFeatures,finalFeatures,clientName,clientVersion,serverName,serverVersion){return encodeTranscript("",clientNonce,serverNonce,selectedVersion,selectedWireVersion,offeredFeatures,finalFeatures,clientName,clientVersion,serverName,serverVersion).slice(4);}
+
+
+// File 19: browser\components\aistarter\garp\moz.build
+EXTRA_JS_MODULES += [
+    'GarpAuth.sys.mjs',
+    'GarpConnection.sys.mjs',
+    'GarpErrors.sys.mjs',
+    'GarpFrame.sys.mjs',
+    'GarpJson.sys.mjs',
+    'GarpRegistry.sys.mjs',
+    'GarpReplayStore.sys.mjs',
+    'GarpSchema.sys.mjs',
+    'GarpUtil.sys.mjs',
+]
+
+
+// File 20: browser\components\aistarter\moz.build
+DIRS += [
+    'actors',
+    'diagnostics',
+    'garp',
+    'providers',
+    'requests',
+    'sessions',
+]
+
+EXTRA_JS_MODULES += [
+    'AIAutomation.sys.mjs',
+]
+
+
+// File 21: browser\components\aistarter\providers\ChatGPTAdapter.sys.mjs
+import {ProviderAdapter} from "./ProviderAdapter.sys.mjs";
+export class ChatGPTAdapter extends ProviderAdapter{constructor(){super("chatgpt","https://chatgpt.com/")}input(doc){return this.findBySelectors(doc,["#prompt-textarea","textarea",'[contenteditable="true"][role="textbox"]'])}sendButton(doc){return this.findBySelectors(doc,['button[data-testid*="send"]','button[aria-label*="Send"]'])}responseNodes(doc){return this.findAllBySelectors(doc,['[data-message-author-role="assistant"] .markdown','.agent-turn .markdown'])}isStreaming(doc){return!!doc.querySelector('[data-testid="stop-button"],.result-streaming')}isAuthenticated(doc){return!/(auth0|login|signin)/i.test(doc.location?.href||"")}}
+
+
+// File 22: browser\components\aistarter\providers\ClaudeAdapter.sys.mjs
+import {ProviderAdapter} from "./ProviderAdapter.sys.mjs";
+export class ClaudeAdapter extends ProviderAdapter{constructor(){super("claude","https://claude.ai/")}input(doc){return this.findBySelectors(doc,['div[contenteditable="true"]','textarea','[aria-label*="Claude"]'])}sendButton(doc){return this.findBySelectors(doc,['button[aria-label*="Send"]','button[type="submit"]'])}responseNodes(doc){return this.findAllBySelectors(doc,[".font-claude-message",".markdown"])}isStreaming(doc){return!!doc.querySelector('.loading-indicator,[class*="streaming"]')}isAuthenticated(doc){return!/(login|signin)/i.test(doc.location?.href||"")}}
+
+
+// File 23: browser\components\aistarter\providers\CopilotAdapter.sys.mjs
+import {ProviderAdapter} from "./ProviderAdapter.sys.mjs";
+export class CopilotAdapter extends ProviderAdapter{constructor(){super("copilot","https://copilot.microsoft.com/")}input(doc){return this.findBySelectors(doc,['textarea#userInput','textarea[placeholder*="Message"]','textarea[placeholder*="Ask"]','[data-testid="composer-input"] textarea','[data-testid="chat-input"] textarea','.cib-text-input','textarea[aria-label*="Ask"]','[aria-label*="Copilot"] textarea','div[contenteditable="true"][role="textbox"]','textarea'])}sendButton(doc){return this.findBySelectors(doc,['button[aria-label*="Submit"]','button[aria-label*="Send"]','button[data-testid*="send"]','button[type="submit"]'])}responseNodes(doc){return this.findAllBySelectors(doc,['cib-message-group[source="bot"] cib-message .content','.cib-message-content','[data-testid="ai-response"]','.response-message','.bot-message','.response-text','.answer-text'])}isStreaming(doc){return this.findAllBySelectors(doc,['.loading-dots','.typing-indicator','[data-testid="stop-button"]','button[aria-label*="Stop"]','.cib-stop-responding-button']).length>0}}
+
+
+// File 24: browser\components\aistarter\providers\DeepSeekAdapter.sys.mjs
+import {ProviderAdapter} from "./ProviderAdapter.sys.mjs";
+export class DeepSeekAdapter extends ProviderAdapter{constructor(){super("deepseek","https://chat.deepseek.com/")}input(doc){return this.findBySelectors(doc,["textarea.ds-input__input","textarea#chat-input",'textarea[placeholder*="DeepSeek"]',"textarea"])}sendButton(doc){return this.findBySelectors(doc,['div[role="button"].ds-icon-button',"button.ds-icon-button",'button[aria-label*="Send"]','[data-testid*="send"]'])}responseNodes(doc){return this.findAllBySelectors(doc,[".ds-markdown",".ds-message-bubble"])}isStreaming(doc){return!!doc.querySelector('.ds-loading,[class*="loading"],.spinner,[class*="spinner"],[data-streaming="true"]')}isAuthenticated(doc){return!/(login|sign_in|auth)/i.test(doc.location?.href||"")}isRateLimited(doc){return/rate.?limit|too many requests/i.test(doc.body?.innerText||"")}}
+
+
+// File 25: browser\components\aistarter\providers\GeminiAdapter.sys.mjs
+import {ProviderAdapter} from "./ProviderAdapter.sys.mjs";
+export class GeminiAdapter extends ProviderAdapter{constructor(){super("gemini","https://gemini.google.com/app")}input(doc){return this.findBySelectors(doc,[".ql-editor",'textarea','[contenteditable="true"]'])}sendButton(doc){return this.findBySelectors(doc,['button[aria-label*="Send"]','button[aria-label*="send"]'])}responseNodes(doc){return this.findAllBySelectors(doc,["model-response .markdown",".model-response-text .markdown",".response-container .markdown","model-response",".message-content.model .markdown"])}isStreaming(doc){return!!doc.querySelector('button[aria-label*="Stop"],.loading-indicator,mat-progress-bar,.response-loading')}isAuthenticated(doc){return!/(accounts.google.com|signin)/i.test(doc.location?.href||"")}}
+
+
+// File 26: browser\components\aistarter\providers\GrokAdapter.sys.mjs
+import {ProviderAdapter} from "./ProviderAdapter.sys.mjs";
+export class GrokAdapter extends ProviderAdapter{constructor(){super("grok","https://grok.com/")}input(doc){return this.findBySelectors(doc,['.tiptap.ProseMirror','textarea[placeholder*="know"]','textarea[placeholder*="What"]','textarea'])}sendButton(doc){return this.findBySelectors(doc,['button[aria-label="Submit"]','button[data-testid*="send"]'])}responseNodes(doc){return this.findAllBySelectors(doc,[".items-start .response-content-markdown"])}isStreaming(doc){return!!doc.querySelector('[data-streaming="true"],.loading-indicator,.spinner')}}
+
+
+// File 27: browser\components\aistarter\providers\InceptionAdapter.sys.mjs
+import {ProviderAdapter} from "./ProviderAdapter.sys.mjs";
+export class InceptionAdapter extends ProviderAdapter{constructor(){super("inception","https://chat.inceptionlabs.ai/")}input(doc){return this.findBySelectors(doc,["textarea",'[contenteditable="true"]'])}sendButton(doc){return this.findBySelectors(doc,['button[aria-label*="Send"]'])}responseNodes(doc){return this.findAllBySelectors(doc,[".prose-chat",".markdown"])}isStreaming(doc){return!!doc.querySelector('.loading-indicator,[class*="loading"]')}}
+
+
+// File 28: browser\components\aistarter\providers\PerplexityAdapter.sys.mjs
+import {ProviderAdapter} from "./ProviderAdapter.sys.mjs";
+export class PerplexityAdapter extends ProviderAdapter{constructor(){super("perplexity","https://www.perplexity.ai/")}input(doc){return this.findBySelectors(doc,['textarea','[contenteditable="true"]','[placeholder*="Ask"]','[placeholder*="anything"]'])}sendButton(doc){return this.findBySelectors(doc,['button[aria-label*="Submit"]','button[class*="send"]','button[aria-label*="Send"]','button[aria-label*="Ask"]'])}responseNodes(doc){return this.findAllBySelectors(doc,[".prose",".markdown",".break-words"])}isStreaming(doc){return!!doc.querySelector('.loading-indicator,[class*="loading"]')}}
+
+
+// File 29: browser\components\aistarter\providers\ProviderAdapter.sys.mjs
+export class ProviderAdapter{
+ constructor(name,url){this.name=name;this.url=url;this.adapter_version="1.24.0";this.selector_strategy_version="1.24.0";this.supported_features=["streaming","cancel","continuation","diagnostics"]}
+ inputStrategies(_doc){return["keyboard_enter","provider_native_send"]}
+ supportsContinuation(_doc){return true}
+ matchesDocument(doc){try{const e=new URL(this.url),a=new URL(doc.location?.href||"");return a.protocol===e.protocol&&(a.hostname===e.hostname||a.hostname.endsWith(`.${e.hostname}`))}catch(_){return false}}
+ deepQuerySelectorAll(doc,selector){const result=Array.from(doc.querySelectorAll(selector)),roots=new Set(),walk=root=>{if(!root||roots.has(root))return;roots.add(root);for(const e of root.querySelectorAll?.("*")||[]){if(e.shadowRoot){result.push(...e.shadowRoot.querySelectorAll(selector));walk(e.shadowRoot)}}};walk(doc);return[...new Set(result)]}
+ visible(e){return!!e&&!!((e.offsetWidth>0||e.offsetHeight>0||e.getClientRects?.().length>0)&&e.style?.display!=="none"&&e.style?.visibility!=="hidden")}
+ enabled(e){return!!e&&!e.disabled&&e.getAttribute("aria-disabled")!=="true"}
+ findBySelectors(doc,s){for(const sel of s)for(const e of this.deepQuerySelectorAll(doc,sel))if(this.visible(e)&&this.enabled(e))return e;return null}
+ findAllBySelectors(doc,s){const r=[];for(const sel of s)r.push(...this.deepQuerySelectorAll(doc,sel));return[...new Set(r)].filter(e=>this.visible(e))}
+ findContinueButton(doc){const sels=['button[data-testid*="continue"]','button[aria-label*="Continue"]','button[aria-label*="continue"]','button[aria-label*="继续"]',"button","[role=button]"];const is=t=>{const v=String(t||"").trim().toLowerCase();return v==="continue"||v.startsWith("continue")||v==="继续"||v.includes("继续生成")||v==="continuer"||v==="continuar"||v==="weiter"};for(const e of this.findAllBySelectors(doc,sels).reverse())if(is(e.textContent)||is(e.getAttribute("aria-label")))return e;return null}
+ input(doc){return this.findBySelectors(doc,["textarea",'[contenteditable="true"]'])}
+ sendButton(doc){return this.findBySelectors(doc,['button[aria-label*="Send"]','button[aria-label*="Submit"]','button[type="submit"]','[data-testid*="send"]'])}
+ responseNodes(doc){return this.findAllBySelectors(doc,[".markdown",'[data-message-author-role="assistant"]'])}
+ isStreaming(doc){return!!doc.querySelector('[data-streaming="true"],.loading-indicator,.spinner,button[aria-label*="Stop"],[data-testid*="stop"]')}
+ isAuthenticated(_doc){return true}
+ isRateLimited(_doc){return false}
+ dispatchInputEvent(input,prompt){try{input.dispatchEvent(new InputEvent("input",{bubbles:true,cancelable:true,inputType:"insertText",data:prompt}))}catch(_){input.dispatchEvent(new Event("input",{bubbles:true,cancelable:true}))}input.dispatchEvent(new Event("change",{bubbles:true}))}
+ async inject(input,prompt,options={}){const doc=input.ownerDocument,win=doc.defaultView;input.focus();const focusVerified=doc.activeElement===input||input.isContentEditable;if(options.forceFocus&&!focusVerified)return{error:"Focus verification failed",code:"INPUT_VERIFICATION_FAILED"};if("value"in input){const proto=Object.getPrototypeOf(input),desc=Object.getOwnPropertyDescriptor(proto,"value");if(desc?.set)desc.set.call(input,prompt);else input.value=prompt;this.dispatchInputEvent(input,prompt);await new Promise(r=>win.setTimeout(r,50));const actual=String(input.value??"");if(actual!==prompt)return{error:"Input verification failed",code:"INPUT_VERIFICATION_FAILED"};return{input_method:"native_value_setter",input_verified:true,input_text_length:new TextEncoder().encode(actual).length,focus_verified:focusVerified,strategy:"provider_native_send"}}if(input.isContentEditable||input.getAttribute("contenteditable")==="true"){const sel=win.getSelection(),range=doc.createRange();range.selectNodeContents(input);sel.removeAllRanges();sel.addRange(range);let ok=false;try{ok=doc.execCommand("insertText",false,prompt)}catch(_){}if(!ok)input.textContent=prompt;this.dispatchInputEvent(input,prompt);await new Promise(r=>win.setTimeout(r,50));const actual=String(input.textContent||"");if(actual!==prompt)return{error:"Contenteditable verification failed",code:"INPUT_VERIFICATION_FAILED"};return{input_method:"contenteditable",input_verified:true,input_text_length:new TextEncoder().encode(actual).length,focus_verified:focusVerified,strategy:"provider_native_send"}}return{error:"Unsupported input element",code:"INPUT_VERIFICATION_FAILED"}}
+ async submitVerified(input,doc,options={}){let strategy="provider_native_send";if(options.simulateEnter){input.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",code:"Enter",bubbles:true,cancelable:true}));input.dispatchEvent(new KeyboardEvent("keyup",{key:"Enter",code:"Enter",bubbles:true,cancelable:true}));strategy="keyboard_enter"}else{const b=this.sendButton(doc);if(!b)return{error:"Provider send action unavailable",code:"SUBMISSION_FAILED"};b.focus();b.click()}const beforeCount=this.responseNodes(doc).length,before=input&&("value"in input?String(input.value||""):String(input.textContent||"")),win=doc.defaultView,deadline=Date.now()+5000;while(Date.now()<deadline){if(this.isStreaming(doc)||this.responseNodes(doc).length>beforeCount)return{provider_submission_verified:true,submit_method:strategy==="keyboard_enter"?"keyboard_enter":"button_click",strategy};const after=input&&("value"in input?String(input.value||""):String(input.textContent||""));if(after!==before)return{provider_submission_verified:true,submit_method:strategy==="keyboard_enter"?"keyboard_enter":"button_click",strategy};await new Promise(r=>win.setTimeout(r,100))}return{error:"Provider submission could not be positively verified",code:"SUBMISSION_FAILED"}}
+ async verifyContinuationSubmission(doc){const deadline=Date.now()+5000,win=doc.defaultView;while(Date.now()<deadline){if(this.isStreaming(doc))return true;await new Promise(r=>win.setTimeout(r,100))}return false}
+ cancel(doc){const stop=this.findBySelectors(doc,['button[aria-label*="Stop"]','button[data-testid*="stop"]','[data-testid="stop-button"]']);if(!stop)return false;stop.click();return true}
+ inspect(doc){const ns=this.responseNodes(doc),last=ns.length?ns[ns.length-1]:null;return{provider_context_valid:this.matchesDocument(doc),input_ready:!!this.input(doc),input_state:this.input(doc)?"READY":"NOT_READY",authenticated:this.isAuthenticated(doc),rate_limited:this.isRateLimited(doc),message_count:ns.length,last_message_text:String(last?.textContent||""),streaming:this.isStreaming(doc),provider_state:this.isStreaming(doc)?"busy":"idle"}}
+}
+
+
+// File 30: browser\components\aistarter\providers\ProviderRegistry.sys.mjs
+import {DeepSeekAdapter} from "./DeepSeekAdapter.sys.mjs";
+import {GeminiAdapter} from "./GeminiAdapter.sys.mjs";
+import {ChatGPTAdapter} from "./ChatGPTAdapter.sys.mjs";
+import {ClaudeAdapter} from "./ClaudeAdapter.sys.mjs";
+import {GrokAdapter} from "./GrokAdapter.sys.mjs";
+import {CopilotAdapter} from "./CopilotAdapter.sys.mjs";
+import {PerplexityAdapter} from "./PerplexityAdapter.sys.mjs";
+import {InceptionAdapter} from "./InceptionAdapter.sys.mjs";
+import {sortedUtf8} from "../garp/GarpUtil.sys.mjs";
+export class ProviderRegistry{constructor(){this.adapters=new Map();for(const a of [new ChatGPTAdapter(),new ClaudeAdapter(),new CopilotAdapter(),new DeepSeekAdapter(),new GeminiAdapter(),new GrokAdapter(),new InceptionAdapter(),new PerplexityAdapter()])this.adapters.set(a.name,a)}get(name){return this.adapters.get(String(name||"").toLowerCase())||null}list(){return sortedUtf8([...this.adapters.keys()]).map(n=>this.adapters.get(n))}getCapabilityEntries(){return sortedUtf8([...this.adapters.keys()]).map(n=>{const a=this.adapters.get(n);return{id:a.name,version:a.adapter_version,state:"AVAILABLE",input_strategies:sortedUtf8(a.inputStrategies(null)),capabilities:{streaming:a.supported_features.includes("streaming"),cancellation:a.supported_features.includes("cancel"),continuation:a.supported_features.includes("continuation"),diagnostics:a.supported_features.includes("diagnostics")}}})}}
+
+
+// File 31: browser\components\aistarter\providers\moz.build
+EXTRA_JS_MODULES += [
+    'ProviderAdapter.sys.mjs',
+    'ProviderRegistry.sys.mjs',
+    'DeepSeekAdapter.sys.mjs',
+    'GeminiAdapter.sys.mjs',
+    'ChatGPTAdapter.sys.mjs',
+    'ClaudeAdapter.sys.mjs',
+    'GrokAdapter.sys.mjs',
+    'CopilotAdapter.sys.mjs',
+    'PerplexityAdapter.sys.mjs',
+    'InceptionAdapter.sys.mjs',
+]
+
+
+// File 32: browser\components\aistarter\requests\GarpRequest.sys.mjs
+import {GARP_UINT64_MAX} from "../garp/GarpRegistry.sys.mjs";
+import {GarpError,GarpErrorCode} from "../garp/GarpErrors.sys.mjs";
+export const PromptState=Object.freeze({PENDING:"PENDING",SUBMITTING:"SUBMITTING",GENERATING:"GENERATING",WAITING_CONTINUATION:"WAITING_CONTINUATION",CANCELLING:"CANCELLING",COMPLETED:"COMPLETED",FAILED:"FAILED",CANCELLED:"CANCELLED"});
+export class GarpMessageState{constructor(messageId){this.messageId=messageId;this.revision=0n;this.content="";this.lastObservedText="";this.hasCommittedContent=false;this.started=false}apply(observed){const text=String(observed??"");if(text===this.content)return null;let mode="REPLACE",delta=text;if(text.startsWith(this.content)){mode="APPEND";delta=text.slice(this.content.length)}const next=this.revision+1n;if(next>GARP_UINT64_MAX)throw new GarpError(GarpErrorCode.REVISION_GAP,"Message revision overflow");this.revision=next;this.content=text;this.lastObservedText=text;if(text.length>0)this.hasCommittedContent=true;return{revision:String(next),delta,mode}}
+}
+export class GarpRequest{constructor(requestId,sessionId,prompt,options={}){this.requestId=requestId;this.sessionId=sessionId;this.prompt=prompt;this.options=Object.freeze({...options});this.state=PromptState.PENDING;this.messages=new Map();this.messageOrder=[];this.lastMessageCount=0;this.baselineMessageCount=0;this.baselineMessageText="";this.lastPageGeneration=1n;this.actorInstance=null;this.provider=null;this.continuationCount=0;this.maxContinuations=Number(options.max_continuations??8);this.promptDeadline=null;this.continuationWaitDeadline=null;this.startedAt=globalThis.performance?.now?.()??Date.now();this.completedAt=null;this.responseStarted=false;this.partial=false;this.terminalCommitted=false;this.error=null;this.cancelAccepted=false;this.cancellationVerified=false;this.providerOperationEpoch=0;this.continuationEpoch=0;this.timeoutEpoch=0;this.cancelEpoch=0;this.fencingEpoch=0}
+ get terminal(){return [PromptState.COMPLETED,PromptState.FAILED,PromptState.CANCELLED].includes(this.state)}
+ get contentCommitted(){if(this.partial)return true;for(const m of this.messages.values())if(m.hasCommittedContent)return true;return false}
+ ensureMessage(id){let m=this.messages.get(id);if(!m){m=new GarpMessageState(id);this.messages.set(id,m);this.messageOrder.push(id)}return m}
+ aggregateContent(){if(this.messageOrder.length===0)return"";if(this.messageOrder.length===1)return this.messages.get(this.messageOrder[0]).content;return this.messages.get(this.messageOrder[this.messageOrder.length-1]).content}
+ snapshot(){const first=this.messageOrder.length?this.messages.get(this.messageOrder[0]):null;return{success:true,prompt_request_id:this.requestId,state:this.state,page_generation:String(this.lastPageGeneration),message_id:first?.messageId??null,revision:first?String(first.revision):"0",continuation_count:this.continuationCount,max_continuations:this.maxContinuations,partial:this.partial,...(this.error?{error:this.error}:{})}}
+}
+
+
+// File 33: browser\components\aistarter\requests\GarpRequestManager.sys.mjs
+import {GarpRequest,PromptState} from "./GarpRequest.sys.mjs";
+import {GarpError,GarpErrorCode} from "../garp/GarpErrors.sys.mjs";
+import {GARP_DEFAULT_CONTINUATION_WAIT_MS,GARP_DEFAULT_RECOVERY_DEADLINE_MS,GARP_MAX_GENERATION_BUFFER_MB,GARP_MAX_RESPONSE_SIZE,GARP_UINT64_MAX} from "../garp/GarpRegistry.sys.mjs";
+import {byteLength,monotonicNow,uuid} from "../garp/GarpUtil.sys.mjs";
+const ACTIVE=new Set(Object.values(PromptState).filter(x=>!["COMPLETED","FAILED","CANCELLED"].includes(x)));
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+export class GarpRequestManager{
+ constructor(service,sessionManager){this.service=service;this.sessionManager=sessionManager;this.requests=new Map();this.subscribers=new Map()}
+ get(id){const r=this.requests.get(id);if(!r)throw new GarpError(GarpErrorCode.PROMPT_NOT_FOUND,`Prompt not found: ${id}`);return r}
+ getForSession(sid,id){const r=this.get(id);if(r.sessionId!==sid)throw new GarpError(GarpErrorCode.PROMPT_NOT_FOUND,`Prompt not found in session: ${id}`);return r}
+ subscribe(id,connection){let s=this.subscribers.get(id);if(!s){s=new Set();this.subscribers.set(id,s)}s.add(connection);return this.get(id)}
+ unsubscribeConnection(c){for(const s of this.subscribers.values())s.delete(c)}
+ startPrompt(connection,sid,rid,prompt,options={}){const s=this.sessionManager.get(sid);s.assertIdle();if(this.requests.has(rid))throw new GarpError(GarpErrorCode.DUPLICATE_REQUEST,"Prompt request ID already exists");const r=new GarpRequest(rid||uuid(),sid,prompt,options);r.provider=s.provider;r.lastPageGeneration=s.pageGeneration;r.actorInstance=s.actorInstance;s.reservePrompt(r.requestId);this.requests.set(r.requestId,r);this.subscribe(r.requestId,connection);const timeout=BigInt(options.timeout_ms??"0");if(timeout>0n){r.promptDeadline=monotonicNow()+Number(timeout);this.scheduleTimer(r,r.promptDeadline,++r.timeoutEpoch,GarpErrorCode.PROMPT_TIMEOUT,"Prompt timeout")}this.runPrompt(r).catch(e=>this.failCandidate(r,e?.code||GarpErrorCode.PROVIDER_ERROR,e?.message||String(e),e));return r}
+ scheduleTimer(r,deadline,epoch,code,message){const delay=Math.max(0,deadline-monotonicNow());setTimeout(()=>{if(!this.requests.has(r.requestId)||r.terminalCommitted||epoch!==r.timeoutEpoch)return;if(monotonicNow()+1<deadline){this.scheduleTimer(r,deadline,epoch,code,message);return}this.failCandidate(r,code,message)},Math.min(delay+10,0x7fffffff))}
+ async emit(r,type,payload){const s=this.sessionManager.get(r.sessionId);return s.enqueue(`event:${type}`,()=>{if(r.terminalCommitted&&!type.startsWith("GENERATION_"))return null;const e=this.service.commitSessionEvent(s,type,payload,{broadcast:false});for(const c of this.subscribers.get(r.requestId)||[])if(c.authenticated)c.sendEnvelope(e,false);return e})}
+ async waitForReady(s,r){const deadline=monotonicNow()+Number(r.options.ready_timeout_ms??r.options.timeout_ms??30000);while(monotonicNow()<deadline){if(r.terminalCommitted)return false;if(r.cancelAccepted)throw new GarpError(GarpErrorCode.PROMPT_CANCELLED,"Prompt cancelled during preparation");try{const x=await this.service.callChild(s,"InspectReady",{provider:s.provider,prompt_request_id:r.requestId});if(x.error)throw this.errorFromChild(x);if(x.authenticated===false||x.state==="AUTH_REQUIRED")throw new GarpError(GarpErrorCode.PROVIDER_AUTH_REQUIRED,"Provider authentication required");if(x.rate_limited||x.state==="RATE_LIMITED")throw new GarpError(GarpErrorCode.PROVIDER_RATE_LIMITED,"Provider rate limited");s.inputState=x.input_state||(x.input_ready?"READY":"NOT_READY");if(x.input_ready){if(s.state==="PREPARING"||s.state==="RETRYING")s.transition("READY");return true}}catch(e){if(![GarpErrorCode.STALE_ACTOR,GarpErrorCode.NAVIGATION_DRIFT,GarpErrorCode.TAB_UNAVAILABLE].includes(e?.code))throw e}await sleep(250)}throw new GarpError(GarpErrorCode.PROMPT_TIMEOUT,"Provider input did not become ready before timeout")}
+ async runPrompt(r){const s=this.sessionManager.get(r.sessionId);await this.waitForReady(s,r);if(r.terminalCommitted)return;r.state=PromptState.SUBMITTING;const snap=await this.service.callChild(s,"CaptureSnapshot",{provider:s.provider,prompt_request_id:r.requestId});if(snap.error)throw this.errorFromChild(snap);r.lastMessageCount=Number(snap.last_message_count||0);r.baselineMessageCount=r.lastMessageCount;r.baselineMessageText=String(snap.last_message_text||"");r.lastPageGeneration=s.pageGeneration;r.actorInstance=s.actorInstance;const inj=await this.service.callChild(s,"InjectPrompt",{provider:s.provider,prompt:r.prompt,forceFocus:!!r.options.force_focus,simulateEnter:!!r.options.simulate_enter,prompt_request_id:r.requestId});if(inj.error)throw this.errorFromChild(inj);if(!inj.provider_submission_verified)throw new GarpError(GarpErrorCode.SUBMISSION_FAILED,"Provider submission was not positively verified");await this.emit(r,"INPUT_SUBMITTED",{prompt_request_id:r.requestId,page_generation:String(s.pageGeneration),strategy:inj.strategy||"provider_native_send"});if(r.cancelAccepted){this.startCancellationResolution(r,s);return}this.observe(r).catch(e=>this.failCandidate(r,e?.code||GarpErrorCode.PROVIDER_ERROR,e?.message||String(e),e))}
+ async observe(r){const s=this.sessionManager.get(r.sessionId);let stable=0;for(;;){if(r.terminalCommitted)return;if(r.state===PromptState.CANCELLING){await this.resolveCancellationStep(r,s);return}if(r.promptDeadline!==null&&monotonicNow()>=r.promptDeadline){await this.failCandidate(r,GarpErrorCode.PROMPT_TIMEOUT,"Prompt timeout");return}let x;try{x=await this.service.callChild(s,"ObserveGeneration",{provider:s.provider,previous_message_count:r.lastMessageCount,previous_message_text:r.baselineMessageText,prompt_request_id:r.requestId})}catch(e){if([GarpErrorCode.STALE_ACTOR,GarpErrorCode.NAVIGATION_DRIFT].includes(e?.code)){await this.handleNavigationDrift(r,s,e);return}throw e}if(x.error){const code=x.code||GarpErrorCode.PROVIDER_ERROR;if(code===GarpErrorCode.PROVIDER_AUTH_REQUIRED)await this.service.commitSessionEvent(s,"PROVIDER_AUTH_REQUIRED",{provider:s.provider,reason:"LOGIN_REQUIRED",page_generation:String(s.pageGeneration)});else if(code===GarpErrorCode.PROVIDER_RATE_LIMITED)await this.service.commitSessionEvent(s,"PROVIDER_RATE_LIMITED",{provider:s.provider,retry_after_ms:"0",page_generation:String(s.pageGeneration)});else await this.service.commitSessionEvent(s,"PROVIDER_ERROR",{provider:s.provider,code,message:x.error||"Provider error",retryable:!!x.retryable,prompt_request_id:r.requestId,page_generation:String(s.pageGeneration)});await this.failCandidate(r,code,x.error);return}const count=Number(x.message_count||0);const text=String(x.text??"");const observedMessages=Array.isArray(x.messages)&&x.messages.length?x.messages:[{message_id:x.message_id||null,text}];const identified=count>r.lastMessageCount||text!==r.baselineMessageText||x.authoritative_generation_started===true;const priorCount=r.lastMessageCount;r.lastMessageCount=count;r.baselineMessageText=text;r.lastPageGeneration=s.pageGeneration;r.actorInstance=s.actorInstance;if(identified&&!r.responseStarted){r.responseStarted=true;r.state=PromptState.GENERATING;}
+ for(const observed of observedMessages){const mid=observed.message_id||r.messageOrder[0]||uuid();const observedText=String(observed.text??"");const m=r.ensureMessage(mid);if(!m.started){m.started=true;await this.emit(r,"GENERATION_STARTED",{prompt_request_id:r.requestId,message_id:mid,revision:"0",page_generation:String(s.pageGeneration)})}if(!r.responseStarted)continue;const delta=m.apply(observedText);if(delta){if(byteLength(m.content)>GARP_MAX_RESPONSE_SIZE){await this.failCandidate(r,GarpErrorCode.RESPONSE_TOO_LARGE,"Response exceeds max_response_size");return}if(byteLength(observedText)>GARP_MAX_GENERATION_BUFFER_MB*1024*1024){await this.failCandidate(r,GarpErrorCode.GENERATION_BUFFER_LIMIT,"Generation buffer limit exceeded");return}r.partial=true;stable=0;await this.emit(r,"GENERATION_DELTA",{prompt_request_id:r.requestId,message_id:m.messageId,revision:delta.revision,delta:delta.delta,mode:delta.mode,page_generation:String(s.pageGeneration)})}}
+ if(r.responseStarted&&!observedMessages.some(m=>String(m.text??"")!=="")&&text)stable++;
+ await this.emit(r,"GENERATION_PROGRESS",{prompt_request_id:r.requestId,message_count:count,page_generation:String(s.pageGeneration)});if(x.continuation_required){await this.handleContinuationRequired(r,s,x);return}if(r.responseStarted&&x.done&&stable>=2){await this.completeCandidate(r,s,x);return}await sleep(500)}}
+ async handleContinuationRequired(r,s,x){if(r.cancelAccepted){this.startCancellationResolution(r,s);return}if(r.maxContinuations===0){await this.failCandidate(r,GarpErrorCode.CONTINUATION_NOT_ALLOWED,"Continuation is disabled");return}if(r.continuationCount>=r.maxContinuations){await this.failCandidate(r,GarpErrorCode.CONTINUATION_LIMIT_REACHED,"Continuation limit reached");return}if(x.continuation_supported===false&&!x.continuation_available){await this.failCandidate(r,GarpErrorCode.CONTINUATION_NOT_AVAILABLE,"Continuation unavailable");return}r.state=PromptState.WAITING_CONTINUATION;r.continuationWaitDeadline=monotonicNow()+Number(GARP_DEFAULT_CONTINUATION_WAIT_MS);const epoch=++r.timeoutEpoch;await this.emit(r,"CONTINUATION_REQUIRED",{prompt_request_id:r.requestId,continuation_count:r.continuationCount,max_continuations:r.maxContinuations,page_generation:String(s.pageGeneration)});this.scheduleTimer(r,r.continuationWaitDeadline,epoch,GarpErrorCode.CONTINUATION_TIMEOUT,"Continuation timeout");if(r.options.auto_continue===true)this.autoContinue(r,s)}
+ async autoContinue(r,s){try{const reserved=await this.reserveContinuation(r,s,"auto");if(reserved)await this.runContinuation(r,s,reserved.epoch)}catch(_){}}
+ async reserveContinuation(r,s,source){return s.enqueue(`continue:${source}`,()=>{if(r.terminalCommitted||r.state!==PromptState.WAITING_CONTINUATION)return source==="auto"?null:Promise.reject(new GarpError(GarpErrorCode.PROMPT_NOT_ACTIVE,"Prompt is not waiting for continuation"));if(r.continuationCount>=r.maxContinuations)throw new GarpError(GarpErrorCode.CONTINUATION_LIMIT_REACHED,"Continuation limit reached");const epoch=++r.continuationEpoch;r.state=PromptState.SUBMITTING;return{epoch}})}
+ async continuePrompt(connection,sid,pid){const s=this.sessionManager.get(sid),r=this.getForSession(sid,pid);if(r.terminal)throw new GarpError(GarpErrorCode.PROMPT_ALREADY_TERMINAL,"Prompt is terminal");if(r.state!==PromptState.WAITING_CONTINUATION)throw new GarpError(GarpErrorCode.PROMPT_NOT_ACTIVE,"Prompt is not waiting for continuation");if(s.ownerConnection&&s.ownerConnection!==connection)throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE,"Connection does not own session");const reserved=await this.reserveContinuation(r,s,"explicit");if(!reserved)throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE,"Continuation reservation lost");this.runContinuation(r,s,reserved.epoch).catch(e=>this.failCandidate(r,e?.code||GarpErrorCode.PROVIDER_ERROR,e?.message||String(e),e))}
+ async runContinuation(r,s,epoch){const result=await this.service.callChild(s,"ContinueGeneration",{provider:s.provider,prompt_request_id:r.requestId,continuation_epoch:epoch,reason:"provider_length_limit"});if(r.cancelAccepted||r.terminalCommitted||epoch!==r.continuationEpoch)return;if(result.error)throw this.errorFromChild(result);if(!result.provider_submission_verified)throw new GarpError(GarpErrorCode.SUBMISSION_FAILED,"Continuation submission was not positively verified");r.continuationCount++;r.state=PromptState.GENERATING;await this.emit(r,"CONTINUATION_SUBMITTED",{prompt_request_id:r.requestId,page_generation:String(s.pageGeneration),continuation_count:r.continuationCount,strategy:result.strategy||"provider_native_send"});this.observe(r).catch(e=>this.failCandidate(r,e?.code||GarpErrorCode.PROVIDER_ERROR,e?.message||String(e),e))}
+ async cancel(connection,sid,pid){const s=this.sessionManager.get(sid),r=this.getForSession(sid,pid);if(s.ownerConnection&&s.ownerConnection!==connection)throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE,"Connection does not own session");if(r.terminal)throw new GarpError(GarpErrorCode.PROMPT_ALREADY_TERMINAL,"Prompt is terminal");if(r.state===PromptState.CANCELLING)throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE,"Cancellation already in progress");if(!ACTIVE.has(r.state))throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE,`Cannot cancel from ${r.state}`);r.cancelAccepted=true;r.state=PromptState.CANCELLING;r.cancelEpoch++;r.continuationEpoch++;await s.enqueue("cancel-accept",()=>{if(s.state==="BUSY")s.transition("RECOVERING")});this.startCancellationResolution(r,s);return r}
+ startCancellationResolution(r,s){this.resolveCancellationStep(r,s).catch(e=>this.failCandidate(r,GarpErrorCode.RECOVERY_FAILED,e.message,e))}
+ async resolveCancellationStep(r,s){const deadline=monotonicNow()+Number(GARP_DEFAULT_RECOVERY_DEADLINE_MS);let issued=false;const epoch=r.cancelEpoch;while(monotonicNow()<deadline&&!r.terminalCommitted&&epoch===r.cancelEpoch){try{if(!issued){issued=true;const opEpoch=r.providerOperationEpoch+1;r.providerOperationEpoch=opEpoch;await this.service.callChild(s,"CancelGeneration",{provider:s.provider,prompt_request_id:r.requestId,provider_operation_epoch:opEpoch})}const state=await this.service.callChild(s,"InspectProviderState",{provider:s.provider,prompt_request_id:r.requestId,previous_message_count:r.lastMessageCount,previous_message_text:r.baselineMessageText,provider_operation_epoch:r.providerOperationEpoch});if(state.streaming===false&&state.authoritative_cessation===true){r.cancellationVerified=true;await this.cancelCandidate(r,s);return}if(state.streaming===false&&state.authoritative_completion===true&&r.responseStarted){await this.completeCandidate(r,s,state);return}}catch(e){if([GarpErrorCode.STALE_ACTOR,GarpErrorCode.NAVIGATION_DRIFT].includes(e?.code)){}else if(e?.code===GarpErrorCode.PROVIDER_ERROR){} }await sleep(250)}if(!r.terminalCommitted)await this.failCandidate(r,GarpErrorCode.RECOVERY_FAILED,"Cancellation state could not be authoritatively established")}
+ currentFencing(r,s){return{session_id:s.sessionId,provider:s.provider,prompt_request_id:r.requestId,page_generation:s.pageGeneration,actor_instance:s.actorInstance,message_id:r.messageOrder[0]||null,fencing_epoch:r.fencingEpoch}}
+ async completeCandidate(r,s,result){return s.enqueue("terminal-completed",()=>this.commitTerminalCandidate({kind:"COMPLETED",request:r,session:s,fencing:this.currentFencing(r,s),result}))}
+ async cancelCandidate(r,s){return s.enqueue("terminal-cancelled",()=>this.commitTerminalCandidate({kind:"CANCELLED",request:r,session:s,fencing:this.currentFencing(r,s)}))}
+ failCandidate(r,code,message,error=null){const s=this.sessionManager.sessions.get(r.sessionId);if(!s||r.terminalCommitted)return Promise.resolve(false);const c={kind:"FAILED",request:r,session:s,fencing:this.currentFencing(r,s),code,message,partial:r.contentCommitted};return s.enqueue(`terminal-failed:${code}`,()=>this.commitTerminalCandidate(c))}
+ async commitTerminalCandidate(c){const r=c.request,s=c.session;if(r.terminalCommitted||s.activeRequestId!==r.requestId)return false;if(c.fencing.provider!==s.provider||c.fencing.prompt_request_id!==r.requestId)return false;if((c.kind!=="FAILED")&&(!c.fencing.actor_instance||c.fencing.actor_instance!==s.actorInstance||c.fencing.page_generation!==s.pageGeneration))return false;r.terminalCommitted=true;r.completedAt=monotonicNow();r.partial=r.partial||r.contentCommitted||!!c.partial;let messages=[];for(const id of r.messageOrder){const m=r.messages.get(id);messages.push({message_id:m.messageId,revision:String(m.revision),response:m.content})}if(c.kind==="COMPLETED"){r.state=PromptState.COMPLETED;s.clearActivePrompt();s.lastMessageId=r.messageOrder[0]||null;s.lastMessageText=r.aggregateContent();s.lastMessageCount=Math.max(s.lastMessageCount,r.lastMessageCount);const payload=messages.length===1?{prompt_request_id:r.requestId,message_id:messages[0].message_id,revision:messages[0].revision,response:messages[0].response,page_generation:String(s.pageGeneration)}:{prompt_request_id:r.requestId,messages,page_generation:String(s.pageGeneration)};await this.emit(r,"GENERATION_COMPLETED",payload)}else if(c.kind==="CANCELLED"){r.state=PromptState.CANCELLED;s.clearActivePrompt();const payload=messages.length===1?{prompt_request_id:r.requestId,message_id:messages[0].message_id,revision:messages[0].revision,cancel_verified:true,partial:r.partial,response:messages[0].response,page_generation:String(s.pageGeneration)}:{prompt_request_id:r.requestId,cancel_verified:true,partial:r.partial,messages,page_generation:String(s.pageGeneration)};await this.emit(r,"GENERATION_CANCELLED",payload)}else{r.state=PromptState.FAILED;r.error={code:c.code,message:c.message};s.activeRequestId=null;s.generationState="IDLE";if(c.code===GarpErrorCode.PROVIDER_AUTH_REQUIRED)s.state="AUTH_REQUIRED";else if(c.code===GarpErrorCode.PROVIDER_RATE_LIMITED)s.state="RATE_LIMITED";else if([GarpErrorCode.NAVIGATION_DRIFT,GarpErrorCode.PROVIDER_UNAVAILABLE,GarpErrorCode.RESPONSE_TOO_LARGE,GarpErrorCode.GENERATION_BUFFER_LIMIT,GarpErrorCode.RECOVERY_FAILED].includes(c.code))s.state="RECOVERING";else if(c.code===GarpErrorCode.EVENT_QUEUE_OVERFLOW)s.state="FAILED";else s.state=s.state==="CLOSED"?"CLOSED":"READY";const payload=messages.length===1?{prompt_request_id:r.requestId,message_id:messages[0].message_id,revision:messages[0].revision,error:r.error,partial:r.partial,response:messages[0].response||null,page_generation:String(s.pageGeneration)}:{prompt_request_id:r.requestId,error:r.error,partial:r.partial,messages,page_generation:String(s.pageGeneration)};await this.emit(r,"GENERATION_FAILED",payload)}return true}
+ async handleNavigationDrift(r,s,error){if(r.terminalCommitted)return;s.state="RECOVERING";await this.emit(r,"NAVIGATION_DRIFT",{page_generation:String(s.pageGeneration),reason:error?.reason||"DOCUMENT_REPLACED"});await this.failCandidate(r,GarpErrorCode.NAVIGATION_DRIFT,"Navigation drift invalidated active prompt");this.service.recoverSession(s,"DOCUMENT_REPLACED").catch(()=>{})}
+ async abortForSessionReset(s,reason){const id=s.activeRequestId;if(!id)return;const r=this.requests.get(id);if(!r||r.terminalCommitted)return;await this.failCandidate(r,GarpErrorCode.RECOVERY_FAILED,reason==="SESSION_CLOSE"?"Session closed while prompt was active":"Prompt invalidated by RESET_SESSION");this.service.callChild(s,"CancelGeneration",{provider:s.provider,prompt_request_id:id}).catch(()=>{})}
+ errorFromChild(result){return new GarpError(result.code||GarpErrorCode.PROVIDER_ERROR,result.error||"Provider operation failed",{retryable:!!result.retryable})}
+ getResponse(r){if(!r.terminal)throw new GarpError(GarpErrorCode.RESPONSE_NOT_READY,"The response is not terminally available");if(r.messageOrder.length===1)return{success:true,state:r.state,partial:r.partial,response:r.messages.get(r.messageOrder[0]).content||null,...(r.state==="FAILED"?{error:r.error}:{})};return{success:true,state:r.state,partial:r.partial,messages:r.messageOrder.map(id=>{const m=r.messages.get(id);return{message_id:m.messageId,revision:String(m.revision),response:m.content}}),...(r.state==="FAILED"?{error:r.error}:{})}}
+ prune(retentionMs){const n=monotonicNow();for(const [id,r] of this.requests)if(r.terminalCommitted&&r.completedAt!==null&&n-r.completedAt>retentionMs){this.requests.delete(id);this.subscribers.delete(id)}}
+}
+
+
+// File 34: browser\components\aistarter\requests\moz.build
+EXTRA_JS_MODULES += [
+    'GarpRequest.sys.mjs',
+    'GarpRequestManager.sys.mjs',
+]
+
+
+// File 35: browser\components\aistarter\sessions\AIAutomationSession.sys.mjs
+import {GARP_MAX_EVENT_HISTORY_MEMORY_MB,GARP_MAX_QUEUED_EVENTS,GARP_UINT64_MAX} from "../garp/GarpRegistry.sys.mjs";
+import {GarpError,GarpErrorCode} from "../garp/GarpErrors.sys.mjs";
+import {byteLength,uuid} from "../garp/GarpUtil.sys.mjs";
+const T=new Set(["COMPLETED","FAILED","CANCELLED"]);
+const TRANS={CREATED:["PREPARING","FAILED","CLOSED"],PREPARING:["READY","AUTH_REQUIRED","RATE_LIMITED","RETRYING","RECOVERING","FAILED","CLOSED"],READY:["BUSY","PREPARING","AUTH_REQUIRED","RATE_LIMITED","RECOVERING","FAILED","CLOSED"],BUSY:["READY","PREPARING","RETRYING","AUTH_REQUIRED","RATE_LIMITED","RECOVERING","FAILED","CLOSED"],AUTH_REQUIRED:["PREPARING","FAILED","CLOSED"],RATE_LIMITED:["PREPARING","FAILED","CLOSED"],RECOVERING:["READY","BUSY","RETRYING","FAILED","CLOSED"],RETRYING:["BUSY","PREPARING","FAILED","CLOSED"],FAILED:["PREPARING","CLOSED"],CLOSED:[]};
+export class AIAutomationSession{constructor({sessionId,provider,tabId,pageGeneration=1n}){this.sessionId=sessionId||uuid();this.provider=provider;this.authoritativeProvider=provider;this.tabId=tabId;this.pageGeneration=BigInt(pageGeneration);this.state="CREATED";this.inputState="UNKNOWN";this.generationState="IDLE";this.lastRequestId=null;this.lastMessageId=null;this.lastMessageText="";this.lastMessageCount=0;this.activeRequestId=null;this.pageURL="";this.actorObject=null;this.actorInstance=null;this.ownerConnection=null;this.eventSequence=0n;this.eventHistory=[];this.eventHistoryBytes=0;this.subscribers=new Set();this.arbiterTail=Promise.resolve()}
+ enqueue(_label,op){const run=this.arbiterTail.then(()=>op());this.arbiterTail=run.catch(()=>{});return run}
+ transition(s){if(s===this.state)return;if(!TRANS[this.state]?.includes(s))throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE,`Invalid session transition ${this.state} -> ${s}`);this.state=s}
+ assertMutable(){if(this.state==="CLOSED")throw new GarpError(GarpErrorCode.SESSION_CLOSED,"Session is closed")}
+ assertIdle(){this.assertMutable();if(this.activeRequestId)throw new GarpError(GarpErrorCode.SESSION_BUSY,"Session already has an active prompt");if(this.state!=="READY")throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE,`Session is not READY: ${this.state}`)}
+ reservePrompt(id){this.assertIdle();this.activeRequestId=id;this.lastRequestId=id;this.transition("BUSY")}
+ clearActivePrompt(){this.activeRequestId=null;this.generationState="IDLE";if(this.state==="BUSY"||this.state==="RECOVERING"||this.state==="RETRYING")this.state="READY"}
+ incrementPageGeneration(url=""){if(this.pageGeneration>=GARP_UINT64_MAX)throw new GarpError(GarpErrorCode.PAGE_GENERATION_OVERFLOW,"Page generation overflow");this.pageGeneration++;if(url)this.pageURL=url;this.actorObject=null;this.actorInstance=null;return this.pageGeneration}
+ commitEvent(envelope){if(this.eventSequence>=GARP_UINT64_MAX)throw new GarpError(GarpErrorCode.EVENT_SEQUENCE_OVERFLOW,"Event sequence overflow");this.eventSequence++;const committed=structuredClone({...envelope,sequence:String(this.eventSequence)});const size=byteLength(JSON.stringify(committed));const max=GARP_MAX_EVENT_HISTORY_MEMORY_MB*1024*1024;if(size>max)throw new GarpError(GarpErrorCode.EVENT_QUEUE_OVERFLOW,"Event exceeds history memory budget");while(this.eventHistory.length>=GARP_MAX_QUEUED_EVENTS||this.eventHistoryBytes+size>max){if(!this.eventHistory.length)throw new GarpError(GarpErrorCode.EVENT_QUEUE_OVERFLOW,"Event queue overflow");this.eventHistoryBytes-=byteLength(JSON.stringify(this.eventHistory.shift()))}this.eventHistory.push(committed);this.eventHistoryBytes+=size;return committed}
+ oldestSequence(){return this.eventHistory.length?BigInt(this.eventHistory[0].sequence):this.eventSequence+1n} lastSequence(){return this.eventSequence}
+ snapshot(){return{session_id:this.sessionId,provider:this.provider,tab_id:this.tabId,url:this.pageURL,page_generation:String(this.pageGeneration),state:this.state,input_state:this.inputState,generation_state:this.generationState,active_prompt_request_id:this.activeRequestId,last_request_id:this.lastRequestId,last_message_id:this.lastMessageId,last_message_count:this.lastMessageCount,event_sequence:String(this.eventSequence)}}
+}
+
+
+// File 36: browser\components\aistarter\sessions\AIAutomationSessionManager.sys.mjs
+import {AIAutomationSession} from "./AIAutomationSession.sys.mjs";
+import {GarpError,GarpErrorCode} from "../garp/GarpErrors.sys.mjs";
+import {uuid} from "../garp/GarpUtil.sys.mjs";
+function validateUrl(url){try{const u=new URL(url);if(!["http:","https:"].includes(u.protocol))throw 0}catch(_){throw new GarpError(GarpErrorCode.INVALID_ARGUMENT,"Only http:// and https:// URLs are permitted")}}
+export class AIAutomationSessionManager{constructor(service,registry){this.service=service;this.registry=registry;this.sessions=new Map();this.tabIds=new WeakMap();this.tabsById=new Map()}
+ getTopWindow(){const w=this.service.getTopWindow();if(!w)throw new GarpError(GarpErrorCode.TAB_UNAVAILABLE,"No browser window available");return w}
+ getStableTabId(tab){if(!tab)throw new GarpError(GarpErrorCode.TAB_NOT_FOUND,"Tab unavailable");let id=this.tabIds.get(tab);if(!id){id=uuid();this.tabIds.set(tab,id)}this.tabsById.set(id,tab);return id}
+ resolveTab(id){const w=this.getTopWindow(),tab=this.tabsById.get(id);if(!tab||w.gBrowser.tabs.indexOf(tab)<0){if(tab)this.tabsById.delete(id);throw new GarpError(GarpErrorCode.TAB_NOT_FOUND,`Tab not found: ${id}`)}if(tab.linkedBrowser?.browsingContext?.discarded)throw new GarpError(GarpErrorCode.TAB_UNAVAILABLE,`Tab unavailable: ${id}`);return tab}
+ listTabs(){const w=this.getTopWindow();return w.gBrowser.tabs.map(tab=>({tab_id:this.getStableTabId(tab),url:tab.linkedBrowser?.currentURI?.spec||"about:blank",title:tab.label||"",active:!!tab.selected}))}
+ openTab(url){validateUrl(url);const w=this.getTopWindow();const tab=w.gBrowser.addTrustedTab(url);w.gBrowser.selectedTab=tab;return{tab_id:this.getStableTabId(tab),url}}
+ closeTab(id){const w=this.getTopWindow(),tab=this.resolveTab(id),tid=this.getStableTabId(tab);for(const s of this.sessions.values())if(s.tabId===tid)s.state="CLOSED";w.gBrowser.removeTab(tab);this.tabsById.delete(tid);return{success:true}}
+ selectTab(id){const w=this.getTopWindow(),tab=this.resolveTab(id);w.gBrowser.selectedTab=tab;return{success:true,tab_id:this.getStableTabId(tab)}}
+ createSession(provider,tabId=null){const a=this.registry.get(provider);if(!a)throw new GarpError(GarpErrorCode.PROVIDER_UNAVAILABLE,`Provider adapter unavailable: ${provider}`);let tab;if(tabId!==null)tab=this.resolveTab(tabId);else{const w=this.getTopWindow();tab=w.gBrowser.addTrustedTab(a.url);w.gBrowser.selectedTab=tab}const s=new AIAutomationSession({sessionId:uuid(),provider:a.name,tabId:this.getStableTabId(tab),pageGeneration:1n});s.state="PREPARING";s.pageURL=tab.linkedBrowser?.currentURI?.spec||"";this.sessions.set(s.sessionId,s);return s}
+ get(id){const s=this.sessions.get(id);if(!s)throw new GarpError(GarpErrorCode.SESSION_NOT_FOUND,`Session not found: ${id}`);if(s.state==="CLOSED")throw new GarpError(GarpErrorCode.SESSION_CLOSED,"Session is closed");return s}
+ attach(sid,connection){const s=this.get(sid);if(s.ownerConnection&&s.ownerConnection!==connection)throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE,"Session already attached");s.ownerConnection=connection;s.subscribers.add(connection);return s}
+ detach(sid,connection){const s=this.get(sid);if(s.ownerConnection&&s.ownerConnection!==connection)throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE,"Connection does not own session");s.ownerConnection=null;s.subscribers.delete(connection);return s}
+ closeSession(sid){const s=this.sessions.get(sid);if(!s)return null;s.state="CLOSED";s.activeRequestId=null;s.ownerConnection=null;s.subscribers.clear();s.actorObject=null;s.actorInstance=null;return s}
+ resetSession(sid,connection){const s=this.get(sid);if(s.ownerConnection&&s.ownerConnection!==connection)throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE,"Connection does not own session");s.assertMutable();s.state="PREPARING";s.inputState="UNKNOWN";s.generationState="IDLE";s.lastRequestId=null;s.lastMessageId=null;s.lastMessageText="";s.lastMessageCount=0;s.incrementPageGeneration(s.pageURL);return s}
+ getTabForSession(s){return this.resolveTab(s.tabId)}
+}
+
+
+// File 37: browser\components\aistarter\sessions\moz.build
+EXTRA_JS_MODULES += [
+    'AIAutomationSession.sys.mjs',
+    'AIAutomationSessionManager.sys.mjs',
+]
+
+
+// File 38: install-component.ps1
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$FirefoxRoot
+)
+
+$ErrorActionPreference = "Stop"
+$source = Join-Path $PSScriptRoot "browser\components\aistarter"
+$target = Join-Path $FirefoxRoot "browser\components\aistarter"
+
+if (-not (Test-Path (Join-Path $FirefoxRoot "mach"))) {
+    throw "FirefoxRoot does not appear to be a Firefox source checkout: $FirefoxRoot"
+}
+
+if (Test-Path $target) {
+    Write-Host "Target already exists: $target"
+    Write-Host "Rename or remove the old aistarter directory before installing this GARP/1.24 implementation."
+    exit 2
+}
+
+New-Item -ItemType Directory -Path (Split-Path $target) -Force | Out-Null
+Copy-Item -Path $source -Destination $target -Recurse -Force
+Write-Host "Installed GARP/1.24 Firefox component to: $target"
+Write-Host "Manual integration remains required for browser/components/moz.build, BrowserGlue.sys.mjs, and DesktopActorRegistry.sys.mjs."
+
+
+// File 39: tests\Garp124Conformance.mjs
+import assert from "node:assert/strict";
+import { encodeGarpMessage, decodeGarpFrame } from "../browser/components/aistarter/garp/GarpFrame.sys.mjs";
+import { GarpError, GarpErrorCode } from "../browser/components/aistarter/garp/GarpErrors.sys.mjs";
+import { textEncoder, encodeTranscript, hmacSha256, base64UrlEncode } from "../browser/components/aistarter/garp/GarpUtil.sys.mjs";
+import { validateMessagePayload } from "../browser/components/aistarter/garp/GarpSchema.sys.mjs";
+const secret=textEncoder.encode("0123456789abcdef0123456789abcdef");
+const cn=Uint8Array.from([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]);
+const sn=Uint8Array.from([16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1]);
+const common=[cn,sn,"1.24","0x00",["!ext-pong"],["!ext-pong"],"GARPClient","1.24.0","GarpGateway","1.24.0"];
+const ct=encodeTranscript("GARP/1.24/client-proof",...common); const st=encodeTranscript("GARP/1.24/server-proof",...common);
+assert.equal(ct.length,165); assert.equal(st.length,165);
+const cp=await hmacSha256(secret,ct),sp=await hmacSha256(secret,st);
+assert.equal(base64UrlEncode(cp),"4RiTq2SUP15gOp1alqIRdMBUM7Qv4CMZqREMXX4efQs");
+assert.equal(base64UrlEncode(sp),"iFaTVoYbn_pb5yCCHOTpAUyfzFaCkXXKgLAbpMX6cfI");
+const id="00000000-0000-0000-0000-000000000001";
+const f=encodeGarpMessage("PING",{},{request_id:id,session_id:null,timestamp:"2026-01-01T00:00:00.000Z",sequence:null});
+assert.equal(f.length-48,167); assert.equal(decodeGarpFrame(f).request_id,id);
+assert.throws(()=>validateMessagePayload("PROMPT",{prompt:"ok",options:{auto_continue:"false"}}),e=>e instanceof GarpError&&e.code===GarpErrorCode.INVALID_ARGUMENT);
+console.log("GARP/1.24 hybrid conformance vectors: PASS");
+
+
+// File 40: tests\moz.build
+TESTING_JS_MODULES += [
+    'Garp124Conformance.mjs',
+]
+
+

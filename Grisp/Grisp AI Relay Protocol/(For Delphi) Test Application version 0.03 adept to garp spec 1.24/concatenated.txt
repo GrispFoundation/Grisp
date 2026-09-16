@@ -1,0 +1,2526 @@
+﻿// File 1: README.md
+# GARP/1.24 Delphi Test Client
+
+Standalone Delphi console client and live smoke tester for the Firefox-side **GARP/1.24** gateway.
+
+The client uses TCP + Indy and speaks the GARP/1.24 binary framing and Common Envelope directly. It does not use Selenium or the old GARP/1.01 protocol.
+
+## Requirements
+
+- Delphi with Indy (`IdTCPClient`).
+- A Firefox build containing the GARP/1.24 gateway.
+- Firefox GARP listener available at `127.0.0.1:9999` unless another host/port is configured.
+- The same deployment-provisioned `GARP_SECRET` as the Firefox process.
+
+The source does **not** require the Delphi `Winapi.BCrypt` unit. The protocol unit calls the Windows `BCryptGenRandom` export directly from `bcrypt.dll`, so the project remains compatible with Delphi installations where `Winapi.BCrypt.pas` is not present.
+
+## Build
+
+Open:
+
+```text
+src\GARP124.Test.dpr
+```
+
+Build it as a Delphi Console application.
+
+The project uses standard Delphi RTL/JSON/Hash APIs plus Indy.
+
+## Local self-test
+
+The self-test does not require Firefox:
+
+```text
+GARP124.Test.exe --self-test
+```
+
+It verifies:
+
+- GARP/1.24 envelope construction.
+- 48-byte fixed header.
+- Big-endian header fields.
+- UUID placement and header/envelope identity.
+- UTF-8 JSON round-trip.
+- 16-byte nonce generation.
+- Base64URL encoding.
+- GARP/1.24 client-proof and server-proof transcript vectors.
+
+The expected proof vectors are:
+
+```text
+client proof:
+4RiTq2SUP15gOp1alqIRdMBUM7Qv4CMZqREMXX4efQs
+
+server proof:
+iFaTVoYbn_pb5yCCHOTpAUyfzFaCkXXKgLAbpMX6cfI
+```
+
+## Environment
+
+Set the same secret used by Firefox:
+
+```cmd
+set GARP_SECRET=your-development-secret
+```
+
+or pass it explicitly with `--secret`.
+
+The secret must provide at least 32 UTF-8 bytes.
+
+## Basic tests
+
+```text
+GARP124.Test.exe --secret your-development-secret --ping
+GARP124.Test.exe --secret your-development-secret --capabilities
+GARP124.Test.exe --secret your-development-secret --browser-status
+GARP124.Test.exe --secret your-development-secret --list-tabs
+```
+
+A connection uses the GARP/1.24 handshake:
+
+```text
+HELLO
+HELLO_CHALLENGE
+HELLO_AUTH
+HELLO_ACK
+CAPABILITIES
+BROWSER_STATUS
+```
+
+The client verifies the server proof in `HELLO_ACK` before considering the connection authenticated.
+
+## Session and prompt test
+
+Create a session:
+
+```text
+GARP124.Test.exe --secret your-development-secret --session deepseek
+```
+
+Run a prompt:
+
+```text
+GARP124.Test.exe --secret your-development-secret --session deepseek --prompt "Reply with exactly: GARP/1.24 TEST OK"
+```
+
+Providers currently represented by the supplied Firefox adapters include:
+
+```text
+chatgpt
+claude
+copilot
+deepseek
+gemini
+grok
+inception
+perplexity
+```
+
+Provider page selectors remain dependent on the current provider websites.
+
+## Conformance smoke test
+
+```text
+GARP124.Test.exe --secret your-development-secret --conformance
+```
+
+The test performs:
+
+```text
+HELLO / authentication
+PING / RESPONSE
+GET_CAPABILITIES
+BROWSER_STATUS
+LIST_TABS
+CREATE_SESSION
+PROMPT
+terminal generation event
+CLOSE_SESSION
+```
+
+The default provider is `deepseek`. Use `--session <provider>` together with `--conformance` to select another adapter.
+
+## GARP/1.24 wire details
+
+The client implements:
+
+```text
+Protocol:          GARP/1.24
+Semantic version:  1.24
+Wire version:     0x00
+Header:            48 bytes
+Byte order:        big-endian
+Nonce:             16 raw bytes
+Nonce encoding:    unpadded Base64URL
+Authentication:    HMAC-SHA256
+```
+
+The handshake transcript binds:
+
+```text
+protocol/domain
+client nonce
+server nonce
+selected semantic version
+selected wire version
+offered feature set
+final feature set
+client name/version
+server name/version
+```
+
+The feature set is UTF-8 byte sorted and currently offers:
+
+```text
+ext-pong
+ext-replay-store
+```
+
+## Prompt lifecycle
+
+GARP/1.24 does not use the old 1.01 `PROMPT_ACK` or `CANCEL_ACK` message types.
+
+`PROMPT` receives a normal correlated `RESPONSE` indicating command acceptance.
+
+Generation then arrives asynchronously using events such as:
+
+```text
+INPUT_SUBMITTED
+GENERATION_STARTED
+GENERATION_DELTA
+GENERATION_PROGRESS
+CONTINUATION_REQUIRED
+CONTINUATION_SUBMITTED
+GENERATION_COMPLETED
+GENERATION_FAILED
+GENERATION_CANCELLED
+```
+
+Generation events have a null Common Envelope `request_id`; the prompt is correlated through:
+
+```text
+payload.prompt_request_id
+```
+
+The client therefore uses the frame request ID for command responses and the payload prompt request ID for generation events.
+
+## Files
+
+```text
+src\
+    GARP124.Protocol.pas
+    GARP124.Client.pas
+    GARP124.Test.dpr
+```
+
+No PowerShell installer is required. Copy/build the Delphi project normally.
+
+## Firefox relationship
+
+```text
+Delphi GARP/1.24 Test Client
+            |
+            | TCP 127.0.0.1:9999
+            v
+Custom Firefox
+            |
+            +-- AIAutomationService
+            +-- GarpConnection
+            +-- sessions / requests
+            +-- JSWindowActor bridge
+            +-- provider adapter
+            v
+AI provider website
+```
+
+The Delphi application is the GARP peer and test client. It does not directly manipulate provider website DOMs.
+
+
+// File 2: src\GARP124.Client.pas
+﻿unit GARP124.Client;
+
+interface
+
+uses
+    System.SysUtils,
+    System.Classes,
+    System.JSON,
+    IdTCPClient,
+    IdException,
+    GARP124.Protocol;
+
+type
+    TGARPClient124 = class
+    private
+        FClient: TIdTCPClient;
+        FClientID: string;
+        FClientName: string;
+        FClientVersion: string;
+        FSecret: string;
+        FClientNonce: TBytes;
+        FServerNonce: TBytes;
+        FOfferedFeatures: TArray<string>;
+        FNegotiatedFeatures: TArray<string>;
+        FServerName: string;
+        FServerVersion: string;
+        FAuthenticated: Boolean;
+        FSessionID: string;
+        FTabID: string;
+        FRequestID: string;
+        FDebug: Boolean;
+        FBrowserStatus: TJSONObject;
+        FCapabilities: TJSONObject;
+        FServerProof: TBytes;
+
+        procedure DebugLog(const AMessage: string);
+        procedure DebugFrame(const APrefix: string; const AFrameBytes: TBytes; const AFrame: TGARPFrame);
+        procedure EnsureConnected;
+        function NextRequestID: string;
+        procedure SendFrame(const AMessageType: TGARPMessageType; const AMessage: TJSONObject; const ARequestID: string = ''; const ASessionID: string = '');
+        function ReceiveFrame(out AFrame: TGARPFrame; const ATimeoutMS: Cardinal = 0; const AMaxPayloadBytes: Cardinal = GARP_APPLICATION_MAX_PAYLOAD): Boolean;
+        function ReceiveUntilRequest(const ARequestID: string; const AAcceptedTypes: array of TGARPMessageType; out AFrame: TGARPFrame; const ATimeoutMS: Cardinal = 30000; const AMaxPayloadBytes: Cardinal = GARP_APPLICATION_MAX_PAYLOAD): Boolean;
+        function ReceiveUntilPromptEvent(const APromptRequestID: string; out AFrame: TGARPFrame; const ATimeoutMS: Cardinal): Boolean;
+        function BuildMessage(const ATypeName: string; const APayload: TJSONValue; const ARequestID: string = ''; const ASessionID: string = ''): TJSONObject;
+        function GetErrorText(const AFrame: TGARPFrame): string;
+        function IsAcceptedType(const AMessageType: TGARPMessageType; const AAcceptedTypes: array of TGARPMessageType): Boolean;
+        function ConstantTimeEqual(const ALeft, ARight: TBytes): Boolean;
+        procedure HandleUnsolicitedFrame(var AFrame: TGARPFrame);
+        procedure StoreCapabilities(const AFrame: TGARPFrame);
+        procedure StoreBrowserStatus(const AFrame: TGARPFrame);
+        function WaitForSessionReady(const ASessionID: string; const ATimeoutMS: Cardinal): TJSONObject;
+        procedure CloseConnection;
+    public
+        constructor Create(const AHost: string; const APort: Integer; const ASecret: string);
+        destructor Destroy; override;
+
+        procedure ConnectAndAuthenticate;
+
+        function GetCapabilities: TJSONObject;
+        function GetBrowserStatus: TJSONObject;
+        function ListTabs: TJSONObject;
+        function OpenTab(const AURL: string): TJSONObject;
+        function CloseTab(const ATabID: string): TJSONObject;
+        function SelectTab(const ATabID: string): TJSONObject;
+
+        function CreateSession(const AProvider: string; const ATabID: string = ''): TJSONObject;
+        function GetSession: TJSONObject;
+        function Prompt(const APrompt: string; const ATimeoutMS: Integer = 180000; const AAutoContinue: Boolean = True; const AForceFocus: Boolean = False; const ASimulateEnter: Boolean = False): TJSONObject;
+        function WaitForCompletion(const ARequestID: string; const ATimeoutMS: Cardinal = 180000): TJSONObject;
+        function GetPromptStatus(const ARequestID: string): TJSONObject;
+        function GetResponse(const ARequestID: string): TJSONObject;
+        function CancelPrompt(const ARequestID: string): TJSONObject;
+        function ContinuePrompt(const ARequestID: string): TJSONObject;
+        function GetEvents(const AFromSequence: UInt64; const AMaxEvents: Cardinal = 4096): TJSONObject;
+        function SubscribeResponse(const ARequestID: string): TJSONObject;
+        procedure Ping;
+        procedure CloseSession;
+
+        property SessionID: string read FSessionID;
+        property TabID: string read FTabID;
+        property RequestID: string read FRequestID;
+        property Authenticated: Boolean read FAuthenticated;
+        property Debug: Boolean read FDebug write FDebug;
+        property BrowserStatus: TJSONObject read FBrowserStatus;
+        property Capabilities: TJSONObject read FCapabilities;
+        property NegotiatedFeatures: TArray<string> read FNegotiatedFeatures;
+    end;
+
+implementation
+
+constructor TGARPClient124.Create(const AHost: string; const APort: Integer; const ASecret: string);
+begin
+    inherited Create;
+    FClient := TIdTCPClient.Create(nil);
+    FClient.Host := AHost;
+    FClient.Port := APort;
+    FClient.ConnectTimeout := 5000;
+    FClient.ReadTimeout := GARP_READ_TIMEOUT;
+
+    FClientID := 'GARP124-Delphi-Test-' + GARPNewUUID;
+    FClientName := 'GARP124-Delphi-Test';
+    FClientVersion := '1.24.0';
+    FSecret := ASecret;
+    FAuthenticated := False;
+    FSessionID := '';
+    FTabID := '';
+    FRequestID := '';
+    FDebug := False;
+    FBrowserStatus := nil;
+    FCapabilities := nil;
+    FOfferedFeatures := GARPCanonicalFeatureList([GARP_FEATURE_EXT_PONG, GARP_FEATURE_EXT_REPLAY_STORE]);
+end;
+
+destructor TGARPClient124.Destroy;
+begin
+    CloseConnection;
+    FBrowserStatus.Free;
+    FCapabilities.Free;
+    FClient.Free;
+    inherited Destroy;
+end;
+
+procedure TGARPClient124.DebugLog(const AMessage: string);
+begin
+    if not FDebug then
+        Exit;
+    Writeln('[DEBUG ', FormatDateTime('hh:nn:ss.zzz', Now), '] ', AMessage);
+end;
+
+procedure TGARPClient124.DebugFrame(const APrefix: string; const AFrameBytes: TBytes; const AFrame: TGARPFrame);
+begin
+    if not FDebug then
+        Exit;
+    DebugLog(Format('%s bytes=%d type=%s request_id=%s session_id=%s', [
+        APrefix, Length(AFrameBytes), GARPMessageTypeToName(AFrame.MessageType), AFrame.RequestID, AFrame.SessionID
+    ]));
+    if AFrame.MessageJSON <> nil then
+        DebugLog(APrefix + ' JSON=' + AFrame.MessageJSON.ToJSON);
+end;
+
+procedure TGARPClient124.CloseConnection;
+begin
+    FAuthenticated := False;
+    if (FClient <> nil) and FClient.Connected then
+    begin
+        try
+            FClient.Disconnect;
+        except
+            on E: Exception do
+                DebugLog('disconnect: ' + E.Message);
+        end;
+    end;
+end;
+
+procedure TGARPClient124.EnsureConnected;
+begin
+    if not FClient.Connected then
+        raise EGARPProtocolError.Create('GARP client is not connected');
+    if not FAuthenticated then
+        raise EGARPProtocolError.Create('GARP client is not authenticated');
+end;
+
+function TGARPClient124.NextRequestID: string;
+begin
+    Result := GARPNewUUID;
+    FRequestID := Result;
+end;
+
+function TGARPClient124.BuildMessage(const ATypeName: string; const APayload: TJSONValue; const ARequestID: string; const ASessionID: string): TJSONObject;
+begin
+    Result := GARPBuildJSON(ATypeName, APayload, ARequestID, ASessionID);
+end;
+
+procedure TGARPClient124.SendFrame(const AMessageType: TGARPMessageType; const AMessage: TJSONObject; const ARequestID: string; const ASessionID: string);
+var
+    LFrame: TBytes;
+    LDecodedFrame: TGARPFrame;
+begin
+    LFrame := GARPEncodeFrame(AMessageType, AMessage, ARequestID, ASessionID);
+    if FDebug then
+    begin
+        LDecodedFrame := GARPDecodeFrame(LFrame);
+        try
+            DebugFrame('SEND', LFrame, LDecodedFrame);
+        finally
+            LDecodedFrame.MessageJSON.Free;
+            LDecodedFrame.MessageJSON := nil;
+        end;
+    end;
+    GARPWriteFrame(FClient, LFrame);
+end;
+
+function TGARPClient124.ReceiveFrame(out AFrame: TGARPFrame; const ATimeoutMS: Cardinal; const AMaxPayloadBytes: Cardinal): Boolean;
+var
+    LFrameBytes: TBytes;
+    LOldTimeout: Integer;
+begin
+    FillChar(AFrame, SizeOf(AFrame), 0);
+    AFrame.MessageJSON := nil;
+    LOldTimeout := FClient.IOHandler.ReadTimeout;
+    try
+        if ATimeoutMS > 0 then
+            FClient.IOHandler.ReadTimeout := ATimeoutMS;
+        LFrameBytes := GARPReadFrame(FClient, AMaxPayloadBytes);
+        AFrame := GARPDecodeFrame(LFrameBytes);
+        DebugFrame('RECEIVE', LFrameBytes, AFrame);
+        Result := True;
+    finally
+        FClient.IOHandler.ReadTimeout := LOldTimeout;
+    end;
+end;
+
+function TGARPClient124.IsAcceptedType(const AMessageType: TGARPMessageType; const AAcceptedTypes: array of TGARPMessageType): Boolean;
+var
+    LType: TGARPMessageType;
+begin
+    Result := False;
+    for LType in AAcceptedTypes do
+        if LType = AMessageType then
+            Exit(True);
+end;
+
+function TGARPClient124.GetErrorText(const AFrame: TGARPFrame): string;
+var
+    LPayload: TJSONObject;
+begin
+    Result := AFrame.MessageJSON.ToJSON;
+    if AFrame.MessageType <> GARP_ERROR then
+        Exit;
+    try
+        LPayload := GARPJSONObjectPayload(AFrame);
+        Result := Format('%s: %s', [LPayload.GetValue<string>('code', 'ERROR'), LPayload.GetValue<string>('message', Result)]);
+    except
+        { Keep complete frame JSON as fallback. }
+    end;
+end;
+
+procedure TGARPClient124.StoreCapabilities(const AFrame: TGARPFrame);
+begin
+    FCapabilities.Free;
+    FCapabilities := AFrame.MessageJSON.Clone as TJSONObject;
+end;
+
+procedure TGARPClient124.StoreBrowserStatus(const AFrame: TGARPFrame);
+begin
+    FBrowserStatus.Free;
+    FBrowserStatus := AFrame.MessageJSON.Clone as TJSONObject;
+end;
+
+procedure TGARPClient124.HandleUnsolicitedFrame(var AFrame: TGARPFrame);
+begin
+    if AFrame.MessageType = GARP_CAPABILITIES then
+        StoreCapabilities(AFrame)
+    else if AFrame.MessageType = GARP_BROWSER_STATUS then
+        StoreBrowserStatus(AFrame)
+    else if AFrame.MessageType = GARP_PING then
+    begin
+        var LPong := BuildMessage('PONG', nil);
+        try
+            SendFrame(GARP_PONG, LPong);
+        finally
+            LPong.Free;
+        end;
+    end;
+end;
+
+function TGARPClient124.ReceiveUntilRequest(const ARequestID: string; const AAcceptedTypes: array of TGARPMessageType; out AFrame: TGARPFrame; const ATimeoutMS: Cardinal; const AMaxPayloadBytes: Cardinal): Boolean;
+var
+    LStart: UInt64;
+    LNow: UInt64;
+    LRemaining: Cardinal;
+    LFrame: TGARPFrame;
+begin
+    Result := False;
+    LStart := TThread.GetTickCount64;
+    FillChar(AFrame, SizeOf(AFrame), 0);
+
+    while True do
+    begin
+        LNow := TThread.GetTickCount64;
+        if LNow - LStart >= ATimeoutMS then
+            Exit(False);
+        LRemaining := ATimeoutMS - Cardinal(LNow - LStart);
+        if LRemaining > 1000 then
+            LRemaining := 1000;
+
+        ReceiveFrame(LFrame, LRemaining, AMaxPayloadBytes);
+        try
+            if (LFrame.MessageType in [GARP_CAPABILITIES, GARP_BROWSER_STATUS]) and (LFrame.RequestID = '') then
+            begin
+                HandleUnsolicitedFrame(LFrame);
+                Continue;
+            end;
+            if LFrame.MessageType = GARP_PING then
+            begin
+                HandleUnsolicitedFrame(LFrame);
+                Continue;
+            end;
+            if (ARequestID <> '') and not GARPFrameRequestIDMatches(LFrame, ARequestID) then
+                Continue;
+            if IsAcceptedType(LFrame.MessageType, AAcceptedTypes) then
+            begin
+                AFrame := LFrame;
+                LFrame.MessageJSON := nil;
+                Exit(True);
+            end;
+        finally
+            LFrame.MessageJSON.Free;
+            LFrame.MessageJSON := nil;
+        end;
+    end;
+end;
+
+function TGARPClient124.ReceiveUntilPromptEvent(const APromptRequestID: string; out AFrame: TGARPFrame; const ATimeoutMS: Cardinal): Boolean;
+var
+    LStart: UInt64;
+    LFrame: TGARPFrame;
+    LPayload: TJSONObject;
+    LPromptID: string;
+    LNow: UInt64;
+    LRemaining: Cardinal;
+begin
+    Result := False;
+    LStart := TThread.GetTickCount64;
+    FillChar(AFrame, SizeOf(AFrame), 0);
+
+    while True do
+    begin
+        LNow := TThread.GetTickCount64;
+        if LNow - LStart >= ATimeoutMS then
+            Exit(False);
+        LRemaining := ATimeoutMS - Cardinal(LNow - LStart);
+        if LRemaining > 1000 then
+            LRemaining := 1000;
+
+        ReceiveFrame(LFrame, LRemaining);
+        try
+            if LFrame.MessageType in [GARP_CAPABILITIES, GARP_BROWSER_STATUS, GARP_PING] then
+            begin
+                HandleUnsolicitedFrame(LFrame);
+                Continue;
+            end;
+
+            if LFrame.MessageType in [GARP_GENERATION_STARTED, GARP_GENERATION_DELTA, GARP_GENERATION_PROGRESS,
+                GARP_CONTINUATION_REQUIRED, GARP_CONTINUATION_SUBMITTED, GARP_GENERATION_COMPLETED,
+                GARP_GENERATION_FAILED, GARP_GENERATION_CANCELLED, GARP_INPUT_SUBMITTED,
+                GARP_PROVIDER_ERROR, GARP_PROVIDER_AUTH_REQUIRED, GARP_PROVIDER_RATE_LIMITED, GARP_DIAGNOSTIC] then
+            begin
+                LPayload := GARPJSONObjectPayload(LFrame);
+                LPromptID := LPayload.GetValue<string>('prompt_request_id', '');
+                if SameText(LPromptID, APromptRequestID) then
+                begin
+                    AFrame := LFrame;
+                    LFrame.MessageJSON := nil;
+                    Exit(True);
+                end;
+                Continue;
+            end;
+        finally
+            LFrame.MessageJSON.Free;
+            LFrame.MessageJSON := nil;
+        end;
+    end;
+end;
+
+function TGARPClient124.ConstantTimeEqual(const ALeft, ARight: TBytes): Boolean;
+var
+    LIndex: Integer;
+    LDiff: Byte;
+begin
+    if Length(ALeft) <> Length(ARight) then
+        Exit(False);
+    LDiff := 0;
+    for LIndex := 0 to High(ALeft) do
+        LDiff := LDiff or (ALeft[LIndex] xor ARight[LIndex]);
+    Result := LDiff = 0;
+end;
+
+procedure TGARPClient124.ConnectAndAuthenticate;
+var
+    LHelloPayload: TJSONObject;
+    LAuthPayload: TJSONObject;
+    LMessage: TJSONObject;
+    LFrame: TGARPFrame;
+    LChallenge: TJSONObject;
+    LAck: TJSONObject;
+    LServerNonceText: string;
+    LSelectedVersion: string;
+    LSelectedWire: string;
+    LFinalFeaturesJSON: TJSONArray;
+    LOfferedFeaturesJSON: TJSONArray;
+    LFinalFeatures: TArray<string>;
+    LOfferedFeatures: TArray<string>;
+    LIndex: Integer;
+    LExpectedProof: TBytes;
+    LServerProofText: string;
+    LServerProof: TBytes;
+    LOldTimeout: Integer;
+begin
+    if FSecret = '' then
+        raise EGARPProtocolError.Create('GARP secret is empty');
+
+    CloseConnection;
+    FSessionID := '';
+    FTabID := '';
+    FRequestID := '';
+    FAuthenticated := False;
+    FCapabilities.Free;
+    FCapabilities := nil;
+    FBrowserStatus.Free;
+    FBrowserStatus := nil;
+
+    FClient.Connect;
+    LOldTimeout := FClient.IOHandler.ReadTimeout;
+    try
+        FClient.IOHandler.ReadTimeout := GARP_HANDSHAKE_TIMEOUT;
+        FClientNonce := GARPCreateNonce;
+
+        LHelloPayload := TJSONObject.Create;
+        try
+            LHelloPayload.AddPair('client_name', FClientName);
+            LHelloPayload.AddPair('client_version', FClientVersion);
+            LOfferedFeaturesJSON := TJSONArray.Create;
+            for LIndex := 0 to High(FOfferedFeatures) do
+                LOfferedFeaturesJSON.Add(FOfferedFeatures[LIndex]);
+            LHelloPayload.AddPair('versions', TJSONArray.Create.Add(GARP_SEMANTIC_VERSION));
+            LHelloPayload.AddPair('wire_versions', TJSONArray.Create.Add(GARP_WIRE_VERSION));
+            LHelloPayload.AddPair('features', LOfferedFeaturesJSON);
+            LHelloPayload.AddPair('client_nonce', GARPBase64UrlEncode(FClientNonce));
+            LMessage := BuildMessage('HELLO', LHelloPayload, GARPNewUUID);
+            try
+                FRequestID := LMessage.GetValue<string>('request_id');
+                SendFrame(GARP_HELLO, LMessage, FRequestID);
+            finally
+                LMessage.Free;
+            end;
+        finally
+            LHelloPayload.Free;
+        end;
+
+        if not ReceiveUntilRequest(FRequestID, [GARP_HELLO_CHALLENGE, GARP_ERROR], LFrame, GARP_HANDSHAKE_TIMEOUT, GARP_HANDSHAKE_MAX_PAYLOAD) then
+            raise EGARPProtocolError.Create('Timed out waiting for HELLO_CHALLENGE');
+        try
+            if LFrame.MessageType = GARP_ERROR then
+                raise EGARPProtocolError.Create('HELLO rejected: ' + GetErrorText(LFrame));
+            LChallenge := GARPJSONObjectPayload(LFrame);
+            LServerName := LChallenge.GetValue<string>('server_name', '');
+            FServerVersion := LChallenge.GetValue<string>('server_version', '');
+            LSelectedVersion := LChallenge.GetValue<string>('selected_version', '');
+            LSelectedWire := LChallenge.GetValue<string>('selected_wire_version', '');
+            if LSelectedVersion <> GARP_SEMANTIC_VERSION then
+                raise EGARPProtocolError.Create('Server selected an unsupported semantic version');
+            if LSelectedWire <> GARP_WIRE_VERSION then
+                raise EGARPProtocolError.Create('Server selected an unsupported wire version');
+            LServerNonceText := LChallenge.GetValue<string>('server_nonce', '');
+            FServerNonce := GARPRequireNonce16(LServerNonceText);
+
+            LFinalFeaturesJSON := LChallenge.GetValue<TJSONArray>('features');
+            if LFinalFeaturesJSON = nil then
+                raise EGARPProtocolError.Create('HELLO_CHALLENGE has no features');
+            SetLength(LFinalFeatures, LFinalFeaturesJSON.Count);
+            for LIndex := 0 to LFinalFeaturesJSON.Count - 1 do
+                LFinalFeatures[LIndex] := LFinalFeaturesJSON.Items[LIndex].Value;
+            FNegotiatedFeatures := GARPCanonicalFeatureList(LFinalFeatures);
+        finally
+            LFrame.MessageJSON.Free;
+            LFrame.MessageJSON := nil;
+        end;
+
+        LExpectedProof := GARPMakeProof(
+            FSecret,
+            GARP_DOMAIN_CLIENT_PROOF,
+            FClientNonce,
+            FServerNonce,
+            FOfferedFeatures,
+            FNegotiatedFeatures,
+            FClientName,
+            FClientVersion,
+            LServerName,
+            FServerVersion
+        );
+
+        LAuthPayload := TJSONObject.Create;
+        try
+            LAuthPayload.AddPair('client_proof', GARPBase64UrlEncode(LExpectedProof));
+            LMessage := BuildMessage('HELLO_AUTH', LAuthPayload, FRequestID);
+            try
+                SendFrame(GARP_HELLO_AUTH, LMessage, FRequestID);
+            finally
+                LMessage.Free;
+            end;
+        finally
+            LAuthPayload.Free;
+        end;
+
+        if not ReceiveUntilRequest(FRequestID, [GARP_HELLO_ACK, GARP_ERROR], LFrame, GARP_HANDSHAKE_TIMEOUT, GARP_HANDSHAKE_MAX_PAYLOAD) then
+            raise EGARPProtocolError.Create('Timed out waiting for HELLO_ACK');
+        try
+            if LFrame.MessageType = GARP_ERROR then
+                raise EGARPProtocolError.Create('Authentication failed: ' + GetErrorText(LFrame));
+            LAck := GARPJSONObjectPayload(LFrame);
+            LServerProofText := LAck.GetValue<string>('server_proof', '');
+            LServerProof := GARPBase64UrlDecode(LServerProofText);
+            if Length(LServerProof) <> 32 then
+                raise EGARPProtocolError.Create('HELLO_ACK server_proof must decode to 32 bytes');
+            LExpectedProof := GARPMakeProof(
+                FSecret,
+                GARP_DOMAIN_SERVER_PROOF,
+                FClientNonce,
+                FServerNonce,
+                FOfferedFeatures,
+                FNegotiatedFeatures,
+                FClientName,
+                FClientVersion,
+                LServerName,
+                FServerVersion
+            );
+            if not ConstantTimeEqual(LExpectedProof, LServerProof) then
+                raise EGARPProtocolError.Create('HELLO_ACK server proof verification failed');
+            FServerProof := LServerProof;
+            FAuthenticated := True;
+        finally
+            LFrame.MessageJSON.Free;
+            LFrame.MessageJSON := nil;
+        end;
+
+        { The server emits CAPABILITIES and BROWSER_STATUS immediately after HELLO_ACK. }
+        for LIndex := 1 to 2 do
+        begin
+            if not ReceiveUntilRequest('', [GARP_CAPABILITIES, GARP_BROWSER_STATUS, GARP_ERROR], LFrame, GARP_HANDSHAKE_TIMEOUT, GARP_HANDSHAKE_MAX_PAYLOAD) then
+                raise EGARPProtocolError.Create('Timed out waiting for post-authentication state');
+            try
+                if LFrame.MessageType = GARP_ERROR then
+                    raise EGARPProtocolError.Create('Post-authentication ERROR: ' + GetErrorText(LFrame));
+                if LFrame.MessageType = GARP_CAPABILITIES then
+                    StoreCapabilities(LFrame)
+                else if LFrame.MessageType = GARP_BROWSER_STATUS then
+                    StoreBrowserStatus(LFrame)
+                else
+                    Continue;
+            finally
+                LFrame.MessageJSON.Free;
+                LFrame.MessageJSON := nil;
+            end;
+        end;
+    finally
+        FClient.IOHandler.ReadTimeout := LOldTimeout;
+    end;
+end;
+
+function TGARPClient124.GetCapabilities: TJSONObject;
+var
+    LRequestID: string;
+    LMessage: TJSONObject;
+    LFrame: TGARPFrame;
+begin
+    EnsureConnected;
+    LRequestID := NextRequestID;
+    LMessage := BuildMessage('GET_CAPABILITIES', nil, LRequestID);
+    try
+        SendFrame(GARP_GET_CAPABILITIES, LMessage, LRequestID);
+    finally
+        LMessage.Free;
+    end;
+    if not ReceiveUntilRequest(LRequestID, [GARP_RESPONSE, GARP_ERROR], LFrame, 30000) then
+        raise EGARPProtocolError.Create('Timed out waiting for GET_CAPABILITIES response');
+    try
+        if LFrame.MessageType = GARP_ERROR then
+            raise EGARPProtocolError.Create(GetErrorText(LFrame));
+        Result := LFrame.MessageJSON.Clone as TJSONObject;
+    finally
+        LFrame.MessageJSON.Free;
+        LFrame.MessageJSON := nil;
+    end;
+end;
+
+function TGARPClient124.GetBrowserStatus: TJSONObject;
+begin
+    EnsureConnected;
+    if FBrowserStatus = nil then
+        raise EGARPProtocolError.Create('No BROWSER_STATUS has been received yet');
+    Result := FBrowserStatus.Clone as TJSONObject;
+end;
+
+function TGARPClient124.ListTabs: TJSONObject;
+var
+    LRequestID: string;
+    LMessage: TJSONObject;
+    LFrame: TGARPFrame;
+begin
+    EnsureConnected;
+    LRequestID := NextRequestID;
+    LMessage := BuildMessage('LIST_TABS', nil, LRequestID);
+    try
+        SendFrame(GARP_LIST_TABS, LMessage, LRequestID);
+    finally
+        LMessage.Free;
+    end;
+    if not ReceiveUntilRequest(LRequestID, [GARP_RESPONSE, GARP_ERROR], LFrame, 30000) then
+        raise EGARPProtocolError.Create('Timed out waiting for LIST_TABS response');
+    try
+        if LFrame.MessageType = GARP_ERROR then
+            raise EGARPProtocolError.Create(GetErrorText(LFrame));
+        Result := LFrame.MessageJSON.Clone as TJSONObject;
+    finally
+        LFrame.MessageJSON.Free;
+        LFrame.MessageJSON := nil;
+    end;
+end;
+
+function TGARPClient124.OpenTab(const AURL: string): TJSONObject;
+var
+    LPayload: TJSONObject;
+    LMessage: TJSONObject;
+    LFrame: TGARPFrame;
+    LRequestID: string;
+begin
+    EnsureConnected;
+    LRequestID := NextRequestID;
+    LPayload := TJSONObject.Create;
+    try
+        LPayload.AddPair('url', AURL);
+        LMessage := BuildMessage('OPEN_TAB', LPayload, LRequestID);
+        LPayload := nil;
+        try
+            SendFrame(GARP_OPEN_TAB, LMessage, LRequestID);
+        finally
+            LMessage.Free;
+        end;
+    finally
+        LPayload.Free;
+    end;
+    if not ReceiveUntilRequest(LRequestID, [GARP_RESPONSE, GARP_ERROR], LFrame, 30000) then
+        raise EGARPProtocolError.Create('Timed out waiting for OPEN_TAB response');
+    try
+        if LFrame.MessageType = GARP_ERROR then
+            raise EGARPProtocolError.Create(GetErrorText(LFrame));
+        Result := LFrame.MessageJSON.Clone as TJSONObject;
+    finally
+        LFrame.MessageJSON.Free;
+    end;
+end;
+
+function TGARPClient124.CloseTab(const ATabID: string): TJSONObject;
+var
+    LPayload, LMessage: TJSONObject;
+    LFrame: TGARPFrame;
+    LRequestID: string;
+begin
+    EnsureConnected;
+    LRequestID := NextRequestID;
+    LPayload := TJSONObject.Create;
+    try
+        LPayload.AddPair('tab_id', ATabID);
+        LMessage := BuildMessage('CLOSE_TAB', LPayload, LRequestID);
+        LPayload := nil;
+        try
+            SendFrame(GARP_CLOSE_TAB, LMessage, LRequestID);
+        finally
+            LMessage.Free;
+        end;
+    finally
+        LPayload.Free;
+    end;
+    if not ReceiveUntilRequest(LRequestID, [GARP_RESPONSE, GARP_ERROR], LFrame, 30000) then
+        raise EGARPProtocolError.Create('Timed out waiting for CLOSE_TAB response');
+    try
+        if LFrame.MessageType = GARP_ERROR then raise EGARPProtocolError.Create(GetErrorText(LFrame));
+        Result := LFrame.MessageJSON.Clone as TJSONObject;
+    finally
+        LFrame.MessageJSON.Free;
+    end;
+end;
+
+function TGARPClient124.SelectTab(const ATabID: string): TJSONObject;
+var
+    LPayload, LMessage: TJSONObject;
+    LFrame: TGARPFrame;
+    LRequestID: string;
+begin
+    EnsureConnected;
+    LRequestID := NextRequestID;
+    LPayload := TJSONObject.Create;
+    try
+        LPayload.AddPair('tab_id', ATabID);
+        LMessage := BuildMessage('SELECT_TAB', LPayload, LRequestID);
+        LPayload := nil;
+        try
+            SendFrame(GARP_SELECT_TAB, LMessage, LRequestID);
+        finally
+            LMessage.Free;
+        end;
+    finally
+        LPayload.Free;
+    end;
+    if not ReceiveUntilRequest(LRequestID, [GARP_RESPONSE, GARP_ERROR], LFrame, 30000) then
+        raise EGARPProtocolError.Create('Timed out waiting for SELECT_TAB response');
+    try
+        if LFrame.MessageType = GARP_ERROR then raise EGARPProtocolError.Create(GetErrorText(LFrame));
+        Result := LFrame.MessageJSON.Clone as TJSONObject;
+    finally
+        LFrame.MessageJSON.Free;
+    end;
+end;
+
+function TGARPClient124.CreateSession(const AProvider: string; const ATabID: string): TJSONObject;
+var
+    LPayload, LOptions, LMessage: TJSONObject;
+    LFrame: TGARPFrame;
+    LRequestID: string;
+    LReturnedSessionID: string;
+    LReturnedTabID: string;
+begin
+    EnsureConnected;
+    if Trim(AProvider) = '' then
+        raise EGARPProtocolError.Create('Provider is empty');
+
+    LRequestID := NextRequestID;
+    LPayload := TJSONObject.Create;
+    try
+        LPayload.AddPair('provider', AProvider);
+        LOptions := TJSONObject.Create;
+        LPayload.AddPair('options', LOptions);
+        if ATabID <> '' then
+            LPayload.AddPair('tab_id', ATabID);
+
+        LMessage := BuildMessage('CREATE_SESSION', LPayload, LRequestID);
+        LPayload := nil;
+        try
+            SendFrame(GARP_CREATE_SESSION, LMessage, LRequestID);
+        finally
+            LMessage.Free;
+        end;
+    finally
+        LPayload.Free;
+    end;
+
+    if not ReceiveUntilRequest(LRequestID, [GARP_RESPONSE, GARP_ERROR], LFrame, 30000) then
+        raise EGARPProtocolError.Create('Timed out waiting for CREATE_SESSION response');
+    try
+        if LFrame.MessageType = GARP_ERROR then
+            raise EGARPProtocolError.Create(GetErrorText(LFrame));
+        Result := LFrame.MessageJSON.Clone as TJSONObject;
+        LReturnedSessionID := GARPJSONObjectPayload(LFrame).GetValue<string>('session_id', '');
+        if LReturnedSessionID = '' then
+            raise EGARPProtocolError.Create('CREATE_SESSION response did not contain session_id');
+        FSessionID := LReturnedSessionID;
+        LReturnedTabID := GARPJSONObjectPayload(LFrame).GetValue<string>('tab_id', '');
+        if LReturnedTabID <> '' then
+            FTabID := LReturnedTabID;
+    finally
+        LFrame.MessageJSON.Free;
+    end;
+end;
+
+function TGARPClient124.WaitForSessionReady(const ASessionID: string; const ATimeoutMS: Cardinal): TJSONObject;
+var
+    LStart, LNow: UInt64;
+    LFrame: TGARPFrame;
+    LRemaining: Cardinal;
+begin
+    LStart := TThread.GetTickCount64;
+    while True do
+    begin
+        LNow := TThread.GetTickCount64;
+        if LNow - LStart >= ATimeoutMS then
+            raise EGARPProtocolError.Create('Timed out waiting for SESSION_READY');
+        LRemaining := ATimeoutMS - Cardinal(LNow - LStart);
+        if LRemaining > 1000 then LRemaining := 1000;
+        ReceiveFrame(LFrame, LRemaining);
+        try
+            if LFrame.MessageType in [GARP_CAPABILITIES, GARP_BROWSER_STATUS, GARP_PING] then
+            begin
+                HandleUnsolicitedFrame(LFrame);
+                Continue;
+            end;
+            if LFrame.MessageType = GARP_SESSION_READY then
+            begin
+                if SameText(LFrame.SessionID, ASessionID) then
+                begin
+                    Result := LFrame.MessageJSON.Clone as TJSONObject;
+                    Exit;
+                end;
+            end;
+        finally
+            LFrame.MessageJSON.Free;
+        end;
+    end;
+end;
+
+function TGARPClient124.GetSession: TJSONObject;
+var
+    LRequestID: string;
+    LMessage: TJSONObject;
+    LFrame: TGARPFrame;
+begin
+    EnsureConnected;
+    if FSessionID = '' then raise EGARPProtocolError.Create('No active session');
+    LRequestID := NextRequestID;
+    LMessage := BuildMessage('GET_SESSION', TJSONObject.Create, LRequestID, FSessionID);
+    try
+        SendFrame(GARP_GET_SESSION, LMessage, LRequestID, FSessionID);
+    finally
+        LMessage.Free;
+    end;
+    if not ReceiveUntilRequest(LRequestID, [GARP_RESPONSE, GARP_ERROR], LFrame, 30000) then
+        raise EGARPProtocolError.Create('Timed out waiting for GET_SESSION response');
+    try
+        if LFrame.MessageType = GARP_ERROR then raise EGARPProtocolError.Create(GetErrorText(LFrame));
+        Result := LFrame.MessageJSON.Clone as TJSONObject;
+    finally
+        LFrame.MessageJSON.Free;
+    end;
+end;
+
+function TGARPClient124.Prompt(const APrompt: string; const ATimeoutMS: Integer; const AAutoContinue, AForceFocus, ASimulateEnter: Boolean): TJSONObject;
+var
+    LPayload, LOptions, LMessage: TJSONObject;
+    LFrame: TGARPFrame;
+    LRequestID: string;
+begin
+    EnsureConnected;
+    if FSessionID = '' then raise EGARPProtocolError.Create('No active session');
+    if APrompt = '' then raise EGARPProtocolError.Create('Prompt text is empty');
+    if ATimeoutMS <= 0 then raise EGARPProtocolError.Create('Prompt timeout must be positive');
+
+    LRequestID := NextRequestID;
+    LPayload := TJSONObject.Create;
+    try
+        LPayload.AddPair('prompt', APrompt);
+        LOptions := TJSONObject.Create;
+        LOptions.AddPair('timeout_ms', UIntToStr(ATimeoutMS));
+        LOptions.AddPair('auto_continue', TJSONBool.Create(AAutoContinue));
+        LOptions.AddPair('max_continuations', TJSONNumber.Create(8));
+        LOptions.AddPair('force_focus', TJSONBool.Create(AForceFocus));
+        LOptions.AddPair('simulate_enter', TJSONBool.Create(ASimulateEnter));
+        LPayload.AddPair('options', LOptions);
+
+        LMessage := BuildMessage('PROMPT', LPayload, LRequestID, FSessionID);
+        LPayload := nil;
+        try
+            SendFrame(GARP_PROMPT, LMessage, LRequestID, FSessionID);
+        finally
+            LMessage.Free;
+        end;
+    finally
+        LPayload.Free;
+    end;
+
+    if not ReceiveUntilRequest(LRequestID, [GARP_RESPONSE, GARP_ERROR], LFrame, 30000) then
+        raise EGARPProtocolError.Create('Timed out waiting for PROMPT acceptance');
+    try
+        if LFrame.MessageType = GARP_ERROR then
+            raise EGARPProtocolError.Create(GetErrorText(LFrame));
+        Result := LFrame.MessageJSON.Clone as TJSONObject;
+        FRequestID := LRequestID;
+    finally
+        LFrame.MessageJSON.Free;
+    end;
+end;
+
+function TGARPClient124.WaitForCompletion(const ARequestID: string; const ATimeoutMS: Cardinal): TJSONObject;
+var
+    LFrame: TGARPFrame;
+    LStatus: TJSONObject;
+    LErrorPayload: TJSONObject;
+begin
+    EnsureConnected;
+    if ARequestID = '' then
+        raise EGARPProtocolError.Create('Request ID is empty');
+
+    if ReceiveUntilPromptEvent(ARequestID, LFrame, ATimeoutMS) then
+    begin
+        try
+            Result := LFrame.MessageJSON.Clone as TJSONObject;
+        finally
+            LFrame.MessageJSON.Free;
+        end;
+        Exit;
+    end;
+
+    LStatus := nil;
+    try
+        try
+            LStatus := GetPromptStatus(ARequestID);
+        except
+            on E: Exception do
+                DebugLog('GET_PROMPT_STATUS after timeout failed: ' + E.Message);
+        end;
+
+        LErrorPayload := TJSONObject.Create;
+        try
+            LErrorPayload.AddPair('code', 'GENERATION_TIMEOUT');
+            LErrorPayload.AddPair('message', 'Timed out waiting for a terminal prompt event');
+            LErrorPayload.AddPair('prompt_request_id', ARequestID);
+            if LStatus <> nil then
+                LErrorPayload.AddPair('status', LStatus.Clone as TJSONObject);
+            Result := GARPBuildJSON('ERROR', LErrorPayload);
+            LErrorPayload := nil;
+        finally
+            LErrorPayload.Free;
+        end;
+    finally
+        LStatus.Free;
+    end;
+end;
+
+function TGARPClient124.GetPromptStatus(const ARequestID: string): TJSONObject;
+var
+    LPayload, LMessage: TJSONObject;
+    LFrame: TGARPFrame;
+    LCommandID: string;
+begin
+    EnsureConnected;
+    if FSessionID = '' then raise EGARPProtocolError.Create('No active session');
+    LCommandID := NextRequestID;
+    LPayload := TJSONObject.Create;
+    try
+        LPayload.AddPair('prompt_request_id', ARequestID);
+        LMessage := BuildMessage('GET_PROMPT_STATUS', LPayload, LCommandID, FSessionID);
+        LPayload := nil;
+        try
+            SendFrame(GARP_GET_PROMPT_STATUS, LMessage, LCommandID, FSessionID);
+        finally
+            LMessage.Free;
+        end;
+    finally
+        LPayload.Free;
+    end;
+    if not ReceiveUntilRequest(LCommandID, [GARP_RESPONSE, GARP_ERROR], LFrame, 30000) then raise EGARPProtocolError.Create('Timed out waiting for GET_PROMPT_STATUS');
+    try
+        if LFrame.MessageType = GARP_ERROR then raise EGARPProtocolError.Create(GetErrorText(LFrame));
+        Result := LFrame.MessageJSON.Clone as TJSONObject;
+    finally
+        LFrame.MessageJSON.Free;
+    end;
+end;
+
+function TGARPClient124.GetResponse(const ARequestID: string): TJSONObject;
+var
+    LPayload, LMessage: TJSONObject;
+    LFrame: TGARPFrame;
+    LCommandID: string;
+begin
+    EnsureConnected;
+    LCommandID := NextRequestID;
+    LPayload := TJSONObject.Create;
+    try
+        LPayload.AddPair('prompt_request_id', ARequestID);
+        LMessage := BuildMessage('GET_RESPONSE', LPayload, LCommandID, FSessionID);
+        LPayload := nil;
+        try
+            SendFrame(GARP_GET_RESPONSE, LMessage, LCommandID, FSessionID);
+        finally
+            LMessage.Free;
+        end;
+    finally
+        LPayload.Free;
+    end;
+    if not ReceiveUntilRequest(LCommandID, [GARP_RESPONSE, GARP_ERROR], LFrame, 30000) then raise EGARPProtocolError.Create('Timed out waiting for GET_RESPONSE');
+    try
+        if LFrame.MessageType = GARP_ERROR then raise EGARPProtocolError.Create(GetErrorText(LFrame));
+        Result := LFrame.MessageJSON.Clone as TJSONObject;
+    finally
+        LFrame.MessageJSON.Free;
+    end;
+end;
+
+function TGARPClient124.CancelPrompt(const ARequestID: string): TJSONObject;
+var
+    LPayload, LMessage: TJSONObject;
+    LFrame: TGARPFrame;
+    LCommandID: string;
+begin
+    EnsureConnected;
+    LCommandID := NextRequestID;
+    LPayload := TJSONObject.Create;
+    try
+        LPayload.AddPair('prompt_request_id', ARequestID);
+        LMessage := BuildMessage('CANCEL_PROMPT', LPayload, LCommandID, FSessionID);
+        LPayload := nil;
+        try
+            SendFrame(GARP_CANCEL_PROMPT, LMessage, LCommandID, FSessionID);
+        finally
+            LMessage.Free;
+        end;
+    finally
+        LPayload.Free;
+    end;
+    if not ReceiveUntilRequest(LCommandID, [GARP_RESPONSE, GARP_ERROR], LFrame, 30000) then raise EGARPProtocolError.Create('Timed out waiting for CANCEL_PROMPT');
+    try
+        if LFrame.MessageType = GARP_ERROR then raise EGARPProtocolError.Create(GetErrorText(LFrame));
+        Result := LFrame.MessageJSON.Clone as TJSONObject;
+    finally
+        LFrame.MessageJSON.Free;
+    end;
+end;
+
+function TGARPClient124.ContinuePrompt(const ARequestID: string): TJSONObject;
+var
+    LPayload, LMessage: TJSONObject;
+    LFrame: TGARPFrame;
+    LCommandID: string;
+begin
+    EnsureConnected;
+    LCommandID := NextRequestID;
+    LPayload := TJSONObject.Create;
+    try
+        LPayload.AddPair('prompt_request_id', ARequestID);
+        LMessage := BuildMessage('CONTINUE_PROMPT', LPayload, LCommandID, FSessionID);
+        LPayload := nil;
+        try
+            SendFrame(GARP_CONTINUE_PROMPT, LMessage, LCommandID, FSessionID);
+        finally
+            LMessage.Free;
+        end;
+    finally
+        LPayload.Free;
+    end;
+    if not ReceiveUntilRequest(LCommandID, [GARP_RESPONSE, GARP_ERROR], LFrame, 30000) then raise EGARPProtocolError.Create('Timed out waiting for CONTINUE_PROMPT');
+    try
+        if LFrame.MessageType = GARP_ERROR then raise EGARPProtocolError.Create(GetErrorText(LFrame));
+        Result := LFrame.MessageJSON.Clone as TJSONObject;
+    finally
+        LFrame.MessageJSON.Free;
+    end;
+end;
+
+function TGARPClient124.GetEvents(const AFromSequence: UInt64; const AMaxEvents: Cardinal): TJSONObject;
+var
+    LPayload, LMessage: TJSONObject;
+    LFrame: TGARPFrame;
+    LCommandID: string;
+begin
+    EnsureConnected;
+    if not (GARP_FEATURE_EXT_REPLAY_STORE in FNegotiatedFeatures) then
+        raise EGARPProtocolError.Create('ext-replay-store was not negotiated');
+    LCommandID := NextRequestID;
+    LPayload := TJSONObject.Create;
+    try
+        LPayload.AddPair('from_sequence', AFromSequence.ToString);
+        LPayload.AddPair('max_events', TJSONNumber.Create(AMaxEvents));
+        LMessage := BuildMessage('GET_EVENTS', LPayload, LCommandID, FSessionID);
+        LPayload := nil;
+        try
+            SendFrame(GARP_GET_EVENTS, LMessage, LCommandID, FSessionID);
+        finally
+            LMessage.Free;
+        end;
+    finally
+        LPayload.Free;
+    end;
+    if not ReceiveUntilRequest(LCommandID, [GARP_RESPONSE, GARP_ERROR], LFrame, 30000) then raise EGARPProtocolError.Create('Timed out waiting for GET_EVENTS');
+    try
+        if LFrame.MessageType = GARP_ERROR then raise EGARPProtocolError.Create(GetErrorText(LFrame));
+        Result := LFrame.MessageJSON.Clone as TJSONObject;
+    finally
+        LFrame.MessageJSON.Free;
+    end;
+end;
+
+function TGARPClient124.SubscribeResponse(const ARequestID: string): TJSONObject;
+var
+    LPayload, LMessage: TJSONObject;
+    LFrame: TGARPFrame;
+    LCommandID: string;
+begin
+    EnsureConnected;
+    LCommandID := NextRequestID;
+    LPayload := TJSONObject.Create;
+    try
+        LPayload.AddPair('prompt_request_id', ARequestID);
+        LMessage := BuildMessage('SUBSCRIBE_RESPONSE', LPayload, LCommandID, FSessionID);
+        LPayload := nil;
+        try
+            SendFrame(GARP_SUBSCRIBE_RESPONSE, LMessage, LCommandID, FSessionID);
+        finally
+            LMessage.Free;
+        end;
+    finally
+        LPayload.Free;
+    end;
+    if not ReceiveUntilRequest(LCommandID, [GARP_RESPONSE, GARP_ERROR], LFrame, 30000) then raise EGARPProtocolError.Create('Timed out waiting for SUBSCRIBE_RESPONSE');
+    try
+        if LFrame.MessageType = GARP_ERROR then raise EGARPProtocolError.Create(GetErrorText(LFrame));
+        Result := LFrame.MessageJSON.Clone as TJSONObject;
+    finally
+        LFrame.MessageJSON.Free;
+    end;
+end;
+
+procedure TGARPClient124.Ping;
+var
+    LMessage: TJSONObject;
+    LFrame: TGARPFrame;
+    LRequestID: string;
+begin
+    EnsureConnected;
+    LRequestID := NextRequestID;
+    LMessage := BuildMessage('PING', nil, LRequestID);
+    try
+        SendFrame(GARP_PING, LMessage, LRequestID);
+    finally
+        LMessage.Free;
+    end;
+    if not ReceiveUntilRequest(LRequestID, [GARP_RESPONSE, GARP_PONG, GARP_ERROR], LFrame, 30000) then
+        raise EGARPProtocolError.Create('Timed out waiting for PING response');
+    try
+        if LFrame.MessageType = GARP_ERROR then raise EGARPProtocolError.Create(GetErrorText(LFrame));
+    finally
+        LFrame.MessageJSON.Free;
+    end;
+end;
+
+procedure TGARPClient124.CloseSession;
+var
+    LMessage: TJSONObject;
+    LFrame: TGARPFrame;
+    LRequestID: string;
+begin
+    if FSessionID = '' then Exit;
+    EnsureConnected;
+    LRequestID := NextRequestID;
+    LMessage := BuildMessage('CLOSE_SESSION', nil, LRequestID, FSessionID);
+    try
+        SendFrame(GARP_CLOSE_SESSION, LMessage, LRequestID, FSessionID);
+    finally
+        LMessage.Free;
+    end;
+    if not ReceiveUntilRequest(LRequestID, [GARP_RESPONSE, GARP_ERROR], LFrame, 30000) then
+        raise EGARPProtocolError.Create('Timed out waiting for CLOSE_SESSION');
+    try
+        if LFrame.MessageType = GARP_ERROR then raise EGARPProtocolError.Create(GetErrorText(LFrame));
+    finally
+        LFrame.MessageJSON.Free;
+    end;
+    FSessionID := '';
+    FTabID := '';
+end;
+
+end.
+
+
+// File 3: src\GARP124.Protocol.pas
+unit GARP124.Protocol;
+
+interface
+
+uses
+    System.SysUtils,
+    System.JSON,
+    System.Hash,
+    System.NetEncoding,
+    System.Generics.Collections,
+    System.RegularExpressions,
+    Winapi.Windows,
+    IdTCPClient,
+    IdGlobal;
+
+const
+    GARP_PROTOCOL = 'GARP/1.24';
+    GARP_SEMANTIC_VERSION = '1.24';
+    GARP_WIRE_VERSION = '0x00';
+    GARP_VERSION_BYTE = $00;
+    GARP_FIXED_HEADER_LENGTH = 48;
+    GARP_DEFAULT_PORT = 9999;
+    GARP_HANDSHAKE_MAX_PAYLOAD = 1024 * 1024;
+    GARP_APPLICATION_MAX_PAYLOAD = 16 * 1024 * 1024;
+    GARP_MAX_FRAME_SIZE = GARP_APPLICATION_MAX_PAYLOAD;
+    GARP_READ_TIMEOUT = 10000;
+    GARP_HANDSHAKE_TIMEOUT = 10000;
+    GARP_ZERO_UUID = '00000000-0000-0000-0000-000000000000';
+    GARP_DOMAIN_CLIENT_PROOF = 'GARP/1.24/client-proof';
+    GARP_DOMAIN_SERVER_PROOF = 'GARP/1.24/server-proof';
+    GARP_FEATURE_EXT_PONG = 'ext-pong';
+    GARP_FEATURE_EXT_REPLAY_STORE = 'ext-replay-store';
+
+    GARP_HELLO = $0001;
+    GARP_HELLO_CHALLENGE = $0002;
+    GARP_HELLO_AUTH = $0003;
+    GARP_HELLO_ACK = $0004;
+    GARP_RESPONSE = $0005;
+    GARP_ERROR = $0006;
+
+    GARP_CAPABILITIES = $0010;
+    GARP_BROWSER_STATUS = $0011;
+    GARP_LIST_TABS = $0012;
+    GARP_OPEN_TAB = $0013;
+    GARP_CLOSE_TAB = $0014;
+    GARP_SELECT_TAB = $0015;
+    GARP_GET_CAPABILITIES = $0016;
+
+    GARP_CREATE_SESSION = $0020;
+    GARP_ATTACH_SESSION = $0021;
+    GARP_DETACH_SESSION = $0022;
+    GARP_CLOSE_SESSION = $0023;
+    GARP_RESET_SESSION = $0024;
+    GARP_GET_SESSION = $0025;
+
+    GARP_PROMPT = $0030;
+    GARP_CANCEL_PROMPT = $0031;
+    GARP_GET_PROMPT_STATUS = $0032;
+    GARP_GET_RESPONSE = $0033;
+    GARP_SUBSCRIBE_RESPONSE = $0034;
+    GARP_CONTINUE_PROMPT = $0035;
+
+    GARP_SESSION_READY = $0040;
+    GARP_SESSION_CHANGED = $0041;
+    GARP_NAVIGATION = $0042;
+    GARP_NAVIGATION_DRIFT = $0043;
+    GARP_RECOVERY_STATE = $0044;
+    GARP_PROVIDER_CHANGED = $0045;
+
+    GARP_INPUT_SUBMITTED = $0050;
+    GARP_GENERATION_STARTED = $0051;
+    GARP_GENERATION_DELTA = $0052;
+    GARP_GENERATION_PROGRESS = $0053;
+    GARP_CONTINUATION_REQUIRED = $0054;
+    GARP_CONTINUATION_SUBMITTED = $0055;
+    GARP_GENERATION_COMPLETED = $0056;
+    GARP_GENERATION_FAILED = $0057;
+    GARP_GENERATION_CANCELLED = $0058;
+
+    GARP_PROVIDER_ERROR = $0060;
+    GARP_PROVIDER_AUTH_REQUIRED = $0061;
+    GARP_PROVIDER_RATE_LIMITED = $0062;
+    GARP_DIAGNOSTIC = $0063;
+
+    GARP_PING = $0070;
+    GARP_PONG = $0071;
+
+    GARP_GET_EVENTS = $0100;
+
+    BCRYPT_USE_SYSTEM_PREFERRED_RNG = $00000002;
+
+type
+    TGARPMessageType = Word;
+
+    EGARPProtocolError = class(Exception);
+
+    TGARPFrame = record
+        MessageType: TGARPMessageType;
+        RequestID: string;
+        SessionID: string;
+        Timestamp: string;
+        MessageJSON: TJSONObject;
+        PayloadLength: Cardinal;
+    end;
+
+function GARPMessageTypeToName(const AMessageType: TGARPMessageType): string;
+function GARPMessageNameToType(const AName: string): TGARPMessageType;
+function GARPNewUUID: string;
+function GARPCreateNonce: TBytes;
+function GARPBase64UrlEncode(const ABytes: TBytes): string;
+function GARPBase64UrlDecode(const AValue: string): TBytes;
+function GARPRequireNonce16(const AValue: string): TBytes;
+function GARPUUIDToBytes(const AValue: string): TBytes;
+function GARPBytesToUUID(const ABytes: TBytes; const AOffset: Integer): string;
+function GARPBuildJSON(
+    const ATypeName: string;
+    const APayload: TJSONValue;
+    const ARequestID: string = '';
+    const ASessionID: string = ''
+): TJSONObject;
+function GARPEncodeFrame(
+    const AMessageType: TGARPMessageType;
+    const AJSON: TJSONObject;
+    const ARequestID: string = '';
+    const ASessionID: string = ''
+): TBytes;
+function GARPDecodeFrame(const AFrame: TBytes): TGARPFrame;
+function GARPReadFrame(
+    AClient: TIdTCPClient;
+    const AMaxPayloadBytes: Cardinal = GARP_HANDSHAKE_MAX_PAYLOAD
+): TBytes;
+procedure GARPWriteFrame(AClient: TIdTCPClient; const AFrame: TBytes);
+function GARPWriteRead(AClient: TIdTCPClient; const AFrame: TBytes): TBytes;
+function GARPCanonicalFeatureList(const AFeatures: array of string): TArray<string>;
+function GARPEncodeTranscript(
+    const ADomain: string;
+    const AClientNonce: TBytes;
+    const AServerNonce: TBytes;
+    const ASelectedVersion: string;
+    const ASelectedWireVersion: string;
+    const AOfferedFeatures: TArray<string>;
+    const AFinalFeatures: TArray<string>;
+    const AClientName: string;
+    const AClientVersion: string;
+    const AServerName: string;
+    const AServerVersion: string
+): TBytes;
+function GARPHMACSHA256(const ASecret: string; const AData: TBytes): TBytes;
+function GARPMakeProof(
+    const ASecret: string;
+    const ADomain: string;
+    const AClientNonce: TBytes;
+    const AServerNonce: TBytes;
+    const AOfferedFeatures: TArray<string>;
+    const AFinalFeatures: TArray<string>;
+    const AClientName: string;
+    const AClientVersion: string;
+    const AServerName: string;
+    const AServerVersion: string
+): TBytes;
+function GARPJSONObjectPayload(const AFrame: TGARPFrame): TJSONObject;
+function GARPFrameRequestIDMatches(const AFrame: TGARPFrame; const ARequestID: string): Boolean;
+function GARPFramePromptRequestID(const AFrame: TGARPFrame): string;
+
+implementation
+
+function BCryptGenRandom(
+    hAlgorithm: Pointer;
+    pbBuffer: PByte;
+    cbBuffer: Cardinal;
+    dwFlags: Cardinal
+): Cardinal; stdcall; external 'bcrypt.dll' name 'BCryptGenRandom';
+
+function GARPMessageTypeToName(const AMessageType: TGARPMessageType): string;
+begin
+    case AMessageType of
+        GARP_HELLO: Result := 'HELLO';
+        GARP_HELLO_CHALLENGE: Result := 'HELLO_CHALLENGE';
+        GARP_HELLO_AUTH: Result := 'HELLO_AUTH';
+        GARP_HELLO_ACK: Result := 'HELLO_ACK';
+        GARP_RESPONSE: Result := 'RESPONSE';
+        GARP_ERROR: Result := 'ERROR';
+        GARP_CAPABILITIES: Result := 'CAPABILITIES';
+        GARP_BROWSER_STATUS: Result := 'BROWSER_STATUS';
+        GARP_LIST_TABS: Result := 'LIST_TABS';
+        GARP_OPEN_TAB: Result := 'OPEN_TAB';
+        GARP_CLOSE_TAB: Result := 'CLOSE_TAB';
+        GARP_SELECT_TAB: Result := 'SELECT_TAB';
+        GARP_GET_CAPABILITIES: Result := 'GET_CAPABILITIES';
+        GARP_CREATE_SESSION: Result := 'CREATE_SESSION';
+        GARP_ATTACH_SESSION: Result := 'ATTACH_SESSION';
+        GARP_DETACH_SESSION: Result := 'DETACH_SESSION';
+        GARP_CLOSE_SESSION: Result := 'CLOSE_SESSION';
+        GARP_RESET_SESSION: Result := 'RESET_SESSION';
+        GARP_GET_SESSION: Result := 'GET_SESSION';
+        GARP_PROMPT: Result := 'PROMPT';
+        GARP_CANCEL_PROMPT: Result := 'CANCEL_PROMPT';
+        GARP_GET_PROMPT_STATUS: Result := 'GET_PROMPT_STATUS';
+        GARP_GET_RESPONSE: Result := 'GET_RESPONSE';
+        GARP_SUBSCRIBE_RESPONSE: Result := 'SUBSCRIBE_RESPONSE';
+        GARP_CONTINUE_PROMPT: Result := 'CONTINUE_PROMPT';
+        GARP_SESSION_READY: Result := 'SESSION_READY';
+        GARP_SESSION_CHANGED: Result := 'SESSION_CHANGED';
+        GARP_NAVIGATION: Result := 'NAVIGATION';
+        GARP_NAVIGATION_DRIFT: Result := 'NAVIGATION_DRIFT';
+        GARP_RECOVERY_STATE: Result := 'RECOVERY_STATE';
+        GARP_PROVIDER_CHANGED: Result := 'PROVIDER_CHANGED';
+        GARP_INPUT_SUBMITTED: Result := 'INPUT_SUBMITTED';
+        GARP_GENERATION_STARTED: Result := 'GENERATION_STARTED';
+        GARP_GENERATION_DELTA: Result := 'GENERATION_DELTA';
+        GARP_GENERATION_PROGRESS: Result := 'GENERATION_PROGRESS';
+        GARP_CONTINUATION_REQUIRED: Result := 'CONTINUATION_REQUIRED';
+        GARP_CONTINUATION_SUBMITTED: Result := 'CONTINUATION_SUBMITTED';
+        GARP_GENERATION_COMPLETED: Result := 'GENERATION_COMPLETED';
+        GARP_GENERATION_FAILED: Result := 'GENERATION_FAILED';
+        GARP_GENERATION_CANCELLED: Result := 'GENERATION_CANCELLED';
+        GARP_PROVIDER_ERROR: Result := 'PROVIDER_ERROR';
+        GARP_PROVIDER_AUTH_REQUIRED: Result := 'PROVIDER_AUTH_REQUIRED';
+        GARP_PROVIDER_RATE_LIMITED: Result := 'PROVIDER_RATE_LIMITED';
+        GARP_DIAGNOSTIC: Result := 'DIAGNOSTIC';
+        GARP_PING: Result := 'PING';
+        GARP_PONG: Result := 'PONG';
+        GARP_GET_EVENTS: Result := 'GET_EVENTS';
+    else
+        Result := '';
+    end;
+end;
+
+function GARPMessageNameToType(const AName: string): TGARPMessageType;
+var
+    LIndex: TGARPMessageType;
+    LName: string;
+begin
+    LName := UpperCase(Trim(AName));
+    for LIndex := 0 to $0100 do
+    begin
+        if GARPMessageTypeToName(LIndex) = LName then
+            Exit(LIndex);
+    end;
+    Result := 0;
+end;
+
+function GARPNewUUID: string;
+var
+    LGuid: TGUID;
+begin
+    if CreateGUID(LGuid) <> 0 then
+        raise EGARPProtocolError.Create('Unable to generate UUID');
+    Result := LowerCase(Copy(GUIDToString(LGuid), 2, 36));
+end;
+
+function GARPCreateNonce: TBytes;
+begin
+    SetLength(Result, 16);
+    if BCryptGenRandom(nil, @Result[0], Length(Result), BCRYPT_USE_SYSTEM_PREFERRED_RNG) <> 0 then
+        raise EGARPProtocolError.Create('Unable to generate cryptographically random GARP nonce');
+end;
+
+function GARPBase64UrlEncode(const ABytes: TBytes): string;
+begin
+    Result := TNetEncoding.Base64.EncodeBytesToString(ABytes);
+    Result := StringReplace(Result, '+', '-', [rfReplaceAll]);
+    Result := StringReplace(Result, '/', '_', [rfReplaceAll]);
+    Result := StringReplace(Result, '=', '', [rfReplaceAll]);
+end;
+
+function GARPBase64UrlDecode(const AValue: string): TBytes;
+var
+    LText: string;
+    LPadding: Integer;
+begin
+    if not TRegEx.IsMatch(AValue, '^[A-Za-z0-9_-]*$') then
+        raise EGARPProtocolError.Create('Invalid Base64URL encoding');
+    if (Length(AValue) mod 4) = 1 then
+        raise EGARPProtocolError.Create('Invalid Base64URL length');
+
+    LText := StringReplace(AValue, '-', '+', [rfReplaceAll]);
+    LText := StringReplace(LText, '_', '/', [rfReplaceAll]);
+    LPadding := (4 - (Length(LText) mod 4)) mod 4;
+    while LPadding > 0 do
+    begin
+        LText := LText + '=';
+        Dec(LPadding);
+    end;
+
+    try
+        Result := TNetEncoding.Base64.DecodeStringToBytes(LText);
+    except
+        on E: Exception do
+            raise EGARPProtocolError.Create('Invalid Base64URL encoding: ' + E.Message);
+    end;
+end;
+
+function GARPRequireNonce16(const AValue: string): TBytes;
+begin
+    Result := GARPBase64UrlDecode(AValue);
+    if Length(Result) <> 16 then
+        raise EGARPProtocolError.Create('GARP nonce must decode to exactly 16 bytes');
+end;
+
+function GARPUUIDToBytes(const AValue: string): TBytes;
+var
+    LText: string;
+    LIndex: Integer;
+begin
+    SetLength(Result, 16);
+    if AValue = '' then
+        Exit;
+    if SameText(AValue, GARP_ZERO_UUID) then
+        Exit;
+    if not TRegEx.IsMatch(AValue, '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') then
+        raise EGARPProtocolError.Create('Invalid UUID: ' + AValue);
+    LText := StringReplace(LowerCase(AValue), '-', '', [rfReplaceAll]);
+    for LIndex := 0 to 15 do
+        Result[LIndex] := StrToInt('$' + Copy(LText, LIndex * 2 + 1, 2));
+end;
+
+function GARPBytesToUUID(const ABytes: TBytes; const AOffset: Integer): string;
+var
+    LIndex: Integer;
+    LZero: Boolean;
+    LText: string;
+begin
+    if (AOffset < 0) or (Length(ABytes) < AOffset + 16) then
+        raise EGARPProtocolError.Create('UUID field is truncated');
+    LZero := True;
+    LText := '';
+    for LIndex := 0 to 15 do
+    begin
+        LZero := LZero and (ABytes[AOffset + LIndex] = 0);
+        LText := LText + IntToHex(ABytes[AOffset + LIndex], 2);
+    end;
+    if LZero then
+        Exit('');
+    Result := LowerCase(
+        Copy(LText, 1, 8) + '-' +
+        Copy(LText, 9, 4) + '-' +
+        Copy(LText, 13, 4) + '-' +
+        Copy(LText, 17, 4) + '-' +
+        Copy(LText, 21, 12)
+    );
+end;
+
+function GARPBuildJSON(
+    const ATypeName: string;
+    const APayload: TJSONValue;
+    const ARequestID: string;
+    const ASessionID: string
+): TJSONObject;
+begin
+    Result := TJSONObject.Create;
+    try
+        Result.AddPair('garp', GARP_SEMANTIC_VERSION);
+        Result.AddPair('type', UpperCase(ATypeName));
+        if ARequestID = '' then
+            Result.AddPair('request_id', TJSONNull.Create)
+        else
+            Result.AddPair('request_id', ARequestID);
+        if ASessionID = '' then
+            Result.AddPair('session_id', TJSONNull.Create)
+        else
+            Result.AddPair('session_id', ASessionID);
+        Result.AddPair('timestamp', FormatDateTime('yyyy-mm-dd"T"hh:nn:ss.zzz"Z"', TTimeZone.Local.ToUniversalTime(Now)));
+        Result.AddPair('sequence', TJSONNull.Create);
+        if APayload = nil then
+            Result.AddPair('payload', TJSONObject.Create)
+        else
+            Result.AddPair('payload', APayload);
+    except
+        Result.Free;
+        raise;
+    end;
+end;
+
+function GARPEncodeFrame(
+    const AMessageType: TGARPMessageType;
+    const AJSON: TJSONObject;
+    const ARequestID: string;
+    const ASessionID: string
+): TBytes;
+var
+    LPayloadBytes: TBytes;
+    LRequestBytes: TBytes;
+    LSessionBytes: TBytes;
+    LPayloadText: string;
+    LLength: Cardinal;
+    LIndex: Integer;
+begin
+    if AJSON = nil then
+        raise EGARPProtocolError.Create('JSON message is nil');
+    if GARPMessageTypeToName(AMessageType) = '' then
+        raise EGARPProtocolError.CreateFmt('Unknown GARP message type: 0x%.4x', [AMessageType]);
+    LPayloadText := AJSON.ToJSON;
+    LPayloadBytes := TEncoding.UTF8.GetBytes(LPayloadText);
+    LLength := Length(LPayloadBytes);
+    if LLength > GARP_MAX_FRAME_SIZE then
+        raise EGARPProtocolError.Create('GARP payload exceeds maximum frame size');
+
+    SetLength(Result, GARP_FIXED_HEADER_LENGTH + LLength);
+    Result[0] := Ord('G'); Result[1] := Ord('A'); Result[2] := Ord('R'); Result[3] := Ord('P');
+    Result[4] := GARP_VERSION_BYTE;
+    Result[5] := 0;
+    Result[6] := 0;
+    Result[7] := GARP_FIXED_HEADER_LENGTH;
+    Result[8] := Byte(LLength shr 24);
+    Result[9] := Byte(LLength shr 16);
+    Result[10] := Byte(LLength shr 8);
+    Result[11] := Byte(LLength);
+    Result[12] := Byte(AMessageType shr 8);
+    Result[13] := Byte(AMessageType);
+    Result[14] := 0;
+    Result[15] := 0;
+
+    LRequestBytes := GARPUUIDToBytes(ARequestID);
+    LSessionBytes := GARPUUIDToBytes(ASessionID);
+    for LIndex := 0 to 15 do
+    begin
+        Result[16 + LIndex] := LRequestBytes[LIndex];
+        Result[32 + LIndex] := LSessionBytes[LIndex];
+    end;
+    if LLength > 0 then
+        Move(LPayloadBytes[0], Result[GARP_FIXED_HEADER_LENGTH], LLength);
+end;
+
+function GARPDecodeFrame(const AFrame: TBytes): TGARPFrame;
+var
+    LHeaderLength: Cardinal;
+    LPayloadLength: Cardinal;
+    LMessageType: TGARPMessageType;
+    LPayloadBytes: TBytes;
+    LPayloadText: string;
+    LValue: TJSONValue;
+    LExpectedName: string;
+    LRequestID: string;
+    LSessionID: string;
+    LEnvelopeRequestID: TJSONValue;
+    LEnvelopeSessionID: TJSONValue;
+begin
+    FillChar(Result, SizeOf(Result), 0);
+    Result.MessageJSON := nil;
+    if Length(AFrame) < GARP_FIXED_HEADER_LENGTH then
+        raise EGARPProtocolError.Create('GARP frame is shorter than the fixed header');
+    if (AFrame[0] <> Ord('G')) or (AFrame[1] <> Ord('A')) or (AFrame[2] <> Ord('R')) or (AFrame[3] <> Ord('P')) then
+        raise EGARPProtocolError.Create('Invalid GARP magic');
+    if AFrame[4] <> GARP_VERSION_BYTE then
+        raise EGARPProtocolError.CreateFmt('Unsupported GARP wire version: 0x%.2x', [AFrame[4]]);
+    if AFrame[5] <> 0 then
+        raise EGARPProtocolError.Create('Unsupported GARP flags');
+    LHeaderLength := (Cardinal(AFrame[6]) shl 8) or Cardinal(AFrame[7]);
+    if LHeaderLength <> GARP_FIXED_HEADER_LENGTH then
+        raise EGARPProtocolError.Create('GARP header length must be exactly 48 bytes');
+    LPayloadLength :=
+        (Cardinal(AFrame[8]) shl 24) or
+        (Cardinal(AFrame[9]) shl 16) or
+        (Cardinal(AFrame[10]) shl 8) or
+        Cardinal(AFrame[11]);
+    if Cardinal(Length(AFrame)) <> GARP_FIXED_HEADER_LENGTH + LPayloadLength then
+        raise EGARPProtocolError.Create('GARP payload length mismatch');
+    if LPayloadLength > GARP_MAX_FRAME_SIZE then
+        raise EGARPProtocolError.Create('GARP payload exceeds maximum frame size');
+    if (AFrame[14] <> 0) or (AFrame[15] <> 0) then
+        raise EGARPProtocolError.Create('GARP reserved header field is nonzero');
+
+    LMessageType := (Word(AFrame[12]) shl 8) or Word(AFrame[13]);
+    LExpectedName := GARPMessageTypeToName(LMessageType);
+    if LExpectedName = '' then
+        raise EGARPProtocolError.CreateFmt('Unknown GARP message type: 0x%.4x', [LMessageType]);
+
+    SetLength(LPayloadBytes, LPayloadLength);
+    if LPayloadLength > 0 then
+        Move(AFrame[GARP_FIXED_HEADER_LENGTH], LPayloadBytes[0], LPayloadLength);
+    LPayloadText := TEncoding.UTF8.GetString(LPayloadBytes);
+
+    LValue := TJSONObject.ParseJSONValue(LPayloadText);
+    if not (LValue is TJSONObject) then
+    begin
+        LValue.Free;
+        raise EGARPProtocolError.Create('GARP payload is not a JSON object');
+    end;
+
+    Result.MessageJSON := TJSONObject(LValue);
+    try
+        if Result.MessageJSON.GetValue<string>('garp', '') <> GARP_SEMANTIC_VERSION then
+            raise EGARPProtocolError.Create('GARP semantic version mismatch');
+        if not SameText(Result.MessageJSON.GetValue<string>('type', ''), LExpectedName) then
+            raise EGARPProtocolError.Create('GARP binary/header message type mismatch');
+
+        LRequestID := GARPBytesToUUID(AFrame, 16);
+        LSessionID := GARPBytesToUUID(AFrame, 32);
+        LEnvelopeRequestID := Result.MessageJSON.GetValue('request_id');
+        LEnvelopeSessionID := Result.MessageJSON.GetValue('session_id');
+
+        if ((LRequestID = '') and not (LEnvelopeRequestID is TJSONNull)) or
+           ((LRequestID <> '') and
+            (not (LEnvelopeRequestID is TJSONString) or
+             not SameText(TJSONString(LEnvelopeRequestID).Value, LRequestID))) then
+            raise EGARPProtocolError.Create('Header/envelope request_id mismatch');
+
+        if ((LSessionID = '') and not (LEnvelopeSessionID is TJSONNull)) or
+           ((LSessionID <> '') and
+            (not (LEnvelopeSessionID is TJSONString) or
+             not SameText(TJSONString(LEnvelopeSessionID).Value, LSessionID))) then
+            raise EGARPProtocolError.Create('Header/envelope session_id mismatch');
+
+        Result.MessageType := LMessageType;
+        Result.RequestID := LRequestID;
+        Result.SessionID := LSessionID;
+        Result.Timestamp := Result.MessageJSON.GetValue<string>('timestamp', '');
+        Result.PayloadLength := LPayloadLength;
+    except
+        Result.MessageJSON.Free;
+        Result.MessageJSON := nil;
+        raise;
+    end;
+end;
+
+function GARPReadFrame(AClient: TIdTCPClient; const AMaxPayloadBytes: Cardinal): TBytes;
+var
+    LHeader: TIdBytes;
+    LPayload: TIdBytes;
+    LPayloadLength: Cardinal;
+    LHeaderLength: Cardinal;
+    LIndex: Integer;
+begin
+    SetLength(LHeader, GARP_FIXED_HEADER_LENGTH);
+    AClient.IOHandler.ReadBytes(LHeader, GARP_FIXED_HEADER_LENGTH, False);
+    if Length(LHeader) <> GARP_FIXED_HEADER_LENGTH then
+        raise EGARPProtocolError.Create('Incomplete GARP header');
+    if (LHeader[0] <> Ord('G')) or (LHeader[1] <> Ord('A')) or (LHeader[2] <> Ord('R')) or (LHeader[3] <> Ord('P')) then
+        raise EGARPProtocolError.Create('Invalid GARP magic received');
+    if LHeader[4] <> GARP_VERSION_BYTE then
+        raise EGARPProtocolError.CreateFmt('Unsupported GARP wire version: 0x%.2x', [LHeader[4]]);
+    if LHeader[5] <> 0 then
+        raise EGARPProtocolError.Create('Unsupported GARP flags');
+    LHeaderLength := (Cardinal(LHeader[6]) shl 8) or Cardinal(LHeader[7]);
+    if LHeaderLength <> GARP_FIXED_HEADER_LENGTH then
+        raise EGARPProtocolError.Create('GARP header length must be exactly 48 bytes');
+    LPayloadLength :=
+        (Cardinal(LHeader[8]) shl 24) or
+        (Cardinal(LHeader[9]) shl 16) or
+        (Cardinal(LHeader[10]) shl 8) or
+        Cardinal(LHeader[11]);
+    if LPayloadLength > AMaxPayloadBytes then
+        raise EGARPProtocolError.CreateFmt('GARP payload exceeds receive limit: %d > %d', [LPayloadLength, AMaxPayloadBytes]);
+
+    SetLength(Result, GARP_FIXED_HEADER_LENGTH + LPayloadLength);
+    for LIndex := 0 to GARP_FIXED_HEADER_LENGTH - 1 do
+        Result[LIndex] := LHeader[LIndex];
+    if LPayloadLength > 0 then
+    begin
+        SetLength(LPayload, LPayloadLength);
+        AClient.IOHandler.ReadBytes(LPayload, LPayloadLength, False);
+        if Cardinal(Length(LPayload)) <> LPayloadLength then
+            raise EGARPProtocolError.Create('Incomplete GARP payload');
+        Move(LPayload[0], Result[GARP_FIXED_HEADER_LENGTH], LPayloadLength);
+    end;
+end;
+
+procedure GARPWriteFrame(AClient: TIdTCPClient; const AFrame: TBytes);
+var
+    LBytes: TIdBytes;
+begin
+    if Length(AFrame) < GARP_FIXED_HEADER_LENGTH then
+        raise EGARPProtocolError.Create('Cannot send undersized GARP frame');
+    if Length(AFrame) > GARP_FIXED_HEADER_LENGTH + GARP_MAX_FRAME_SIZE then
+        raise EGARPProtocolError.Create('Cannot send a GARP frame exceeding configured maximum');
+    SetLength(LBytes, Length(AFrame));
+    Move(AFrame[0], LBytes[0], Length(AFrame));
+    AClient.IOHandler.Write(LBytes);
+end;
+
+function GARPWriteRead(AClient: TIdTCPClient; const AFrame: TBytes): TBytes;
+begin
+    GARPWriteFrame(AClient, AFrame);
+    Result := GARPReadFrame(AClient);
+end;
+
+function GARPCompareUTF8(const ALeft, ARight: string): Integer;
+var
+    LLeft: TBytes;
+    LRight: TBytes;
+    LIndex: Integer;
+    LLimit: Integer;
+begin
+    LLeft := TEncoding.UTF8.GetBytes(ALeft);
+    LRight := TEncoding.UTF8.GetBytes(ARight);
+    LLimit := Length(LLeft);
+    if Length(LRight) < LLimit then
+        LLimit := Length(LRight);
+    for LIndex := 0 to LLimit - 1 do
+    begin
+        if LLeft[LIndex] < LRight[LIndex] then
+            Exit(-1);
+        if LLeft[LIndex] > LRight[LIndex] then
+            Exit(1);
+    end;
+    if Length(LLeft) < Length(LRight) then
+        Result := -1
+    else if Length(LLeft) > Length(LRight) then
+        Result := 1
+    else
+        Result := 0;
+end;
+
+function GARPStringCompare(const ALeft, ARight: string): Integer;
+begin
+    Result := GARPCompareUTF8(ALeft, ARight);
+end;
+
+function GARPCanonicalFeatureList(const AFeatures: array of string): TArray<string>;
+var
+    LIndex: Integer;
+    LList: TList<string>;
+    LValue: string;
+begin
+    LList := TList<string>.Create(TComparer<string>.Construct(
+        function(const ALeft, ARight: string): Integer
+        begin
+            Result := GARPStringCompare(ALeft, ARight);
+        end));
+    try
+        for LIndex := Low(AFeatures) to High(AFeatures) do
+        begin
+            LValue := AFeatures[LIndex];
+            if LValue = '' then
+                raise EGARPProtocolError.Create('Empty GARP feature token');
+            if LList.Contains(LValue) then
+                raise EGARPProtocolError.Create('Duplicate feature: ' + LValue);
+            LList.Add(LValue);
+        end;
+        LList.Sort;
+        Result := LList.ToArray;
+    finally
+        LList.Free;
+    end;
+end;
+
+procedure GARPPutU32(var ABuffer: TBytes; var AOffset: Integer; const AValue: Cardinal);
+begin
+    if AOffset + 4 > Length(ABuffer) then
+        SetLength(ABuffer, AOffset + 4);
+    ABuffer[AOffset] := Byte(AValue shr 24);
+    ABuffer[AOffset + 1] := Byte(AValue shr 16);
+    ABuffer[AOffset + 2] := Byte(AValue shr 8);
+    ABuffer[AOffset + 3] := Byte(AValue);
+    Inc(AOffset, 4);
+end;
+
+procedure GARPPutBytes(var ABuffer: TBytes; var AOffset: Integer; const AValue: TBytes);
+begin
+    GARPPutU32(ABuffer, AOffset, Length(AValue));
+    if Length(AValue) > 0 then
+    begin
+        if AOffset + Length(AValue) > Length(ABuffer) then
+            SetLength(ABuffer, AOffset + Length(AValue));
+        Move(AValue[0], ABuffer[AOffset], Length(AValue));
+        Inc(AOffset, Length(AValue));
+    end;
+end;
+
+function GARPEncodeTranscript(
+    const ADomain: string;
+    const AClientNonce: TBytes;
+    const AServerNonce: TBytes;
+    const ASelectedVersion: string;
+    const ASelectedWireVersion: string;
+    const AOfferedFeatures: TArray<string>;
+    const AFinalFeatures: TArray<string>;
+    const AClientName: string;
+    const AClientVersion: string;
+    const AServerName: string;
+    const AServerVersion: string
+): TBytes;
+var
+    LOffset: Integer;
+    LValue: TBytes;
+    LFeature: string;
+begin
+    LOffset := 0;
+    SetLength(Result, 0);
+    LValue := TEncoding.UTF8.GetBytes(ADomain);
+    GARPPutBytes(Result, LOffset, LValue);
+    GARPPutBytes(Result, LOffset, AClientNonce);
+    GARPPutBytes(Result, LOffset, AServerNonce);
+    LValue := TEncoding.UTF8.GetBytes(ASelectedVersion);
+    GARPPutBytes(Result, LOffset, LValue);
+    LValue := TEncoding.UTF8.GetBytes(ASelectedWireVersion);
+    GARPPutBytes(Result, LOffset, LValue);
+    GARPPutU32(Result, LOffset, Length(AOfferedFeatures));
+    for LFeature in AOfferedFeatures do
+    begin
+        LValue := TEncoding.UTF8.GetBytes(LFeature);
+        GARPPutBytes(Result, LOffset, LValue);
+    end;
+    GARPPutU32(Result, LOffset, Length(AFinalFeatures));
+    for LFeature in AFinalFeatures do
+    begin
+        LValue := TEncoding.UTF8.GetBytes(LFeature);
+        GARPPutBytes(Result, LOffset, LValue);
+    end;
+    LValue := TEncoding.UTF8.GetBytes(AClientName);
+    GARPPutBytes(Result, LOffset, LValue);
+    LValue := TEncoding.UTF8.GetBytes(AClientVersion);
+    GARPPutBytes(Result, LOffset, LValue);
+    LValue := TEncoding.UTF8.GetBytes(AServerName);
+    GARPPutBytes(Result, LOffset, LValue);
+    LValue := TEncoding.UTF8.GetBytes(AServerVersion);
+    GARPPutBytes(Result, LOffset, LValue);
+end;
+
+function GARPHMACSHA256(const ASecret: string; const AData: TBytes): TBytes;
+begin
+    Result := THashSHA2.GetHMACAsBytes(AData, TEncoding.UTF8.GetBytes(ASecret), SHA256);
+end;
+
+function GARPMakeProof(
+    const ASecret: string;
+    const ADomain: string;
+    const AClientNonce: TBytes;
+    const AServerNonce: TBytes;
+    const AOfferedFeatures: TArray<string>;
+    const AFinalFeatures: TArray<string>;
+    const AClientName: string;
+    const AClientVersion: string;
+    const AServerName: string;
+    const AServerVersion: string
+): TBytes;
+var
+    LTranscript: TBytes;
+begin
+    LTranscript := GARPEncodeTranscript(
+        ADomain,
+        AClientNonce,
+        AServerNonce,
+        GARP_SEMANTIC_VERSION,
+        GARP_WIRE_VERSION,
+        AOfferedFeatures,
+        AFinalFeatures,
+        AClientName,
+        AClientVersion,
+        AServerName,
+        AServerVersion
+    );
+    Result := GARPHMACSHA256(ASecret, LTranscript);
+end;
+
+function GARPJSONObjectPayload(const AFrame: TGARPFrame): TJSONObject;
+begin
+    Result := AFrame.MessageJSON.GetValue<TJSONObject>('payload');
+    if Result = nil then
+        raise EGARPProtocolError.Create('GARP frame payload is not an object');
+end;
+
+function GARPFrameRequestIDMatches(const AFrame: TGARPFrame; const ARequestID: string): Boolean;
+begin
+    Result := SameText(AFrame.RequestID, ARequestID);
+end;
+
+function GARPFramePromptRequestID(const AFrame: TGARPFrame): string;
+var
+    LPayload: TJSONObject;
+begin
+    LPayload := GARPJSONObjectPayload(AFrame);
+    Result := LPayload.GetValue<string>('prompt_request_id', '');
+end;
+
+end.
+
+
+// File 4: src\GARP124.Test.dpr
+﻿program GARP124.Test;
+
+{$APPTYPE CONSOLE}
+
+uses
+    System.SysUtils,
+    System.JSON,
+    Winapi.Windows,
+    GARP124.Protocol in 'GARP124.Protocol.pas',
+    GARP124.Client in 'GARP124.Client.pas';
+
+const
+    CP_UTF8 = 65001;
+
+type
+    TOptions = record
+        Host: string;
+        Port: Integer;
+        Secret: string;
+        Provider: string;
+        PromptText: string;
+        RunConformance: Boolean;
+        RunSelfTest: Boolean;
+        DoPing: Boolean;
+        DoCapabilities: Boolean;
+        DoBrowserStatus: Boolean;
+        DoListTabs: Boolean;
+        DoPrompt: Boolean;
+        DoSession: Boolean;
+        Debug: Boolean;
+    end;
+
+procedure PrintHelp;
+begin
+    Writeln('GARP/1.24 Delphi Test Client');
+    Writeln;
+    Writeln('Usage: GARP124.Test.exe [options]');
+    Writeln;
+    Writeln('Connection:');
+    Writeln('  --host <host>             Default 127.0.0.1');
+    Writeln('  --port <port>             Default 9999');
+    Writeln('  --secret <secret>         GARP_SECRET used by Firefox');
+    Writeln;
+    Writeln('Tests:');
+    Writeln('  --self-test               Local 1.24 framing/transcript tests');
+    Writeln('  --conformance             Live GARP/1.24 smoke test');
+    Writeln('  --ping                    PING and RESPONSE test');
+    Writeln('  --capabilities            GET_CAPABILITIES test');
+    Writeln('  --browser-status          Show latest BROWSER_STATUS event');
+    Writeln('  --list-tabs               LIST_TABS test');
+    Writeln('  --session <provider>      CREATE_SESSION test');
+    Writeln('  --prompt <text>           Create/use session and run prompt');
+    Writeln('  --debug                   Enable protocol tracing');
+end;
+
+function ParseOptions: TOptions;
+var
+    LIndex: Integer;
+    LArg: string;
+begin
+    Result.Host := '127.0.0.1';
+    Result.Port := GARP_DEFAULT_PORT;
+    Result.Secret := GetEnvironmentVariable('GARP_SECRET');
+    Result.Provider := '';
+    Result.PromptText := '';
+    Result.RunConformance := False;
+    Result.RunSelfTest := False;
+    Result.DoPing := False;
+    Result.DoCapabilities := False;
+    Result.DoBrowserStatus := False;
+    Result.DoListTabs := False;
+    Result.DoPrompt := False;
+    Result.DoSession := False;
+    Result.Debug := False;
+
+    LIndex := 1;
+    while LIndex <= ParamCount do
+    begin
+        LArg := ParamStr(LIndex);
+        if LArg = '--host' then
+        begin
+            Inc(LIndex);
+            if LIndex > ParamCount then raise Exception.Create('--host requires a value');
+            Result.Host := ParamStr(LIndex);
+        end
+        else if LArg = '--port' then
+        begin
+            Inc(LIndex);
+            if LIndex > ParamCount then raise Exception.Create('--port requires a value');
+            Result.Port := StrToInt(ParamStr(LIndex));
+        end
+        else if LArg = '--secret' then
+        begin
+            Inc(LIndex);
+            if LIndex > ParamCount then raise Exception.Create('--secret requires a value');
+            Result.Secret := ParamStr(LIndex);
+        end
+        else if LArg = '--self-test' then Result.RunSelfTest := True
+        else if LArg = '--conformance' then Result.RunConformance := True
+        else if LArg = '--ping' then Result.DoPing := True
+        else if LArg = '--capabilities' then Result.DoCapabilities := True
+        else if LArg = '--browser-status' then Result.DoBrowserStatus := True
+        else if LArg = '--list-tabs' then Result.DoListTabs := True
+        else if LArg = '--session' then
+        begin
+            Inc(LIndex);
+            if LIndex > ParamCount then raise Exception.Create('--session requires a provider');
+            Result.Provider := ParamStr(LIndex);
+            Result.DoSession := True;
+        end
+        else if LArg = '--prompt' then
+        begin
+            Inc(LIndex);
+            if LIndex > ParamCount then raise Exception.Create('--prompt requires text');
+            Result.PromptText := ParamStr(LIndex);
+            Result.DoPrompt := True;
+        end
+        else if LArg = '--debug' then Result.Debug := True
+        else raise Exception.Create('Unknown option: ' + LArg);
+        Inc(LIndex);
+    end;
+
+    if not (Result.RunConformance or Result.RunSelfTest or Result.DoPing or
+        Result.DoCapabilities or Result.DoBrowserStatus or Result.DoListTabs or
+        Result.DoSession or Result.DoPrompt) then
+        PrintHelp;
+end;
+
+procedure AssertEqual(const AName, AExpected, AActual: string);
+begin
+    if AExpected <> AActual then
+        raise Exception.CreateFmt('%s failed. Expected="%s" Actual="%s"', [AName, AExpected, AActual]);
+    Writeln('[PASS] ', AName);
+end;
+
+procedure AssertTrue(const AName: string; ACondition: Boolean);
+begin
+    if not ACondition then
+        raise Exception.Create(AName + ' failed');
+    Writeln('[PASS] ', AName);
+end;
+
+procedure RunSelfTest;
+const
+    LSecret = '0123456789abcdef0123456789abcdef';
+var
+    LRequestID: string;
+    LSessionID: string;
+    LPayload: TJSONObject;
+    LMessage: TJSONObject;
+    LFrameBytes: TBytes;
+    LFrame: TGARPFrame;
+    LText: string;
+    LClientNonce: TBytes;
+    LServerNonce: TBytes;
+    LOffered: TArray<string>;
+    LFinal: TArray<string>;
+    LProof: TBytes;
+begin
+    Writeln('=== GARP/1.24 local self-test ===');
+    LRequestID := GARPNewUUID;
+    LSessionID := GARPNewUUID;
+    LText := 'Unicode: äöü 日本語 🚀 and embedded newline' + sLineBreak + 'second line';
+
+    LPayload := TJSONObject.Create;
+    try
+        LPayload.AddPair('text', LText);
+        LMessage := GARPBuildJSON('DIAGNOSTIC', LPayload, LRequestID, LSessionID);
+        LPayload := nil;
+        try
+            LFrameBytes := GARPEncodeFrame(GARP_DIAGNOSTIC, LMessage, LRequestID, LSessionID);
+        finally
+            LMessage.Free;
+        end;
+    finally
+        LPayload.Free;
+    end;
+
+    LFrame := GARPDecodeFrame(LFrameBytes);
+    try
+        AssertEqual('protocol', GARP_PROTOCOL, LFrame.MessageJSON.GetValue<string>('garp', ''));
+        AssertEqual('message type', 'DIAGNOSTIC', LFrame.MessageJSON.GetValue<string>('type', ''));
+        AssertEqual('request UUID', LRequestID, LFrame.RequestID);
+        AssertEqual('session UUID', LSessionID, LFrame.SessionID);
+        AssertEqual('UTF-8 payload', LText, LFrame.MessageJSON.GetValue<string>('payload.text', ''));
+        AssertTrue('48-byte fixed header', Length(LFrameBytes) > GARP_FIXED_HEADER_LENGTH);
+    finally
+        LFrame.MessageJSON.Free;
+    end;
+
+    SetLength(LClientNonce, 16);
+    SetLength(LServerNonce, 16);
+    for var LIndex := 0 to 15 do
+    begin
+        LClientNonce[LIndex] := LIndex + 1;
+        LServerNonce[LIndex] := 16 - LIndex;
+    end;
+    LOffered := ['!ext-pong'];
+    LFinal := ['!ext-pong'];
+    LProof := GARPMakeProof(
+        LSecret,
+        GARP_DOMAIN_CLIENT_PROOF,
+        LClientNonce,
+        LServerNonce,
+        LOffered,
+        LFinal,
+        'GARPClient',
+        '1.24.0',
+        'GarpGateway',
+        '1.24.0'
+    );
+    AssertEqual(
+        'client proof Base64URL',
+        '4RiTq2SUP15gOp1alqIRdMBUM7Qv4CMZqREMXX4efQs',
+        GARPBase64UrlEncode(LProof)
+    );
+    LProof := GARPMakeProof(
+        LSecret,
+        GARP_DOMAIN_SERVER_PROOF,
+        LClientNonce,
+        LServerNonce,
+        LOffered,
+        LFinal,
+        'GARPClient',
+        '1.24.0',
+        'GarpGateway',
+        '1.24.0'
+    );
+    AssertEqual(
+        'server proof Base64URL',
+        'iFaTVoYbn_pb5yCCHOTpAUyfzFaCkXXKgLAbpMX6cfI',
+        GARPBase64UrlEncode(LProof)
+    );
+end;
+
+procedure PrintJSONObject(const ATitle: string; AObject: TJSONObject);
+begin
+    Writeln('--- ', ATitle, ' ---');
+    if AObject = nil then Writeln('<nil>') else Writeln(AObject.Format(2));
+end;
+
+procedure RunLiveBasic(const AOptions: TOptions);
+var
+    LClient: TGARPClient124;
+    LResponse: TJSONObject;
+begin
+    LClient := TGARPClient124.Create(AOptions.Host, AOptions.Port, AOptions.Secret);
+    try
+        LClient.Debug := AOptions.Debug;
+        LClient.ConnectAndAuthenticate;
+        Writeln('[PASS] HELLO/HELLO_CHALLENGE/HELLO_AUTH/HELLO_ACK');
+
+        if AOptions.DoPing then begin LClient.Ping; Writeln('[PASS] PING/RESPONSE'); end;
+        if AOptions.DoCapabilities then begin LResponse := LClient.GetCapabilities; try PrintJSONObject('GET_CAPABILITIES', LResponse); finally LResponse.Free; end; end;
+        if AOptions.DoBrowserStatus then begin LResponse := LClient.GetBrowserStatus; try PrintJSONObject('BROWSER_STATUS', LResponse); finally LResponse.Free; end; end;
+        if AOptions.DoListTabs then begin LResponse := LClient.ListTabs; try PrintJSONObject('LIST_TABS', LResponse); finally LResponse.Free; end; end;
+        if AOptions.DoSession then begin
+            LResponse := LClient.CreateSession(AOptions.Provider);
+            try PrintJSONObject('CREATE_SESSION', LResponse); finally LResponse.Free; end;
+            Writeln('SessionID: ', LClient.SessionID);
+            Writeln('TabID    : ', LClient.TabID);
+        end;
+        if AOptions.DoPrompt then
+        begin
+            if LClient.SessionID = '' then
+            begin
+                if AOptions.Provider = '' then raise Exception.Create('--prompt requires --session <provider>');
+                LResponse := LClient.CreateSession(AOptions.Provider);
+                LResponse.Free;
+            end;
+            LResponse := LClient.Prompt(AOptions.PromptText);
+            try PrintJSONObject('PROMPT RESPONSE', LResponse); finally LResponse.Free; end;
+            LResponse := LClient.WaitForCompletion(LClient.RequestID, 180000);
+            try PrintJSONObject('TERMINAL EVENT', LResponse); finally LResponse.Free; end;
+        end;
+        LClient.CloseSession;
+    finally
+        LClient.Free;
+    end;
+end;
+
+procedure RunConformance(const AOptions: TOptions);
+var
+    LClient: TGARPClient124;
+    LResponse: TJSONObject;
+    LProvider: string;
+    LPromptID: string;
+begin
+    Writeln('=== GARP/1.24 live conformance smoke test ===');
+    if AOptions.Secret = '' then raise Exception.Create('GARP secret not supplied');
+
+    LProvider := AOptions.Provider;
+    if LProvider = '' then LProvider := 'deepseek';
+
+    LClient := TGARPClient124.Create(AOptions.Host, AOptions.Port, AOptions.Secret);
+    try
+        LClient.Debug := AOptions.Debug;
+        LClient.ConnectAndAuthenticate;
+        Writeln('[PASS] HELLO/HELLO_CHALLENGE/HELLO_AUTH/HELLO_ACK');
+
+        LClient.Ping;
+        Writeln('[PASS] PING/RESPONSE');
+
+        LResponse := LClient.GetCapabilities;
+        try
+            Writeln('[PASS] GET_CAPABILITIES');
+            PrintJSONObject('CAPABILITIES', LResponse);
+        finally LResponse.Free; end;
+
+        LResponse := LClient.GetBrowserStatus;
+        try
+            Writeln('[PASS] BROWSER_STATUS');
+            PrintJSONObject('BROWSER_STATUS', LResponse);
+        finally LResponse.Free; end;
+
+        LResponse := LClient.ListTabs;
+        try
+            Writeln('[PASS] LIST_TABS');
+            PrintJSONObject('LIST_TABS', LResponse);
+        finally LResponse.Free; end;
+
+        Writeln('Creating session for provider: ', LProvider);
+        LResponse := LClient.CreateSession(LProvider);
+        try
+            Writeln('[PASS] CREATE_SESSION');
+            PrintJSONObject('CREATE_SESSION', LResponse);
+        finally LResponse.Free; end;
+
+        LResponse := LClient.Prompt('Reply with exactly: GARP/1.24 TEST OK', 120000, True);
+        try
+            Writeln('[PASS] PROMPT accepted by RESPONSE');
+            PrintJSONObject('PROMPT RESPONSE', LResponse);
+        finally LResponse.Free; end;
+        LPromptID := LClient.RequestID;
+
+        LResponse := LClient.WaitForCompletion(LPromptID, 120000);
+        try
+            PrintJSONObject('TERMINAL EVENT', LResponse);
+            AssertTrue('terminal generation event',
+                SameText(LResponse.GetValue<string>('type', ''), 'GENERATION_COMPLETED') or
+                SameText(LResponse.GetValue<string>('type', ''), 'GENERATION_FAILED') or
+                SameText(LResponse.GetValue<string>('type', ''), 'GENERATION_CANCELLED'));
+        finally LResponse.Free; end;
+
+        LClient.CloseSession;
+        Writeln('[PASS] CLOSE_SESSION');
+    finally
+        LClient.Free;
+    end;
+end;
+
+var
+    LOptions: TOptions;
+begin
+    SetConsoleOutputCP(CP_UTF8);
+    try
+        LOptions := ParseOptions;
+        if LOptions.RunSelfTest then RunSelfTest;
+        if LOptions.RunConformance then
+            RunConformance(LOptions)
+        else if LOptions.DoPing or LOptions.DoCapabilities or LOptions.DoBrowserStatus or
+            LOptions.DoListTabs or LOptions.DoSession or LOptions.DoPrompt then
+            RunLiveBasic(LOptions);
+    except
+        on E: Exception do
+        begin
+            Writeln('ERROR: ', E.ClassName, ': ', E.Message);
+            ExitCode := 1;
+        end;
+    end;
+end.
+
+
