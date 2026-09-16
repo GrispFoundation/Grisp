@@ -1,0 +1,523 @@
+import { GarpConnectionScopedTypes, GarpSessionEventTypes, GarpSessionScopedCommandTypes, GARP_APPLICATION_LIMIT_DEFAULT, GARP_DEFAULT_CONTINUATION_WAIT_MS, GARP_DEFAULT_IDLE_TIMEOUT_MS, GARP_DEFAULT_INTERVAL_MS, GARP_DEFAULT_RECOVERY_DEADLINE_MS, GARP_DEFAULT_RESPONSE_RETENTION_MS, GARP_MAX_EVENT_HISTORY_MEMORY_MB, GARP_MAX_GENERATION_BUFFER_MB, GARP_MAX_OUTSTANDING_REQUESTS, GARP_MAX_PROMPT_SIZE, GARP_MAX_QUEUED_EVENTS, GARP_MAX_RESPONSE_SIZE, GARP_MAX_ERROR_DETAILS_BYTES, GARP_MAX_DIAGNOSTIC_DETAILS_BYTES, GARP_PROTOCOL, GARP_SEMANTIC_VERSION, GARP_WIRE_VERSION, } from "./GarpRegistry.sys.mjs";
+import { GarpError, GarpErrorCode } from "./GarpErrors.sys.mjs";
+import { byteLength, durationMs, isUuid, sortedUtf8, u32, uint64 } from "./GarpUtil.sys.mjs";
+const TOP_KEYS = ["garp", "type", "request_id", "session_id", "timestamp", "sequence", "payload"];
+const FEATURE_RE = /^!?[a-z0-9][a-z0-9._-]{0,127}$/;
+const STRATEGY_RE = /^[a-z][a-z0-9_]{0,63}$/;
+const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const invalid = m => { throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, m); };
+function obj(v, n) {
+    if (!v || typeof v !== "object" || Array.isArray(v))
+        invalid(`${n} must be an object`);
+}
+function keys(v, required, allowed = required, n = "object") {
+    obj(v, n);
+    for (const k of required)
+        if (!Object.prototype.hasOwnProperty.call(v, k))
+            throw new GarpError(GarpErrorCode.INVALID_ENVELOPE, `${n} missing required member ${k}`);
+    for (const k of Object.keys(v))
+        if (!allowed.includes(k))
+            invalid(`${n} contains unknown member ${k}`);
+}
+function str(v, n, min, max) {
+    if (typeof v !== "string")
+        invalid(`${n} must be string`);
+    const l = byteLength(v);
+    if (l < min || l > max)
+        invalid(`${n} length outside ${min}..${max}`);
+    return v;
+}
+function bool(v, n) {
+    if (typeof v !== "boolean")
+        invalid(`${n} must be boolean`);
+}
+function unique(a, n) {
+    if (new Set(a).size !== a.length)
+        invalid(`${n} contains duplicates`);
+}
+function features(a, n) {
+    if (!Array.isArray(a))
+        invalid(`${n} must be array`);
+    const canonical = a.map(v => {
+        if (typeof v !== "string" || !FEATURE_RE.test(v))
+            invalid(`${n} contains invalid feature`);
+        return v.startsWith("!") ? v.slice(1) : v;
+    });
+    unique(canonical, n);
+    const s = sortedUtf8(a);
+    for (let i = 0; i < a.length; i++)
+        if (a[i] !== s[i])
+            invalid(`${n} must be UTF-8 byte sorted`);
+    return a;
+}
+function timestamp(v) {
+    if (typeof v !== "string" || !ISO_RE.test(v))
+        invalid("timestamp must be RFC3339 UTC with millisecond precision");
+}
+function identity(v, n) {
+    if (v !== null && !isUuid(v))
+        invalid(`${n} must be UUID or null`);
+}
+function seq(v, event) {
+    if (event) {
+        if (typeof v !== "string")
+            invalid("sequence must be uint64-string");
+        uint64(v, "sequence");
+    }
+    else if (v !== null)
+        invalid("sequence must be null");
+}
+function validateCapabilities(p) {
+    keys(p, ["protocol", "wire_version", "limits", "keepalive", "providers", "extensions"]);
+    str(p.protocol, "protocol", 4, 16);
+    if (p.protocol !== GARP_SEMANTIC_VERSION)
+        invalid("CAPABILITIES.protocol mismatch");
+    if (p.wire_version !== GARP_WIRE_VERSION)
+        invalid("CAPABILITIES.wire_version mismatch");
+    obj(p.limits, "limits");
+    const u32s = ["max_payload_bytes", "max_prompt_size", "max_response_size", "max_outstanding_requests", "max_queued_events", "max_event_history_memory_mb", "max_generation_buffer_mb", "max_error_details_bytes", "max_diagnostic_details_bytes"];
+    const u64s = ["handshake_timeout_ms", "response_retention_ms", "continuation_wait_ms", "recovery_deadline_ms"];
+    for (const n of u32s)
+        u32(p.limits[n], `limits.${n}`);
+    for (const n of u64s)
+        durationMs(p.limits[n], `limits.${n}`);
+    if (p.limits.handshake_timeout_ms !== "10000")
+        invalid("handshake_timeout_ms must be 10000");
+    keys(p.keepalive, ["enabled", "idle_timeout_ms", "interval_ms"]);
+    bool(p.keepalive.enabled, "keepalive.enabled");
+    durationMs(p.keepalive.idle_timeout_ms, "idle_timeout_ms");
+    durationMs(p.keepalive.interval_ms, "interval_ms");
+    if (p.keepalive.enabled && (BigInt(p.keepalive.interval_ms) <= 0n || BigInt(p.keepalive.idle_timeout_ms) <= 0n || BigInt(p.keepalive.interval_ms) >= BigInt(p.keepalive.idle_timeout_ms)))
+        invalid("invalid keepalive intervals");
+    if (!Array.isArray(p.providers))
+        invalid("providers must be array");
+    const ids = [];
+    for (const e of p.providers) {
+        keys(e, ["id", "version", "state", "input_strategies", "capabilities"]);
+        str(e.id, "provider.id", 1, 64);
+        str(e.version, "provider.version", 1, 64);
+        if (!["AVAILABLE", "UNAVAILABLE", "AUTH_REQUIRED", "RATE_LIMITED", "DEGRADED"].includes(e.state))
+            invalid("invalid provider state");
+        if (!Array.isArray(e.input_strategies) || !e.input_strategies.length)
+            invalid("provider.input_strategies must contain at least one strategy");
+        for (const s of e.input_strategies)
+            if (typeof s !== "string" || !STRATEGY_RE.test(s) || byteLength(s) > 64)
+                invalid("invalid provider input strategy");
+        unique(e.input_strategies, "provider.input_strategies");
+        const ss = sortedUtf8(e.input_strategies);
+        for (let i = 0; i < ss.length; i++)
+            if (ss[i] !== e.input_strategies[i])
+                invalid("input strategies must be UTF-8 sorted");
+        keys(e.capabilities, ["streaming", "cancellation", "continuation", "diagnostics"]);
+        for (const n of ["streaming", "cancellation", "continuation", "diagnostics"])
+            bool(e.capabilities[n], `provider.capabilities.${n}`);
+        ids.push(e.id);
+    }
+    const si = sortedUtf8(ids);
+    for (let i = 0; i < si.length; i++)
+        if (si[i] !== ids[i])
+            invalid("providers must be UTF-8 sorted");
+    unique(ids, "providers");
+    if (!Array.isArray(p.extensions))
+        invalid("extensions must be array");
+    const en = [];
+    for (const e of p.extensions) {
+        keys(e, ["name", "version"]);
+        str(e.name, "extension.name", 1, 128);
+        str(e.version, "extension.version", 1, 64);
+        en.push(e.name);
+    }
+    const es = sortedUtf8(en);
+    for (let i = 0; i < es.length; i++)
+        if (en[i] !== es[i])
+            invalid("extensions must be UTF-8 sorted");
+    unique(en, "extensions");
+}
+function validatePromptOptions(o) {
+    obj(o, "PROMPT.options");
+    keys(o, [], ["timeout_ms", "auto_continue", "max_continuations", "force_focus", "simulate_enter", "ready_timeout_ms", "_extensions"], "PROMPT.options");
+    durationMs(o.timeout_ms ?? "0", "timeout_ms", 86400000n);
+    if (o.ready_timeout_ms !== undefined)
+        durationMs(o.ready_timeout_ms, "ready_timeout_ms", 86400000n);
+    bool(o.auto_continue ?? false, "auto_continue");
+    u32(o.max_continuations ?? 8, "max_continuations");
+    if ((o.max_continuations ?? 8) > 1024)
+        invalid("max_continuations exceeds 1024");
+    bool(o.force_focus ?? false, "force_focus");
+    bool(o.simulate_enter ?? false, "simulate_enter");
+    if (o._extensions !== undefined)
+        obj(o._extensions, "PROMPT.options._extensions");
+}
+function validateErrorObject(e) {
+    keys(e, ["code", "message"]);
+    str(e.code, "error.code", 1, 64);
+    str(e.message, "error.message", 0, 1024);
+}
+function validateTerminal(p, failed) {
+    if (Array.isArray(p.messages)) {
+        keys(p, failed ? ["prompt_request_id", "error", "partial", "messages", "page_generation"] : ["prompt_request_id", "messages", "page_generation"], failed ? ["prompt_request_id", "error", "partial", "messages", "page_generation"] : ["prompt_request_id", "messages", "page_generation"]);
+        if (!isUuid(p.prompt_request_id))
+            invalid("prompt_request_id invalid");
+        if (failed) {
+            validateErrorObject(p.error);
+            bool(p.partial, "partial");
+        }
+        if (!Array.isArray(p.messages))
+            invalid("messages must array");
+        for (const m of p.messages) {
+            keys(m, ["message_id", "revision", "response"]);
+            if (!isUuid(m.message_id))
+                invalid("message_id invalid");
+            uint64(m.revision, "revision");
+            if (typeof m.response !== "string")
+                invalid("message.response invalid");
+        }
+        uint64(p.page_generation, "page_generation");
+        return;
+    }
+    if (failed) {
+        keys(p, ["prompt_request_id", "error", "partial", "response", "page_generation"]);
+        if (!isUuid(p.prompt_request_id))
+            invalid("prompt_request_id invalid");
+        validateErrorObject(p.error);
+        bool(p.partial, "partial");
+        if (p.response !== null && typeof p.response !== "string")
+            invalid("response invalid");
+        if (p.response === null && p.partial)
+            invalid("partial cannot be true with null response");
+        uint64(p.page_generation, "page_generation");
+        return;
+    }
+    keys(p, ["prompt_request_id", "message_id", "revision", "response", "page_generation"]);
+    if (!isUuid(p.prompt_request_id) || !isUuid(p.message_id))
+        invalid("generation ids invalid");
+    uint64(p.revision, "revision");
+    if (typeof p.response !== "string")
+        invalid("response invalid");
+    uint64(p.page_generation, "page_generation");
+}
+function validateCancelled(p) {
+    if (Array.isArray(p.messages)) {
+        keys(p, ["prompt_request_id", "cancel_verified", "partial", "messages", "page_generation"]);
+        if (!isUuid(p.prompt_request_id))
+            invalid("prompt_request_id invalid");
+        bool(p.cancel_verified, "cancel_verified");
+        if (!p.cancel_verified)
+            invalid("cancel_verified must be true");
+        bool(p.partial, "partial");
+        for (const m of p.messages) {
+            keys(m, ["message_id", "revision", "response"]);
+            if (!isUuid(m.message_id))
+                invalid("message_id invalid");
+            uint64(m.revision, "revision");
+            if (typeof m.response !== "string")
+                invalid("message response invalid");
+        }
+        uint64(p.page_generation, "page_generation");
+        return;
+    }
+    keys(p, ["prompt_request_id", "message_id", "revision", "cancel_verified", "partial", "response", "page_generation"]);
+    if (!isUuid(p.prompt_request_id) || !isUuid(p.message_id))
+        invalid("generation ids invalid");
+    uint64(p.revision, "revision");
+    bool(p.cancel_verified, "cancel_verified");
+    if (!p.cancel_verified)
+        invalid("cancel_verified must be true");
+    bool(p.partial, "partial");
+    if (typeof p.response !== "string")
+        invalid("response invalid");
+    uint64(p.page_generation, "page_generation");
+}
+export function validateEnvelope(json, expectedType = null, header = null) {
+    obj(json, "Common Envelope");
+    keys(json, TOP_KEYS, TOP_KEYS, "Common Envelope");
+    if (json.garp !== GARP_SEMANTIC_VERSION)
+        throw new GarpError(GarpErrorCode.UNSUPPORTED_VERSION, `Unsupported semantic version: ${json.garp}`);
+    if (typeof json.type !== "string" || !/^[A-Z][A-Z0-9_]{0,63}$/.test(json.type))
+        throw new GarpError(GarpErrorCode.INVALID_ENVELOPE, "Envelope.type invalid");
+    if (expectedType && json.type !== expectedType)
+        throw new GarpError(GarpErrorCode.HEADER_JSON_MISMATCH, "Envelope type mismatch");
+    identity(json.request_id, "request_id");
+    identity(json.session_id, "session_id");
+    timestamp(json.timestamp);
+    const ev = GarpSessionEventTypes.has(json.type), sc = GarpSessionScopedCommandTypes.has(json.type);
+    seq(json.sequence, ev);
+    obj(json.payload, "payload");
+    if (ev && (json.request_id !== null || json.session_id === null))
+        throw new GarpError(GarpErrorCode.INVALID_ENVELOPE, "Invalid session event identity");
+    if (GarpConnectionScopedTypes.has(json.type) && json.session_id !== null)
+        throw new GarpError(GarpErrorCode.INVALID_ENVELOPE, "Connection-scoped message must have null session_id");
+    if (sc && json.session_id === null)
+        throw new GarpError(GarpErrorCode.INVALID_ENVELOPE, "Session-scoped command requires session_id");
+    if (header && ((json.request_id ?? null) !== (header.request_id ?? null) || (json.session_id ?? null) !== (header.session_id ?? null)))
+        throw new GarpError(GarpErrorCode.HEADER_JSON_MISMATCH, "Header/envelope UUID mismatch");
+    validateMessagePayload(json.type, json.payload);
+    return json;
+}
+export function validateMessagePayload(type, p) {
+    switch (type) {
+        case "HELLO":
+            keys(p, ["client_name", "client_version", "versions", "wire_versions", "features", "client_nonce"]);
+            str(p.client_name, "client_name", 1, 64);
+            str(p.client_version, "client_version", 1, 64);
+            if (!Array.isArray(p.versions) || !p.versions.includes(GARP_SEMANTIC_VERSION))
+                throw new GarpError(GarpErrorCode.UNSUPPORTED_VERSION, "HELLO does not offer GARP/1.24");
+            if (!Array.isArray(p.wire_versions) || !p.wire_versions.includes(GARP_WIRE_VERSION))
+                throw new GarpError(GarpErrorCode.UNSUPPORTED_WIRE_VERSION, "HELLO does not offer wire 0x00");
+            features(p.features, "HELLO.features");
+            str(p.client_nonce, "client_nonce", 1, 64);
+            break;
+        case "HELLO_CHALLENGE":
+            keys(p, ["server_name", "server_version", "selected_version", "selected_wire_version", "features", "server_nonce"]);
+            str(p.server_name, "server_name", 1, 64);
+            str(p.server_version, "server_version", 1, 64);
+            if (p.selected_version !== GARP_SEMANTIC_VERSION)
+                throw new GarpError(GarpErrorCode.UNSUPPORTED_VERSION, "Unsupported selected version");
+            if (p.selected_wire_version !== GARP_WIRE_VERSION)
+                throw new GarpError(GarpErrorCode.UNSUPPORTED_WIRE_VERSION, "Unsupported selected wire version");
+            features(p.features, "HELLO_CHALLENGE.features");
+            str(p.server_nonce, "server_nonce", 1, 64);
+            break;
+        case "HELLO_AUTH":
+            keys(p, ["client_proof"]);
+            str(p.client_proof, "client_proof", 1, 128);
+            break;
+        case "HELLO_ACK":
+            keys(p, ["server_proof", "selected_version", "selected_wire_version", "features"]);
+            str(p.server_proof, "server_proof", 1, 128);
+            if (p.selected_version !== GARP_SEMANTIC_VERSION || p.selected_wire_version !== GARP_WIRE_VERSION)
+                invalid("HELLO_ACK selection invalid");
+            features(p.features, "HELLO_ACK.features");
+            break;
+        case "CAPABILITIES":
+            validateCapabilities(p);
+            break;
+        case "BROWSER_STATUS":
+            keys(p, ["state", "active_tab_id"]);
+            if (!["STARTING", "READY", "DEGRADED", "FAILED"].includes(p.state))
+                invalid("invalid browser state");
+            if (p.active_tab_id !== null)
+                str(p.active_tab_id, "active_tab_id", 1, 64);
+            break;
+        case "LIST_TABS":
+        case "GET_CAPABILITIES":
+        case "PING":
+        case "PONG":
+            keys(p, [], [], `${type} payload`);
+            break;
+        case "OPEN_TAB":
+            keys(p, ["url"]);
+            str(p.url, "url", 1, 4096);
+            try {
+                const u = new URL(p.url);
+                if (!["http:", "https:"].includes(u.protocol))
+                    invalid("OPEN_TAB only permits http/https");
+            }
+            catch (_) {
+                invalid("invalid URL");
+            }
+            ;
+            break;
+        case "CLOSE_TAB":
+        case "SELECT_TAB":
+            keys(p, ["tab_id"]);
+            str(p.tab_id, "tab_id", 1, 64);
+            break;
+        case "CREATE_SESSION":
+            keys(p, ["provider", "options"], ["provider", "tab_id", "options"]);
+            str(p.provider, "provider", 1, 64);
+            keys(p.options, [], [], "CREATE_SESSION.options");
+            if (p.tab_id !== undefined)
+                str(p.tab_id, "tab_id", 1, 64);
+            break;
+        case "ATTACH_SESSION":
+        case "RESET_SESSION":
+            keys(p, ["options"], ["options"], `${type}.payload`);
+            keys(p.options, [], [], `${type}.options`);
+            break;
+        case "DETACH_SESSION":
+        case "CLOSE_SESSION":
+        case "GET_SESSION":
+            keys(p, [], [], `${type}.payload`);
+            break;
+        case "PROMPT":
+            keys(p, ["prompt", "options"]);
+            if (typeof p.prompt !== "string" || byteLength(p.prompt) > GARP_MAX_PROMPT_SIZE)
+                invalid("prompt invalid or exceeds max_prompt_size");
+            validatePromptOptions(p.options);
+            break;
+        case "CANCEL_PROMPT":
+        case "GET_PROMPT_STATUS":
+        case "GET_RESPONSE":
+        case "SUBSCRIBE_RESPONSE":
+        case "CONTINUE_PROMPT":
+            keys(p, ["prompt_request_id"]);
+            if (!isUuid(p.prompt_request_id))
+                invalid("prompt_request_id invalid");
+            break;
+        case "RESPONSE":
+            obj(p, "RESPONSE payload");
+            if (typeof p.success !== "boolean")
+                invalid("RESPONSE.success must be boolean");
+            break;
+        case "ERROR":
+            keys(p, ["code", "message"], ["code", "message", "details"]);
+            str(p.code, "error.code", 1, 64);
+            str(p.message, "error.message", 0, 1024);
+            if (p.details !== undefined) {
+                obj(p.details, "ERROR.details");
+                if (byteLength(JSON.stringify(p.details)) > GARP_MAX_ERROR_DETAILS_BYTES)
+                    invalid("ERROR.details too large");
+            }
+            break;
+        case "SESSION_READY":
+            keys(p, ["provider", "tab_id", "url", "page_generation"]);
+            str(p.provider, "provider", 1, 64);
+            str(p.tab_id, "tab_id", 1, 64);
+            str(p.url, "url", 1, 4096);
+            uint64(p.page_generation, "page_generation");
+            break;
+        case "SESSION_CHANGED":
+            keys(p, ["changed", "page_generation"]);
+            if (!Array.isArray(p.changed) || p.changed.length < 1 || p.changed.length > 4)
+                invalid("changed invalid");
+            unique(p.changed, "changed");
+            for (const x of p.changed)
+                if (!["provider", "tab_id", "url", "page_generation"].includes(x))
+                    invalid("invalid changed member");
+            uint64(p.page_generation, "page_generation");
+            break;
+        case "NAVIGATION":
+            keys(p, ["page_generation", "url"]);
+            uint64(p.page_generation, "page_generation");
+            str(p.url, "url", 1, 4096);
+            break;
+        case "NAVIGATION_DRIFT":
+            keys(p, ["page_generation", "reason"]);
+            uint64(p.page_generation, "page_generation");
+            if (!["UNEXPECTED_URL", "DOCUMENT_REPLACED", "PROVIDER_CONTEXT_LOST", "ACTOR_CONTEXT_STALE"].includes(p.reason))
+                invalid("invalid navigation drift reason");
+            break;
+        case "RECOVERY_STATE":
+            keys(p, ["state", "reason", "deadline_remaining_ms"]);
+            if (!["RECOVERING", "RECOVERED", "FAILED"].includes(p.state) || !["ACTOR_REPLACED", "DOCUMENT_REPLACED", "UNEXPECTED_URL", "PROVIDER_CONTEXT_LOST", "CANCELLATION_UNVERIFIED", "PROVIDER_RECOVERY", "INTERNAL_DESYNC"].includes(p.reason))
+                invalid("invalid recovery state/reason");
+            durationMs(p.deadline_remaining_ms, "deadline_remaining_ms");
+            break;
+        case "PROVIDER_CHANGED":
+            keys(p, ["previous_provider", "provider", "page_generation"]);
+            if (p.previous_provider !== null)
+                str(p.previous_provider, "previous_provider", 1, 64);
+            str(p.provider, "provider", 1, 64);
+            uint64(p.page_generation, "page_generation");
+            break;
+        case "INPUT_SUBMITTED":
+            keys(p, ["prompt_request_id", "page_generation", "strategy"]);
+            if (!isUuid(p.prompt_request_id))
+                invalid("prompt_request_id invalid");
+            uint64(p.page_generation, "page_generation");
+            str(p.strategy, "strategy", 1, 64);
+            if (!STRATEGY_RE.test(p.strategy))
+                invalid("strategy invalid");
+            break;
+        case "GENERATION_STARTED":
+            keys(p, ["prompt_request_id", "message_id", "revision", "page_generation"]);
+            if (!isUuid(p.prompt_request_id) || !isUuid(p.message_id))
+                invalid("generation ids invalid");
+            if (uint64(p.revision, "revision") !== 0n)
+                invalid("GENERATION_STARTED revision must be 0");
+            uint64(p.page_generation, "page_generation");
+            break;
+        case "GENERATION_DELTA":
+            keys(p, ["prompt_request_id", "message_id", "revision", "delta", "mode", "page_generation"]);
+            if (!isUuid(p.prompt_request_id) || !isUuid(p.message_id))
+                invalid("generation ids invalid");
+            uint64(p.revision, "revision");
+            if (typeof p.delta !== "string")
+                invalid("delta invalid");
+            if (!["APPEND", "REPLACE"].includes(p.mode))
+                invalid("mode invalid");
+            uint64(p.page_generation, "page_generation");
+            break;
+        case "GENERATION_PROGRESS":
+            keys(p, ["prompt_request_id", "message_count", "page_generation"]);
+            if (!isUuid(p.prompt_request_id))
+                invalid("prompt_request_id invalid");
+            u32(p.message_count, "message_count");
+            uint64(p.page_generation, "page_generation");
+            break;
+        case "CONTINUATION_REQUIRED":
+            keys(p, ["prompt_request_id", "continuation_count", "max_continuations", "page_generation"]);
+            if (!isUuid(p.prompt_request_id))
+                invalid("prompt_request_id invalid");
+            u32(p.continuation_count, "continuation_count");
+            u32(p.max_continuations, "max_continuations");
+            uint64(p.page_generation, "page_generation");
+            break;
+        case "CONTINUATION_SUBMITTED":
+            keys(p, ["prompt_request_id", "page_generation", "continuation_count", "strategy"]);
+            if (!isUuid(p.prompt_request_id))
+                invalid("prompt_request_id invalid");
+            uint64(p.page_generation, "page_generation");
+            u32(p.continuation_count, "continuation_count");
+            str(p.strategy, "strategy", 1, 64);
+            if (!STRATEGY_RE.test(p.strategy))
+                invalid("strategy invalid");
+            break;
+        case "GENERATION_COMPLETED":
+            validateTerminal(p, false);
+            break;
+        case "GENERATION_FAILED":
+            validateTerminal(p, true);
+            break;
+        case "GENERATION_CANCELLED":
+            validateCancelled(p);
+            break;
+        case "PROVIDER_ERROR":
+            keys(p, ["provider", "code", "message", "retryable", "prompt_request_id", "page_generation"]);
+            str(p.provider, "provider", 1, 64);
+            str(p.code, "code", 1, 64);
+            str(p.message, "message", 0, 1024);
+            bool(p.retryable, "retryable");
+            if (p.prompt_request_id !== null && !isUuid(p.prompt_request_id))
+                invalid("prompt_request_id invalid");
+            uint64(p.page_generation, "page_generation");
+            break;
+        case "PROVIDER_AUTH_REQUIRED":
+            keys(p, ["provider", "reason", "page_generation"]);
+            str(p.provider, "provider", 1, 64);
+            str(p.reason, "reason", 1, 64);
+            uint64(p.page_generation, "page_generation");
+            break;
+        case "PROVIDER_RATE_LIMITED":
+            keys(p, ["provider", "retry_after_ms", "page_generation"]);
+            str(p.provider, "provider", 1, 64);
+            durationMs(p.retry_after_ms, "retry_after_ms");
+            uint64(p.page_generation, "page_generation");
+            break;
+        case "DIAGNOSTIC":
+            keys(p, ["level", "stage", "code", "message", "details", "actor_instance"]);
+            if (!["TRACE", "DEBUG", "INFO", "WARN", "ERROR"].includes(p.level) || !["TRANSPORT", "AUTHENTICATION", "SESSION", "SUBMISSION", "GENERATION", "CONTINUATION", "CANCELLATION", "RECOVERY", "PROVIDER"].includes(p.stage))
+                invalid("invalid diagnostic level/stage");
+            str(p.code, "diagnostic.code", 1, 64);
+            str(p.message, "diagnostic.message", 0, 1024);
+            obj(p.details, "diagnostic.details");
+            if (byteLength(JSON.stringify(p.details)) > GARP_MAX_DIAGNOSTIC_DETAILS_BYTES)
+                invalid("diagnostic details too large");
+            str(p.actor_instance, "diagnostic.actor_instance", 1, 64);
+            break;
+        case "GET_EVENTS":
+            keys(p, ["from_sequence", "max_events"]);
+            if (uint64(p.from_sequence, "from_sequence") < 1n)
+                invalid("from_sequence must be >= 1");
+            u32(p.max_events, "max_events");
+            if (p.max_events < 1 || p.max_events > 4096)
+                invalid("max_events out of range");
+            break;
+        default: break;
+    }
+}
+export function capabilitiesObject(registry) {
+    return { protocol: GARP_SEMANTIC_VERSION, wire_version: GARP_WIRE_VERSION, limits: { handshake_timeout_ms: "10000", max_payload_bytes: GARP_APPLICATION_LIMIT_DEFAULT, max_prompt_size: GARP_MAX_PROMPT_SIZE, max_response_size: GARP_MAX_RESPONSE_SIZE, max_outstanding_requests: GARP_MAX_OUTSTANDING_REQUESTS, max_queued_events: GARP_MAX_QUEUED_EVENTS, max_event_history_memory_mb: GARP_MAX_EVENT_HISTORY_MEMORY_MB, max_generation_buffer_mb: GARP_MAX_GENERATION_BUFFER_MB, response_retention_ms: String(GARP_DEFAULT_RESPONSE_RETENTION_MS), continuation_wait_ms: String(GARP_DEFAULT_CONTINUATION_WAIT_MS), recovery_deadline_ms: String(GARP_DEFAULT_RECOVERY_DEADLINE_MS), max_error_details_bytes: GARP_MAX_ERROR_DETAILS_BYTES, max_diagnostic_details_bytes: GARP_MAX_DIAGNOSTIC_DETAILS_BYTES }, keepalive: { enabled: true, idle_timeout_ms: String(GARP_DEFAULT_IDLE_TIMEOUT_MS), interval_ms: String(GARP_DEFAULT_INTERVAL_MS) }, providers: registry.getCapabilityEntries(), extensions: [{ name: "ext-pong", version: "1.0" }, { name: "ext-replay-store", version: "1.0" }] };
+}
+
