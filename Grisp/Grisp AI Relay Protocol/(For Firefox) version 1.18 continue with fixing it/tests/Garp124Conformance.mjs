@@ -1,0 +1,23 @@
+import assert from "node:assert/strict";
+import { encodeGarpMessage, decodeGarpFrame } from "../browser/components/aistarter/garp/GarpFrame.sys.mjs";
+import { GarpError, GarpErrorCode } from "../browser/components/aistarter/garp/GarpErrors.sys.mjs";
+import { textEncoder, encodeTranscript, hmacSha256, base64UrlEncode, } from "../browser/components/aistarter/garp/GarpUtil.sys.mjs";
+import { validateMessagePayload } from "../browser/components/aistarter/garp/GarpSchema.sys.mjs";
+const secret = textEncoder.encode("0123456789abcdef0123456789abcdef");
+const cn = Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+const sn = Uint8Array.from([16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
+const common = [cn, sn, "1.24", "0x00", ["!ext-pong"], ["!ext-pong"], "GARPClient", "1.24.0", "GarpGateway", "1.24.0"];
+const ct = encodeTranscript("GARP/1.24/client-proof", ...common);
+const st = encodeTranscript("GARP/1.24/server-proof", ...common);
+assert.equal(ct.length, 165);
+assert.equal(st.length, 165);
+const cp = await hmacSha256(secret, ct), sp = await hmacSha256(secret, st);
+assert.equal(base64UrlEncode(cp), "4RiTq2SUP15gOp1alqIRdMBUM7Qv4CMZqREMXX4efQs");
+assert.equal(base64UrlEncode(sp), "iFaTVoYbn_pb5yCCHOTpAUyfzFaCkXXKgLAbpMX6cfI");
+const id = "00000000-0000-0000-0000-000000000001";
+const f = encodeGarpMessage("PING", {}, { request_id: id, session_id: null, timestamp: "2026-01-01T00:00:00.000Z", sequence: null });
+assert.equal(f.length - 48, 167);
+assert.equal(decodeGarpFrame(f).request_id, id);
+assert.throws(() => validateMessagePayload("PROMPT", { prompt: "ok", options: { auto_continue: "false" } }), e => e instanceof GarpError && e.code === GarpErrorCode.INVALID_ARGUMENT);
+console.log("GARP/1.24 hybrid conformance vectors: PASS");
+
