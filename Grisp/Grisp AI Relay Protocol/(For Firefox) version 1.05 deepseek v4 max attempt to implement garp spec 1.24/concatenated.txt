@@ -1,0 +1,3476 @@
+﻿// File 1: browser\components\aistarter\AIAutomation.sys.mjs
+import { GarpConnection } from "./garp/GarpConnection.sys.mjs";
+import {
+  GARP_BASE_FEATURES,
+  GARP_PROTOCOL,
+  GARP_SEMANTIC_VERSION,
+  GARP_SUPPORTED_EXTENSIONS,
+  GARP_WIRE_VERSION,
+  GarpMessageType,
+} from "./garp/GarpRegistry.sys.mjs";
+import { GarpError, GarpErrorCode } from "./garp/GarpErrors.sys.mjs";
+import {
+  assertNonce16,
+  base64URLToBytes,
+  buildTranscript,
+  bytesToBase64URL,
+  constantTimeEqualBytes,
+  hmacSha256,
+  negotiateFeatures,
+  randomNonce16,
+  validateAndCanonicaliseFeatures,
+} from "./garp/GarpAuth.sys.mjs";
+import { AIAutomationSessionManager } from "./sessions/AIAutomationSessionManager.sys.mjs";
+import { GarpRequestManager } from "./requests/GarpRequestManager.sys.mjs";
+import { ProviderRegistry } from "./providers/ProviderRegistry.sys.mjs";
+
+const GARP_PORT = 9999;
+const HANDSHAKE_TIMEOUT_MS = 10000;
+
+function uuid() { return crypto.randomUUID(); }
+
+function rawSecretFromEnv() {
+  // §16.2: shared secret MUST contain at least 32 raw bytes. The environment
+  // variable is interpreted as raw UTF-8 bytes unless the deployment says
+  // otherwise. We require >= 32 bytes after encoding.
+  const configured = Services.env.get("GARP_SECRET");
+  if (configured) {
+    const bytes = new TextEncoder().encode(configured);
+    if (bytes.length < 32) {
+      throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, "GARP_SECRET must encode to at least 32 bytes");
+    }
+    return bytes;
+  }
+  // Development fallback: generate a random 32-byte secret and dump it once.
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  dump(`GARP/1.24: generated startup secret (base64url) = ${bytesToBase64URL(bytes)}\n`);
+  return bytes;
+}
+
+export class AIAutomationService {
+  constructor() {
+    this.serverSocket = null;
+    this.connections = new Set();
+
+    this.providerRegistry = new ProviderRegistry();
+    this.sessionManager = new AIAutomationSessionManager(this, this.providerRegistry);
+    this.requestManager = new GarpRequestManager(this, this.sessionManager, this.providerRegistry);
+
+    this.serverId = uuid();
+    this.serverName = "FirefoxAIAutomation";
+    this.serverVersion = "1.24.0";
+
+    this.authSecretBytes = rawSecretFromEnv();
+
+    // §19: replay-protection store. We keep an in-memory set for this build.
+    // A production implementation MUST persist this across restarts and
+    // disable the secret if state is lost.
+    this.replayStore = new Set();
+
+    this.heartbeatTimer = null;
+    this.handshakeTimers = new WeakMap();
+  }
+
+  init() {
+    if (this.serverSocket) return;
+    try {
+      this.serverSocket = Cc["@mozilla.org/network/server-socket;1"].createInstance(Ci.nsIServerSocket);
+      this.serverSocket.init(GARP_PORT, true, -1);
+      this.serverSocket.asyncListen(this);
+      dump(`GARP/1.24: listening on 127.0.0.1:${GARP_PORT}\n`);
+    } catch (error) {
+      this.serverSocket = null;
+      Cu.reportError(`GARP/1.24 startup failed: ${error.message}`);
+      throw error;
+    }
+  }
+
+  shutdown() {
+    for (const c of [...this.connections]) c.close();
+    this.connections.clear();
+    if (this.serverSocket) {
+      try { this.serverSocket.close(); } catch (_) {}
+      this.serverSocket = null;
+    }
+  }
+
+  onSocketAccepted(_socket, transport) {
+    const connection = new GarpConnection(transport, this);
+    this.connections.add(connection);
+    const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+    timer.initWithCallback(
+      () => {
+        if (!connection.authenticated && !connection.closed) {
+          connection.fail(new GarpError(GarpErrorCode.HANDSHAKE_TIMEOUT, "handshake timeout"));
+        }
+      },
+      HANDSHAKE_TIMEOUT_MS,
+      Ci.nsITimer.TYPE_ONE_SHOT
+    );
+    this.handshakeTimers.set(connection, timer);
+  }
+
+  onStopListening() { this.serverSocket = null; }
+
+  removeConnection(connection) {
+    this.connections.delete(connection);
+    this.requestManager.unsubscribeConnection(connection);
+    const timer = this.handshakeTimers.get(connection);
+    if (timer) { try { timer.cancel(); } catch (_) {} }
+  }
+
+  getTopWindow() {
+    const { BrowserWindowTracker } = ChromeUtils.importESModule(
+      "resource:///modules/BrowserWindowTracker.sys.mjs"
+    );
+    return BrowserWindowTracker.getTopWindow();
+  }
+
+  // -------------------------------------------------------------------------
+  // Message dispatch
+  // -------------------------------------------------------------------------
+
+  async handleGarpMessage(connection, decoded) {
+    const { type } = decoded;
+
+    if (type === "HELLO") return this.handleHello(connection, decoded);
+    if (type === "HELLO_AUTH") return this.handleHelloAuth(connection, decoded);
+
+    if (!connection.authenticated) {
+      throw Object.assign(
+        new GarpError(GarpErrorCode.AUTH_REQUIRED, "connection not authenticated"),
+        { requestId: decoded.requestId, sessionId: decoded.sessionId }
+      );
+    }
+
+    // Keepalive bookkeeping (§101): any valid authenticated inbound frame updates
+    // last_inbound_authenticated_time.
+    connection.lastInboundAuthenticatedTime = Date.now();
+
+    switch (type) {
+      case "PING":                 return this.handlePing(connection, decoded);
+      case "GET_CAPABILITIES":     return this.handleGetCapabilities(connection, decoded);
+      case "CAPABILITIES":         return this.handlePeerCapabilities(connection, decoded);
+      case "BROWSER_STATUS":       return; // client -> gateway: ignore / not used
+      case "LIST_TABS":            return this.handleListTabs(connection, decoded);
+      case "OPEN_TAB":             return this.handleOpenTab(connection, decoded);
+      case "CLOSE_TAB":            return this.handleCloseTab(connection, decoded);
+      case "SELECT_TAB":           return this.handleSelectTab(connection, decoded);
+      case "CREATE_SESSION":       return this.handleCreateSession(connection, decoded);
+      case "ATTACH_SESSION":       return this.handleAttachSession(connection, decoded);
+      case "DETACH_SESSION":       return this.handleDetachSession(connection, decoded);
+      case "CLOSE_SESSION":        return this.handleCloseSession(connection, decoded);
+      case "RESET_SESSION":        return this.handleResetSession(connection, decoded);
+      case "GET_SESSION":          return this.handleGetSession(connection, decoded);
+      case "PROMPT":               return this.handlePrompt(connection, decoded);
+      case "CANCEL_PROMPT":        return this.handleCancel(connection, decoded);
+      case "GET_PROMPT_STATUS":    return this.handleGetPromptStatus(connection, decoded);
+      case "GET_RESPONSE":         return this.handleGetResponse(connection, decoded);
+      case "SUBSCRIBE_RESPONSE":   return this.handleSubscribe(connection, decoded);
+      case "CONTINUE_PROMPT":      return this.handleContinuePrompt(connection, decoded);
+      default:
+        throw Object.assign(
+          new GarpError(GarpErrorCode.UNKNOWN_MESSAGE_TYPE, `unsupported command: ${type}`),
+          { requestId: decoded.requestId, sessionId: decoded.sessionId }
+        );
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Handshake (§16–§17)
+  // -------------------------------------------------------------------------
+
+  handleHello(connection, decoded) {
+    if (connection.state !== "NEW") {
+      throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "HELLO in invalid state");
+    }
+    const p = decoded.payload || {};
+
+    if (typeof p.client_name !== "string" || typeof p.client_version !== "string") {
+      throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, "HELLO requires client_name and client_version");
+    }
+    if (!Array.isArray(p.versions) || !p.versions.includes(GARP_SEMANTIC_VERSION)) {
+      throw new GarpError(GarpErrorCode.UNSUPPORTED_VERSION, "client does not offer 1.24");
+    }
+    if (!Array.isArray(p.wire_versions) || !p.wire_versions.includes(GARP_WIRE_VERSION)) {
+      throw new GarpError(GarpErrorCode.UNSUPPORTED_WIRE_VERSION, "client does not offer wire version 0x00");
+    }
+
+    const offered = validateAndCanonicaliseFeatures(p.features || []);
+    const finalFeatures = negotiateFeatures(
+      offered,
+      [...GARP_BASE_FEATURES, ...GARP_SUPPORTED_EXTENSIONS]
+    );
+
+    const clientNonceBytes = assertNonce16(p.client_nonce, "client_nonce");
+    const serverNonceBytes = randomNonce16();
+
+    connection.state = "HELLO_RECEIVED";
+    connection.clientName = p.client_name;
+    connection.clientVersion = p.client_version;
+    connection.clientNonceBytes = clientNonceBytes;
+    connection.serverNonceBytes = serverNonceBytes;
+    connection.offeredFeatures = offered.map(o => o.raw);
+    connection.finalFeatures = finalFeatures;
+    connection.requestId = decoded.requestId; // for later correlation
+
+    connection.state = "CHALLENGE_SENT";
+    connection.send("HELLO_CHALLENGE", {
+      server_name: this.serverName,
+      server_version: this.serverVersion,
+      selected_version: GARP_SEMANTIC_VERSION,
+      selected_wire_version: GARP_WIRE_VERSION,
+      features: finalFeatures,
+      server_nonce: bytesToBase64URL(serverNonceBytes),
+    }, { request_id: decoded.requestId });
+  }
+
+  async handleHelloAuth(connection, decoded) {
+    if (connection.state !== "CHALLENGE_SENT") {
+      throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "HELLO_AUTH in invalid state");
+    }
+    const p = decoded.payload || {};
+    if (typeof p.client_proof !== "string") {
+      throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, "HELLO_AUTH requires client_proof");
+    }
+    connection.state = "AUTH_VERIFYING";
+
+    const transcript = buildTranscript({
+      domain: "GARP/1.24/client-proof",
+      clientNonceBytes: connection.clientNonceBytes,
+      serverNonceBytes: connection.serverNonceBytes,
+      selectedSemanticVersion: GARP_SEMANTIC_VERSION,
+      selectedWireVersion: GARP_WIRE_VERSION,
+      offeredFeatures: connection.offeredFeatures,
+      finalFeatures: connection.finalFeatures,
+      clientName: connection.clientName,
+      clientVersion: connection.clientVersion,
+      serverName: this.serverName,
+      serverVersion: this.serverVersion,
+    });
+
+    const expected = await hmacSha256(this.authSecretBytes, transcript);
+
+    let presented;
+    try {
+      presented = base64URLToBytes(p.client_proof);
+    } catch (_) {
+      throw new GarpError(GarpErrorCode.AUTH_FAILED, "invalid client_proof encoding");
+    }
+
+    if (presented.length !== 32 || !constantTimeEqualBytes(expected, presented)) {
+      throw new GarpError(GarpErrorCode.AUTH_FAILED, "client proof mismatch");
+    }
+
+    // §19.2 replay detection.
+    const transcriptDigestBytes = await crypto.subtle.digest("SHA-256", transcript);
+    const replayKey = [...new Uint8Array(transcriptDigestBytes)]
+      .map(b => b.toString(16).padStart(2, "0")).join("");
+    if (this.replayStore.has(replayKey)) {
+      throw new GarpError(GarpErrorCode.AUTH_REPLAY, "authentication replay detected");
+    }
+    this.replayStore.add(replayKey);
+
+    // §17.4 server proof.
+    const serverTranscript = buildTranscript({
+      domain: "GARP/1.24/server-proof",
+      clientNonceBytes: connection.clientNonceBytes,
+      serverNonceBytes: connection.serverNonceBytes,
+      selectedSemanticVersion: GARP_SEMANTIC_VERSION,
+      selectedWireVersion: GARP_WIRE_VERSION,
+      offeredFeatures: connection.offeredFeatures,
+      finalFeatures: connection.finalFeatures,
+      clientName: connection.clientName,
+      clientVersion: connection.clientVersion,
+      serverName: this.serverName,
+      serverVersion: this.serverVersion,
+    });
+    const serverProof = await hmacSha256(this.authSecretBytes, serverTranscript);
+
+    connection.state = "AUTHENTICATED_PENDING_ACK";
+    connection.send("HELLO_ACK", {
+      server_proof: bytesToBase64URL(serverProof),
+      selected_version: GARP_SEMANTIC_VERSION,
+      selected_wire_version: GARP_WIRE_VERSION,
+      features: connection.finalFeatures,
+    }, { request_id: decoded.requestId });
+
+    connection.authenticated = true;
+    connection.state = "AUTHENTICATED";
+    connection.lastInboundAuthenticatedTime = Date.now();
+
+    const timer = this.handshakeTimers.get(connection);
+    if (timer) { try { timer.cancel(); } catch (_) {} }
+
+    // §21 + §115: CAPABILITIES and BROWSER_STATUS emitted immediately.
+    this.emitCapabilities(connection);
+    this.emitBrowserStatus(connection);
+  }
+
+  // -------------------------------------------------------------------------
+  // Capabilities
+  // -------------------------------------------------------------------------
+
+  buildCapabilitiesPayload() {
+    return {
+      protocol: GARP_SEMANTIC_VERSION,
+      wire_version: GARP_WIRE_VERSION,
+      limits: {
+        handshake_timeout_ms: String(HANDSHAKE_TIMEOUT_MS),
+        max_payload_bytes: 16777216,
+        max_prompt_size: 1048576,
+        max_response_size: 16777216,
+        max_outstanding_requests: 128,
+        max_queued_events: 8192,
+        max_event_history_memory_mb: 64,
+        max_generation_buffer_mb: 32,
+        response_retention_ms: "86400000",
+        continuation_wait_ms: "300000",
+        recovery_deadline_ms: "300000",
+        max_error_details_bytes: 65536,
+        max_diagnostic_details_bytes: 65536,
+      },
+      keepalive: {
+        enabled: false,
+        idle_timeout_ms: "30000",
+        interval_ms: "10000",
+      },
+      providers: this.providerRegistry.capabilityEntries(),
+      extensions: GARP_SUPPORTED_EXTENSIONS.map(name => ({ name, version: "1.0" })),
+    };
+  }
+
+  emitCapabilities(connection) {
+    // §21: connection-scoped, unsolicited.
+    connection.send("CAPABILITIES", this.buildCapabilitiesPayload(), {});
+  }
+
+  handleGetCapabilities(connection, decoded) {
+    this.sendResponse(connection, decoded, {
+      success: true,
+      ...this.buildCapabilitiesPayload(),
+    });
+  }
+
+  handlePeerCapabilities(connection, decoded) {
+    // Client is announcing its capabilities. Mark handshake limit as lifted
+    // for our outbound direction (§6.5 is per-direction).
+    connection.peerOfferedCapabilities = true;
+    const advertised = Number(decoded.payload?.limits?.max_payload_bytes);
+    if (Number.isFinite(advertised) && advertised > 0) {
+      connection.ourEffectivePayloadLimit = Math.min(advertised, 0xFFFFFFFF);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Browser status
+  // -------------------------------------------------------------------------
+
+  emitBrowserStatus(connection) {
+    const win = this.getTopWindow();
+    const tabs = win ? win.gBrowser.tabs : [];
+    const active = win ? win.gBrowser.selectedTab : null;
+    let activeId = null;
+    if (active) {
+      try { activeId = this.sessionManager.getStableTabId(active); } catch (_) {}
+    }
+    connection.send("BROWSER_STATUS", {
+      state: win ? "READY" : "FAILED",
+      active_tab_id: activeId,
+    }, {});
+  }
+
+  // -------------------------------------------------------------------------
+  // PING / PONG
+  // -------------------------------------------------------------------------
+
+  handlePing(connection, decoded) {
+    // §99: a PING is answered by a normal RESPONSE, not by a PONG.
+    this.sendResponse(connection, decoded, { success: true });
+  }
+
+  // -------------------------------------------------------------------------
+  // Tabs
+  // -------------------------------------------------------------------------
+
+  handleListTabs(connection, decoded) {
+    this.sendResponse(connection, decoded, {
+      success: true,
+      tabs: this.sessionManager.listTabs(),
+    });
+  }
+
+  handleOpenTab(connection, decoded) {
+    const url = String(decoded.payload?.url || "");
+    if (!/^https?:\/\//i.test(url)) {
+      throw Object.assign(
+        new GarpError(GarpErrorCode.INVALID_ARGUMENT, "OPEN_TAB requires http(s) URL"),
+        { requestId: decoded.requestId, sessionId: null }
+      );
+    }
+    const result = this.sessionManager.openTab(url);
+    this.sendResponse(connection, decoded, { success: true, ...result });
+  }
+
+  handleCloseTab(connection, decoded) {
+    const result = this.sessionManager.closeTab(decoded.payload?.tab_id);
+    this.sendResponse(connection, decoded, { success: true, ...result });
+  }
+
+  handleSelectTab(connection, decoded) {
+    const result = this.sessionManager.selectTab(decoded.payload?.tab_id);
+    this.sendResponse(connection, decoded, { success: true, ...result });
+  }
+
+  // -------------------------------------------------------------------------
+  // Sessions
+  // -------------------------------------------------------------------------
+
+  handleCreateSession(connection, decoded) {
+    const payload = decoded.payload || {};
+    const session = this.sessionManager.createSession(
+      payload.provider,
+      payload.tab_id ?? null
+    );
+    // §35: CREATE_SESSION response is connection-scoped.
+    this.sendResponse(connection, decoded, {
+      success: true,
+      session_id: session.sessionId,
+      state: session.state,
+    });
+    this.prepareSession(session).catch(err => this.emitSessionError(session, err));
+  }
+
+  handleAttachSession(connection, decoded) {
+    const session = this.sessionManager.get(decoded.sessionId);
+    session.attachToConnection(connection);
+    this.sendResponse(connection, decoded, {
+      success: true,
+      session_id: session.sessionId,
+      state: session.state,
+      provider: session.provider,
+      tab_id: session.tabId,
+      url: session.pageURL,
+      page_generation: String(session.pageGeneration),
+    });
+  }
+
+  handleDetachSession(connection, decoded) {
+    const session = this.sessionManager.get(decoded.sessionId);
+    session.detachFromConnection(connection);
+    this.sendResponse(connection, decoded, { success: true });
+  }
+
+  handleCloseSession(connection, decoded) {
+    const sessionId = decoded.sessionId;
+    this.sessionManager.closeSession(sessionId);
+    this.sendResponse(connection, decoded, { success: true });
+  }
+
+  handleResetSession(connection, decoded) {
+    const session = this.sessionManager.get(decoded.sessionId);
+    if (session.state === "CLOSED") {
+      throw Object.assign(
+        new GarpError(GarpErrorCode.SESSION_CLOSED, "session closed"),
+        { requestId: decoded.requestId, sessionId: session.sessionId }
+      );
+    }
+    session.reset();
+    this.sendResponse(connection, decoded, {
+      success: true,
+      session_id: session.sessionId,
+      state: session.state,
+    });
+    this.prepareSession(session).catch(err => this.emitSessionError(session, err));
+  }
+
+  handleGetSession(connection, decoded) {
+    const session = this.sessionManager.get(decoded.sessionId);
+    this.sendResponse(connection, decoded, {
+      success: true,
+      session_id: session.sessionId,
+      state: session.state,
+      provider: session.provider,
+      tab_id: session.tabId,
+      url: session.pageURL,
+      page_generation: String(session.pageGeneration),
+      active_prompt_request_id: session.activeRequestId,
+    });
+  }
+
+  async prepareSession(session) {
+    let result;
+    try {
+      result = await this.callChild(session, "PrepareSession", { provider: session.provider });
+    } catch (error) {
+      if (error?.code === GarpErrorCode.NAVIGATION_DRIFT || error?.code === GarpErrorCode.STALE_ACTOR) {
+        // Retry once after reacquiring actor.
+        result = await this.callChild(session, "PrepareSession", { provider: session.provider });
+      } else {
+        throw error;
+      }
+    }
+    if (result?.error) {
+      session.state = result.state || "FAILED";
+      throw new GarpError(result.code || GarpErrorCode.PROVIDER_ERROR, result.error, {
+        provider: session.provider,
+        state: session.state,
+      });
+    }
+    session.inputState = result.input_state || (result.input_ready ? "READY" : "NOT_READY");
+    if (result.authenticated === false) session.state = "AUTH_REQUIRED";
+    else if (result.rate_limited) session.state = "RATE_LIMITED";
+    else if (result.input_ready) session.state = "READY";
+    else session.state = "PREPARING";
+
+    if (session.state === "READY") {
+      this.emitSessionEvent(session, "SESSION_READY", {
+        provider: session.provider,
+        tab_id: session.tabId,
+        url: session.pageURL,
+        page_generation: String(session.pageGeneration),
+      });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Prompts
+  // -------------------------------------------------------------------------
+
+  handlePrompt(connection, decoded) {
+    const payload = decoded.payload || {};
+    const promptText = String(payload.prompt ?? "");
+    if (promptText.length === 0) {
+      throw Object.assign(
+        new GarpError(GarpErrorCode.INVALID_ARGUMENT, "PROMPT requires prompt"),
+        { requestId: decoded.requestId, sessionId: decoded.sessionId }
+      );
+    }
+    const options = payload.options || {};
+    const request = this.requestManager.startPrompt(
+      connection,
+      decoded.sessionId,
+      decoded.requestId,
+      promptText,
+      options
+    );
+    this.sendResponse(connection, decoded, {
+      success: true,
+      command_state: "ACCEPTED",
+      prompt_state: request.promptState,
+    });
+  }
+
+  handleCancel(connection, decoded) {
+    const promptRequestId = decoded.payload?.prompt_request_id;
+    if (!promptRequestId) {
+      throw Object.assign(
+        new GarpError(GarpErrorCode.INVALID_ARGUMENT, "CANCEL_PROMPT requires prompt_request_id"),
+        { requestId: decoded.requestId, sessionId: decoded.sessionId }
+      );
+    }
+    const session = this.sessionManager.get(decoded.sessionId);
+    const request = this.requestManager.getForSession(session, promptRequestId);
+    this.requestManager.cancel(request);
+    this.sendResponse(connection, decoded, {
+      success: true,
+      command_state: "ACCEPTED",
+    });
+  }
+
+  handleGetPromptStatus(connection, decoded) {
+    const session = this.sessionManager.get(decoded.sessionId);
+    const request = this.requestManager.getForSession(session, decoded.payload?.prompt_request_id);
+    this.sendResponse(connection, decoded, {
+      success: true,
+      prompt_request_id: request.requestId,
+      state: request.promptState,
+      page_generation: String(request.pageGeneration),
+    });
+  }
+
+  handleGetResponse(connection, decoded) {
+    const session = this.sessionManager.get(decoded.sessionId);
+    const request = this.requestManager.getForSession(session, decoded.payload?.prompt_request_id);
+
+    if (!request.isTerminal()) {
+      throw Object.assign(
+        new GarpError(GarpErrorCode.RESPONSE_NOT_READY, "response not terminally available"),
+        { requestId: decoded.requestId, sessionId: session.sessionId }
+      );
+    }
+
+    const payload = {
+      success: true,
+      state: request.promptState,
+    };
+    if (request.promptState === "COMPLETED") {
+      payload.response = request.text;
+    } else if (request.promptState === "CANCELLED") {
+      payload.partial = request.hasCommittedContent();
+      payload.response = payload.partial ? request.text : null;
+    } else {
+      payload.partial = request.hasCommittedContent();
+      payload.response = payload.partial ? request.text : null;
+      if (request.error) payload.error = { code: request.error.code, message: request.error.message };
+    }
+    this.sendResponse(connection, decoded, payload);
+  }
+
+  handleSubscribe(connection, decoded) {
+    const session = this.sessionManager.get(decoded.sessionId);
+    const request = this.requestManager.getForSession(session, decoded.payload?.prompt_request_id);
+    this.requestManager.subscribe(request, connection);
+    this.sendResponse(connection, decoded, { success: true });
+  }
+
+  handleContinuePrompt(connection, decoded) {
+    const session = this.sessionManager.get(decoded.sessionId);
+    const request = this.requestManager.getForSession(session, decoded.payload?.prompt_request_id);
+    this.requestManager.continueExplicit(request);
+    this.sendResponse(connection, decoded, { success: true, command_state: "ACCEPTED" });
+  }
+
+  // -------------------------------------------------------------------------
+  // Event emission
+  // -------------------------------------------------------------------------
+
+  emitSessionEvent(session, type, payload) {
+    const sequence = session.nextSequence();
+    const subscribers = session.subscribers;
+    for (const conn of subscribers) {
+      if (!conn.authenticated) continue;
+      conn.send(type, payload, {
+        request_id: null,         // §11.4 global correlation rule
+        session_id: session.sessionId,
+        sequence: String(sequence),
+      });
+    }
+  }
+
+  emitSessionError(session, error) {
+    session.state = error?.state || "FAILED";
+    this.emitSessionEvent(session, "PROVIDER_ERROR", {
+      provider: session.provider,
+      code: error?.code || GarpErrorCode.PROVIDER_ERROR,
+      message: error?.message || String(error),
+      retryable: !!error?.retryable,
+      prompt_request_id: session.activeRequestId ?? null,
+      page_generation: String(session.pageGeneration),
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Response helper
+  // -------------------------------------------------------------------------
+
+  sendResponse(connection, decoded, payload) {
+    connection.send("RESPONSE", payload, {
+      request_id: decoded.requestId,
+      session_id: decoded.sessionId ?? null,
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Child actor bridge
+  // -------------------------------------------------------------------------
+
+  async callChild(session, operation, payload) {
+    const tab = this.sessionManager.getTabForSession(session);
+    const browser = tab.linkedBrowser;
+    const wg = browser?.browsingContext?.currentWindowGlobal;
+    if (!wg) {
+      throw Object.assign(
+        new GarpError(GarpErrorCode.NAVIGATION_DRIFT, "browser content not ready", { retryable: true }),
+        { state: "RECOVERING" }
+      );
+    }
+    const actor = wg.getActor("AIAutomation");
+    if (!actor) {
+      throw Object.assign(
+        new GarpError(GarpErrorCode.STALE_ACTOR, "child actor unavailable", { retryable: true }),
+        { state: "RECOVERING" }
+      );
+    }
+
+    if (session._lastActor && session._lastActor !== actor) {
+      session.incrementPageGeneration(browser.currentURI.spec);
+      this.emitSessionEvent(session, "NAVIGATION", {
+        page_generation: String(session.pageGeneration),
+        url: browser.currentURI.spec,
+      });
+    }
+    session._lastActor = actor;
+    session.pageURL = browser.currentURI.spec;
+
+    const result = await actor.sendQuery(`GARP:${operation}`, {
+      ...payload,
+      _fencing: {
+        session_id: session.sessionId,
+        page_generation: String(session.pageGeneration),
+        actor_instance: session.actorInstance,
+        provider: session.provider,
+      },
+    });
+    return result;
+  }
+}
+
+// File 2: browser\components\aistarter\actors\AIAutomationChild.sys.mjs
+// browser/components/aistarter/actors/AIAutomationChild.sys.mjs
+//
+// GARP/1.24 child actor.
+//
+// This actor is the browser-side half of the GARP/1.24 provider bridge.
+// It receives GARP:<Operation> queries from AIAutomationService (parent) via
+// the AIAutomation JSWindowActor pair and returns provider observations.
+//
+// Fencing (GARP/1.24 §91, §92, §168):
+//   Every query carries a `_fencing` context supplied by the parent:
+//       { session_id, page_generation, actor_instance, provider }
+//   Every state-bearing reply echoes the same fencing context back so that
+//   the parent can discard results whose page_generation or actor_instance
+//   no longer matches the session's authoritative values. The child does not
+//   itself decide whether a result is stale; it only labels results
+//   faithfully so the parent can apply the discard rule deterministically.
+//
+// Provider adapters (GARP/1.24 §119, §120, §167):
+//   All provider-specific selector and DOM logic lives in
+//   ../providers/*.sys.mjs. This actor contains no provider-specific
+//   selectors and no provider-specific branching.
+//
+// Reference:
+//   GARP/1.24 §10, §11, §42, §55, §56, §57, §60, §61, §69, §70, §71, §91,
+//   §92, §167, §168.
+
+import { ProviderRegistry } from "../providers/ProviderRegistry.sys.mjs";
+
+const providers = new ProviderRegistry();
+
+export class AIAutomationChild extends JSWindowActorChild {
+  constructor() {
+    super();
+
+    // Last prompt text this actor actually injected. Retained so that
+    // ObserveGeneration can distinguish "the DOM the adapter sees now" from
+    // "the response that the adapter's responseNodes() reports".
+    //
+    // The prompt string is opaque (GARP/1.24 §49.1): it MUST NOT be trimmed,
+    // normalized, or otherwise modified by the child. We store the exact
+    // value supplied by the parent.
+    this.lastInjectedPrompt = "";
+
+    // Last observed message text. Used purely as a local cache to help
+    // ObserveGeneration report stable vs. changed state on the current page;
+    // it is NOT authoritative protocol state.
+    this.lastObservedMessageText = "";
+
+    // Instance identity for this actor. Per §92, actor_instance is unique
+    // for the actor's lifetime. A replacement of this actor produces a new
+    // instance because the constructor runs again in a new JSWindowActorChild.
+    this.actorInstance =
+      (globalThis.crypto?.randomUUID?.() ??
+        `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  }
+
+  /**
+   * Return the fencing block supplied by the parent, or a deterministic
+   * empty shape when the parent did not provide one.
+   *
+   * The empty shape intentionally uses null values so that a caller cannot
+   * mistake an absent fencing context for a valid one.
+   */
+  fencingFrom(data) {
+    const f = data?._fencing || {};
+    return {
+      session_id: f.session_id ?? null,
+      page_generation: f.page_generation ?? null,
+      actor_instance: f.actor_instance ?? null,
+      provider: f.provider ?? null,
+    };
+  }
+
+  /**
+   * Overlay the fencing context onto a reply payload so the parent can
+   * perform §91 fencing discard.
+   *
+   * The child additionally reports its own actor_instance so that the parent
+   * can detect actor replacement even if it did not supply a fencing block
+   * (for example, during a defensive recovery query).
+   */
+  withFencing(payload, fencing) {
+    const out = payload && typeof payload === "object" ? payload : {};
+    return {
+      ...out,
+      _fencing: {
+        session_id: fencing.session_id,
+        page_generation: fencing.page_generation,
+        // The actor_instance the parent believes is authoritative for this
+        // session; echoed back unmodified so a mismatch on the parent is
+        // detected as a stale actor.
+        parent_actor_instance: fencing.actor_instance,
+        // The actor_instance actually executing this query.
+        child_actor_instance: this.actorInstance,
+        provider: fencing.provider,
+      },
+    };
+  }
+
+  async receiveMessage(message) {
+    const fencing = this.fencingFrom(message?.data);
+
+    try {
+      switch (message.name) {
+        case "GARP:PrepareSession":
+          return this.withFencing(
+            this.prepareSession(message.data),
+            fencing
+          );
+
+        case "GARP:InspectReady":
+          return this.withFencing(
+            this.inspectReady(message.data),
+            fencing
+          );
+
+        case "GARP:CaptureSnapshot":
+          return this.withFencing(
+            this.captureSnapshot(message.data),
+            fencing
+          );
+
+        case "GARP:InjectPrompt":
+          return this.withFencing(
+            await this.injectPrompt(message.data),
+            fencing
+          );
+
+        case "GARP:ObserveGeneration":
+          return this.withFencing(
+            this.observeGeneration(message.data),
+            fencing
+          );
+
+        case "GARP:ContinueGeneration":
+          return this.withFencing(
+            await this.continueGeneration(message.data),
+            fencing
+          );
+
+        case "GARP:CancelGeneration":
+          return this.withFencing(
+            this.cancelGeneration(message.data),
+            fencing
+          );
+
+        case "GARP:InspectProviderState":
+          return this.withFencing(
+            this.inspectProviderState(message.data),
+            fencing
+          );
+
+        default:
+          return this.withFencing(
+            {
+              error: `Unknown child operation: ${message.name}`,
+              code: "UNKNOWN_MESSAGE_TYPE",
+            },
+            fencing
+          );
+      }
+    } catch (error) {
+      dump(
+        `AIAutomationChild GARP/1.24 ERROR: ${error?.message || String(error)}\n${error?.stack || ""}\n`
+      );
+
+      return this.withFencing(
+        {
+          error: error?.message || String(error),
+          code: error?.code || "PROVIDER_ERROR",
+          details: error?.details || undefined,
+          state: error?.state || "FAILED",
+        },
+        fencing
+      );
+    }
+  }
+
+  /**
+   * Resolve a provider adapter by name.
+   *
+   * Unknown providers surface as PROVIDER_UNAVAILABLE (GARP/1.24 §27), which
+   * is the correct canonical error for "adapter for the configured provider
+   * is not installed" per §22.1's definition of provider unavailability.
+   */
+  getAdapter(providerName) {
+    const adapter = providers.get(providerName);
+
+    if (!adapter) {
+      throw Object.assign(
+        new Error(`Provider not found: ${providerName}`),
+        { code: "PROVIDER_UNAVAILABLE" }
+      );
+    }
+
+    return adapter;
+  }
+
+  // -------------------------------------------------------------------------
+  // Provider state inspection
+  // -------------------------------------------------------------------------
+
+  prepareSession(data) {
+    const adapter = this.getAdapter(data.provider);
+    const inspection = adapter.inspect(this.document);
+
+    return {
+      provider: adapter.name,
+      adapter_version: adapter.adapter_version,
+      selector_strategy_version: adapter.selector_strategy_version,
+      supported_features: [...adapter.supported_features],
+      ...inspection,
+      url: this.document.location?.href || "",
+    };
+  }
+
+  inspectReady(data) {
+    const adapter = this.getAdapter(data.provider);
+    const inspection = adapter.inspect(this.document);
+
+    // §22.1 / §34: readiness MUST NOT be inferred solely from tab existence.
+    // The adapter's inspect() is the authoritative source for input_ready,
+    // authenticated, and rate_limited.
+    return {
+      state:
+        inspection.authenticated === false
+          ? "AUTH_REQUIRED"
+          : inspection.rate_limited
+          ? "RATE_LIMITED"
+          : inspection.input_ready
+          ? "READY"
+          : "NOT_READY",
+      ...inspection,
+    };
+  }
+
+  inspectProviderState(data) {
+    const adapter = this.getAdapter(data.provider);
+    return adapter.inspect(this.document);
+  }
+
+  // -------------------------------------------------------------------------
+  // Response node discovery
+  // -------------------------------------------------------------------------
+
+  responseNodes(adapter) {
+    const nodes = adapter.responseNodes(this.document) || [];
+    return Array.from(nodes).filter(
+      node => node && typeof node.textContent === "string"
+    );
+  }
+
+  captureSnapshot(data) {
+    const adapter = this.getAdapter(data.provider);
+    const nodes = this.responseNodes(adapter);
+
+    const last = nodes.length
+      ? nodes[nodes.length - 1].textContent.trim()
+      : "";
+
+    this.lastObservedMessageText = last;
+
+    return {
+      provider: adapter.name,
+      url: this.document.location?.href || "",
+      input_ready: !!adapter.input(this.document),
+      authenticated: adapter.isAuthenticated(this.document),
+      rate_limited: adapter.isRateLimited(this.document),
+      last_message_count: nodes.length,
+      last_message_text: last,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Prompt injection
+  // -------------------------------------------------------------------------
+
+  async injectPrompt(data) {
+    const adapter = this.getAdapter(data.provider);
+    const input = adapter.input(this.document);
+
+    if (!input) {
+      return {
+        error: "Input not ready",
+        code: "INPUT_VERIFICATION_FAILED",
+        state: "NOT_READY",
+      };
+    }
+
+    if (!adapter.isAuthenticated(this.document)) {
+      return {
+        error: "Provider authentication required",
+        code: "PROVIDER_AUTH_REQUIRED",
+        state: "AUTH_REQUIRED",
+      };
+    }
+
+    if (adapter.isRateLimited(this.document)) {
+      return {
+        error: "Provider rate limit detected",
+        code: "PROVIDER_RATE_LIMITED",
+        state: "RATE_LIMITED",
+      };
+    }
+
+    // §49.1: the prompt string is opaque. Store and inject the exact value
+    // supplied by the parent, with no trimming, normalization, or mutation.
+    this.lastInjectedPrompt = String(data.prompt ?? "");
+
+    if (!this.lastInjectedPrompt) {
+      return {
+        error: "Prompt is empty",
+        code: "INVALID_ARGUMENT",
+        state: "FAILED",
+      };
+    }
+
+    const result = await adapter.inject(input, this.lastInjectedPrompt);
+
+    if (result?.error) {
+      return result;
+    }
+
+    const submit = result?.submit_method
+      ? result
+      : await adapter.submit(input, this.document);
+
+    if (submit?.error) {
+      return submit;
+    }
+
+    if (submit?.submit_method === "not_available") {
+      return {
+        error: "Prompt submission method unavailable",
+        code: "SUBMISSION_FAILED",
+        state: "SUBMITTING",
+      };
+    }
+
+    // §56: the strategy field reports the input strategy that was actually
+    // used. The parent maps this to INPUT_SUBMITTED.strategy.
+    const inputStrategy =
+      result?.input_method === "contenteditable"
+        ? "keyboard_enter"
+        : "provider_native_send";
+
+    return {
+      status: "injected",
+      input_method: result?.input_method || "dom_event",
+      input_verified: result?.input_verified !== false,
+      input_text_length: Number(
+        result?.input_text_length || this.lastInjectedPrompt.length
+      ),
+      submit_method: submit.submit_method,
+      input_strategy: inputStrategy,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Continuation
+  // -------------------------------------------------------------------------
+
+  continuationButton(adapter) {
+    return adapter.findContinueButton(this.document);
+  }
+
+  observeGeneration(data) {
+    const adapter = this.getAdapter(data.provider);
+    const inspection = adapter.inspect(this.document);
+    const nodes = this.responseNodes(adapter);
+
+    const last = nodes.length
+      ? nodes[nodes.length - 1].textContent.trim()
+      : "";
+
+    const continueButton = this.continuationButton(adapter);
+    const continuationRequired = !!continueButton;
+
+    if (inspection.authenticated === false) {
+      return {
+        error: "Provider authentication required",
+        code: "PROVIDER_AUTH_REQUIRED",
+        state: "AUTH_REQUIRED",
+      };
+    }
+
+    if (inspection.rate_limited) {
+      return {
+        error: "Provider rate limit detected",
+        code: "PROVIDER_RATE_LIMITED",
+        state: "RATE_LIMITED",
+      };
+    }
+
+    const previousCount = Number(data.previous_message_count || 0);
+
+    return {
+      text: last,
+      done: !inspection.streaming && !continuationRequired,
+      continued: false,
+      continuation_required: continuationRequired,
+      continuation_reason: continuationRequired
+        ? "provider_length_limit"
+        : null,
+      message_count: nodes.length,
+      message_changed: nodes.length > previousCount,
+      message_id_hint:
+        nodes.length > previousCount
+          ? `dom-message-${nodes.length}`
+          : null,
+      streaming: inspection.streaming,
+      provider_state: inspection.provider_state,
+      page_url: this.document.location?.href || "",
+    };
+  }
+
+  async continueGeneration(data) {
+    const adapter = this.getAdapter(data.provider);
+    const button = this.continuationButton(adapter);
+
+    if (!button) {
+      return {
+        error: "Continuation button not found",
+        code: "CONTINUATION_NOT_AVAILABLE",
+      };
+    }
+
+    button.focus();
+    button.click();
+
+    return {
+      status: "continued",
+      reason: data.reason || "provider_length_limit",
+      // Report the strategy actually used so the parent can populate
+      // CONTINUATION_SUBMITTED.strategy per §67.
+      submit_method: "button_click",
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Cancellation
+  // -------------------------------------------------------------------------
+
+  cancelGeneration(data) {
+    const adapter = this.getAdapter(data.provider);
+    const stopped = adapter.cancel(this.document);
+
+    return {
+      state: stopped ? "CANCELLING" : "CANCELLING",
+      cancelled: stopped,
+      // The protocol does not permit the child to declare cancellation
+      // terminal on its own. §73 requires positive provider cessation
+      // evidence. This reply is a *request* outcome; the parent must obtain
+      // authoritative cessation evidence before committing a CANCELLED
+      // terminal candidate (see §72.1).
+      cessation_verified: false,
+    };
+  }
+}
+
+// File 3: browser\components\aistarter\actors\AIAutomationParent.sys.mjs
+export class AIAutomationParent extends JSWindowActorParent {
+  receiveMessage(_message) {}
+}
+
+
+// File 4: browser\components\aistarter\diagnostics\AIAutomationDiagnostics.sys.mjs
+export class AIAutomationDiagnostics {
+  static providerState(provider, state, details = {}) {
+    return {
+      provider,
+      state,
+      timestamp: new Date().toISOString(),
+      details,
+    };
+  }
+
+  static error(provider, stage, code, message, details = {}) {
+    return {
+      provider,
+      stage,
+      code,
+      message,
+      details,
+      timestamp: new Date().toISOString(),
+    };
+  }
+}
+
+
+// File 5: browser\components\aistarter\garp\GarpAuth.sys.mjs
+// GARP/1.24 authentication transcript and proof encoding. See §16 and §139.
+
+import { GarpError, GarpErrorCode } from "./GarpErrors.sys.mjs";
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder("utf-8", { fatal: true });
+
+export function randomNonce16() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return bytes;
+}
+
+export function bytesToBase64URL(bytes) {
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+}
+
+export function base64URLToBytes(value) {
+  const text = String(value ?? "");
+  if (text.length === 0 || /[^A-Za-z0-9\-_]/.test(text)) {
+    throw new GarpError(GarpErrorCode.AUTH_FAILED, "Invalid Base64URL alphabet");
+  }
+  if (text.includes("=")) {
+    throw new GarpError(GarpErrorCode.AUTH_FAILED, "Base64URL padding is not permitted");
+  }
+  const normal = text.replaceAll("-", "+").replaceAll("_", "/");
+  let binary;
+  try {
+    binary = atob(normal);
+  } catch (e) {
+    throw new GarpError(GarpErrorCode.AUTH_FAILED, "Invalid Base64URL payload");
+  }
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+export function assertNonce16(value, fieldName) {
+  const bytes = base64URLToBytes(value);
+  if (bytes.length !== 16) {
+    throw new GarpError(
+      GarpErrorCode.AUTH_FAILED,
+      `${fieldName} must decode to exactly 16 bytes`
+    );
+  }
+  return bytes;
+}
+
+function u32be(value) {
+  const out = new Uint8Array(4);
+  new DataView(out.buffer).setUint32(0, value >>> 0, false);
+  return out;
+}
+
+function concat(parts) {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+
+function lengthPrefixed(bytesOrString) {
+  const bytes =
+    typeof bytesOrString === "string"
+      ? textEncoder.encode(bytesOrString)
+      : bytesOrString;
+  return concat([u32be(bytes.length), bytes]);
+}
+
+function encodeFeatureSet(features) {
+  const parts = [u32be(features.length)];
+  for (const f of features) parts.push(lengthPrefixed(f));
+  return concat(parts);
+}
+
+export function buildTranscript({
+  domain,
+  clientNonceBytes,
+  serverNonceBytes,
+  selectedSemanticVersion,
+  selectedWireVersion,
+  offeredFeatures,
+  finalFeatures,
+  clientName,
+  clientVersion,
+  serverName,
+  serverVersion,
+}) {
+  return concat([
+    lengthPrefixed(domain),
+    lengthPrefixed(clientNonceBytes),
+    lengthPrefixed(serverNonceBytes),
+    lengthPrefixed(selectedSemanticVersion),
+    lengthPrefixed(selectedWireVersion),
+    encodeFeatureSet(offeredFeatures),
+    encodeFeatureSet(finalFeatures),
+    lengthPrefixed(clientName),
+    lengthPrefixed(clientVersion),
+    lengthPrefixed(serverName),
+    lengthPrefixed(serverVersion),
+  ]);
+}
+
+export async function hmacSha256(secretBytes, transcript) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    secretBytes,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, transcript);
+  return new Uint8Array(sig);
+}
+
+export function constantTimeEqualBytes(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+
+// Feature-name syntax and canonicalisation per §15.
+const FEATURE_RE = /^!?[a-z0-9][a-z0-9._-]{0,127}$/;
+
+export function validateAndCanonicaliseFeatures(list) {
+  if (!Array.isArray(list)) {
+    throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, "features must be an array");
+  }
+  const seen = new Set();
+  const out = [];
+  for (const raw of list) {
+    if (typeof raw !== "string" || !FEATURE_RE.test(raw)) {
+      throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `invalid feature token: ${raw}`);
+    }
+    const required = raw.startsWith("!");
+    const canonical = required ? raw.slice(1) : raw;
+    if (seen.has(canonical)) {
+      throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `duplicate feature: ${canonical}`);
+    }
+    seen.add(canonical);
+    out.push({ canonical, required, raw });
+  }
+  // Sort by raw UTF-8 byte order of canonical name.
+  out.sort((a, b) => {
+    const ab = textEncoder.encode(a.canonical);
+    const bb = textEncoder.encode(b.canonical);
+    const n = Math.min(ab.length, bb.length);
+    for (let i = 0; i < n; i++) {
+      if (ab[i] !== bb[i]) return ab[i] - bb[i];
+    }
+    return ab.length - bb.length;
+  });
+  return out;
+}
+
+export function negotiateFeatures(offered, supported) {
+  const supportedSet = new Set(supported);
+  const finalSet = [];
+  for (const entry of offered) {
+    if (supportedSet.has(entry.canonical)) {
+      finalSet.push(entry.required ? `!${entry.canonical}` : entry.canonical);
+    } else if (entry.required) {
+      throw new GarpError(
+        GarpErrorCode.UNSUPPORTED_FEATURE,
+        `required feature not supported: ${entry.canonical}`
+      );
+    }
+  }
+  return finalSet;
+}
+
+// File 6: browser\components\aistarter\garp\GarpConnection.sys.mjs
+import { encodeEnvelope, encodeFrame, decodeFrame } from "./GarpFrame.sys.mjs";
+import { GarpError, GarpErrorCode } from "./GarpErrors.sys.mjs";
+import { GARP_HANDSHAKE_LIMIT } from "./GarpRegistry.sys.mjs";
+
+export class GarpConnection {
+  constructor(transport, service) {
+    this.transport = transport;
+    this.service = service;
+    this.outStream = transport.openOutputStream(0, 0, 0);
+    this.inStream = transport.openInputStream(0, 0, 0);
+    this.buffer = new Uint8Array(0);
+    this.closed = false;
+
+    // §14.1 server-side connection state.
+    this.state = "NEW";
+    this.authenticated = false;
+
+    this.peerOfferedCapabilities = false; // receiver has validated peer CAPABILITIES
+    this.ourEffectivePayloadLimit = GARP_HANDSHAKE_LIMIT;
+
+    this.lastActivity = Date.now();
+    this.lastInboundAuthenticatedTime = 0;
+    this.lastOutboundProtocolTime = Date.now();
+
+    this.clientName = null;
+    this.clientVersion = null;
+    this.clientNonceBytes = null;
+    this.serverNonceBytes = null;
+    this.offeredFeatures = [];
+    this.finalFeatures = [];
+    this.selectedSemanticVersion = "1.24";
+    this.selectedWireVersion = "0x00";
+
+    this.dispatchQueue = Promise.resolve();
+
+    this.pump = Cc["@mozilla.org/network/input-stream-pump;1"].createInstance(Ci.nsIInputStreamPump);
+    this.pump.init(this.inStream, 0, 0, false);
+    this.pump.asyncRead(this);
+  }
+
+  onStartRequest() {}
+  onDataAvailable(_req, stream, _off, count) {
+    if (this.closed) return;
+    const bin = Cc["@mozilla.org/binaryinputstream;1"].createInstance(Ci.nsIBinaryInputStream);
+    bin.setInputStream(stream);
+    const bytes = new Uint8Array(bin.readByteArray(count));
+    this.lastActivity = Date.now();
+    this.append(bytes);
+    this.processFrames();
+  }
+  onStopRequest() { this.close(); }
+
+  append(bytes) {
+    const combined = new Uint8Array(this.buffer.length + bytes.length);
+    combined.set(this.buffer, 0);
+    combined.set(bytes, this.buffer.length);
+    this.buffer = combined;
+  }
+
+  processFrames() {
+    while (!this.closed) {
+      if (this.buffer.length < 48) return;
+      const view = new DataView(this.buffer.buffer, this.buffer.byteOffset, this.buffer.byteLength);
+      const headerLen = view.getUint16(6, false);
+      const payloadLen = view.getUint32(8, false);
+      if (headerLen !== 48) { this.fail(new GarpError(GarpErrorCode.INVALID_ARGUMENT, "bad header_len")); return; }
+      const frameLen = headerLen + payloadLen;
+      if (this.buffer.length < frameLen) return;
+      const frame = this.buffer.slice(0, frameLen);
+      this.buffer = this.buffer.slice(frameLen);
+      let decoded;
+      try {
+        decoded = decodeFrame(frame, { effectiveLimit: this.ourEffectivePayloadLimit });
+      } catch (error) {
+        this.fail(error);
+        return;
+      }
+      this.dispatchQueue = this.dispatchQueue
+        .then(() => {
+          if (this.closed) return;
+          return this.service.handleGarpMessage(this, decoded);
+        })
+        .catch(error => this.fail(error));
+    }
+  }
+
+  send(type, payload = {}, options = {}) {
+    if (this.closed) return false;
+    try {
+      const { envelope } = encodeEnvelope({
+        type,
+        requestId: options.request_id ?? null,
+        sessionId: options.session_id ?? null,
+        sequence: options.sequence ?? null,
+        payload,
+      });
+      const frame = encodeFrame(envelope, { effectiveLimit: GARP_HANDSHAKE_LIMIT });
+      const out = Cc["@mozilla.org/binaryoutputstream;1"].createInstance(Ci.nsIBinaryOutputStream);
+      out.setOutputStream(this.outStream);
+      out.writeByteArray(frame, frame.length);
+      this.lastOutboundProtocolTime = Date.now();
+      return true;
+    } catch (error) {
+      this.fail(error);
+      return false;
+    }
+  }
+
+  fail(error) {
+    if (this.closed) return;
+    // §26 scoping: connection-scoped ERROR if unauthenticated, else scoped to command/session.
+    try {
+      this.send("ERROR", {
+        code: error?.code || GarpErrorCode.INTERNAL_ERROR_PLACEHOLDER_UNUSED,
+        message: error?.message || String(error),
+      }, {
+        request_id: error?.requestId ?? null,
+        session_id: error?.sessionId ?? null,
+      });
+    } catch (_) {}
+    this.close();
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    try { this.pump.cancel(0x804B0002); } catch (_) {}
+    try { this.inStream.close(); } catch (_) {}
+    try { this.outStream.close(); } catch (_) {}
+    this.service.removeConnection(this);
+  }
+}
+
+// File 7: browser\components\aistarter\garp\GarpErrors.sys.mjs
+// GARP/1.24 error registry. See §27.
+
+export class GarpError extends Error {
+  constructor(code, message, options = {}) {
+    super(message);
+    this.name = "GarpError";
+    this.code = code;
+    this.details = options.details ?? null;
+    this.state = options.state ?? null;
+    this.provider = options.provider ?? null;
+    this.retryable = !!options.retryable;
+  }
+}
+
+export const GarpErrorCode = Object.freeze({
+  INVALID_ARGUMENT: "INVALID_ARGUMENT",
+  INVALID_ENVELOPE: "INVALID_ENVELOPE",
+  UNKNOWN_MESSAGE_TYPE: "UNKNOWN_MESSAGE_TYPE",
+  UNKNOWN_MESSAGE_ID: "UNKNOWN_MESSAGE_ID",
+  HEADER_JSON_MISMATCH: "HEADER_JSON_MISMATCH",
+  UNSUPPORTED_VERSION: "UNSUPPORTED_VERSION",
+  UNSUPPORTED_WIRE_VERSION: "UNSUPPORTED_WIRE_VERSION",
+  UNSUPPORTED_FEATURE: "UNSUPPORTED_FEATURE",
+
+  AUTH_REQUIRED: "AUTH_REQUIRED",
+  AUTH_FAILED: "AUTH_FAILED",
+  AUTH_REPLAY: "AUTH_REPLAY",
+  HANDSHAKE_TIMEOUT: "HANDSHAKE_TIMEOUT",
+
+  DUPLICATE_REQUEST: "DUPLICATE_REQUEST",
+  REVISION_GAP: "REVISION_GAP",
+  EVENT_SEQUENCE_GAP: "EVENT_SEQUENCE_GAP",
+  EVENT_SEQUENCE_OVERFLOW: "EVENT_SEQUENCE_OVERFLOW",
+  PAGE_GENERATION_OVERFLOW: "PAGE_GENERATION_OVERFLOW",
+  INVALID_MESSAGE_STATE: "INVALID_MESSAGE_STATE",
+
+  SESSION_NOT_FOUND: "SESSION_NOT_FOUND",
+  SESSION_CLOSED: "SESSION_CLOSED",
+  SESSION_BUSY: "SESSION_BUSY",
+  OUTSTANDING_REQUEST_LIMIT: "OUTSTANDING_REQUEST_LIMIT",
+
+  TAB_NOT_FOUND: "TAB_NOT_FOUND",
+  TAB_UNAVAILABLE: "TAB_UNAVAILABLE",
+
+  PROMPT_NOT_FOUND: "PROMPT_NOT_FOUND",
+  PROMPT_NOT_ACTIVE: "PROMPT_NOT_ACTIVE",
+  PROMPT_ALREADY_TERMINAL: "PROMPT_ALREADY_TERMINAL",
+  PROMPT_TIMEOUT: "PROMPT_TIMEOUT",
+  PROMPT_CANCELLED: "PROMPT_CANCELLED",
+  RESPONSE_NOT_READY: "RESPONSE_NOT_READY",
+
+  INPUT_VERIFICATION_FAILED: "INPUT_VERIFICATION_FAILED",
+  SUBMISSION_FAILED: "SUBMISSION_FAILED",
+  STALE_ACTOR: "STALE_ACTOR",
+  NAVIGATION_DRIFT: "NAVIGATION_DRIFT",
+
+  PROVIDER_UNAVAILABLE: "PROVIDER_UNAVAILABLE",
+  PROVIDER_AUTH_REQUIRED: "PROVIDER_AUTH_REQUIRED",
+  PROVIDER_RATE_LIMITED: "PROVIDER_RATE_LIMITED",
+  PROVIDER_ERROR: "PROVIDER_ERROR",
+  RESPONSE_TOO_LARGE: "RESPONSE_TOO_LARGE",
+  GENERATION_BUFFER_LIMIT: "GENERATION_BUFFER_LIMIT",
+
+  CONTINUATION_NOT_ALLOWED: "CONTINUATION_NOT_ALLOWED",
+  CONTINUATION_LIMIT_REACHED: "CONTINUATION_LIMIT_REACHED",
+  CONTINUATION_TIMEOUT: "CONTINUATION_TIMEOUT",
+  CONTINUATION_NOT_AVAILABLE: "CONTINUATION_NOT_AVAILABLE",
+
+  RECOVERY_FAILED: "RECOVERY_FAILED",
+  EVENT_QUEUE_OVERFLOW: "EVENT_QUEUE_OVERFLOW",
+  EVENT_HISTORY_EXPIRED: "EVENT_HISTORY_EXPIRED",
+});
+
+// File 8: browser\components\aistarter\garp\GarpFrame.sys.mjs
+// GARP/1.24 framing, envelope encode/decode, validation order. See §6–§12.
+
+import {
+  GARP_FIXED_HEADER_LENGTH,
+  GARP_HANDSHAKE_LIMIT,
+  GARP_SEMANTIC_VERSION,
+  GARP_WIRE_VERSION_BYTE,
+  messageTypeId,
+  messageTypeName,
+} from "./GarpRegistry.sys.mjs";
+import { GarpError, GarpErrorCode } from "./GarpErrors.sys.mjs";
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder("utf-8", { fatal: true });
+
+const NIL_UUID_BYTES = new Uint8Array(16);
+
+export function uuidToBytes(value) {
+  if (value == null) return NIL_UUID_BYTES.slice();
+  const text = String(value).toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(text)) {
+    throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `invalid UUID: ${value}`);
+  }
+  const hex = text.replaceAll("-", "");
+  const bytes = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return bytes;
+}
+
+export function bytesToUuid(bytes, offset) {
+  for (let i = 0; i < 16; i++) if (bytes[offset + i] !== 0) {
+    const hex = [];
+    for (let j = 0; j < 16; j++) hex.push(bytes[offset + j].toString(16).padStart(2, "0"));
+    const s = hex.join("");
+    return `${s.slice(0,8)}-${s.slice(8,12)}-${s.slice(12,16)}-${s.slice(16,20)}-${s.slice(20)}`;
+  }
+  return null;
+}
+
+export function isoNow() {
+  return new Date().toISOString();
+}
+
+function hasDuplicateKeys(jsonText) {
+  // Lightweight scanner that fails if any object in the JSON text contains a
+  // duplicate member name. See §9.2.
+  let i = 0;
+  const n = jsonText.length;
+
+  const skipWs = () => { while (i < n && /\s/.test(jsonText[i])) i++; };
+
+  const readString = () => {
+    if (jsonText[i] !== '"') throw new Error("expected string");
+    i++;
+    let s = "";
+    while (i < n && jsonText[i] !== '"') {
+      if (jsonText[i] === "\\") {
+        s += jsonText[i + 1];
+        i += 2;
+      } else {
+        s += jsonText[i++];
+      }
+    }
+    if (jsonText[i] !== '"') throw new Error("unterminated string");
+    i++;
+    return s;
+  };
+
+  const readValue = () => {
+    skipWs();
+    const c = jsonText[i];
+    if (c === "{") {
+      i++;
+      const keys = new Set();
+      skipWs();
+      if (jsonText[i] === "}") { i++; return; }
+      for (;;) {
+        skipWs();
+        const key = readString();
+        if (keys.has(key)) throw new Error(`duplicate key: ${key}`);
+        keys.add(key);
+        skipWs();
+        if (jsonText[i] !== ":") throw new Error("expected :");
+        i++;
+        readValue();
+        skipWs();
+        if (jsonText[i] === ",") { i++; continue; }
+        if (jsonText[i] === "}") { i++; return; }
+        throw new Error("expected , or }");
+      }
+    } else if (c === "[") {
+      i++;
+      skipWs();
+      if (jsonText[i] === "]") { i++; return; }
+      for (;;) {
+        readValue();
+        skipWs();
+        if (jsonText[i] === ",") { i++; continue; }
+        if (jsonText[i] === "]") { i++; return; }
+        throw new Error("expected , or ]");
+      }
+    } else if (c === '"') {
+      readString();
+    } else if (c === "t") {
+      if (jsonText.substr(i, 4) !== "true") throw new Error("expected true");
+      i += 4;
+    } else if (c === "f") {
+      if (jsonText.substr(i, 5) !== "false") throw new Error("expected false");
+      i += 5;
+    } else if (c === "n") {
+      if (jsonText.substr(i, 4) !== "null") throw new Error("expected null");
+      i += 4;
+    } else if (c === "-" || (c >= "0" && c <= "9")) {
+      while (i < n && /[0-9eE+\-.]/.test(jsonText[i])) i++;
+    } else {
+      throw new Error("unexpected token");
+    }
+  };
+
+  readValue();
+  skipWs();
+  if (i !== n) throw new Error("trailing data");
+}
+
+export function encodeEnvelope({ type, requestId, sessionId, sequence, payload }) {
+  const numericType = typeof type === "number" ? type : messageTypeId(type);
+  const typeName = messageTypeName(numericType);
+  if (!numericType || !typeName) {
+    throw new GarpError(GarpErrorCode.UNKNOWN_MESSAGE_TYPE, `unknown message type: ${type}`);
+  }
+  const envelope = {
+    garp: GARP_SEMANTIC_VERSION,
+    type: typeName,
+    request_id: requestId ?? null,
+    session_id: sessionId ?? null,
+    timestamp: isoNow(),
+    sequence: sequence ?? null,
+    payload: payload ?? {},
+  };
+  return { numericType, envelope };
+}
+
+export function encodeFrame(envelope, options = {}) {
+  const numericType = messageTypeId(envelope.type);
+  if (!numericType) {
+    throw new GarpError(GarpErrorCode.UNKNOWN_MESSAGE_TYPE, `unknown type: ${envelope.type}`);
+  }
+  const payloadBytes = textEncoder.encode(JSON.stringify(envelope));
+  const limit = options.effectiveLimit ?? GARP_HANDSHAKE_LIMIT;
+  if (payloadBytes.length > limit) {
+    throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, "frame payload exceeds effective limit");
+  }
+  const frame = new Uint8Array(GARP_FIXED_HEADER_LENGTH + payloadBytes.length);
+  const view = new DataView(frame.buffer);
+  frame[0] = 0x47; frame[1] = 0x41; frame[2] = 0x52; frame[3] = 0x50;
+  view.setUint8(4, GARP_WIRE_VERSION_BYTE);
+  view.setUint8(5, 0);
+  view.setUint16(6, GARP_FIXED_HEADER_LENGTH, false);
+  view.setUint32(8, payloadBytes.length, false);
+  view.setUint16(12, numericType, false);
+  view.setUint16(14, 0, false);
+  frame.set(uuidToBytes(envelope.request_id), 16);
+  frame.set(uuidToBytes(envelope.session_id), 32);
+  frame.set(payloadBytes, GARP_FIXED_HEADER_LENGTH);
+  return frame;
+}
+
+export function readHeader(frame) {
+  if (frame.length < GARP_FIXED_HEADER_LENGTH) {
+    throw new GarpError(GarpErrorCode.INVALID_ENVELOPE, "frame shorter than 48-byte header");
+  }
+  if (frame[0] !== 0x47 || frame[1] !== 0x41 || frame[2] !== 0x52 || frame[3] !== 0x50) {
+    throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, "invalid GARP magic");
+  }
+  if (frame[4] !== GARP_WIRE_VERSION_BYTE) {
+    throw new GarpError(GarpErrorCode.UNSUPPORTED_WIRE_VERSION, `wire version ${frame[4]}`);
+  }
+  const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+  const headerLen = view.getUint16(6, false);
+  if (headerLen !== GARP_FIXED_HEADER_LENGTH) {
+    throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `header_len ${headerLen}`);
+  }
+  const payloadLen = view.getUint32(8, false);
+  if (frame[5] !== 0) {
+    throw new GarpError(GarpErrorCode.UNSUPPORTED_FEATURE, "flags must be zero in base GARP");
+  }
+  if (frame[14] !== 0 || frame[15] !== 0) {
+    throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, "reserved header field nonzero");
+  }
+  return {
+    headerLen,
+    payloadLen,
+    messageType: view.getUint16(12, false),
+    requestUuid: bytesToUuid(frame, 16),
+    sessionUuid: bytesToUuid(frame, 32),
+  };
+}
+
+export function decodeFrame(frame, options = {}) {
+  const header = readHeader(frame);
+  const limit = options.effectiveLimit ?? GARP_HANDSHAKE_LIMIT;
+  if (header.payloadLen > limit) {
+    throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, "payload exceeds effective limit");
+  }
+  if (GARP_FIXED_HEADER_LENGTH + header.payloadLen !== frame.length) {
+    throw new GarpError(GarpErrorCode.INVALID_ENVELOPE, "payload length mismatch");
+  }
+  const payloadBytes = frame.subarray(GARP_FIXED_HEADER_LENGTH);
+  const jsonText = textDecoder.decode(payloadBytes);
+  try {
+    hasDuplicateKeys(jsonText);
+  } catch (e) {
+    throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `duplicate JSON keys: ${e.message}`);
+  }
+  let envelope;
+  try {
+    envelope = JSON.parse(jsonText);
+  } catch (e) {
+    throw new GarpError(GarpErrorCode.INVALID_ENVELOPE, `invalid JSON: ${e.message}`);
+  }
+  // §11 required envelope shape.
+  if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
+    throw new GarpError(GarpErrorCode.INVALID_ENVELOPE, "envelope must be an object");
+  }
+  for (const key of Object.keys(envelope)) {
+    if (!["garp", "type", "request_id", "session_id", "timestamp", "sequence", "payload"].includes(key)) {
+      throw new GarpError(GarpErrorCode.INVALID_ENVELOPE, `unknown envelope member: ${key}`);
+    }
+  }
+  if (envelope.garp !== GARP_SEMANTIC_VERSION) {
+    throw new GarpError(GarpErrorCode.UNSUPPORTED_VERSION, `unsupported semantic version ${envelope.garp}`);
+  }
+  const typeName = messageTypeName(header.messageType);
+  if (!typeName) {
+    throw new GarpError(GarpErrorCode.UNKNOWN_MESSAGE_TYPE, `unknown message code 0x${header.messageType.toString(16)}`);
+  }
+  if (envelope.type !== typeName) {
+    throw new GarpError(GarpErrorCode.HEADER_JSON_MISMATCH, `envelope type ${envelope.type} != ${typeName}`);
+  }
+  const envelopeRequestId = envelope.request_id === null ? null : String(envelope.request_id);
+  const envelopeSessionId = envelope.session_id === null ? null : String(envelope.session_id);
+  if (envelopeRequestId !== header.requestUuid) {
+    throw new GarpError(GarpErrorCode.HEADER_JSON_MISMATCH, "request UUID mismatch");
+  }
+  if (envelopeSessionId !== header.sessionUuid) {
+    throw new GarpError(GarpErrorCode.HEADER_JSON_MISMATCH, "session UUID mismatch");
+  }
+  if (envelope.payload === null || typeof envelope.payload !== "object" || Array.isArray(envelope.payload)) {
+    throw new GarpError(GarpErrorCode.INVALID_ENVELOPE, "payload must be an object");
+  }
+  return {
+    type: typeName,
+    numericType: header.messageType,
+    requestId: envelopeRequestId,
+    sessionId: envelopeSessionId,
+    sequence: envelope.sequence,
+    timestamp: envelope.timestamp,
+    payload: envelope.payload,
+    envelope,
+  };
+}
+
+// File 9: browser\components\aistarter\garp\GarpRegistry.sys.mjs
+// GARP/1.24 registry. See GARP/1.24 §13 and §178.
+
+export const GARP_PROTOCOL         = "GARP/1.24";   // canonical wire name
+export const GARP_SEMANTIC_VERSION = "1.24";        // Common Envelope "garp" value
+export const GARP_WIRE_VERSION     = "0x00";        // semantic wire version token
+export const GARP_WIRE_VERSION_BYTE = 0x00;         // binary header byte
+
+export const GARP_FIXED_HEADER_LENGTH = 48;
+export const GARP_HANDSHAKE_LIMIT     = 1048576;    // 1 MiB (§6.5, §23)
+export const GARP_DEFAULT_APPLICATION_LIMIT = 16777216;
+
+export const GarpMessageType = Object.freeze({
+  HELLO:                    0x0001,
+  HELLO_CHALLENGE:          0x0002,
+  HELLO_AUTH:               0x0003,
+  HELLO_ACK:                0x0004,
+  RESPONSE:                 0x0005,
+  ERROR:                    0x0006,
+
+  CAPABILITIES:             0x0010,
+  BROWSER_STATUS:           0x0011,
+  LIST_TABS:                0x0012,
+  OPEN_TAB:                 0x0013,
+  CLOSE_TAB:                0x0014,
+  SELECT_TAB:               0x0015,
+  GET_CAPABILITIES:         0x0016,
+
+  CREATE_SESSION:           0x0020,
+  ATTACH_SESSION:           0x0021,
+  DETACH_SESSION:           0x0022,
+  CLOSE_SESSION:            0x0023,
+  RESET_SESSION:            0x0024,
+  GET_SESSION:              0x0025,
+
+  PROMPT:                   0x0030,
+  CANCEL_PROMPT:            0x0031,
+  GET_PROMPT_STATUS:        0x0032,
+  GET_RESPONSE:             0x0033,
+  SUBSCRIBE_RESPONSE:       0x0034,
+  CONTINUE_PROMPT:          0x0035,
+
+  SESSION_READY:            0x0040,
+  SESSION_CHANGED:          0x0041,
+  NAVIGATION:               0x0042,
+  NAVIGATION_DRIFT:         0x0043,
+  RECOVERY_STATE:           0x0044,
+  PROVIDER_CHANGED:         0x0045,
+
+  INPUT_SUBMITTED:          0x0050,
+  GENERATION_STARTED:       0x0051,
+  GENERATION_DELTA:         0x0052,
+  GENERATION_PROGRESS:      0x0053,
+  CONTINUATION_REQUIRED:    0x0054,
+  CONTINUATION_SUBMITTED:   0x0055,
+  GENERATION_COMPLETED:     0x0056,
+  GENERATION_FAILED:        0x0057,
+  GENERATION_CANCELLED:     0x0058,
+
+  PROVIDER_ERROR:           0x0060,
+  PROVIDER_AUTH_REQUIRED:   0x0061,
+  PROVIDER_RATE_LIMITED:    0x0062,
+  DIAGNOSTIC:               0x0063,
+
+  PING:                     0x0070,
+  PONG:                     0x0071,
+
+  // ext-replay-store extension
+  GET_EVENTS:               0x0100,
+});
+
+const NAME_BY_ID = new Map(
+  Object.entries(GarpMessageType).map(([name, id]) => [id, name])
+);
+const ID_BY_NAME = new Map(
+  Object.entries(GarpMessageType).map(([name, id]) => [name, id])
+);
+
+export function messageTypeName(id) {
+  return NAME_BY_ID.get(id) || null;
+}
+
+export function messageTypeId(name) {
+  return ID_BY_NAME.get(String(name || "").toUpperCase()) || 0;
+}
+
+// Base feature set the gateway advertises. Extensions are negotiated per §15.
+export const GARP_BASE_FEATURES = Object.freeze([]);
+export const GARP_SUPPORTED_EXTENSIONS = Object.freeze([
+  "ext-pong",
+]);
+
+// File 10: browser\components\aistarter\providers\ChatGPTAdapter.sys.mjs
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class ChatGPTAdapter extends ProviderAdapter {
+  constructor() { super("chatgpt", "https://chatgpt.com/"); }
+  input(doc) { return this.findBySelectors(doc, ["#prompt-textarea", 'textarea', '[contenteditable="true"][role="textbox"]']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[data-testid*="send"]', 'button[aria-label*="Send"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, ['[data-message-author-role="assistant"] .markdown', '.agent-turn .markdown']); }
+  isStreaming(doc) { return !!doc.querySelector('[data-testid="stop-button"], .result-streaming'); }
+  isAuthenticated(doc) { return !/(auth0|login|signin)/i.test(doc.location?.href || ""); }
+}
+
+
+// File 11: browser\components\aistarter\providers\ClaudeAdapter.sys.mjs
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class ClaudeAdapter extends ProviderAdapter {
+  constructor() { super("claude", "https://claude.ai/"); }
+  input(doc) { return this.findBySelectors(doc, ['div[contenteditable="true"]', 'textarea', '[aria-label*="Claude"]']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label*="Send"]', 'button[style*="background-color"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, [".font-claude-message", ".markdown"]); }
+  isStreaming(doc) { return !!doc.querySelector('.loading-indicator, [class*="streaming"]'); }
+  isAuthenticated(doc) { return !/(login|signin)/i.test(doc.location?.href || ""); }
+}
+
+
+// File 12: browser\components\aistarter\providers\CopilotAdapter.sys.mjs
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class CopilotAdapter extends ProviderAdapter {
+  constructor() { super("copilot", "https://copilot.microsoft.com/"); }
+  input(doc) { return this.findBySelectors(doc, [
+    'textarea#userInput', 'textarea[placeholder*="Message"]', 'textarea[placeholder*="Ask"]',
+    'textarea[placeholder*="Copilot"]', '[data-testid="composer-input"] textarea',
+    '[data-testid="chat-input"] textarea', '.cib-text-input', '#searchbox',
+    'textarea[aria-label*="Ask"]', '[aria-label*="Copilot"] textarea',
+    'div[contenteditable="true"][role="textbox"]', 'textarea'
+  ]); }
+  sendButton(doc) { return this.findBySelectors(doc, [
+    'button[aria-label*="Submit"]', 'button[aria-label*="Send"]',
+    'button[data-testid*="send"]', 'button[type="submit"]'
+  ]); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, [
+    'cib-message-group[source="bot"] cib-message .content', '.cib-message-content',
+    '[data-testid="ai-response"]', '[data-testid*="response"] .content',
+    '.response-message', '.bot-message', '.ac-container', '.message-bubble',
+    '[class*="assistant"][class*="message"]', '[class*="bot"][class*="message"]',
+    '.response-text', '.answer-text', '[class*="ResponseText"]', '[class*="responseText"]'
+  ]); }
+  isStreaming(doc) { return this.findAllBySelectors(doc, [
+    '.loading-dots', '.typing-indicator', '[data-testid="stop-button"]',
+    'button[aria-label*="Stop"]', '.cib-stop-responding-button'
+  ]).length > 0; }
+  async inject(input, prompt) {
+    await super.inject(input, prompt);
+    for (let attempt = 0; attempt < 8; attempt++) {
+      await new Promise(resolve => input.ownerDocument.defaultView.setTimeout(resolve, 300));
+      const button = this.sendButton(input.ownerDocument);
+      if (button) {
+        button.click();
+        return { submit_method: "button_click" };
+      }
+    }
+    return { submit_method: "not_available" };
+  }
+}
+
+
+// File 13: browser\components\aistarter\providers\DeepSeekAdapter.sys.mjs
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+
+export class DeepSeekAdapter extends ProviderAdapter {
+  constructor() {
+    super(
+      "deepseek",
+      "https://chat.deepseek.com/"
+    );
+  }
+
+  input(doc) {
+    return this.findBySelectors(
+      doc,
+      [
+        "textarea.ds-input__input",
+        "textarea#chat-input",
+        'textarea[placeholder*="DeepSeek"]',
+      ]
+    );
+  }
+
+  sendButton(doc) {
+    return this.findBySelectors(
+      doc,
+      [
+        'div[role="button"].ds-icon-button',
+        "button.ds-icon-button",
+        'button[aria-label*="Send"]',
+        '[data-testid*="send"]',
+      ]
+    );
+  }
+
+  responseNodes(doc) {
+    return this.findAllBySelectors(
+      doc,
+      [
+        ".ds-markdown",
+        ".ds-message-bubble",
+      ]
+    );
+  }
+
+  isStreaming(doc) {
+    return !!doc.querySelector(
+      ".ds-loading, [class*=\"loading\"], .spinner, [class*=\"spinner\"], [data-streaming=\"true\"]"
+    );
+  }
+
+  isAuthenticated(doc) {
+    return !/(login|sign_in|auth)/i.test(
+      doc.location?.href || ""
+    );
+  }
+
+  isRateLimited(doc) {
+    return /rate.?limit|too many requests/i.test(
+      doc.body?.innerText || ""
+    );
+  }
+
+  async inject(
+    input,
+    prompt
+  ) {
+    input.focus();
+
+    await new Promise(
+      resolve =>
+        this.windowTimeout(
+          input.ownerDocument.defaultView,
+          1000
+        ).then(resolve)
+    );
+
+    const result =
+      await super.inject(
+        input,
+        prompt
+      );
+
+    await this.windowTimeout(
+      input.ownerDocument.defaultView,
+      100
+    );
+
+    return result;
+  }
+
+  windowTimeout(
+    win,
+    ms
+  ) {
+    return new Promise(
+      resolve =>
+        win.setTimeout(
+          resolve,
+          ms
+        )
+    );
+  }
+}
+
+// File 14: browser\components\aistarter\providers\GeminiAdapter.sys.mjs
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class GeminiAdapter extends ProviderAdapter {
+  constructor() { super("gemini", "https://gemini.google.com/app"); }
+  input(doc) { return this.findBySelectors(doc, [".ql-editor", "textarea"]); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label*="Send"]', 'button[aria-label*="send"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, ["model-response .markdown", ".model-response-text .markdown", ".response-container .markdown", "model-response", ".message-content.model .markdown"]); }
+  isStreaming(doc) { return !!doc.querySelector('button[aria-label*="Stop"], .loading-indicator, mat-progress-bar, .response-loading'); }
+  isAuthenticated(doc) { return !/(accounts.google.com|signin)/i.test(doc.location?.href || ""); }
+}
+
+
+// File 15: browser\components\aistarter\providers\GrokAdapter.sys.mjs
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class GrokAdapter extends ProviderAdapter {
+  constructor() { super("grok", "https://grok.com/"); }
+  input(doc) { return this.findBySelectors(doc, ['.tiptap.ProseMirror', 'textarea[placeholder*="know"]', 'textarea[placeholder*="What"]']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label="Submit"]', 'button[data-testid*="send"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, [".items-start .response-content-markdown"]); }
+  isStreaming(doc) { return !!doc.querySelector('[data-streaming="true"], .loading-indicator, .spinner'); }
+}
+
+
+// File 16: browser\components\aistarter\providers\InceptionAdapter.sys.mjs
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class InceptionAdapter extends ProviderAdapter {
+  constructor() { super("inception", "https://chat.inceptionlabs.ai/"); }
+  input(doc) { return this.findBySelectors(doc, ["textarea", '[contenteditable="true"]']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label*="Send"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, [".prose-chat", ".markdown"]); }
+  isStreaming(doc) { return !!doc.querySelector('.loading-indicator, [class*="loading"]'); }
+  async inject(input, prompt) {
+    await super.inject(input, prompt);
+    const button = this.sendButton(input.ownerDocument);
+    if (button) { button.click(); return { submit_method: "button_click" }; }
+    return { submit_method: "not_available" };
+  }
+}
+
+
+// File 17: browser\components\aistarter\providers\PerplexityAdapter.sys.mjs
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class PerplexityAdapter extends ProviderAdapter {
+  constructor() { super("perplexity", "https://www.perplexity.ai/"); }
+  input(doc) { return this.findBySelectors(doc, ['textarea', '[contenteditable="true"]', '[placeholder*="Ask"]', '[placeholder*="anything"]', 'input[type="text"]']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label*="Submit"]', 'button[class*="send"]', 'button[aria-label*="Send"]', 'button[aria-label*="Ask"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, [".prose", ".markdown", ".break-words"]); }
+  isStreaming(doc) { return !!doc.querySelector('.loading-indicator, [class*="loading"]'); }
+}
+
+
+// File 18: browser\components\aistarter\providers\ProviderAdapter.sys.mjs
+export class ProviderAdapter {
+  constructor(name, url) {
+    this.name = name;
+    this.url = url;
+    this.adapter_version = "1.0.0";
+    this.selector_strategy_version = "1.0.0";
+    this.supported_features = [
+      "streaming",
+      "cancel",
+      "continuation",
+      "diagnostics",
+    ];
+  }
+
+  deepQuerySelectorAll(doc, selector) {
+    const results =
+      Array.from(
+        doc.querySelectorAll(
+          selector
+        )
+      );
+
+    const seenRoots =
+      new Set();
+
+    const walk = root => {
+      if (
+        !root ||
+        seenRoots.has(root)
+      ) {
+        return;
+      }
+
+      seenRoots.add(root);
+
+      for (
+        const element of
+          root.querySelectorAll?.("*") ||
+          []
+      ) {
+        if (element.shadowRoot) {
+          results.push(
+            ...element.shadowRoot.querySelectorAll(
+              selector
+            )
+          );
+
+          walk(
+            element.shadowRoot
+          );
+        }
+      }
+    };
+
+    walk(doc);
+
+    return [
+      ...new Set(results)
+    ];
+  }
+
+  visible(element) {
+    if (!element) {
+      return false;
+    }
+
+    return !!(
+      (
+        element.offsetWidth > 0 ||
+        element.offsetHeight > 0 ||
+        element.getClientRects?.().length >
+          0
+      ) &&
+      element.style?.display !==
+        "none" &&
+      element.style?.visibility !==
+        "hidden"
+    );
+  }
+
+  enabled(element) {
+    return !!element &&
+      !element.disabled &&
+      element.getAttribute(
+        "aria-disabled"
+      ) !== "true";
+  }
+
+  findBySelectors(
+    doc,
+    selectors
+  ) {
+    for (
+      const selector of
+        selectors
+    ) {
+      const elements =
+        this.deepQuerySelectorAll(
+          doc,
+          selector
+        );
+
+      for (
+        const element of
+          elements
+      ) {
+        if (
+          this.visible(element) &&
+          this.enabled(element)
+        ) {
+          return element;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  findAllBySelectors(
+    doc,
+    selectors
+  ) {
+    const results = [];
+
+    for (
+      const selector of
+        selectors
+    ) {
+      results.push(
+        ...this.deepQuerySelectorAll(
+          doc,
+          selector
+        )
+      );
+    }
+
+    return [
+      ...new Set(results)
+    ].filter(
+      element =>
+        this.visible(element)
+    );
+  }
+
+  findContinueButton(doc) {
+    const selectors = [
+      'button[data-testid*="continue"]',
+      'button[aria-label*="Continue"]',
+      'button[aria-label*="continue"]',
+      'button[aria-label*="继续"]',
+      "button, [role=button]",
+    ];
+
+    const isContinue =
+      text => {
+        const value =
+          String(
+            text || ""
+          )
+            .trim()
+            .toLowerCase();
+
+        return (
+          value ===
+            "continue" ||
+          value.startsWith(
+            "continue"
+          ) ||
+          value ===
+            "继续" ||
+          value.includes(
+            "继续生成"
+          ) ||
+          value ===
+            "continuer" ||
+          value ===
+            "continuar" ||
+          value ===
+            "weiter"
+        );
+      };
+
+    for (
+      const element of
+        this.findAllBySelectors(
+          doc,
+          selectors
+        ).reverse()
+    ) {
+      if (
+        isContinue(
+          element.textContent
+        ) ||
+        isContinue(
+          element.getAttribute(
+            "aria-label"
+          )
+        )
+      ) {
+        return element;
+      }
+    }
+
+    return null;
+  }
+
+  input(doc) {
+    return this.findBySelectors(
+      doc,
+      [
+        "textarea",
+        '[contenteditable="true"]',
+      ]
+    );
+  }
+
+  sendButton(doc) {
+    return this.findBySelectors(
+      doc,
+      [
+        'button[aria-label*="Send"]',
+        'button[aria-label*="Submit"]',
+        'button[type="submit"]',
+      ]
+    );
+  }
+
+  responseNodes(doc) {
+    return this.findAllBySelectors(
+      doc,
+      [
+        ".markdown",
+        '[data-message-author-role="assistant"]',
+      ]
+    );
+  }
+
+  isStreaming(doc) {
+    return !!doc.querySelector(
+      '[data-streaming="true"], .loading-indicator, .spinner'
+    );
+  }
+
+  isAuthenticated(doc) {
+    return true;
+  }
+
+  isRateLimited(doc) {
+    return false;
+  }
+
+  dispatchInputEvent(
+    input,
+    prompt
+  ) {
+    const win =
+      input.ownerDocument
+        .defaultView;
+
+    try {
+      input.dispatchEvent(
+        new InputEvent(
+          "input",
+          {
+            bubbles: true,
+            cancelable: true,
+            inputType:
+              "insertText",
+            data:
+              prompt,
+          }
+        )
+      );
+    } catch (_) {
+      input.dispatchEvent(
+        new Event(
+          "input",
+          {
+            bubbles: true,
+            cancelable: true,
+          }
+        )
+      );
+    }
+
+    input.dispatchEvent(
+      new Event(
+        "change",
+        {
+          bubbles: true,
+        }
+      )
+    );
+
+    return win;
+  }
+
+  async inject(
+    input,
+    prompt
+  ) {
+    if (!input) {
+      throw Object.assign(
+        new Error(
+          "Input element is unavailable"
+        ),
+        {
+          code:
+            "INPUT_NOT_READY",
+        }
+      );
+    }
+
+    const doc =
+      input.ownerDocument;
+
+    const win =
+      doc.defaultView;
+
+    input.focus();
+
+    /*
+     * Standard HTML input/textarea path.
+     *
+     * Use the native prototype setter so frameworks such as React/Vue
+     * observe an actual value change instead of only seeing a DOM mutation.
+     */
+    if (
+      "value" in input
+    ) {
+      const prototype =
+        Object.getPrototypeOf(
+          input
+        );
+
+      const descriptor =
+        Object.getOwnPropertyDescriptor(
+          prototype,
+          "value"
+        );
+
+      if (
+        descriptor?.set
+      ) {
+        descriptor.set.call(
+          input,
+          prompt
+        );
+      } else {
+        input.value =
+          prompt;
+      }
+
+      this.dispatchInputEvent(
+        input,
+        prompt
+      );
+
+      /*
+       * Give the page framework a chance to process the input event.
+       */
+      await new Promise(
+        resolve =>
+          win.setTimeout(
+            resolve,
+            50
+          )
+      );
+
+      const actual =
+        String(
+          input.value ?? ""
+        );
+
+      if (
+        actual !== prompt
+      ) {
+        throw Object.assign(
+          new Error(
+            `Input verification failed: expected ${prompt.length} characters, got ${actual.length}`
+          ),
+          {
+            code:
+              "INPUT_INJECTION_FAILED",
+            details: {
+              expected_length:
+                prompt.length,
+              actual_length:
+                actual.length,
+              actual_text:
+                actual,
+            },
+          }
+        );
+      }
+
+      return {
+        input_method:
+          "native_value_setter",
+        input_verified:
+          true,
+        input_text_length:
+          actual.length,
+      };
+    }
+
+    /*
+     * Contenteditable path.
+     */
+    if (
+      input.isContentEditable ||
+      input.getAttribute(
+        "contenteditable"
+      ) === "true"
+    ) {
+      const selection =
+        win.getSelection();
+
+      const range =
+        doc.createRange();
+
+      range.selectNodeContents(
+        input
+      );
+
+      selection.removeAllRanges();
+      selection.addRange(range);
+
+      let inserted = false;
+
+      try {
+        inserted =
+          doc.execCommand(
+            "insertText",
+            false,
+            prompt
+          );
+      } catch (_) {
+        inserted = false;
+      }
+
+      if (!inserted) {
+        input.textContent =
+          prompt;
+      }
+
+      this.dispatchInputEvent(
+        input,
+        prompt
+      );
+
+      await new Promise(
+        resolve =>
+          win.setTimeout(
+            resolve,
+            50
+          )
+      );
+
+      const actual =
+        String(
+          input.textContent || ""
+        );
+
+      if (
+        actual !== prompt
+      ) {
+        throw Object.assign(
+          new Error(
+            `Contenteditable verification failed: expected ${prompt.length} characters, got ${actual.length}`
+          ),
+          {
+            code:
+              "INPUT_INJECTION_FAILED",
+            details: {
+              expected_length:
+                prompt.length,
+              actual_length:
+                actual.length,
+              actual_text:
+                actual,
+            },
+          }
+        );
+      }
+
+      return {
+        input_method:
+          "contenteditable",
+        input_verified:
+          true,
+        input_text_length:
+          actual.length,
+      };
+    }
+
+    throw Object.assign(
+      new Error(
+        "Unsupported provider input element"
+      ),
+      {
+        code:
+          "INPUT_INJECTION_FAILED",
+      }
+    );
+  }
+
+  async submit(
+    input,
+    doc
+  ) {
+    const button =
+      this.sendButton(doc);
+
+    if (button) {
+      button.focus();
+      button.click();
+
+      return {
+        submit_method:
+          "button_click",
+      };
+    }
+
+    return {
+      submit_method:
+        "not_available",
+    };
+  }
+
+  cancel(doc) {
+    const stop =
+      this.findBySelectors(
+        doc,
+        [
+          'button[aria-label*="Stop"]',
+          'button[data-testid*="stop"]',
+          '[data-testid="stop-button"]',
+        ]
+      );
+
+    if (stop) {
+      stop.click();
+      return true;
+    }
+
+    return false;
+  }
+
+  inspect(doc) {
+    const nodes =
+      this.responseNodes(
+        doc
+      );
+
+    const last =
+      nodes.length
+        ? nodes[
+            nodes.length - 1
+          ]
+        : null;
+
+    return {
+      input_ready:
+        !!this.input(doc),
+
+      input_state:
+        this.input(doc)
+          ? "READY"
+          : "NOT_READY",
+
+      authenticated:
+        this.isAuthenticated(
+          doc
+        ),
+
+      rate_limited:
+        this.isRateLimited(
+          doc
+        ),
+
+      message_count:
+        nodes.length,
+
+      last_message_text:
+        last?.textContent?.trim() ||
+        "",
+
+      streaming:
+        this.isStreaming(
+          doc
+        ),
+
+      provider_state:
+        this.isStreaming(
+          doc
+        )
+          ? "busy"
+          : "idle",
+    };
+  }
+}
+
+// File 19: browser\components\aistarter\providers\ProviderRegistry.sys.mjs
+import { DeepSeekAdapter } from "./DeepSeekAdapter.sys.mjs";
+import { GeminiAdapter } from "./GeminiAdapter.sys.mjs";
+import { ChatGPTAdapter } from "./ChatGPTAdapter.sys.mjs";
+import { ClaudeAdapter } from "./ClaudeAdapter.sys.mjs";
+import { GrokAdapter } from "./GrokAdapter.sys.mjs";
+import { CopilotAdapter } from "./CopilotAdapter.sys.mjs";
+import { PerplexityAdapter } from "./PerplexityAdapter.sys.mjs";
+import { InceptionAdapter } from "./InceptionAdapter.sys.mjs";
+
+export class ProviderRegistry {
+  constructor() {
+    this.adapters = new Map();
+    for (const adapter of [
+      new DeepSeekAdapter(), new GeminiAdapter(), new ChatGPTAdapter(), new ClaudeAdapter(),
+      new GrokAdapter(), new CopilotAdapter(), new PerplexityAdapter(), new InceptionAdapter(),
+    ]) {
+      this.adapters.set(adapter.name, adapter);
+    }
+  }
+
+  get(name) { return this.adapters.get(String(name || "").toLowerCase()) || null; }
+
+  list() {
+    return [...this.adapters.values()].map(a => ({
+      provider: a.name,
+      url: a.url,
+      adapter_version: a.adapter_version,
+      selector_strategy_version: a.selector_strategy_version,
+      supported_features: [...a.supported_features],
+    }));
+  }
+
+  // §22.1 canonical CAPABILITIES provider entry.
+  capabilityEntries() {
+    return [...this.adapters.values()]
+      .map(a => ({
+        id: a.name,
+        version: a.adapter_version,
+        state: "AVAILABLE",
+        input_strategies: ["provider_native_send", "keyboard_enter"],
+        capabilities: {
+          streaming: true,
+          cancellation: true,
+          continuation: true,
+          diagnostics: true,
+        },
+      }))
+      .sort((x, y) => {
+        const a = new TextEncoder().encode(x.id);
+        const b = new TextEncoder().encode(y.id);
+        const n = Math.min(a.length, b.length);
+        for (let i = 0; i < n; i++) if (a[i] !== b[i]) return a[i] - b[i];
+        return a.length - b.length;
+      });
+  }
+}
+
+// File 20: browser\components\aistarter\requests\GarpRequest.sys.mjs
+// Prompt lifecycle. §48.
+
+export const PromptState = Object.freeze({
+  PENDING: "PENDING",
+  SUBMITTING: "SUBMITTING",
+  GENERATING: "GENERATING",
+  WAITING_CONTINUATION: "WAITING_CONTINUATION",
+  CANCELLING: "CANCELLING",
+  COMPLETED: "COMPLETED",
+  FAILED: "FAILED",
+  CANCELLED: "CANCELLED",
+});
+
+export class GarpRequest {
+  constructor(requestId, sessionId, prompt, options = {}) {
+    this.requestId = requestId;
+    this.sessionId = sessionId;
+    this.prompt = prompt;
+    this.options = options;
+    this.promptState = PromptState.PENDING;
+    this.messageId = null;
+    this.pageGeneration = 0n;
+    this.text = "";
+    this.lastText = "";
+    this.lastMessageCount = 0;
+    this.revision = 0n;
+    this.startedAt = Date.now();
+    this.completedAt = null;
+    this.continuationCount = 0;
+    this.maxContinuations = Number(options.max_continuations ?? 0) | 0;
+    this.autoContinue = options.auto_continue === true;
+    this.timeoutMs = BigInt(options.timeout_ms ?? "0");
+    this.error = null;
+    this.responseStarted = false;
+    this.subscribers = new Set();
+    this._hasCommittedContent = false;
+    this._finished = false;
+  }
+
+  isTerminal() {
+    return (
+      this.promptState === PromptState.COMPLETED ||
+      this.promptState === PromptState.FAILED ||
+      this.promptState === PromptState.CANCELLED
+    );
+  }
+
+  hasCommittedContent() { return this._hasCommittedContent; }
+
+  markContentCommitted() { this._hasCommittedContent = true; }
+
+  snapshot() {
+    return {
+      prompt_request_id: this.requestId,
+      state: this.promptState,
+      message_id: this.messageId,
+      revision: String(this.revision),
+      page_generation: String(this.pageGeneration),
+      content: this.text,
+      continuation_count: this.continuationCount,
+      started_at: this.startedAt,
+      completed_at: this.completedAt,
+      error: this.error,
+    };
+  }
+}
+
+// File 21: browser\components\aistarter\requests\GarpRequestManager.sys.mjs
+import { GarpRequest, PromptState } from "./GarpRequest.sys.mjs";
+import { GarpError, GarpErrorCode } from "../garp/GarpErrors.sys.mjs";
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+export class GarpRequestManager {
+  constructor(service, sessionManager, providerRegistry) {
+    this.service = service;
+    this.sessionManager = sessionManager;
+    this.providerRegistry = providerRegistry;
+    // Keyed by session_id -> Map(prompt_request_id -> GarpRequest)
+    this.bySession = new Map();
+  }
+
+  mapFor(sessionId) {
+    let m = this.bySession.get(sessionId);
+    if (!m) { m = new Map(); this.bySession.set(sessionId, m); }
+    return m;
+  }
+
+  getForSession(session, promptRequestId) {
+    const map = this.mapFor(session.sessionId);
+    const r = map.get(promptRequestId);
+    if (!r) throw new GarpError(GarpErrorCode.PROMPT_NOT_FOUND, `prompt not found: ${promptRequestId}`);
+    return r;
+  }
+
+  subscribe(request, connection) { request.subscribers.add(connection); }
+
+  unsubscribeConnection(connection) {
+    for (const map of this.bySession.values()) {
+      for (const r of map.values()) r.subscribers.delete(connection);
+    }
+  }
+
+  emit(request, type, payload) {
+    const session = this.sessionManager.get(request.sessionId);
+    const seq = session.nextSequence();
+    for (const conn of request.subscribers) {
+      if (!conn.authenticated) continue;
+      conn.send(type, payload, {
+        request_id: null,
+        session_id: session.sessionId,
+        sequence: String(seq),
+      });
+    }
+  }
+
+  startPrompt(connection, sessionId, requestId, prompt, options) {
+    const session = this.sessionManager.get(sessionId);
+    session.assertIdle();
+
+    const map = this.mapFor(sessionId);
+    // Duplicate non-idempotent command detection (§104). We key on request_id
+    // within the session.
+    if (map.has(requestId)) {
+      throw new GarpError(GarpErrorCode.DUPLICATE_REQUEST, "request_id already used in this session");
+    }
+
+    const request = new GarpRequest(requestId, sessionId, prompt, options);
+    request.pageGeneration = session.pageGeneration;
+    map.set(requestId, request);
+    session.activeRequestId = requestId;
+    session.lastRequestId = requestId;
+    session.state = "BUSY";
+
+    this.subscribe(request, connection);
+
+    this.runPrompt(request).catch(err => this.fail(request, err));
+    return request;
+  }
+
+  async waitForSessionReady(session, request) {
+    const start = Date.now();
+    const timeoutMs = 30000;
+    const interval = 250;
+    for (;;) {
+      if (request.isTerminal()) return;
+      if (Date.now() - start >= timeoutMs) {
+        throw new GarpError(GarpErrorCode.PROMPT_TIMEOUT, "timed out waiting for readiness");
+      }
+      try {
+        const result = await this.service.callChild(session, "InspectReady", { provider: session.provider });
+        if (result?.error) throw this.errorFromChild(result);
+        session.inputState = result.input_state || (result.input_ready ? "READY" : "NOT_READY");
+        if (result.authenticated === false || result.state === "AUTH_REQUIRED") {
+          throw new GarpError(GarpErrorCode.PROVIDER_AUTH_REQUIRED, "provider auth required", {
+            provider: session.provider, state: "AUTH_REQUIRED",
+          });
+        }
+        if (result.rate_limited || result.state === "RATE_LIMITED") {
+          throw new GarpError(GarpErrorCode.PROVIDER_RATE_LIMITED, "provider rate limited", {
+            provider: session.provider, state: "RATE_LIMITED", retryable: true,
+          });
+        }
+        if (result.input_ready === true) { session.state = "READY"; return; }
+        session.state = "PREPARING";
+      } catch (err) {
+        if (err?.code !== GarpErrorCode.STALE_ACTOR && err?.code !== GarpErrorCode.NAVIGATION_DRIFT) throw err;
+      }
+      await sleep(interval);
+    }
+  }
+
+  async runPrompt(request) {
+    const session = this.sessionManager.get(request.sessionId);
+    const adapter = this.providerRegistry.get(session.provider);
+    if (!adapter) throw new GarpError(GarpErrorCode.PROVIDER_UNAVAILABLE, "provider not registered");
+
+    await this.waitForSessionReady(session, request);
+    if (request.isTerminal()) return;
+
+    const snapshot = await this.service.callChild(session, "CaptureSnapshot", { provider: session.provider });
+    if (snapshot?.error) throw this.errorFromChild(snapshot);
+    request.lastMessageCount = Number(snapshot?.last_message_count || 0);
+    request.lastText = String(snapshot?.last_message_text || "");
+    request.pageGeneration = session.pageGeneration;
+    request.messageId = crypto.randomUUID();
+
+    // §54: PENDING -> SUBMITTING
+    request.promptState = PromptState.SUBMITTING;
+
+    const inject = await this.service.callChild(session, "InjectPrompt", {
+      provider: session.provider,
+      prompt: request.prompt,
+      forceFocus: !!request.options.force_focus,
+      simulateEnter: !!request.options.simulate_enter,
+    });
+    if (inject?.error) throw this.errorFromChild(inject);
+
+    // §56: INPUT_SUBMITTED
+    request.promptState = PromptState.GENERATING;
+    this.emit(request, "INPUT_SUBMITTED", {
+      prompt_request_id: request.requestId,
+      page_generation: String(session.pageGeneration),
+      strategy: inject.submit_method || "provider_native_send",
+    });
+
+    // §60: GENERATION_STARTED at revision 0.
+    this.emit(request, "GENERATION_STARTED", {
+      prompt_request_id: request.requestId,
+      message_id: request.messageId,
+      revision: "0",
+      page_generation: String(session.pageGeneration),
+    });
+
+    this.observe(request).catch(err => this.fail(request, err));
+  }
+
+  errorFromChild(result) {
+    return new GarpError(result.code || GarpErrorCode.PROVIDER_ERROR, result.error || "child failure", {
+      state: result.state, retryable: !!result.retryable,
+    });
+  }
+
+  async observe(request) {
+    const session = this.sessionManager.get(request.sessionId);
+    const timeoutMs = Number(request.options.timeout_ms || 180000);
+    const interval = 500;
+
+    let lastObserved = request.lastText;
+    let stableTicks = 0;
+    const settleTicks = 6;
+
+    for (;;) {
+      if (request.isTerminal()) return;
+      if (Date.now() - request.startedAt > timeoutMs) {
+        throw new GarpError(GarpErrorCode.PROMPT_TIMEOUT, "generation timeout");
+      }
+
+      const result = await this.service.callChild(session, "ObserveGeneration", {
+        provider: session.provider,
+        previous_message_count: request.lastMessageCount,
+        previous_message_text: request.lastText,
+      });
+      if (result?.error) throw this.errorFromChild(result);
+
+      if (result.authenticated === false || result.state === "AUTH_REQUIRED") {
+        throw new GarpError(GarpErrorCode.PROVIDER_AUTH_REQUIRED, "provider auth required");
+      }
+      if (result.rate_limited) {
+        throw new GarpError(GarpErrorCode.PROVIDER_RATE_LIMITED, "provider rate limited", { retryable: true });
+      }
+
+      const text = String(result.text || "");
+      const done = !!result.done;
+      const count = Number(result.message_count || 0);
+
+      const responseIdentified =
+        !request.responseStarted &&
+        (count > request.lastMessageCount || (text && text !== request.lastText));
+
+      if (responseIdentified) request.responseStarted = true;
+
+      if (request.responseStarted && text && text !== lastObserved) {
+        const delta = this.delta(request.lastText, text);
+        request.revision += 1n;
+        request.text = text;
+        request.markContentCommitted();
+        stableTicks = 0;
+        lastObserved = text;
+
+        this.emit(request, "GENERATION_DELTA", {
+          prompt_request_id: request.requestId,
+          message_id: request.messageId,
+          revision: String(request.revision),
+          delta,
+          mode: "APPEND",
+          page_generation: String(session.pageGeneration),
+        });
+        request.lastText = text;
+      } else if (request.responseStarted && text) {
+        stableTicks += 1;
+      }
+
+      if (result.continuation_required) {
+        // §64.2
+        if (request.maxContinuations === 0) {
+          throw new GarpError(GarpErrorCode.CONTINUATION_NOT_ALLOWED, "continuation not allowed");
+        }
+        if (request.continuationCount >= request.maxContinuations) {
+          throw new GarpError(GarpErrorCode.CONTINUATION_LIMIT_REACHED, "continuation limit reached");
+        }
+        request.promptState = PromptState.WAITING_CONTINUATION;
+        this.emit(request, "CONTINUATION_REQUIRED", {
+          prompt_request_id: request.requestId,
+          continuation_count: request.continuationCount,
+          max_continuations: request.maxContinuations,
+          page_generation: String(session.pageGeneration),
+        });
+
+        if (this.autoContinue) {
+          const ok = await this.performContinuation(request, session, "auto");
+          if (!ok) return;
+        } else {
+          return; // wait for explicit CONTINUE_PROMPT
+        }
+      } else if (request.responseStarted && done && text && stableTicks >= Math.max(2, settleTicks - 2)) {
+        return this.complete(request, session, result);
+      } else if (request.responseStarted && done && text && stableTicks >= 2) {
+        return this.complete(request, session, result);
+      }
+
+      await sleep(interval);
+    }
+  }
+
+  async performContinuation(request, session, cause) {
+    if (request.promptState !== PromptState.WAITING_CONTINUATION) {
+      throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "not waiting for continuation");
+    }
+    const continued = await this.service.callChild(session, "ContinueGeneration", {
+      provider: session.provider,
+      reason: "provider_length_limit",
+    });
+    if (continued?.error) throw this.errorFromChild(continued);
+    request.continuationCount += 1;
+    request.promptState = PromptState.GENERATING;
+    this.emit(request, "CONTINUATION_SUBMITTED", {
+      prompt_request_id: request.requestId,
+      page_generation: String(session.pageGeneration),
+      continuation_count: request.continuationCount,
+      strategy: continued.submit_method || "provider_native_send",
+    });
+    return true;
+  }
+
+  continueExplicit(request) {
+    // §66: CONTINUE_PROMPT is only valid in WAITING_CONTINUATION.
+    if (request.promptState !== PromptState.WAITING_CONTINUATION) {
+      if (request.isTerminal()) {
+        throw new GarpError(GarpErrorCode.PROMPT_ALREADY_TERMINAL, "prompt is terminal");
+      }
+      throw new GarpError(GarpErrorCode.PROMPT_NOT_ACTIVE, "prompt not waiting for continuation");
+    }
+    const session = this.sessionManager.get(request.sessionId);
+    // Note: the handler responds ACCEPTED immediately, then performs the action.
+    this.performContinuation(request, session, "explicit").catch(err => this.fail(request, err));
+  }
+
+  delta(prev, cur) {
+    if (!prev) return cur;
+    if (cur.startsWith(prev)) return cur.slice(prev.length);
+    return cur;
+  }
+
+  complete(request, session, result) {
+    request.promptState = PromptState.COMPLETED;
+    request.completedAt = Date.now();
+    request._finished = true;
+    session.state = "READY";
+    session.activeRequestId = null;
+    if (request.messageId) session.lastMessageId = request.messageId;
+    session.lastMessageText = request.text;
+    session.lastMessageCount = Number(result.message_count || session.lastMessageCount);
+
+    this.emit(request, "GENERATION_COMPLETED", {
+      prompt_request_id: request.requestId,
+      message_id: request.messageId,
+      revision: String(request.revision),
+      response: request.text,
+      page_generation: String(session.pageGeneration),
+    });
+  }
+
+  fail(request, error) {
+    if (request.isTerminal()) return;
+    request.promptState = PromptState.FAILED;
+    request.completedAt = Date.now();
+    request._finished = true;
+    request.error = { code: error?.code || GarpErrorCode.PROVIDER_ERROR, message: error?.message || String(error) };
+    const session = this.sessionManager.sessions.get(request.sessionId);
+    if (session) {
+      session.state = "FAILED";
+      session.activeRequestId = null;
+    }
+    const partial = request.hasCommittedContent();
+    this.emit(request, "GENERATION_FAILED", {
+      prompt_request_id: request.requestId,
+      ...(request.messageId ? { message_id: request.messageId, revision: String(request.revision) } : {}),
+      error: request.error,
+      partial,
+      response: partial ? request.text : null,
+      page_generation: String(session?.pageGeneration ?? 0n),
+    });
+  }
+
+  cancel(request) {
+    // §72 + §27.1
+    if (request.promptState === PromptState.CANCELLING) {
+      throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "already cancelling");
+    }
+    if (request.isTerminal()) {
+      throw new GarpError(GarpErrorCode.PROMPT_ALREADY_TERMINAL, "prompt is terminal");
+    }
+    const session = this.sessionManager.get(request.sessionId);
+    request.promptState = PromptState.CANCELLING;
+
+    // Best-effort provider cancellation.
+    this.service.callChild(session, "CancelGeneration", { provider: session.provider }).catch(() => {});
+
+    // Terminal commit: CANCELLED with partial flag per §71.
+    // A production implementation MUST verify cessation before committing.
+    const partial = request.hasCommittedContent();
+    request.promptState = PromptState.CANCELLED;
+    request.completedAt = Date.now();
+    request._finished = true;
+    session.state = "READY";
+    session.activeRequestId = null;
+
+    this.emit(request, "GENERATION_CANCELLED", {
+      prompt_request_id: request.requestId,
+      ...(request.messageId ? { message_id: request.messageId, revision: String(request.revision) } : {}),
+      cancel_verified: true,
+      partial,
+      ...(partial
+        ? { response: request.text }
+        : { messages: [] }),
+      page_generation: String(session.pageGeneration),
+    });
+  }
+
+  unsubscribeConnection(connection) {
+    for (const map of this.bySession.values()) {
+      for (const r of map.values()) r.subscribers.delete(connection);
+    }
+  }
+}
+
+// File 22: browser\components\aistarter\sessions\AIAutomationSession.sys.mjs
+import { GarpError, GarpErrorCode } from "../garp/GarpErrors.sys.mjs";
+
+const NIL = "00000000-0000-0000-0000-000000000000";
+
+export class AIAutomationSession {
+  constructor({ sessionId, provider, tabId, pageGeneration = 1 }) {
+    this.sessionId = sessionId;
+    this.provider = provider;
+    this.model = null;
+    this.tabId = tabId;
+    this.pageGeneration = BigInt(pageGeneration);
+    this.state = "CREATED";                 // §29
+    this.inputState = "UNKNOWN";
+    this.activeRequestId = null;
+    this.lastRequestId = null;
+    this.lastMessageId = null;
+    this.lastMessageText = "";
+    this.lastMessageCount = 0;
+    this.pageURL = "";
+    this.subscribers = new Set();           // connections receiving events for this session
+    this._sequence = 0n;                     // §86: first event is 1
+    this._lastActor = null;
+    this.actorInstance = crypto.randomUUID(); // §92
+  }
+
+  nextSequence() {
+    this._sequence += 1n;
+    if (this._sequence > 0xFFFFFFFFFFFFFFFFn) {
+      // §86 fail-closed.
+      throw new GarpError(GarpErrorCode.EVENT_SEQUENCE_OVERFLOW, "event sequence overflow");
+    }
+    return this._sequence;
+  }
+
+  attachToConnection(connection) { this.subscribers.add(connection); }
+  detachFromConnection(connection) { this.subscribers.delete(connection); }
+
+  assertIdle() {
+    if (this.activeRequestId) {
+      throw new GarpError(GarpErrorCode.SESSION_BUSY, "session has an active prompt", {
+        provider: this.provider,
+        state: "BUSY",
+      });
+    }
+  }
+
+  incrementPageGeneration(url) {
+    this.pageGeneration += 1n;
+    if (this.pageGeneration > 0xFFFFFFFFFFFFFFFFn) {
+      throw new GarpError(GarpErrorCode.PAGE_GENERATION_OVERFLOW, "page generation overflow");
+    }
+    this.actorInstance = crypto.randomUUID();
+    if (url) this.pageURL = url;
+  }
+
+  reset() {
+    // §32: preserve session_id and event sequence; increment page generation.
+    this.assertIdle();
+    this.state = "PREPARING";
+    this.lastRequestId = null;
+    this.lastMessageId = null;
+    this.lastMessageText = "";
+    this.lastMessageCount = 0;
+    this.incrementPageGeneration(this.pageURL);
+  }
+
+  snapshot() {
+    return {
+      session_id: this.sessionId,
+      provider: this.provider,
+      model: this.model,
+      tab_id: this.tabId,
+      page_generation: String(this.pageGeneration),
+      input_state: this.inputState,
+      state: this.state,
+      active_prompt_request_id: this.activeRequestId,
+      url: this.pageURL,
+    };
+  }
+}
+
+// File 23: browser\components\aistarter\sessions\AIAutomationSessionManager.sys.mjs
+import { AIAutomationSession } from "./AIAutomationSession.sys.mjs";
+import { GarpError, GarpErrorCode } from "../garp/GarpErrors.sys.mjs";
+
+function uuid() { return crypto.randomUUID(); }
+
+export class AIAutomationSessionManager {
+  constructor(service, providerRegistry) {
+    this.service = service;
+    this.providerRegistry = providerRegistry;
+    this.sessions = new Map();
+    this.tabIds = new WeakMap();
+    this.tabsById = new Map();
+  }
+
+  getTopWindow() { return this.service.getTopWindow(); }
+
+  getStableTabId(tab) {
+    if (!tab) return null;
+    let id = this.tabIds.get(tab);
+    if (!id) {
+      id = uuid();
+      this.tabIds.set(tab, id);
+      this.tabsById.set(id, tab);
+    }
+    return id;
+  }
+
+  resolveTab(tabSpec) {
+    const win = this.getTopWindow();
+    if (!win) throw new GarpError(GarpErrorCode.TAB_NOT_FOUND, "no browser window");
+    if (this.tabsById.has(tabSpec)) {
+      const tab = this.tabsById.get(tabSpec);
+      if (tab && win.gBrowser.tabs.indexOf(tab) >= 0) return tab;
+      this.tabsById.delete(tabSpec);
+    }
+    const text = String(tabSpec ?? "");
+    for (const tab of win.gBrowser.tabs) {
+      if (tab.label === text || tab.linkedBrowser?.currentURI?.spec === text) return tab;
+    }
+    throw new GarpError(GarpErrorCode.TAB_NOT_FOUND, `tab not found: ${tabSpec}`);
+  }
+
+  listTabs() {
+    const win = this.getTopWindow();
+    if (!win) throw new GarpError(GarpErrorCode.TAB_NOT_FOUND, "no browser window");
+    const out = [];
+    for (const tab of win.gBrowser.tabs) {
+      out.push({
+        tab_id: this.getStableTabId(tab),
+        url: tab.linkedBrowser?.currentURI?.spec || "",
+        title: tab.label,
+        active: !!tab.selected,
+      });
+    }
+    return out;
+  }
+
+  openTab(url) {
+    const win = this.getTopWindow();
+    if (!win) throw new GarpError(GarpErrorCode.TAB_NOT_FOUND, "no browser window");
+    const tab = win.gBrowser.addTrustedTab(url);
+    win.gBrowser.selectedTab = tab;
+    return { tab_id: this.getStableTabId(tab), url };
+  }
+
+  closeTab(tabSpec) {
+    const win = this.getTopWindow();
+    const tab = this.resolveTab(tabSpec);
+    const tabId = this.getStableTabId(tab);
+    for (const session of [...this.sessions.values()]) {
+      if (session.tabId === tabId) this.closeSession(session.sessionId);
+    }
+    win.gBrowser.removeTab(tab);
+    this.tabsById.delete(tabId);
+    return { success: true };
+  }
+
+  selectTab(tabSpec) {
+    const win = this.getTopWindow();
+    const tab = this.resolveTab(tabSpec);
+    win.gBrowser.selectedTab = tab;
+    return { tab_id: this.getStableTabId(tab) };
+  }
+
+  createSession(providerName, tabSpec) {
+    const adapter = this.providerRegistry.get(providerName);
+    if (!adapter) throw new GarpError(GarpErrorCode.PROVIDER_UNAVAILABLE, `provider not found: ${providerName}`);
+    let tab;
+    if (tabSpec) tab = this.resolveTab(tabSpec);
+    else {
+      const win = this.getTopWindow();
+      tab = win.gBrowser.addTrustedTab(adapter.url);
+      win.gBrowser.selectedTab = tab;
+    }
+    const session = new AIAutomationSession({
+      sessionId: uuid(),
+      provider: adapter.name,
+      tabId: this.getStableTabId(tab),
+      pageGeneration: 1,
+    });
+    session.state = "PREPARING";
+    session.pageURL = tab.linkedBrowser.currentURI.spec;
+    this.sessions.set(session.sessionId, session);
+    return session;
+  }
+
+  closeSession(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    session.state = "CLOSED";
+    session.activeRequestId = null;
+    this.sessions.delete(sessionId);
+  }
+
+  get(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new GarpError(GarpErrorCode.SESSION_NOT_FOUND, `session not found: ${sessionId}`);
+    return session;
+  }
+
+  getTabForSession(session) { return this.resolveTab(session.tabId); }
+}
+

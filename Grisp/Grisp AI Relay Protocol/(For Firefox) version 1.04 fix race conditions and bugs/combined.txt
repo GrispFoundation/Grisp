@@ -1,0 +1,5203 @@
+================================================================ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\IMPLEMENTATION_NOTES.md 
+================================================================ 
+# GARP/1.01 implementation notes
+
+This task targets the GARP/1.01 contract developed in the accompanying conversation.
+
+The following wire-level values are frozen by this implementation because the source protocol text provided to the implementation task did not include a final numeric registry section:
+
+* protocol string: `GARP/1.01`
+* version byte: `0x11`
+* fixed frame header: 48 bytes
+* UUID fields: raw RFC 4122 16-byte representation
+* all frame integers: big-endian
+* message registry includes HELLO_CHALLENGE and generic RESPONSE for command results
+* authentication: HMAC-SHA256 challenge/response
+
+If the user's separate GARP/1.01 document assigns different numeric values or wire encodings, the implementation MUST be aligned to that document before claiming conformance. No semantic GRISP assumptions are encoded in the Firefox gateway.
+
+The provider selectors were intentionally derived from the existing Firefox AI Automation implementation supplied for this task. They are expected to require maintenance as provider DOMs change.
+ 
+================================================================ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\install-component.ps1 
+================================================================ 
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$FirefoxRoot
+)
+
+$ErrorActionPreference = "Stop"
+$source = Join-Path $PSScriptRoot "browser\components\aistarter"
+$target = Join-Path $FirefoxRoot "browser\components\aistarter"
+
+if (-not (Test-Path (Join-Path $FirefoxRoot "mach"))) {
+    throw "FirefoxRoot does not appear to be a Firefox source checkout: $FirefoxRoot"
+}
+
+if (Test-Path $target) {
+    Write-Host "Target already exists: $target"
+    Write-Host "Rename or remove the old aistarter directory before installing this GARP/1.01 implementation."
+    exit 2
+}
+
+New-Item -ItemType Directory -Path (Split-Path $target) -Force | Out-Null
+Copy-Item -Path $source -Destination $target -Recurse -Force
+Write-Host "Installed GARP/1.01 Firefox component to: $target"
+Write-Host "Manual integration is still required for browser/components/moz.build, BrowserGlue.sys.mjs, and DesktopActorRegistry.sys.mjs."
+ 
+================================================================ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\README.md 
+================================================================ 
+# Firefox AI Automation + GARP/1.01
+
+This repository contains the Firefox-side implementation of the **GRISP AI Relay Protocol GARP/1.01**.
+
+It is deliberately **Selenium-free**. Firefox itself is the browser automation substrate. The implementation uses Firefox chrome/parent code, JSWindowActors, and provider-specific adapters.
+
+## Architecture
+
+```text
+GRISP / GARP client
+        |
+        | GARP/1.01 over localhost TCP
+        v
+Firefox AIAutomationService
+        |
+        +-- GarpConnection
+        +-- AIAutomationSessionManager
+        +-- GarpRequestManager
+        +-- ProviderRegistry
+        |
+        v
+AIAutomationParent
+        |
+        v
+AIAutomationChild
+        |
+        +-- DeepSeekAdapter
+        +-- GeminiAdapter
+        +-- ChatGPTAdapter
+        +-- ClaudeAdapter
+        +-- GrokAdapter
+        +-- CopilotAdapter
+        +-- PerplexityAdapter
+        +-- InceptionAdapter
+        |
+        v
+AI provider website DOM
+```
+
+Firefox owns provider interaction and observation. GARP carries the browser/session/request state. GRISP remains responsible for interpreting and verifying AI output.
+
+## Supported providers
+
+| Key | Site |
+|---|---|
+| `gemini` | https://gemini.google.com/app |
+| `grok` | https://grok.com/ |
+| `chatgpt` | https://chatgpt.com/ |
+| `copilot` | https://copilot.microsoft.com/ |
+| `claude` | https://claude.ai/ |
+| `perplexity` | https://www.perplexity.ai/ |
+| `deepseek` | https://chat.deepseek.com/ |
+| `inception` | https://chat.inceptionlabs.ai/ |
+
+Provider adapters are isolated. A provider DOM change should normally require a change only to that provider adapter.
+
+# 1. Requirements
+
+This implementation is intended for a **source build of Firefox**.
+
+On Windows, Mozilla's current build documentation recommends MozillaBuild and a supported Windows installation. The current guide lists 4 GB RAM minimum, 8 GB+ recommended, and at least 40 GB free disk space. The MozillaBuild shell is the supported traditional build environment. 
+
+Official documentation:
+
+- Firefox Windows build guide: https://firefox-source-docs.mozilla.org/setup/windows_build.html
+- Firefox contributor quick reference: https://firefox-source-docs.mozilla.org/contributing/contribution_quickref.html
+- MozillaBuild / Windows Mach notes: https://firefox-source-docs.mozilla.org/mach/windows-usage-outside-mozillabuild.html
+
+# 2. Fresh Firefox checkout
+
+Use a completely fresh clone for the first GARP/1.01 build.
+
+From the **MozillaBuild shell**:
+
+```bash
+git clone https://github.com/mozilla-firefox/firefox L:/Firefox
+cd L:/Firefox
+```
+
+Do not copy the old `ai_automation_logic` implementation into the tree. This GARP/1.01 package is intended to replace that architecture with the structured directory layout below.
+
+# 3. Bootstrap Firefox
+
+Run the Firefox bootstrap process from the Firefox tree:
+
+```bash
+./mach bootstrap
+```
+
+Follow the interactive choices. For this project, a normal desktop source build is the safest choice because the browser source is being modified.
+
+The official Firefox documentation also supports the bootstrap.py workflow when starting from a new source directory.
+
+# 4. Install GARP/1.01 into Firefox
+
+The source package contains:
+
+```text
+browser/components/aistarter/
+    AIAutomation.sys.mjs
+
+    actors/
+        AIAutomationChild.sys.mjs
+        AIAutomationParent.sys.mjs
+
+    garp/
+        GarpConnection.sys.mjs
+        GarpErrors.sys.mjs
+        GarpFrame.sys.mjs
+        GarpRegistry.sys.mjs
+
+    sessions/
+        AIAutomationSession.sys.mjs
+        AIAutomationSessionManager.sys.mjs
+
+    requests/
+        GarpRequest.sys.mjs
+        GarpRequestManager.sys.mjs
+
+    providers/
+        ProviderAdapter.sys.mjs
+        ProviderRegistry.sys.mjs
+        DeepSeekAdapter.sys.mjs
+        GeminiAdapter.sys.mjs
+        ChatGPTAdapter.sys.mjs
+        ClaudeAdapter.sys.mjs
+        GrokAdapter.sys.mjs
+        CopilotAdapter.sys.mjs
+        PerplexityAdapter.sys.mjs
+        InceptionAdapter.sys.mjs
+
+    diagnostics/
+        AIAutomationDiagnostics.sys.mjs
+```
+
+Copy the supplied `browser/components/aistarter` directory into the Firefox source tree.
+
+Example:
+
+```text
+xcopy /E /I /Y F:\GARP101_Firefox\browser\components\aistarter L:\Firefox\browser\components\aistarter
+```
+
+# 5. Register the component
+
+Edit:
+
+```text
+L:\Firefox\browser\components\moz.build
+```
+
+Add `aistarter` to the `DIRS` list:
+
+```python
+DIRS += [
+    "aistarter",
+]
+```
+
+The supplied `browser/components/aistarter/moz.build` exports the GARP, session, request, provider, diagnostic, and actor modules to Firefox's module tree.
+
+# 6. Start AIAutomationService during Firefox startup
+
+Edit:
+
+```text
+L:\Firefox\browser\components\BrowserGlue.sys.mjs
+```
+
+Add the module getter in the existing `ChromeUtils.defineESModuleGetters(lazy, {...})` block:
+
+```javascript
+AIAutomationService: "resource:///modules/aistarter/AIAutomation.sys.mjs",
+```
+
+During `BrowserGlue.prototype._init`, instantiate the service:
+
+```javascript
+try {
+  this.aiAutomationService = new lazy.AIAutomationService();
+  this.aiAutomationService.init();
+} catch (ex) {
+  Cu.reportError("AIAutomationService init failed: " + ex);
+}
+```
+
+Place this after the core browser state exists.
+
+# 7. Register the JSWindowActors
+
+Edit:
+
+```text
+L:\Firefox\browser\components\DesktopActorRegistry.sys.mjs
+```
+
+Inside the `JSWINDOWACTORS` registry add:
+
+```javascript
+AIAutomation: {
+  parent: {
+    esModuleURI: "resource:///modules/aistarter/actors/AIAutomationParent.sys.mjs",
+  },
+  child: {
+    esModuleURI: "resource:///modules/aistarter/actors/AIAutomationChild.sys.mjs",
+  },
+  allFrames: true,
+},
+```
+
+The actor name **must** remain `AIAutomation`, because the parent service requests:
+
+```javascript
+getActor("AIAutomation")
+```
+
+# 8. Optional authentication secret
+
+GARP/1.01 requires authenticated localhost access by default.
+
+The Firefox process looks for:
+
+```text
+GARP_SECRET
+```
+
+in its environment.
+
+For development, if it is not present, Firefox creates a random startup secret. The current development implementation reports that secret through `dump()` so a local test client can retrieve it from the launched Firefox process.
+
+For normal use, prefer setting an explicit secret in the Firefox launch environment rather than relying on the generated development secret.
+
+Example in the MozillaBuild shell:
+
+```bash
+export GARP_SECRET="replace-with-a-random-high-entropy-secret"
+```
+
+Then launch Firefox from that same shell.
+
+The secret is never exposed to page JavaScript or provider pages.
+
+# 9. Build Firefox
+
+From the Firefox root:
+
+```bash
+./mach build
+```
+
+Then run:
+
+```bash
+./mach run
+```
+
+For subsequent incremental changes, rerun `./mach build` and restart the local Firefox instance.
+
+Mozilla's current documentation recommends `./mach build` for source builds. 
+
+# 10. GARP port
+
+The default listener is:
+
+```text
+127.0.0.1:9999
+```
+
+This is intentionally different from the future standalone Delphi GARP test application: Firefox is the GARP server and the Delphi test application will be a GARP client.
+
+# 11. Wire protocol
+
+GARP/1.01 uses a binary length-framed TCP protocol.
+
+Fixed header:
+
+```text
+magic[4]          = GARP
+version[1]        = 0x11 for GARP/1.01
+flags[1]
+header_length[2]
+payload_length[4]
+message_type[2]
+reserved[2]       = 0
+request_id[16]    = binary RFC 4122 UUID
+session_id[16]    = binary RFC 4122 UUID
+```
+
+The fixed header is **48 bytes**.
+
+The payload is UTF-8 JSON.
+
+All integer fields are big-endian.
+
+The JSON `protocol` value is:
+
+```text
+GARP/1.01
+```
+
+Newline characters are ordinary payload data and are not framing characters.
+
+# 12. Handshake
+
+The first logical message is `hello`.
+
+Example:
+
+```json
+{
+  "protocol": "GARP/1.01",
+  "type": "hello",
+  "payload": {
+    "client_id": "GRISP-Agent-001",
+    "client_version": "1.0.0",
+    "nonce": "client-random-nonce"
+  }
+}
+```
+
+Firefox replies with `hello_challenge`, followed by an authenticated `hello_auth`, then the final `hello_ack`.
+
+The authentication proof is HMAC-SHA256 over:
+
+```text
+GARP/1.01|client_id|client_nonce|server_nonce
+```
+
+The shared secret is never sent in the protocol.
+
+# 13. First functional test
+
+After starting the modified Firefox, confirm that the Firefox console contains something similar to:
+
+```text
+GARP/1.01: listening on 127.0.0.1:9999
+```
+
+Then sign in manually to one supported AI provider in the local Firefox profile.
+
+The first external test client should perform this sequence:
+
+```text
+HELLO
+HELLO_CHALLENGE
+HELLO_AUTH
+HELLO_ACK
+CAPABILITIES
+LIST_TABS
+CREATE_SESSION
+PROMPT
+PROMPT_ACK
+GENERATION_STARTED
+INPUT_SUBMITTED
+GENERATION_DELTA ...
+GENERATION_COMPLETED
+```
+
+The separate Delphi GARP test application will implement this sequence in the next task.
+
+# 14. Session behavior
+
+A session has a stable `session_id`.
+
+A tab has a stable `tab_id`.
+
+Changing tab indexes does not change `tab_id`.
+
+A JSWindowActor replacement does not change `session_id` or `tab_id`.
+
+A significant navigation or actor replacement increments `page_generation`.
+
+Only one active prompt is permitted per session by default.
+
+A second simultaneous prompt receives:
+
+```text
+SESSION_BUSY
+```
+
+# 15. Provider adapter behavior
+
+Provider-specific selectors live exclusively in `providers/`.
+
+The generic child actor does not contain one giant provider selector table.
+
+Each adapter is responsible for:
+
+```text
+discover input
+inspect readiness
+submit prompt
+inspect generation
+identify responses
+detect continuation
+continue generation
+detect authentication
+detect rate limits
+detect provider errors
+cancel generation
+reset session
+```
+
+The initial adapter implementation preserves the selector strategies from the existing Firefox AI automation project.
+
+# 16. Existing automation migration
+
+The previous project had:
+
+```text
+AIAutomationService
+AIAutomationConnection
+AIAutomationUtils
+AIAutomationChild
+```
+
+The GARP/1.01 implementation replaces the internal organization with:
+
+```text
+AIAutomationService
+    |
+    +-- GarpConnection
+    +-- AIAutomationSessionManager
+    +-- GarpRequestManager
+    +-- ProviderRegistry
+```
+
+The two-phase navigation-safe design is preserved:
+
+```text
+parent
+  |
+  +-- acquire actor
+  +-- child operation
+  +-- actor disappears during SPA navigation
+  +-- reacquire actor
+  +-- continue session/request state
+```
+
+The old newline JSON commands are deliberately not used by the GARP path.
+
+# 17. Important implementation boundary
+
+The Firefox side does **not** decide whether AI output is a valid GRISP artifact.
+
+The flow is:
+
+```text
+provider response
+    |
+    v
+GARP/1.01
+    |
+    v
+GAI/1.0
+    |
+    v
+GRISP validation
+    |
+    v
+artifact/evidence/state
+```
+
+Firefox must never silently change the semantic AI response while transporting it.
+
+# 18. Troubleshooting
+
+### Port 9999 already in use
+
+Stop the previous local Firefox instance or identify the process holding the port.
+
+### No GARP listener
+
+Check that `BrowserGlue.sys.mjs` actually initializes `AIAutomationService` and that the module path resolves to:
+
+```text
+resource:///modules/aistarter/AIAutomation.sys.mjs
+```
+
+### Child actor unavailable
+
+Verify the `AIAutomation` entry in `DesktopActorRegistry.sys.mjs` and verify the two actor modules were exported by `aistarter/moz.build`.
+
+### Provider says AUTH_REQUIRED
+
+Open that provider manually in the local Firefox profile and sign in. GARP does not automate credential entry.
+
+### Provider DOM unsupported
+
+The affected provider adapter needs an update. Do not add the selector to the generic child actor unless the selector is truly provider-independent.
+
+### Build problems
+
+Start with a clean Firefox source checkout and rerun the official bootstrap process. Mozilla notes that the source/build tree can consume substantial disk space and recommends antivirus exclusions for MozillaBuild, the Firefox source tree, and `.mozbuild` on Windows because security scanning can slow or interfere with builds.
+
+# 19. Source-build references
+
+Use Mozilla's current documentation rather than copying old toolchain versions from historical project instructions:
+
+- https://firefox-source-docs.mozilla.org/setup/windows_build.html
+- https://firefox-source-docs.mozilla.org/contributing/contribution_quickref.html
+- https://firefox-source-docs.mozilla.org/mach/windows-usage-outside-mozillabuild.html
+
+# 20. Status
+
+This package is the **Firefox-side GARP/1.01 implementation task**.
+
+It intentionally contains no Selenium dependency and no Delphi client.
+
+The next separate task is the Delphi GARP conformance/test application that connects to `127.0.0.1:9999` and exercises the normative handshake, session lifecycle, prompt lifecycle, streaming, cancellation, duplicate suppression, sequence handling, and reconnection behavior.
+ 
+================================================================ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\README_INSTALLATION.md 
+================================================================ 
+# Firefox AI Automation + GARP/1.01
+
+This repository contains the Firefox-side implementation of the **GRISP AI Relay Protocol GARP/1.01**.
+
+It is deliberately **Selenium-free**. Firefox itself is the browser automation substrate. The implementation uses Firefox chrome/parent code, JSWindowActors, and provider-specific adapters.
+
+## Architecture
+
+```text
+GRISP / GARP client
+        |
+        | GARP/1.01 over localhost TCP
+        v
+Firefox AIAutomationService
+        |
+        +-- GarpConnection
+        +-- AIAutomationSessionManager
+        +-- GarpRequestManager
+        +-- ProviderRegistry
+        |
+        v
+AIAutomationParent
+        |
+        v
+AIAutomationChild
+        |
+        +-- DeepSeekAdapter
+        +-- GeminiAdapter
+        +-- ChatGPTAdapter
+        +-- ClaudeAdapter
+        +-- GrokAdapter
+        +-- CopilotAdapter
+        +-- PerplexityAdapter
+        +-- InceptionAdapter
+        |
+        v
+AI provider website DOM
+```
+
+Firefox owns provider interaction and observation. GARP carries the browser/session/request state. GRISP remains responsible for interpreting and verifying AI output.
+
+## Supported providers
+
+| Key | Site |
+|---|---|
+| `gemini` | https://gemini.google.com/app |
+| `grok` | https://grok.com/ |
+| `chatgpt` | https://chatgpt.com/ |
+| `copilot` | https://copilot.microsoft.com/ |
+| `claude` | https://claude.ai/ |
+| `perplexity` | https://www.perplexity.ai/ |
+| `deepseek` | https://chat.deepseek.com/ |
+| `inception` | https://chat.inceptionlabs.ai/ |
+
+Provider adapters are isolated. A provider DOM change should normally require a change only to that provider adapter.
+
+# 1. Requirements
+
+This implementation is intended for a **source build of Firefox**.
+
+On Windows, Mozilla's current build documentation recommends MozillaBuild and a supported Windows installation. The current guide lists 4 GB RAM minimum, 8 GB+ recommended, and at least 40 GB free disk space. The MozillaBuild shell is the supported traditional build environment. 
+
+Official documentation:
+
+- Firefox Windows build guide: https://firefox-source-docs.mozilla.org/setup/windows_build.html
+- Firefox contributor quick reference: https://firefox-source-docs.mozilla.org/contributing/contribution_quickref.html
+- MozillaBuild / Windows Mach notes: https://firefox-source-docs.mozilla.org/mach/windows-usage-outside-mozillabuild.html
+
+# 2. Fresh Firefox checkout
+
+Use a completely fresh clone for the first GARP/1.01 build.
+
+From the **MozillaBuild shell**:
+
+```bash
+git clone https://github.com/mozilla-firefox/firefox L:/Firefox
+cd L:/Firefox
+```
+
+Do not copy the old `ai_automation_logic` implementation into the tree. This GARP/1.01 package is intended to replace that architecture with the structured directory layout below.
+
+# 3. Bootstrap Firefox
+
+Run the Firefox bootstrap process from the Firefox tree:
+
+```bash
+./mach bootstrap
+```
+
+Follow the interactive choices. For this project, a normal desktop source build is the safest choice because the browser source is being modified.
+
+The official Firefox documentation also supports the bootstrap.py workflow when starting from a new source directory.
+
+# 4. Install GARP/1.01 into Firefox
+
+The source package contains:
+
+```text
+browser/components/aistarter/
+    AIAutomation.sys.mjs
+
+    actors/
+        AIAutomationChild.sys.mjs
+        AIAutomationParent.sys.mjs
+
+    garp/
+        GarpConnection.sys.mjs
+        GarpErrors.sys.mjs
+        GarpFrame.sys.mjs
+        GarpRegistry.sys.mjs
+
+    sessions/
+        AIAutomationSession.sys.mjs
+        AIAutomationSessionManager.sys.mjs
+
+    requests/
+        GarpRequest.sys.mjs
+        GarpRequestManager.sys.mjs
+
+    providers/
+        ProviderAdapter.sys.mjs
+        ProviderRegistry.sys.mjs
+        DeepSeekAdapter.sys.mjs
+        GeminiAdapter.sys.mjs
+        ChatGPTAdapter.sys.mjs
+        ClaudeAdapter.sys.mjs
+        GrokAdapter.sys.mjs
+        CopilotAdapter.sys.mjs
+        PerplexityAdapter.sys.mjs
+        InceptionAdapter.sys.mjs
+
+    diagnostics/
+        AIAutomationDiagnostics.sys.mjs
+```
+
+Copy the supplied `browser/components/aistarter` directory into the Firefox source tree.
+
+Example:
+
+```text
+xcopy /E /I /Y F:\GARP101_Firefox\browser\components\aistarter L:\Firefox\browser\components\aistarter
+```
+
+# 5. Register the component
+
+Edit:
+
+```text
+L:\Firefox\browser\components\moz.build
+```
+
+Add `aistarter` to the `DIRS` list:
+
+```python
+DIRS += [
+    "aistarter",
+]
+```
+
+The supplied `browser/components/aistarter/moz.build` exports the GARP, session, request, provider, diagnostic, and actor modules to Firefox's module tree.
+
+# 6. Start AIAutomationService during Firefox startup
+
+Edit:
+
+```text
+L:\Firefox\browser\components\BrowserGlue.sys.mjs
+```
+
+Add the module getter in the existing `ChromeUtils.defineESModuleGetters(lazy, {...})` block:
+
+```javascript
+AIAutomationService: "resource:///modules/aistarter/AIAutomation.sys.mjs",
+```
+
+During `BrowserGlue.prototype._init`, instantiate the service:
+
+```javascript
+try {
+  this.aiAutomationService = new lazy.AIAutomationService();
+  this.aiAutomationService.init();
+} catch (ex) {
+  Cu.reportError("AIAutomationService init failed: " + ex);
+}
+```
+
+Place this after the core browser state exists.
+
+# 7. Register the JSWindowActors
+
+Edit:
+
+```text
+L:\Firefox\browser\components\DesktopActorRegistry.sys.mjs
+```
+
+Inside the `JSWINDOWACTORS` registry add:
+
+```javascript
+AIAutomation: {
+  parent: {
+    esModuleURI: "resource:///modules/aistarter/actors/AIAutomationParent.sys.mjs",
+  },
+  child: {
+    esModuleURI: "resource:///modules/aistarter/actors/AIAutomationChild.sys.mjs",
+  },
+  allFrames: true,
+  safeForUntrustedWebProcess: true,    
+},
+```
+
+The actor name **must** remain `AIAutomation`, because the parent service requests:
+
+```javascript
+getActor("AIAutomation")
+```
+
+# 8. Optional authentication secret
+
+GARP/1.01 requires authenticated localhost access by default.
+
+The Firefox process looks for:
+
+```text
+GARP_SECRET
+```
+
+in its environment.
+
+For development, if it is not present, Firefox creates a random startup secret. The current development implementation reports that secret through `dump()` so a local test client can retrieve it from the launched Firefox process.
+
+For normal use, prefer setting an explicit secret in the Firefox launch environment rather than relying on the generated development secret.
+
+Example in the MozillaBuild shell:
+
+```bash
+export GARP_SECRET="replace-with-a-random-high-entropy-secret"
+```
+
+Then launch Firefox from that same shell.
+
+The secret is never exposed to page JavaScript or provider pages.
+
+# 9. Build Firefox
+
+From the Firefox root:
+
+```bash
+./mach build
+```
+
+Then run:
+
+```bash
+./mach run
+```
+
+For subsequent incremental changes, rerun `./mach build` and restart the local Firefox instance.
+
+Mozilla's current documentation recommends `./mach build` for source builds. 
+
+# 10. GARP port
+
+The default listener is:
+
+```text
+127.0.0.1:9999
+```
+
+This is intentionally different from the future standalone Delphi GARP test application: Firefox is the GARP server and the Delphi test application will be a GARP client.
+
+# 11. Wire protocol
+
+GARP/1.01 uses a binary length-framed TCP protocol.
+
+Fixed header:
+
+```text
+magic[4]          = GARP
+version[1]        = 0x11 for GARP/1.01
+flags[1]
+header_length[2]
+payload_length[4]
+message_type[2]
+reserved[2]       = 0
+request_id[16]    = binary RFC 4122 UUID
+session_id[16]    = binary RFC 4122 UUID
+```
+
+The fixed header is **48 bytes**.
+
+The payload is UTF-8 JSON.
+
+All integer fields are big-endian.
+
+The JSON `protocol` value is:
+
+```text
+GARP/1.01
+```
+
+Newline characters are ordinary payload data and are not framing characters.
+
+# 12. Handshake
+
+The first logical message is `hello`.
+
+Example:
+
+```json
+{
+  "protocol": "GARP/1.01",
+  "type": "hello",
+  "payload": {
+    "client_id": "GRISP-Agent-001",
+    "client_version": "1.0.0",
+    "nonce": "client-random-nonce"
+  }
+}
+```
+
+Firefox replies with `hello_challenge`, followed by an authenticated `hello_auth`, then the final `hello_ack`.
+
+The authentication proof is HMAC-SHA256 over:
+
+```text
+GARP/1.01|client_id|client_nonce|server_nonce
+```
+
+The shared secret is never sent in the protocol.
+
+# 13. First functional test
+
+After starting the modified Firefox, confirm that the Firefox console contains something similar to:
+
+```text
+GARP/1.01: listening on 127.0.0.1:9999
+```
+
+Then sign in manually to one supported AI provider in the local Firefox profile.
+
+The first external test client should perform this sequence:
+
+```text
+HELLO
+HELLO_CHALLENGE
+HELLO_AUTH
+HELLO_ACK
+CAPABILITIES
+LIST_TABS
+CREATE_SESSION
+PROMPT
+PROMPT_ACK
+GENERATION_STARTED
+INPUT_SUBMITTED
+GENERATION_DELTA ...
+GENERATION_COMPLETED
+```
+
+The separate Delphi GARP test application will implement this sequence in the next task.
+
+# 14. Session behavior
+
+A session has a stable `session_id`.
+
+A tab has a stable `tab_id`.
+
+Changing tab indexes does not change `tab_id`.
+
+A JSWindowActor replacement does not change `session_id` or `tab_id`.
+
+A significant navigation or actor replacement increments `page_generation`.
+
+Only one active prompt is permitted per session by default.
+
+A second simultaneous prompt receives:
+
+```text
+SESSION_BUSY
+```
+
+# 15. Provider adapter behavior
+
+Provider-specific selectors live exclusively in `providers/`.
+
+The generic child actor does not contain one giant provider selector table.
+
+Each adapter is responsible for:
+
+```text
+discover input
+inspect readiness
+submit prompt
+inspect generation
+identify responses
+detect continuation
+continue generation
+detect authentication
+detect rate limits
+detect provider errors
+cancel generation
+reset session
+```
+
+The initial adapter implementation preserves the selector strategies from the existing Firefox AI automation project.
+
+# 16. Existing automation migration
+
+The previous project had:
+
+```text
+AIAutomationService
+AIAutomationConnection
+AIAutomationUtils
+AIAutomationChild
+```
+
+The GARP/1.01 implementation replaces the internal organization with:
+
+```text
+AIAutomationService
+    |
+    +-- GarpConnection
+    +-- AIAutomationSessionManager
+    +-- GarpRequestManager
+    +-- ProviderRegistry
+```
+
+The two-phase navigation-safe design is preserved:
+
+```text
+parent
+  |
+  +-- acquire actor
+  +-- child operation
+  +-- actor disappears during SPA navigation
+  +-- reacquire actor
+  +-- continue session/request state
+```
+
+The old newline JSON commands are deliberately not used by the GARP path.
+
+# 17. Important implementation boundary
+
+The Firefox side does **not** decide whether AI output is a valid GRISP artifact.
+
+The flow is:
+
+```text
+provider response
+    |
+    v
+GARP/1.01
+    |
+    v
+GAI/1.0
+    |
+    v
+GRISP validation
+    |
+    v
+artifact/evidence/state
+```
+
+Firefox must never silently change the semantic AI response while transporting it.
+
+# 18. Troubleshooting
+
+### Port 9999 already in use
+
+Stop the previous local Firefox instance or identify the process holding the port.
+
+### No GARP listener
+
+Check that `BrowserGlue.sys.mjs` actually initializes `AIAutomationService` and that the module path resolves to:
+
+```text
+resource:///modules/aistarter/AIAutomation.sys.mjs
+```
+
+### Child actor unavailable
+
+Verify the `AIAutomation` entry in `DesktopActorRegistry.sys.mjs` and verify the two actor modules were exported by `aistarter/moz.build`.
+
+### Provider says AUTH_REQUIRED
+
+Open that provider manually in the local Firefox profile and sign in. GARP does not automate credential entry.
+
+### Provider DOM unsupported
+
+The affected provider adapter needs an update. Do not add the selector to the generic child actor unless the selector is truly provider-independent.
+
+### Build problems
+
+Start with a clean Firefox source checkout and rerun the official bootstrap process. Mozilla notes that the source/build tree can consume substantial disk space and recommends antivirus exclusions for MozillaBuild, the Firefox source tree, and `.mozbuild` on Windows because security scanning can slow or interfere with builds.
+
+# 19. Source-build references
+
+Use Mozilla's current documentation rather than copying old toolchain versions from historical project instructions:
+
+- https://firefox-source-docs.mozilla.org/setup/windows_build.html
+- https://firefox-source-docs.mozilla.org/contributing/contribution_quickref.html
+- https://firefox-source-docs.mozilla.org/mach/windows-usage-outside-mozillabuild.html
+
+# 20. Status
+
+This package is the **Firefox-side GARP/1.01 implementation task**.
+
+It intentionally contains no Selenium dependency and no Delphi client.
+
+The next separate task is the Delphi GARP conformance/test application that connects to `127.0.0.1:9999` and exercises the normative handshake, session lifecycle, prompt lifecycle, streaming, cancellation, duplicate suppression, sequence handling, and reconnection behavior.
+ 
+================================================================ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\AIAutomation.sys.mjs 
+================================================================ 
+import { GarpConnection } from "./garp/GarpConnection.sys.mjs";
+import { GarpFeature, GarpMessageType } from "./garp/GarpRegistry.sys.mjs";
+import { GarpError, GarpErrorCode } from "./garp/GarpErrors.sys.mjs";
+import { AIAutomationSessionManager } from "./sessions/AIAutomationSessionManager.sys.mjs";
+import { GarpRequestManager } from "./requests/GarpRequestManager.sys.mjs";
+import { ProviderRegistry } from "./providers/ProviderRegistry.sys.mjs";
+
+const GARP_PORT = 9999;
+const DEFAULT_REQUEST_RETENTION_MS = 10 * 60 * 1000;
+
+function uuid() {
+  return crypto.randomUUID();
+}
+
+function hex(bytes) {
+  return [...bytes]
+    .map(b => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function hmacSha256(secret, text) {
+  const keyBytes = new TextEncoder().encode(secret);
+  const data = new TextEncoder().encode(text);
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  return new Uint8Array(
+    await crypto.subtle.sign("HMAC", key, data)
+  );
+}
+
+function constantTimeEqualHex(left, right) {
+  const a = String(left || "").toLowerCase();
+  const b = String(right || "").toLowerCase();
+
+  if (a.length !== b.length) {
+    return false;
+  }
+
+  let diff = 0;
+
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+
+  return diff === 0;
+}
+
+export class AIAutomationService {
+  constructor() {
+    this.serverSocket = null;
+    this.connections = new Set();
+
+    this.providerRegistry = new ProviderRegistry();
+
+    this.sessionManager = new AIAutomationSessionManager(
+      this,
+      this.providerRegistry
+    );
+
+    this.requestManager = new GarpRequestManager(
+      this,
+      this.sessionManager,
+      this.providerRegistry
+    );
+
+    this.serverId = uuid();
+    this.serverVersion = "1.0.0";
+
+    const configuredSecret = Services.env.get("GARP_SECRET");
+
+    this.authSecret =
+      configuredSecret || this.generateStartupSecret();
+
+    this.authEnabled = true;
+    this.generatedAuthSecret = !configuredSecret;
+
+    this.heartbeatTimer = null;
+    this.requestRetentionTimer = null;
+  }
+
+  generateStartupSecret() {
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    return hex(bytes);
+  }
+
+  init() {
+    if (this.serverSocket) {
+      return;
+    }
+
+    try {
+      this.serverSocket = Cc[
+        "@mozilla.org/network/server-socket;1"
+      ].createInstance(Ci.nsIServerSocket);
+
+      this.serverSocket.init(GARP_PORT, true, -1);
+      this.serverSocket.asyncListen(this);
+
+      dump(
+        `GARP/1.01: listening on 127.0.0.1:${GARP_PORT}\n`
+      );
+
+      if (this.generatedAuthSecret) {
+        dump(
+          `GARP/1.01: generated startup authentication secret = ${this.authSecret}\n`
+        );
+      }
+    } catch (error) {
+      this.serverSocket = null;
+
+      Cu.reportError(
+        `GARP/1.01 startup failed: ${error.message}`
+      );
+
+      throw error;
+    }
+  }
+
+  shutdown() {
+    if (this.heartbeatTimer) {
+      this.heartbeatTimer = null;
+    }
+
+    for (const connection of [...this.connections]) {
+      connection.close();
+    }
+
+    this.connections.clear();
+
+    if (this.serverSocket) {
+      try {
+        this.serverSocket.close();
+      } catch (_) {}
+
+      this.serverSocket = null;
+    }
+  }
+
+  onSocketAccepted(_socket, transport) {
+    const connection = new GarpConnection(
+      transport,
+      this
+    );
+
+    this.connections.add(connection);
+  }
+
+  onStopListening(_socket, _status) {
+    this.serverSocket = null;
+  }
+
+  removeConnection(connection) {
+    this.connections.delete(connection);
+    this.requestManager.unsubscribeConnection(connection);
+  }
+
+  getTopWindow() {
+    const {
+      BrowserWindowTracker,
+    } = ChromeUtils.importESModule(
+      "resource:///modules/BrowserWindowTracker.sys.mjs"
+    );
+
+    return BrowserWindowTracker.getTopWindow();
+  }
+
+  async handleGarpMessage(connection, decoded) {
+    const message = decoded.message;
+    const type = message.type;
+
+    if (type === "hello") {
+      return this.handleHello(connection, message);
+    }
+
+    if (type === "hello_auth") {
+      return this.handleHelloAuth(connection, message);
+    }
+
+    if (!connection.authenticated) {
+      throw new GarpError(
+        GarpErrorCode.UNAUTHORIZED,
+        "GARP authentication required",
+        {
+          state: "AUTHENTICATING",
+        }
+      );
+    }
+
+    switch (type) {
+      case "ping":
+        connection.send(
+          GarpMessageType.PONG,
+          { state: "alive" }
+        );
+        return;
+
+      case "capabilities":
+        connection.send(
+          GarpMessageType.CAPABILITIES,
+          {
+            protocol: "GARP/1.01",
+            features: [...GarpFeature],
+            providers: this.providerRegistry.list(),
+          }
+        );
+        return;
+
+      case "browser_status":
+        connection.send(
+          GarpMessageType.BROWSER_STATUS,
+          this.browserStatus()
+        );
+        return;
+
+      case "list_tabs":
+        this.sendResponse(
+          connection,
+          decoded,
+          this.sessionManager.listTabs()
+        );
+        return;
+
+      case "open_tab":
+        this.sendResponse(
+          connection,
+          decoded,
+          this.sessionManager.openTab(
+            message.payload?.url || "about:blank"
+          )
+        );
+        return;
+
+      case "close_tab":
+        this.sendResponse(
+          connection,
+          decoded,
+          this.sessionManager.closeTab(
+            message.payload?.tab_id ??
+            message.payload?.index
+          )
+        );
+        return;
+
+      case "select_tab":
+        this.sendResponse(
+          connection,
+          decoded,
+          this.sessionManager.selectTab(
+            message.payload?.tab_id ??
+            message.payload?.index
+          )
+        );
+        return;
+
+      case "create_session":
+        return this.handleCreateSession(
+          connection,
+          decoded
+        );
+
+      case "attach_session":
+        return this.handleAttachSession(
+          connection,
+          decoded
+        );
+
+      case "detach_session":
+        return this.handleSessionCommand(
+          connection,
+          decoded,
+          "detach"
+        );
+
+      case "close_session":
+        return this.handleSessionCommand(
+          connection,
+          decoded,
+          "close"
+        );
+
+      case "reset_session":
+        return this.handleSessionCommand(
+          connection,
+          decoded,
+          "reset"
+        );
+
+      case "prompt":
+        return this.handlePrompt(
+          connection,
+          decoded
+        );
+
+      case "cancel_prompt":
+        return this.handleCancel(
+          connection,
+          decoded
+        );
+
+      case "get_prompt_status":
+        return this.handleGetPromptStatus(
+          connection,
+          decoded
+        );
+
+      case "get_response":
+        return this.handleGetResponse(
+          connection,
+          decoded
+        );
+
+      case "subscribe_response":
+        return this.handleSubscribe(
+          connection,
+          decoded
+        );
+
+      default:
+        throw new GarpError(
+          GarpErrorCode.PROTOCOL_ERROR,
+          `Unsupported GARP command: ${type}`
+        );
+    }
+  }
+
+  handleHello(connection, message) {
+    if (connection.authState !== "CONNECTED") {
+      throw new GarpError(
+        GarpErrorCode.PROTOCOL_ERROR,
+        "HELLO received in invalid state"
+      );
+    }
+
+    const payload = message.payload || {};
+
+    const clientId = String(
+      payload.client_id || ""
+    );
+
+    const clientNonce = String(
+      payload.nonce || ""
+    );
+
+    if (!clientId || !clientNonce) {
+      throw new GarpError(
+        GarpErrorCode.BAD_REQUEST,
+        "HELLO requires client_id and nonce"
+      );
+    }
+
+    connection.clientId = clientId;
+    connection.clientNonce = clientNonce;
+
+    connection.serverNonce = hex(
+      crypto.getRandomValues(
+        new Uint8Array(32)
+      )
+    );
+
+    connection.authState = "AUTHENTICATING";
+
+    const challenge = {
+      server_id: this.serverId,
+      server_version: this.serverVersion,
+      server_nonce: connection.serverNonce,
+      auth: {
+        algorithm: "HMAC-SHA256",
+      },
+    };
+
+    connection.send(
+      "hello_challenge",
+      challenge
+    );
+  }
+
+  async handleHelloAuth(connection, message) {
+    if (
+      connection.authState !==
+      "AUTHENTICATING"
+    ) {
+      throw new GarpError(
+        GarpErrorCode.PROTOCOL_ERROR,
+        "HELLO_AUTH received in invalid state"
+      );
+    }
+
+    const payload = message.payload || {};
+
+    if (
+      payload.client_id !== connection.clientId ||
+      payload.client_nonce !== connection.clientNonce ||
+      payload.server_nonce !== connection.serverNonce
+    ) {
+      throw new GarpError(
+        GarpErrorCode.UNAUTHORIZED,
+        "GARP challenge identity mismatch"
+      );
+    }
+
+    const input = [
+      "GARP/1.01",
+      connection.clientId,
+      connection.clientNonce,
+      connection.serverNonce,
+    ].join("|");
+
+    const expected = hex(
+      await hmacSha256(
+        this.authSecret,
+        input
+      )
+    );
+
+    if (
+      !constantTimeEqualHex(
+        expected,
+        payload.proof
+      )
+    ) {
+      throw new GarpError(
+        GarpErrorCode.UNAUTHORIZED,
+        "GARP authentication failed"
+      );
+    }
+
+    connection.authenticated = true;
+    connection.authState = "READY";
+
+    connection.send(
+      "hello_ack",
+      {
+        server_id: this.serverId,
+        server_version: this.serverVersion,
+        browser: {
+          name: "Firefox",
+          version: Services.appinfo.version,
+        },
+        features: [...GarpFeature],
+      }
+    );
+  }
+
+  browserStatus() {
+    const win = this.getTopWindow();
+
+    return {
+      state: win ? "READY" : "ERROR",
+      browser: "Firefox",
+      version: Services.appinfo.version,
+      provider_count:
+        this.providerRegistry.list().length,
+      session_count:
+        this.sessionManager.sessions.size,
+    };
+  }
+
+  handleCreateSession(connection, decoded) {
+    const payload =
+      decoded.message.payload || {};
+
+    const session =
+      this.sessionManager.createSession(
+        payload.provider,
+        payload.tab_id ??
+        payload.tab_index ??
+        null
+      );
+
+    this.sendResponse(
+      connection,
+      decoded,
+      session.snapshot()
+    );
+
+    this.prepareSession(session).catch(
+      error =>
+        this.emitSessionError(
+          session,
+          error
+        )
+    );
+  }
+
+  handleAttachSession(connection, decoded) {
+    const payload =
+      decoded.message.payload || {};
+
+    const session =
+      this.sessionManager.attachSession(
+        payload.session_id,
+        payload.tab_id ??
+        payload.tab_index
+      );
+
+    this.sendResponse(
+      connection,
+      decoded,
+      session.snapshot()
+    );
+
+    this.prepareSession(session).catch(
+      error =>
+        this.emitSessionError(
+          session,
+          error
+        )
+    );
+  }
+
+  handleSessionCommand(
+    connection,
+    decoded,
+    operation
+  ) {
+    const sessionId =
+      decoded.message.payload?.session_id ||
+      decoded.message.session_id;
+
+    const session =
+      operation === "detach"
+        ? this.sessionManager.detachSession(
+            sessionId
+          )
+        : operation === "close"
+        ? (
+            this.sessionManager.closeSession(
+              sessionId
+            ),
+            null
+          )
+        : this.sessionManager.resetSession(
+            sessionId
+          );
+
+    this.sendResponse(
+      connection,
+      decoded,
+      session
+        ? session.snapshot()
+        : {
+            session_id: sessionId,
+            state: "CLOSED",
+          }
+    );
+  }
+
+  async prepareSession(session) {
+    const result =
+      await this.callChild(
+        session,
+        "PrepareSession",
+        {
+          provider: session.provider,
+        }
+      );
+
+    if (result?.error) {
+      throw new GarpError(
+        result.code ||
+          GarpErrorCode.DOM_UNSUPPORTED,
+        result.error,
+        {
+          state:
+            result.state || "ERROR",
+        }
+      );
+    }
+
+    session.inputState =
+      result.input_state ||
+      (
+        result.input_ready
+          ? "READY"
+          : "NOT_READY"
+      );
+
+    if (result.authenticated === false) {
+      session.state = "AUTH_REQUIRED";
+    } else if (result.rate_limited) {
+      session.state = "RATE_LIMITED";
+    } else if (result.input_ready) {
+      session.state = "READY";
+    } else {
+      session.state = "PREPARING";
+    }
+
+    this.broadcastSession(
+      session,
+      "session_ready",
+      session.snapshot()
+    );
+
+    return result;
+  }
+
+  async handlePrompt(connection, decoded) {
+    const message = decoded.message;
+
+    const sessionId =
+      message.session_id ||
+      message.payload?.session_id ||
+      decoded.session_id;
+
+    const requestId =
+      message.request_id ||
+      decoded.request_id ||
+      uuid();
+
+    const session =
+      this.sessionManager.get(sessionId);
+
+    const prompt = String(
+      message.payload?.prompt?.text ?? ""
+    );
+
+    if (!prompt) {
+      throw new GarpError(
+        GarpErrorCode.BAD_REQUEST,
+        "PROMPT requires payload.prompt.text"
+      );
+    }
+
+    const options =
+      message.payload?.options || {};
+
+    const request =
+      this.requestManager.startPrompt(
+        connection,
+        sessionId,
+        requestId,
+        prompt,
+        options
+      );
+
+    connection.send(
+      GarpMessageType.PROMPT_ACK,
+      {
+        state: "accepted",
+      },
+      {
+        request_id:
+          request.requestId,
+        session_id:
+          request.sessionId,
+      }
+    );
+  }
+
+  handleCancel(connection, decoded) {
+    const requestId =
+      decoded.message.request_id ||
+      decoded.request_id;
+
+    if (!requestId) {
+      throw new GarpError(
+        GarpErrorCode.BAD_REQUEST,
+        "CANCEL_PROMPT requires request_id"
+      );
+    }
+
+    const request =
+      this.requestManager.cancel(
+        requestId,
+        decoded.message.payload?.reason ||
+          "cancelled"
+      );
+
+    connection.send(
+      GarpMessageType.CANCEL_ACK,
+      {
+        state: request.state,
+      },
+      {
+        request_id:
+          request.requestId,
+        session_id:
+          request.sessionId,
+      }
+    );
+  }
+
+  handleGetPromptStatus(
+    connection,
+    decoded
+  ) {
+    const requestId =
+      decoded.message.request_id ||
+      decoded.message.payload?.request_id ||
+      decoded.request_id;
+
+    if (!requestId) {
+      throw new GarpError(
+        GarpErrorCode.BAD_REQUEST,
+        "GET_PROMPT_STATUS requires request_id"
+      );
+    }
+
+    const request =
+      this.requestManager.get(
+        requestId
+      );
+
+    this.sendResponse(
+      connection,
+      decoded,
+      request.snapshot()
+    );
+  }
+
+  handleGetResponse(
+    connection,
+    decoded
+  ) {
+    const requestId =
+      decoded.message.request_id ||
+      decoded.request_id;
+
+    const request =
+      this.requestManager.get(
+        requestId
+      );
+
+    if (!request.messageId) {
+      connection.send(
+        "generation_progress",
+        request.snapshot(),
+        {
+          request_id:
+            request.requestId,
+          session_id:
+            request.sessionId,
+        }
+      );
+
+      return;
+    }
+
+    this.sendResponse(
+      connection,
+      decoded,
+      {
+        request_id:
+          request.requestId,
+        state:
+          request.state,
+        message_id:
+          request.messageId,
+        content:
+          request.text,
+        page_generation:
+          request.pageGeneration,
+      }
+    );
+  }
+
+  handleSubscribe(
+    connection,
+    decoded
+  ) {
+    const requestId =
+      decoded.message.request_id ||
+      decoded.message.payload?.request_id ||
+      decoded.request_id;
+
+    if (!requestId) {
+      throw new GarpError(
+        GarpErrorCode.BAD_REQUEST,
+        "SUBSCRIBE_RESPONSE requires request_id"
+      );
+    }
+
+    const request =
+      this.requestManager.get(
+        requestId
+      );
+
+    this.requestManager.subscribe(
+      requestId,
+      connection
+    );
+
+    this.sendResponse(
+      connection,
+      decoded,
+      {
+        request_id: requestId,
+        subscribed: true,
+        state: request.state,
+      }
+    );
+  }
+
+  sendResponse(
+    connection,
+    decoded,
+    payload
+  ) {
+    connection.send(
+      "response",
+      payload,
+      {
+        request_id:
+          decoded.request_id ||
+          decoded.message.request_id ||
+          undefined,
+
+        session_id:
+          decoded.session_id ||
+          decoded.message.session_id ||
+          undefined,
+      }
+    );
+  }
+
+  async callChild(
+    session,
+    operation,
+    payload
+  ) {
+    const tab =
+      this.sessionManager.getTabForSession(
+        session
+      );
+
+    const browser =
+      tab.linkedBrowser;
+
+    if (
+      !browser?.browsingContext
+        ?.currentWindowGlobal
+    ) {
+      throw new GarpError(
+        GarpErrorCode.NAVIGATION_CHANGED,
+        "Browser content is not ready",
+        {
+          retryable: true,
+          state: "PREPARING",
+        }
+      );
+    }
+
+    const actor =
+      browser.browsingContext
+        .currentWindowGlobal
+        .getActor(
+          "AIAutomation"
+        );
+
+    if (!actor) {
+      throw new GarpError(
+        GarpErrorCode.DOM_UNSUPPORTED,
+        "AIAutomation child actor unavailable"
+      );
+    }
+
+    let generationChanged = false;
+
+    if (
+      session._lastActor &&
+      session._lastActor !== actor
+    ) {
+      session.markPageGeneration(
+        session.pageGeneration + 1,
+        browser.currentURI.spec
+      );
+
+      generationChanged = true;
+
+      this.broadcastSession(
+        session,
+        "navigation",
+        {
+          reason:
+            "actor_replaced",
+          page_generation:
+            session.pageGeneration,
+        }
+      );
+    }
+
+    session._lastActor = actor;
+
+    if (
+      !generationChanged &&
+      session.pageURL &&
+      session.pageURL !==
+        browser.currentURI.spec
+    ) {
+      session.markPageGeneration(
+        session.pageGeneration + 1,
+        browser.currentURI.spec
+      );
+
+      generationChanged = true;
+
+      this.broadcastSession(
+        session,
+        "navigation",
+        {
+          reason:
+            "url_changed",
+          page_generation:
+            session.pageGeneration,
+          url:
+            browser.currentURI.spec,
+        }
+      );
+    }
+
+    session.pageURL =
+      browser.currentURI.spec;
+
+    return actor.sendQuery(
+      `GARP:${operation}`,
+      payload
+    );
+  }
+
+  broadcastSession(
+    session,
+    type,
+    payload
+  ) {
+    for (
+      const connection of this.connections
+    ) {
+      if (!connection.authenticated) {
+        continue;
+      }
+
+      connection.send(
+        type,
+        payload,
+        {
+          session_id:
+            session.sessionId,
+          page_generation:
+            session.pageGeneration,
+          timestamp:
+            new Date().toISOString(),
+        }
+      );
+    }
+  }
+
+  emitSessionError(
+    session,
+    error
+  ) {
+    session.state =
+      error?.state || "ERROR";
+
+    this.broadcastSession(
+      session,
+      "provider_error",
+      {
+        code:
+          error?.code ||
+          GarpErrorCode.INTERNAL_ERROR,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+  }
+} 
+================================================================ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\actors\AIAutomationChild.sys.mjs 
+================================================================ 
+import { ProviderRegistry } from "../providers/ProviderRegistry.sys.mjs";
+
+const providers =
+  new ProviderRegistry();
+
+export class AIAutomationChild
+  extends JSWindowActorChild {
+
+  constructor() {
+    super();
+
+    this.lastInjectedPrompt =
+      "";
+
+    this.lastObservedMessageText =
+      "";
+  }
+
+  async receiveMessage(
+    message
+  ) {
+    try {
+      switch (
+        message.name
+      ) {
+        case "GARP:PrepareSession":
+          return this.prepareSession(
+            message.data
+          );
+
+        case "GARP:InspectReady":
+          return this.inspectReady(
+            message.data
+          );
+
+        case "GARP:CaptureSnapshot":
+          return this.captureSnapshot(
+            message.data
+          );
+
+        case "GARP:InjectPrompt":
+          return await this.injectPrompt(
+            message.data
+          );
+
+        case "GARP:ObserveGeneration":
+          return this.observeGeneration(
+            message.data
+          );
+
+        case "GARP:ContinueGeneration":
+          return await this.continueGeneration(
+            message.data
+          );
+
+        case "GARP:CancelGeneration":
+          return this.cancelGeneration(
+            message.data
+          );
+
+        case "GARP:InspectProviderState":
+          return this.inspectProviderState(
+            message.data
+          );
+
+        default:
+          return {
+            error:
+              `Unknown child operation: ${message.name}`,
+            code:
+              "PROTOCOL_ERROR",
+          };
+      }
+    } catch (error) {
+      dump(
+        `AIAutomationChild GARP ERROR: ${error.message}\n${error.stack || ""}\n`
+      );
+
+      return {
+        error:
+          error.message,
+        code:
+          error.code ||
+          "INTERNAL_ERROR",
+        details:
+          error.details ||
+          undefined,
+      };
+    }
+  }
+
+  getAdapter(
+    providerName
+  ) {
+    const adapter =
+      providers.get(
+        providerName
+      );
+
+    if (!adapter) {
+      throw Object.assign(
+        new Error(
+          `Provider not found: ${providerName}`
+        ),
+        {
+          code:
+            "PROVIDER_NOT_FOUND",
+        }
+      );
+    }
+
+    return adapter;
+  }
+
+  prepareSession(
+    data
+  ) {
+    const adapter =
+      this.getAdapter(
+        data.provider
+      );
+
+    const inspection =
+      adapter.inspect(
+        this.document
+      );
+
+    return {
+      provider:
+        adapter.name,
+
+      adapter_version:
+        adapter.adapter_version,
+
+      selector_strategy_version:
+        adapter.selector_strategy_version,
+
+      supported_features:
+        [
+          ...adapter.supported_features
+        ],
+
+      ...inspection,
+
+      url:
+        this.document.location?.href ||
+        "",
+    };
+  }
+
+  inspectReady(
+    data
+  ) {
+    const adapter =
+      this.getAdapter(
+        data.provider
+      );
+
+    const inspection =
+      adapter.inspect(
+        this.document
+      );
+
+    return {
+      state:
+        inspection.authenticated ===
+          false
+          ? "AUTH_REQUIRED"
+          : inspection.rate_limited
+          ? "RATE_LIMITED"
+          : inspection.input_ready
+          ? "READY"
+          : "NOT_READY",
+
+      ...inspection,
+    };
+  }
+
+  responseNodes(
+    adapter
+  ) {
+    const nodes =
+      adapter.responseNodes(
+        this.document
+      ) || [];
+
+    return Array.from(
+      nodes
+    ).filter(
+      node =>
+        node &&
+        typeof node.textContent ===
+          "string"
+    );
+  }
+
+  captureSnapshot(
+    data
+  ) {
+    const adapter =
+      this.getAdapter(
+        data.provider
+      );
+
+    const nodes =
+      this.responseNodes(
+        adapter
+      );
+
+    const last =
+      nodes.length
+        ? nodes[
+            nodes.length - 1
+          ].textContent.trim()
+        : "";
+
+    this.lastObservedMessageText =
+      last;
+
+    return {
+      provider:
+        adapter.name,
+
+      url:
+        this.document.location?.href ||
+        "",
+
+      input_ready:
+        !!adapter.input(
+          this.document
+        ),
+
+      authenticated:
+        adapter.isAuthenticated(
+          this.document
+        ),
+
+      rate_limited:
+        adapter.isRateLimited(
+          this.document
+        ),
+
+      last_message_count:
+        nodes.length,
+
+      last_message_text:
+        last,
+    };
+  }
+
+  async injectPrompt(
+    data
+  ) {
+    const adapter =
+      this.getAdapter(
+        data.provider
+      );
+
+    const input =
+      adapter.input(
+        this.document
+      );
+
+    if (!input) {
+      return {
+        error:
+          "Input not ready",
+        code:
+          "INPUT_NOT_READY",
+        state:
+          "NOT_READY",
+      };
+    }
+
+    if (
+      !adapter.isAuthenticated(
+        this.document
+      )
+    ) {
+      return {
+        error:
+          "Provider authentication required",
+        code:
+          "AUTH_REQUIRED",
+        state:
+          "AUTH_REQUIRED",
+      };
+    }
+
+    if (
+      adapter.isRateLimited(
+        this.document
+      )
+    ) {
+      return {
+        error:
+          "Provider rate limit detected",
+        code:
+          "PROVIDER_RATE_LIMIT",
+        state:
+          "RATE_LIMITED",
+      };
+    }
+
+    /*
+     * Do not trim the actual prompt.
+     * The protocol payload is authoritative.
+     */
+    this.lastInjectedPrompt =
+      String(
+        data.prompt ?? ""
+      );
+
+    if (
+      !this.lastInjectedPrompt
+    ) {
+      return {
+        error:
+          "Prompt is empty",
+        code:
+          "BAD_REQUEST",
+        state:
+          "ERROR",
+      };
+    }
+
+    const result =
+      await adapter.inject(
+        input,
+        this.lastInjectedPrompt
+      );
+
+    if (result?.error) {
+      return result;
+    }
+
+    const submit =
+      result?.submit_method
+        ? result
+        : await adapter.submit(
+            input,
+            this.document
+          );
+
+    if (
+      submit?.error
+    ) {
+      return submit;
+    }
+
+    if (
+      submit?.submit_method ===
+      "not_available"
+    ) {
+      return {
+        error:
+          "Prompt submission method unavailable",
+        code:
+          "SUBMIT_FAILED",
+        state:
+          "SUBMITTING",
+      };
+    }
+
+    return {
+      status:
+        "injected",
+
+      input_method:
+        result?.input_method ||
+        "dom_event",
+
+      input_verified:
+        result?.input_verified !==
+        false,
+
+      input_text_length:
+        Number(
+          result?.input_text_length ||
+          this.lastInjectedPrompt.length
+        ),
+
+      submit_method:
+        submit.submit_method,
+    };
+  }
+
+  continuationButton(
+    adapter
+  ) {
+    return adapter.findContinueButton(
+      this.document
+    );
+  }
+
+  observeGeneration(
+    data
+  ) {
+    const adapter =
+      this.getAdapter(
+        data.provider
+      );
+
+    const inspection =
+      adapter.inspect(
+        this.document
+      );
+
+    const nodes =
+      this.responseNodes(
+        adapter
+      );
+
+    const last =
+      nodes.length
+        ? nodes[
+            nodes.length - 1
+          ].textContent.trim()
+        : "";
+
+    const continueButton =
+      this.continuationButton(
+        adapter
+      );
+
+    const continuationRequired =
+      !!continueButton;
+
+    if (
+      inspection.authenticated ===
+      false
+    ) {
+      return {
+        error:
+          "Provider authentication required",
+        code:
+          "AUTH_REQUIRED",
+        state:
+          "AUTH_REQUIRED",
+      };
+    }
+
+    if (
+      inspection.rate_limited
+    ) {
+      return {
+        error:
+          "Provider rate limit detected",
+        code:
+          "PROVIDER_RATE_LIMIT",
+        state:
+          "RATE_LIMITED",
+      };
+    }
+
+    return {
+      text:
+        last,
+
+      done:
+        !inspection.streaming &&
+        !continuationRequired,
+
+      continued:
+        false,
+
+      continuation_required:
+        continuationRequired,
+
+      continuation_reason:
+        continuationRequired
+          ? "provider_length_limit"
+          : null,
+
+      message_count:
+        nodes.length,
+
+      message_changed:
+        nodes.length >
+        Number(
+          data.previous_message_count ||
+          0
+        ),
+
+      message_id_hint:
+        nodes.length >
+        Number(
+          data.previous_message_count ||
+          0
+        )
+          ? `dom-message-${nodes.length}`
+          : null,
+
+      streaming:
+        inspection.streaming,
+
+      provider_state:
+        inspection.provider_state,
+
+      page_url:
+        this.document.location?.href ||
+        "",
+    };
+  }
+
+  async continueGeneration(
+    data
+  ) {
+    const adapter =
+      this.getAdapter(
+        data.provider
+      );
+
+    const button =
+      this.continuationButton(
+        adapter
+      );
+
+    if (!button) {
+      return {
+        error:
+          "Continuation button not found",
+        code:
+          "CONTINUATION_FAILED",
+      };
+    }
+
+    button.focus();
+    button.click();
+
+    return {
+      status:
+        "continued",
+
+      reason:
+        data.reason ||
+        "provider_length_limit",
+    };
+  }
+
+  cancelGeneration(
+    data
+  ) {
+    const adapter =
+      this.getAdapter(
+        data.provider
+      );
+
+    const stopped =
+      adapter.cancel(
+        this.document
+      );
+
+    return {
+      state:
+        stopped
+          ? "CANCEL_REQUESTED"
+          : "CANCEL_UNAVAILABLE",
+
+      cancelled:
+        stopped,
+    };
+  }
+
+  inspectProviderState(
+    data
+  ) {
+    const adapter =
+      this.getAdapter(
+        data.provider
+      );
+
+    return adapter.inspect(
+      this.document
+    );
+  }
+} 
+================================================================ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\actors\AIAutomationParent.sys.mjs 
+================================================================ 
+export class AIAutomationParent extends JSWindowActorParent {
+  receiveMessage(_message) {}
+}
+ 
+================================================================ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\diagnostics\AIAutomationDiagnostics.sys.mjs 
+================================================================ 
+export class AIAutomationDiagnostics {
+  static providerState(provider, state, details = {}) {
+    return {
+      provider,
+      state,
+      timestamp: new Date().toISOString(),
+      details,
+    };
+  }
+
+  static error(provider, stage, code, message, details = {}) {
+    return {
+      provider,
+      stage,
+      code,
+      message,
+      details,
+      timestamp: new Date().toISOString(),
+    };
+  }
+}
+ 
+================================================================ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\garp\GarpConnection.sys.mjs 
+================================================================ 
+import { encodeGarpMessage, decodeGarpFrame } from "./GarpFrame.sys.mjs";
+import { GarpError } from "./GarpErrors.sys.mjs";
+
+export class GarpConnection {
+  constructor(transport, service) {
+    this.transport = transport;
+    this.service = service;
+    this.outStream = transport.openOutputStream(0, 0, 0);
+    this.inStream = transport.openInputStream(0, 0, 0);
+    this.buffer = new Uint8Array(0);
+    this.closed = false;
+    this.authenticated = false;
+    this.authState = "CONNECTED";
+    this.lastActivity = Date.now();
+    this.dispatchQueue = Promise.resolve();
+
+    this.pump = Cc["@mozilla.org/network/input-stream-pump;1"].createInstance(Ci.nsIInputStreamPump);
+    this.pump.init(this.inStream, 0, 0, false);
+    this.pump.asyncRead(this);
+  }
+
+  onStartRequest() {}
+
+  onDataAvailable(_request, stream, _offset, count) {
+    if (this.closed) return;
+    const binaryStream = Cc["@mozilla.org/binaryinputstream;1"].createInstance(Ci.nsIBinaryInputStream);
+    binaryStream.setInputStream(stream);
+    const bytes = new Uint8Array(binaryStream.readByteArray(count));
+    this.lastActivity = Date.now();
+    this.dispatchQueue = Promise.resolve();
+    this.appendBytes(bytes);
+    this.processFrames();
+  }
+
+  onStopRequest(_request, _status) {
+    this.close();
+  }
+
+  appendBytes(bytes) {
+    const combined = new Uint8Array(this.buffer.length + bytes.length);
+    combined.set(this.buffer, 0);
+    combined.set(bytes, this.buffer.length);
+    this.buffer = combined;
+  }
+
+  processFrames() {
+    while (!this.closed) {
+      if (this.buffer.length < 48) return;
+      const view = new DataView(this.buffer.buffer, this.buffer.byteOffset, this.buffer.byteLength);
+      const headerLength = view.getUint16(6, false);
+      const payloadLength = view.getUint32(8, false);
+      const frameLength = headerLength + payloadLength;
+      if (headerLength < 48 || frameLength < headerLength || frameLength > 16 * 1024 * 1024 + headerLength) {
+        this.fail(new GarpError("PROTOCOL_ERROR", "Invalid or oversized GARP frame"));
+        return;
+      }
+      if (this.buffer.length < frameLength) return;
+      const frame = this.buffer.slice(0, frameLength);
+      this.buffer = this.buffer.slice(frameLength);
+      try {
+        const decoded = decodeGarpFrame(frame);
+        this.dispatchQueue = this.dispatchQueue
+          .then(() => this.service.handleGarpMessage(this, decoded))
+          .catch(error => this.fail(error));
+      } catch (error) {
+        this.fail(error);
+        return;
+      }
+    }
+  }
+
+  send(type, payload = {}, options = {}) {
+    if (this.closed) return false;
+    try {
+      const bytes = encodeGarpMessage(type, payload, options);
+      const output = Cc["@mozilla.org/binaryoutputstream;1"].createInstance(Ci.nsIBinaryOutputStream);
+      output.setOutputStream(this.outStream);
+      output.writeByteArray(bytes, bytes.length);
+      return true;
+    } catch (error) {
+      this.fail(error);
+      return false;
+    }
+  }
+
+  fail(error) {
+    try {
+      this.send("error", {
+        code: error?.code || "INTERNAL_ERROR",
+        message: error?.message || String(error),
+        retryable: !!error?.retryable,
+        state: error?.state || "ERROR",
+        ...(error?.provider ? { provider: error.provider } : {}),
+        ...(error?.details ? { details: error.details } : {}),
+      });
+    } catch (_) {}
+    this.close();
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    try { this.pump.cancel(0x804B0002); } catch (_) {}
+    try { this.inStream.close(); } catch (_) {}
+    try { this.outStream.close(); } catch (_) {}
+    this.service.removeConnection(this);
+  }
+}
+ 
+================================================================ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\garp\GarpErrors.sys.mjs 
+================================================================ 
+export class GarpError extends Error {
+  constructor(code, message, options = {}) {
+    super(message);
+    this.name = "GarpError";
+    this.code = code;
+    this.retryable = !!options.retryable;
+    this.state = options.state || "ERROR";
+    this.provider = options.provider || null;
+    this.details = options.details || null;
+  }
+}
+
+export const GarpErrorCode = Object.freeze({
+  PROTOCOL_ERROR: "PROTOCOL_ERROR",
+  BAD_REQUEST: "BAD_REQUEST",
+  UNAUTHORIZED: "UNAUTHORIZED",
+  FRAME_TOO_LARGE: "FRAME_TOO_LARGE",
+  SESSION_NOT_FOUND: "SESSION_NOT_FOUND",
+  TAB_NOT_FOUND: "TAB_NOT_FOUND",
+  PROVIDER_NOT_FOUND: "PROVIDER_NOT_FOUND",
+  SESSION_BUSY: "SESSION_BUSY",
+  REQUEST_ID_REUSE: "REQUEST_ID_REUSE",
+  DUPLICATE_REQUEST: "DUPLICATE_REQUEST",
+  SEQUENCE_GAP: "SEQUENCE_GAP",
+  SEQUENCE_CONFLICT: "SEQUENCE_CONFLICT",
+  AUTH_REQUIRED: "AUTH_REQUIRED",
+  INPUT_NOT_READY: "INPUT_NOT_READY",
+  SUBMIT_FAILED: "SUBMIT_FAILED",
+  GENERATION_TIMEOUT: "GENERATION_TIMEOUT",
+  GENERATION_FAILED: "GENERATION_FAILED",
+  CONTINUATION_FAILED: "CONTINUATION_FAILED",
+  NAVIGATION_CHANGED: "NAVIGATION_CHANGED",
+  PROVIDER_RATE_LIMIT: "PROVIDER_RATE_LIMIT",
+  DOM_UNSUPPORTED: "DOM_UNSUPPORTED",
+  CANCELLED: "CANCELLED",
+  RESPONSE_IDENTITY_UNKNOWN: "RESPONSE_IDENTITY_UNKNOWN",
+  INTERNAL_ERROR: "INTERNAL_ERROR",
+});
+ 
+================================================================ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\garp\GarpFrame.sys.mjs 
+================================================================ 
+import {
+  GARP_FIXED_HEADER_LENGTH,
+  GARP_MAX_FRAME_SIZE,
+  GARP_PROTOCOL,
+  GARP_VERSION_BYTE,
+  messageTypeId,
+  messageTypeName,
+} from "./GarpRegistry.sys.mjs";
+import { GarpError, GarpErrorCode } from "./GarpErrors.sys.mjs";
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder("utf-8", { fatal: true });
+
+export function uuidToBytes(value) {
+  const text = String(value || "").toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(text)) {
+    return new Uint8Array(16);
+  }
+  const hex = text.replaceAll("-", "");
+  const bytes = new Uint8Array(16);
+  for (let index = 0; index < 16; index++) {
+    bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+export function bytesToUuid(bytes, offset = 0) {
+  let allZero = true;
+  for (let index = 0; index < 16; index++) {
+    if (bytes[offset + index] !== 0) {
+      allZero = false;
+      break;
+    }
+  }
+  if (allZero) {
+    return null;
+  }
+  const hex = [];
+  for (let index = 0; index < 16; index++) {
+    hex.push(bytes[offset + index].toString(16).padStart(2, "0"));
+  }
+  const text = hex.join("");
+  return `${text.slice(0, 8)}-${text.slice(8, 12)}-${text.slice(12, 16)}-${text.slice(16, 20)}-${text.slice(20)}`;
+}
+
+export function encodeGarpMessage(type, payload = {}, options = {}) {
+  const numericType = typeof type === "number" ? type : messageTypeId(type);
+  const typeName = messageTypeName(numericType);
+  if (!numericType || !typeName) {
+    throw new GarpError(GarpErrorCode.PROTOCOL_ERROR, `Unknown GARP message type: ${type}`);
+  }
+
+  const body = {
+    protocol: GARP_PROTOCOL,
+    type: typeName,
+    ...(options.request_id ? { request_id: options.request_id } : {}),
+    ...(options.session_id ? { session_id: options.session_id } : {}),
+    ...(options.tab_id ? { tab_id: options.tab_id } : {}),
+    ...(options.message_id ? { message_id: options.message_id } : {}),
+    ...(options.sequence != null ? { sequence: options.sequence } : {}),
+    ...(options.page_generation != null ? { page_generation: options.page_generation } : {}),
+    ...(options.timestamp ? { timestamp: options.timestamp } : {}),
+    ...(payload !== undefined ? { payload } : {}),
+  };
+
+  const payloadBytes = textEncoder.encode(JSON.stringify(body));
+  if (payloadBytes.length > GARP_MAX_FRAME_SIZE) {
+    throw new GarpError(GarpErrorCode.FRAME_TOO_LARGE, "GARP payload exceeds maximum frame size");
+  }
+
+  const frame = new Uint8Array(GARP_FIXED_HEADER_LENGTH + payloadBytes.length);
+  const view = new DataView(frame.buffer);
+  frame.set([0x47, 0x41, 0x52, 0x50], 0);
+  view.setUint8(4, GARP_VERSION_BYTE);
+  view.setUint8(5, options.flags || 0);
+  view.setUint16(6, GARP_FIXED_HEADER_LENGTH, false);
+  view.setUint32(8, payloadBytes.length, false);
+  view.setUint16(12, numericType, false);
+  view.setUint16(14, 0, false);
+  frame.set(uuidToBytes(options.request_id), 16);
+  frame.set(uuidToBytes(options.session_id), 32);
+  frame.set(payloadBytes, GARP_FIXED_HEADER_LENGTH);
+  return frame;
+}
+
+export function decodeGarpFrame(frame) {
+  if (frame.length < GARP_FIXED_HEADER_LENGTH) {
+    throw new GarpError(GarpErrorCode.PROTOCOL_ERROR, "GARP frame shorter than fixed header");
+  }
+
+  if (frame[0] !== 0x47 || frame[1] !== 0x41 || frame[2] !== 0x52 || frame[3] !== 0x50) {
+    throw new GarpError(GarpErrorCode.PROTOCOL_ERROR, "Invalid GARP magic");
+  }
+
+  const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+  if (view.getUint8(4) !== GARP_VERSION_BYTE) {
+    throw new GarpError(GarpErrorCode.PROTOCOL_ERROR, `Unsupported GARP version byte 0x${view.getUint8(4).toString(16)}`);
+  }
+
+  const headerLength = view.getUint16(6, false);
+  const payloadLength = view.getUint32(8, false);
+  if (headerLength < GARP_FIXED_HEADER_LENGTH) {
+    throw new GarpError(GarpErrorCode.PROTOCOL_ERROR, "Invalid GARP header length");
+  }
+  if (frame[14] !== 0 || frame[15] !== 0) {
+    throw new GarpError(GarpErrorCode.PROTOCOL_ERROR, "Reserved header field is nonzero");
+  }
+  if (headerLength + payloadLength !== frame.length) {
+    throw new GarpError(GarpErrorCode.PROTOCOL_ERROR, "GARP payload length mismatch");
+  }
+  if (payloadLength > GARP_MAX_FRAME_SIZE) {
+    throw new GarpError(GarpErrorCode.FRAME_TOO_LARGE, "GARP payload exceeds maximum frame size");
+  }
+
+  const numericType = view.getUint16(12, false);
+  const type = messageTypeName(numericType);
+  if (!type) {
+    throw new GarpError(GarpErrorCode.PROTOCOL_ERROR, `Unknown GARP message type 0x${numericType.toString(16)}`);
+  }
+
+  let json;
+  try {
+    json = JSON.parse(textDecoder.decode(frame.subarray(headerLength)));
+  } catch (error) {
+    throw new GarpError(GarpErrorCode.PROTOCOL_ERROR, `Invalid UTF-8/JSON payload: ${error.message}`);
+  }
+
+  if (!json || typeof json !== "object") {
+    throw new GarpError(GarpErrorCode.PROTOCOL_ERROR, "GARP payload must be a JSON object");
+  }
+  if (json.protocol !== GARP_PROTOCOL || json.type !== type) {
+    throw new GarpError(GarpErrorCode.PROTOCOL_ERROR, "GARP JSON protocol/type does not match binary header");
+  }
+
+  return {
+    numericType,
+    type,
+    request_id: bytesToUuid(frame, 16),
+    session_id: bytesToUuid(frame, 32),
+    message: json,
+  };
+}
+ 
+================================================================ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\garp\GarpRegistry.sys.mjs 
+================================================================ 
+export const GARP_PROTOCOL = "GARP/1.01";
+export const GARP_VERSION_BYTE = 0x11; // major=1, minor=1
+export const GARP_FIXED_HEADER_LENGTH = 48;
+export const GARP_MAX_FRAME_SIZE = 16 * 1024 * 1024;
+
+export const GarpMessageType = Object.freeze({
+  HELLO: 0x0001,
+  HELLO_ACK: 0x0002,
+  CAPABILITIES: 0x0003,
+  BROWSER_STATUS: 0x0004,
+  HELLO_CHALLENGE: 0x0005,
+  RESPONSE: 0x0006,
+  HELLO_AUTH: 0x0007,
+
+  LIST_TABS: 0x0010,
+  OPEN_TAB: 0x0011,
+  CLOSE_TAB: 0x0012,
+  SELECT_TAB: 0x0013,
+
+  CREATE_SESSION: 0x0020,
+  ATTACH_SESSION: 0x0021,
+  DETACH_SESSION: 0x0022,
+  CLOSE_SESSION: 0x0023,
+  RESET_SESSION: 0x0024,
+
+  PROMPT: 0x0030,
+  PROMPT_ACK: 0x0031,
+  CANCEL_PROMPT: 0x0032,
+  CANCEL_ACK: 0x0033,
+  GET_PROMPT_STATUS: 0x0034,
+  GET_RESPONSE: 0x0035,
+  SUBSCRIBE_RESPONSE: 0x0036,
+
+  SESSION_READY: 0x0040,
+  SESSION_CHANGED: 0x0041,
+  INPUT_SUBMITTED: 0x0042,
+  GENERATION_STARTED: 0x0043,
+  GENERATION_DELTA: 0x0044,
+  GENERATION_PROGRESS: 0x0045,
+  CONTINUATION_REQUIRED: 0x0046,
+  CONTINUATION_SUBMITTED: 0x0047,
+  GENERATION_COMPLETED: 0x0048,
+  GENERATION_FAILED: 0x0049,
+
+  NAVIGATION: 0x0050,
+  PROVIDER_ERROR: 0x0051,
+  AUTH_REQUIRED: 0x0052,
+  RATE_LIMITED: 0x0053,
+  DIAGNOSTIC: 0x0054,
+
+  PING: 0x0060,
+  PONG: 0x0061,
+
+  ERROR: 0x00f0,
+});
+
+const TYPE_NAME_BY_ID = new Map(
+  Object.entries(GarpMessageType).map(([name, id]) => [
+    id,
+    name.toLowerCase(),
+  ])
+);
+
+const TYPE_ID_BY_NAME = new Map(
+  Object.entries(GarpMessageType).map(([name, id]) => [
+    name.toLowerCase(),
+    id,
+  ])
+);
+
+export function messageTypeName(id) {
+  return TYPE_NAME_BY_ID.get(id) || null;
+}
+
+export function messageTypeId(name) {
+  return (
+    TYPE_ID_BY_NAME.get(String(name || "").toLowerCase()) || 0
+  );
+}
+
+export const GarpFeature = Object.freeze([
+  "streaming",
+  "cancel",
+  "sessions",
+  "stable_tabs",
+  "response_events",
+  "page_generation",
+  "diagnostics",
+]); 
+================================================================ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\providers\ChatGPTAdapter.sys.mjs 
+================================================================ 
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class ChatGPTAdapter extends ProviderAdapter {
+  constructor() { super("chatgpt", "https://chatgpt.com/"); }
+  input(doc) { return this.findBySelectors(doc, ["#prompt-textarea", 'textarea', '[contenteditable="true"][role="textbox"]']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[data-testid*="send"]', 'button[aria-label*="Send"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, ['[data-message-author-role="assistant"] .markdown', '.agent-turn .markdown']); }
+  isStreaming(doc) { return !!doc.querySelector('[data-testid="stop-button"], .result-streaming'); }
+  isAuthenticated(doc) { return !/(auth0|login|signin)/i.test(doc.location?.href || ""); }
+}
+ 
+================================================================ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\providers\ClaudeAdapter.sys.mjs 
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class ClaudeAdapter extends ProviderAdapter {
+  constructor() { super("claude", "https://claude.ai/"); }
+  input(doc) { return this.findBySelectors(doc, ['div[contenteditable="true"]', 'textarea', '[aria-label*="Claude"]']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label*="Send"]', 'button[style*="background-color"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, [".font-claude-message", ".markdown"]); }
+  isStreaming(doc) { return !!doc.querySelector('.loading-indicator, [class*="streaming"]'); }
+  isAuthenticated(doc) { return !/(login|signin)/i.test(doc.location?.href || ""); }
+}
+ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\providers\CopilotAdapter.sys.mjs 
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class CopilotAdapter extends ProviderAdapter {
+  constructor() { super("copilot", "https://copilot.microsoft.com/"); }
+  input(doc) { return this.findBySelectors(doc, [
+    'textarea#userInput', 'textarea[placeholder*="Message"]', 'textarea[placeholder*="Ask"]',
+    'textarea[placeholder*="Copilot"]', '[data-testid="composer-input"] textarea',
+    '[data-testid="chat-input"] textarea', '.cib-text-input', '#searchbox',
+    'textarea[aria-label*="Ask"]', '[aria-label*="Copilot"] textarea',
+    'div[contenteditable="true"][role="textbox"]', 'textarea'
+  ]); }
+  sendButton(doc) { return this.findBySelectors(doc, [
+    'button[aria-label*="Submit"]', 'button[aria-label*="Send"]',
+    'button[data-testid*="send"]', 'button[type="submit"]'
+  ]); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, [
+    'cib-message-group[source="bot"] cib-message .content', '.cib-message-content',
+    '[data-testid="ai-response"]', '[data-testid*="response"] .content',
+    '.response-message', '.bot-message', '.ac-container', '.message-bubble',
+    '[class*="assistant"][class*="message"]', '[class*="bot"][class*="message"]',
+    '.response-text', '.answer-text', '[class*="ResponseText"]', '[class*="responseText"]'
+  ]); }
+  isStreaming(doc) { return this.findAllBySelectors(doc, [
+    '.loading-dots', '.typing-indicator', '[data-testid="stop-button"]',
+    'button[aria-label*="Stop"]', '.cib-stop-responding-button'
+  ]).length > 0; }
+  async inject(input, prompt) {
+    await super.inject(input, prompt);
+    for (let attempt = 0; attempt < 8; attempt++) {
+      await new Promise(resolve => input.ownerDocument.defaultView.setTimeout(resolve, 300));
+      const button = this.sendButton(input.ownerDocument);
+      if (button) {
+        button.click();
+        return { submit_method: "button_click" };
+      }
+    }
+    return { submit_method: "not_available" };
+  }
+}
+ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\providers\DeepSeekAdapter.sys.mjs 
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+
+export class DeepSeekAdapter extends ProviderAdapter {
+  constructor() {
+    super(
+      "deepseek",
+      "https://chat.deepseek.com/"
+    );
+  }
+
+  input(doc) {
+    return this.findBySelectors(
+      doc,
+      [
+        "textarea.ds-input__input",
+        "textarea#chat-input",
+        'textarea[placeholder*="DeepSeek"]',
+      ]
+    );
+  }
+
+  sendButton(doc) {
+    return this.findBySelectors(
+      doc,
+      [
+        'div[role="button"].ds-icon-button',
+        "button.ds-icon-button",
+        'button[aria-label*="Send"]',
+        '[data-testid*="send"]',
+      ]
+    );
+  }
+
+  responseNodes(doc) {
+    return this.findAllBySelectors(
+      doc,
+      [
+        ".ds-markdown",
+        ".ds-message-bubble",
+      ]
+    );
+  }
+
+  isStreaming(doc) {
+    return !!doc.querySelector(
+      ".ds-loading, [class*=\"loading\"], .spinner, [class*=\"spinner\"], [data-streaming=\"true\"]"
+    );
+  }
+
+  isAuthenticated(doc) {
+    return !/(login|sign_in|auth)/i.test(
+      doc.location?.href || ""
+    );
+  }
+
+  isRateLimited(doc) {
+    return /rate.?limit|too many requests/i.test(
+      doc.body?.innerText || ""
+    );
+  }
+
+  async inject(
+    input,
+    prompt
+  ) {
+    input.focus();
+
+    await new Promise(
+      resolve =>
+        this.windowTimeout(
+          input.ownerDocument.defaultView,
+          1000
+        ).then(resolve)
+    );
+
+    const result =
+      await super.inject(
+        input,
+        prompt
+      );
+
+    await this.windowTimeout(
+      input.ownerDocument.defaultView,
+      100
+    );
+
+    return result;
+  }
+
+  windowTimeout(
+    win,
+    ms
+  ) {
+    return new Promise(
+      resolve =>
+        win.setTimeout(
+          resolve,
+          ms
+        )
+    );
+  }
+} 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\providers\GeminiAdapter.sys.mjs 
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class GeminiAdapter extends ProviderAdapter {
+  constructor() { super("gemini", "https://gemini.google.com/app"); }
+  input(doc) { return this.findBySelectors(doc, [".ql-editor", "textarea"]); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label*="Send"]', 'button[aria-label*="send"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, ["model-response .markdown", ".model-response-text .markdown", ".response-container .markdown", "model-response", ".message-content.model .markdown"]); }
+  isStreaming(doc) { return !!doc.querySelector('button[aria-label*="Stop"], .loading-indicator, mat-progress-bar, .response-loading'); }
+  isAuthenticated(doc) { return !/(accounts.google.com|signin)/i.test(doc.location?.href || ""); }
+}
+ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\providers\GrokAdapter.sys.mjs 
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class GrokAdapter extends ProviderAdapter {
+  constructor() { super("grok", "https://grok.com/"); }
+  input(doc) { return this.findBySelectors(doc, ['.tiptap.ProseMirror', 'textarea[placeholder*="know"]', 'textarea[placeholder*="What"]']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label="Submit"]', 'button[data-testid*="send"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, [".items-start .response-content-markdown"]); }
+  isStreaming(doc) { return !!doc.querySelector('[data-streaming="true"], .loading-indicator, .spinner'); }
+}
+ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\providers\InceptionAdapter.sys.mjs 
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class InceptionAdapter extends ProviderAdapter {
+  constructor() { super("inception", "https://chat.inceptionlabs.ai/"); }
+  input(doc) { return this.findBySelectors(doc, ["textarea", '[contenteditable="true"]']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label*="Send"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, [".prose-chat", ".markdown"]); }
+  isStreaming(doc) { return !!doc.querySelector('.loading-indicator, [class*="loading"]'); }
+  async inject(input, prompt) {
+    await super.inject(input, prompt);
+    const button = this.sendButton(input.ownerDocument);
+    if (button) { button.click(); return { submit_method: "button_click" }; }
+    return { submit_method: "not_available" };
+  }
+}
+ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\providers\PerplexityAdapter.sys.mjs 
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class PerplexityAdapter extends ProviderAdapter {
+  constructor() { super("perplexity", "https://www.perplexity.ai/"); }
+  input(doc) { return this.findBySelectors(doc, ['textarea', '[contenteditable="true"]', '[placeholder*="Ask"]', '[placeholder*="anything"]', 'input[type="text"]']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label*="Submit"]', 'button[class*="send"]', 'button[aria-label*="Send"]', 'button[aria-label*="Ask"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, [".prose", ".markdown", ".break-words"]); }
+  isStreaming(doc) { return !!doc.querySelector('.loading-indicator, [class*="loading"]'); }
+}
+ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\providers\ProviderAdapter.sys.mjs 
+export class ProviderAdapter {
+  constructor(name, url) {
+    this.name = name;
+    this.url = url;
+    this.adapter_version = "1.0.0";
+    this.selector_strategy_version = "1.0.0";
+    this.supported_features = [
+      "streaming",
+      "cancel",
+      "continuation",
+      "diagnostics",
+    ];
+  }
+
+  deepQuerySelectorAll(doc, selector) {
+    const results =
+      Array.from(
+        doc.querySelectorAll(
+          selector
+        )
+      );
+
+    const seenRoots =
+      new Set();
+
+    const walk = root => {
+      if (
+        !root ||
+        seenRoots.has(root)
+      ) {
+        return;
+      }
+
+      seenRoots.add(root);
+
+      for (
+        const element of
+          root.querySelectorAll?.("*") ||
+          []
+      ) {
+        if (element.shadowRoot) {
+          results.push(
+            ...element.shadowRoot.querySelectorAll(
+              selector
+            )
+          );
+
+          walk(
+            element.shadowRoot
+          );
+        }
+      }
+    };
+
+    walk(doc);
+
+    return [
+      ...new Set(results)
+    ];
+  }
+
+  visible(element) {
+    if (!element) {
+      return false;
+    }
+
+    return !!(
+      (
+        element.offsetWidth > 0 ||
+        element.offsetHeight > 0 ||
+        element.getClientRects?.().length >
+          0
+      ) &&
+      element.style?.display !==
+        "none" &&
+      element.style?.visibility !==
+        "hidden"
+    );
+  }
+
+  enabled(element) {
+    return !!element &&
+      !element.disabled &&
+      element.getAttribute(
+        "aria-disabled"
+      ) !== "true";
+  }
+
+  findBySelectors(
+    doc,
+    selectors
+  ) {
+    for (
+      const selector of
+        selectors
+    ) {
+      const elements =
+        this.deepQuerySelectorAll(
+          doc,
+          selector
+        );
+
+      for (
+        const element of
+          elements
+      ) {
+        if (
+          this.visible(element) &&
+          this.enabled(element)
+        ) {
+          return element;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  findAllBySelectors(
+    doc,
+    selectors
+  ) {
+    const results = [];
+
+    for (
+      const selector of
+        selectors
+    ) {
+      results.push(
+        ...this.deepQuerySelectorAll(
+          doc,
+          selector
+        )
+      );
+    }
+
+    return [
+      ...new Set(results)
+    ].filter(
+      element =>
+        this.visible(element)
+    );
+  }
+
+  findContinueButton(doc) {
+    const selectors = [
+      'button[data-testid*="continue"]',
+      'button[aria-label*="Continue"]',
+      'button[aria-label*="continue"]',
+      'button[aria-label*="继续"]',
+      "button, [role=button]",
+    ];
+
+    const isContinue =
+      text => {
+        const value =
+          String(
+            text || ""
+          )
+            .trim()
+            .toLowerCase();
+
+        return (
+          value ===
+            "continue" ||
+          value.startsWith(
+            "continue"
+          ) ||
+          value ===
+            "继续" ||
+          value.includes(
+            "继续生成"
+          ) ||
+          value ===
+            "continuer" ||
+          value ===
+            "continuar" ||
+          value ===
+            "weiter"
+        );
+      };
+
+    for (
+      const element of
+        this.findAllBySelectors(
+          doc,
+          selectors
+        ).reverse()
+    ) {
+      if (
+        isContinue(
+          element.textContent
+        ) ||
+        isContinue(
+          element.getAttribute(
+            "aria-label"
+          )
+        )
+      ) {
+        return element;
+      }
+    }
+
+    return null;
+  }
+
+  input(doc) {
+    return this.findBySelectors(
+      doc,
+      [
+        "textarea",
+        '[contenteditable="true"]',
+      ]
+    );
+  }
+
+  sendButton(doc) {
+    return this.findBySelectors(
+      doc,
+      [
+        'button[aria-label*="Send"]',
+        'button[aria-label*="Submit"]',
+        'button[type="submit"]',
+      ]
+    );
+  }
+
+  responseNodes(doc) {
+    return this.findAllBySelectors(
+      doc,
+      [
+        ".markdown",
+        '[data-message-author-role="assistant"]',
+      ]
+    );
+  }
+
+  isStreaming(doc) {
+    return !!doc.querySelector(
+      '[data-streaming="true"], .loading-indicator, .spinner'
+    );
+  }
+
+  isAuthenticated(doc) {
+    return true;
+  }
+
+  isRateLimited(doc) {
+    return false;
+  }
+
+  dispatchInputEvent(
+    input,
+    prompt
+  ) {
+    const win =
+      input.ownerDocument
+        .defaultView;
+
+    try {
+      input.dispatchEvent(
+        new InputEvent(
+          "input",
+          {
+            bubbles: true,
+            cancelable: true,
+            inputType:
+              "insertText",
+            data:
+              prompt,
+          }
+        )
+      );
+    } catch (_) {
+      input.dispatchEvent(
+        new Event(
+          "input",
+          {
+            bubbles: true,
+            cancelable: true,
+          }
+        )
+      );
+    }
+
+    input.dispatchEvent(
+      new Event(
+        "change",
+        {
+          bubbles: true,
+        }
+      )
+    );
+
+    return win;
+  }
+
+  async inject(
+    input,
+    prompt
+  ) {
+    if (!input) {
+      throw Object.assign(
+        new Error(
+          "Input element is unavailable"
+        ),
+        {
+          code:
+            "INPUT_NOT_READY",
+        }
+      );
+    }
+
+    const doc =
+      input.ownerDocument;
+
+    const win =
+      doc.defaultView;
+
+    input.focus();
+
+    /*
+     * Standard HTML input/textarea path.
+     *
+     * Use the native prototype setter so frameworks such as React/Vue
+     * observe an actual value change instead of only seeing a DOM mutation.
+     */
+    if (
+      "value" in input
+    ) {
+      const prototype =
+        Object.getPrototypeOf(
+          input
+        );
+
+      const descriptor =
+        Object.getOwnPropertyDescriptor(
+          prototype,
+          "value"
+        );
+
+      if (
+        descriptor?.set
+      ) {
+        descriptor.set.call(
+          input,
+          prompt
+        );
+      } else {
+        input.value =
+          prompt;
+      }
+
+      this.dispatchInputEvent(
+        input,
+        prompt
+      );
+
+      /*
+       * Give the page framework a chance to process the input event.
+       */
+      await new Promise(
+        resolve =>
+          win.setTimeout(
+            resolve,
+            50
+          )
+      );
+
+      const actual =
+        String(
+          input.value ?? ""
+        );
+
+      if (
+        actual !== prompt
+      ) {
+        throw Object.assign(
+          new Error(
+            `Input verification failed: expected ${prompt.length} characters, got ${actual.length}`
+          ),
+          {
+            code:
+              "INPUT_INJECTION_FAILED",
+            details: {
+              expected_length:
+                prompt.length,
+              actual_length:
+                actual.length,
+              actual_text:
+                actual,
+            },
+          }
+        );
+      }
+
+      return {
+        input_method:
+          "native_value_setter",
+        input_verified:
+          true,
+        input_text_length:
+          actual.length,
+      };
+    }
+
+    /*
+     * Contenteditable path.
+     */
+    if (
+      input.isContentEditable ||
+      input.getAttribute(
+        "contenteditable"
+      ) === "true"
+    ) {
+      const selection =
+        win.getSelection();
+
+      const range =
+        doc.createRange();
+
+      range.selectNodeContents(
+        input
+      );
+
+      selection.removeAllRanges();
+      selection.addRange(range);
+
+      let inserted = false;
+
+      try {
+        inserted =
+          doc.execCommand(
+            "insertText",
+            false,
+            prompt
+          );
+      } catch (_) {
+        inserted = false;
+      }
+
+      if (!inserted) {
+        input.textContent =
+          prompt;
+      }
+
+      this.dispatchInputEvent(
+        input,
+        prompt
+      );
+
+      await new Promise(
+        resolve =>
+          win.setTimeout(
+            resolve,
+            50
+          )
+      );
+
+      const actual =
+        String(
+          input.textContent || ""
+        );
+
+      if (
+        actual !== prompt
+      ) {
+        throw Object.assign(
+          new Error(
+            `Contenteditable verification failed: expected ${prompt.length} characters, got ${actual.length}`
+          ),
+          {
+            code:
+              "INPUT_INJECTION_FAILED",
+            details: {
+              expected_length:
+                prompt.length,
+              actual_length:
+                actual.length,
+              actual_text:
+                actual,
+            },
+          }
+        );
+      }
+
+      return {
+        input_method:
+          "contenteditable",
+        input_verified:
+          true,
+        input_text_length:
+          actual.length,
+      };
+    }
+
+    throw Object.assign(
+      new Error(
+        "Unsupported provider input element"
+      ),
+      {
+        code:
+          "INPUT_INJECTION_FAILED",
+      }
+    );
+  }
+
+  async submit(
+    input,
+    doc
+  ) {
+    const button =
+      this.sendButton(doc);
+
+    if (button) {
+      button.focus();
+      button.click();
+
+      return {
+        submit_method:
+          "button_click",
+      };
+    }
+
+    return {
+      submit_method:
+        "not_available",
+    };
+  }
+
+  cancel(doc) {
+    const stop =
+      this.findBySelectors(
+        doc,
+        [
+          'button[aria-label*="Stop"]',
+          'button[data-testid*="stop"]',
+          '[data-testid="stop-button"]',
+        ]
+      );
+
+    if (stop) {
+      stop.click();
+      return true;
+    }
+
+    return false;
+  }
+
+  inspect(doc) {
+    const nodes =
+      this.responseNodes(
+        doc
+      );
+
+    const last =
+      nodes.length
+        ? nodes[
+            nodes.length - 1
+          ]
+        : null;
+
+    return {
+      input_ready:
+        !!this.input(doc),
+
+      input_state:
+        this.input(doc)
+          ? "READY"
+          : "NOT_READY",
+
+      authenticated:
+        this.isAuthenticated(
+          doc
+        ),
+
+      rate_limited:
+        this.isRateLimited(
+          doc
+        ),
+
+      message_count:
+        nodes.length,
+
+      last_message_text:
+        last?.textContent?.trim() ||
+        "",
+
+      streaming:
+        this.isStreaming(
+          doc
+        ),
+
+      provider_state:
+        this.isStreaming(
+          doc
+        )
+          ? "busy"
+          : "idle",
+    };
+  }
+} 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\providers\ProviderRegistry.sys.mjs 
+import { DeepSeekAdapter } from "./DeepSeekAdapter.sys.mjs";
+import { GeminiAdapter } from "./GeminiAdapter.sys.mjs";
+import { ChatGPTAdapter } from "./ChatGPTAdapter.sys.mjs";
+import { ClaudeAdapter } from "./ClaudeAdapter.sys.mjs";
+import { GrokAdapter } from "./GrokAdapter.sys.mjs";
+import { CopilotAdapter } from "./CopilotAdapter.sys.mjs";
+import { PerplexityAdapter } from "./PerplexityAdapter.sys.mjs";
+import { InceptionAdapter } from "./InceptionAdapter.sys.mjs";
+
+export class ProviderRegistry {
+  constructor() {
+    this.adapters = new Map();
+    for (const adapter of [
+      new DeepSeekAdapter(), new GeminiAdapter(), new ChatGPTAdapter(), new ClaudeAdapter(),
+      new GrokAdapter(), new CopilotAdapter(), new PerplexityAdapter(), new InceptionAdapter(),
+    ]) {
+      this.adapters.set(adapter.name, adapter);
+    }
+  }
+
+  get(name) { return this.adapters.get(String(name || "").toLowerCase()) || null; }
+  list() { return [...this.adapters.values()].map(adapter => ({
+    provider: adapter.name,
+    url: adapter.url,
+    adapter_version: adapter.adapter_version,
+    selector_strategy_version: adapter.selector_strategy_version,
+    supported_features: [...adapter.supported_features],
+  })); }
+}
+ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\requests\GarpRequest.sys.mjs 
+export class GarpRequest {
+  constructor(requestId, sessionId, prompt, options = {}) {
+    this.requestId = requestId;
+    this.sessionId = sessionId;
+    this.prompt = prompt;
+    this.options = options;
+    this.state = "SUBMITTING";
+    this.messageId = null;
+    this.sequence = 0;
+    this.pageGeneration = 0;
+    this.text = "";
+    this.lastText = "";
+    this.lastMessageCount = 0;
+    this.startedAt = Date.now();
+    this.completedAt = null;
+    this.continuationCount = 0;
+    this.lastEventTime = this.startedAt;
+    this.error = null;
+    this.responseStarted = false;
+  }
+
+  nextSequence() {
+    this.sequence += 1;
+    return this.sequence;
+  }
+
+  snapshot() {
+    return {
+      request_id: this.requestId,
+      session_id: this.sessionId,
+      state: this.state,
+      message_id: this.messageId,
+      sequence: this.sequence,
+      page_generation: this.pageGeneration,
+      content: this.text,
+      continuation_count: this.continuationCount,
+      started_at: this.startedAt,
+      completed_at: this.completedAt,
+      ...(this.error ? { error: this.error } : {}),
+    };
+  }
+}
+ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\requests\GarpRequestManager.sys.mjs 
+import { GarpRequest } from "./GarpRequest.sys.mjs";
+import { GarpError, GarpErrorCode } from "../garp/GarpErrors.sys.mjs";
+
+function uuid() {
+  return crypto.randomUUID();
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+export class GarpRequestManager {
+  constructor(service, sessionManager, providerRegistry) {
+    this.service = service;
+    this.sessionManager = sessionManager;
+    this.providerRegistry = providerRegistry;
+    this.requests = new Map();
+    this.subscribers = new Map();
+  }
+
+  get(requestId) {
+    const request = this.requests.get(requestId);
+
+    if (!request) {
+      throw new GarpError(
+        "REQUEST_NOT_FOUND",
+        `Request not found: ${requestId}`
+      );
+    }
+
+    return request;
+  }
+
+  subscribe(requestId, connection) {
+    let set = this.subscribers.get(requestId);
+
+    if (!set) {
+      set = new Set();
+      this.subscribers.set(requestId, set);
+    }
+
+    set.add(connection);
+  }
+
+  unsubscribeConnection(connection) {
+    for (const set of this.subscribers.values()) {
+      set.delete(connection);
+    }
+  }
+
+  emit(request, type, payload, extra = {}) {
+    const options = {
+      request_id: request.requestId,
+      session_id: request.sessionId,
+      message_id: request.messageId || undefined,
+      sequence: request.nextSequence(),
+      page_generation: request.pageGeneration || undefined,
+      timestamp: new Date().toISOString(),
+      ...extra,
+    };
+
+    const subscribers =
+      this.subscribers.get(request.requestId) || [];
+
+    for (const connection of subscribers) {
+      connection.send(type, payload, options);
+    }
+
+    return options.sequence;
+  }
+
+  startPrompt(
+    connection,
+    sessionId,
+    requestId,
+    prompt,
+    options = {}
+  ) {
+    if (!requestId) {
+      requestId = uuid();
+    }
+
+    if (this.requests.has(requestId)) {
+      const existing = this.requests.get(requestId);
+
+      if (
+        existing.prompt !== prompt ||
+        existing.sessionId !== sessionId
+      ) {
+        throw new GarpError(
+          GarpErrorCode.REQUEST_ID_REUSE,
+          "request_id already exists with different content"
+        );
+      }
+
+      this.subscribe(
+        requestId,
+        connection
+      );
+
+      return existing;
+    }
+
+    const session =
+      this.sessionManager.get(sessionId);
+
+    session.assertIdle();
+
+    const request =
+      new GarpRequest(
+        requestId,
+        sessionId,
+        prompt,
+        options
+      );
+
+    this.requests.set(
+      requestId,
+      request
+    );
+
+    this.subscribe(
+      requestId,
+      connection
+    );
+
+    session.activeRequestId =
+      requestId;
+
+    session.lastRequestId =
+      requestId;
+
+    session.state = "BUSY";
+
+    request.pageGeneration =
+      session.pageGeneration;
+
+    this.runPrompt(request).catch(
+      error =>
+        this.fail(
+          request,
+          error
+        )
+    );
+
+    return request;
+  }
+
+  async waitForSessionReady(session, request) {
+    const timeout =
+      Number(
+        request.options.ready_timeout_ms ||
+        request.options.timeout_ms ||
+        30000
+      );
+
+    const start =
+      Date.now();
+
+    const intervalMs = 250;
+
+    for (;;) {
+      if (
+        !this.requests.has(
+          request.requestId
+        )
+      ) {
+        throw new GarpError(
+          GarpErrorCode.GENERATION_FAILED,
+          "Request disappeared while waiting for provider readiness"
+        );
+      }
+
+      if (
+        request.state === "CANCELLED"
+      ) {
+        throw new GarpError(
+          GarpErrorCode.GENERATION_FAILED,
+          "Request cancelled while waiting for provider readiness"
+        );
+      }
+
+      if (
+        Date.now() - start >= timeout
+      ) {
+        throw new GarpError(
+          GarpErrorCode.GENERATION_TIMEOUT,
+          "Timed out waiting for provider input to become ready",
+          {
+            retryable: true,
+            state: "PREPARING",
+          }
+        );
+      }
+
+      try {
+        const result =
+          await this.service.callChild(
+            session,
+            "InspectReady",
+            {
+              provider:
+                session.provider,
+            }
+          );
+
+        if (result?.error) {
+          throw this.errorFromChild(
+            result
+          );
+        }
+
+        session.inputState =
+          result.input_state ||
+          (
+            result.input_ready
+              ? "READY"
+              : "NOT_READY"
+          );
+
+        if (
+          result.authenticated === false ||
+          result.state ===
+            "AUTH_REQUIRED"
+        ) {
+          throw new GarpError(
+            GarpErrorCode.AUTH_REQUIRED,
+            "Provider authentication required",
+            {
+              state: "AUTH_REQUIRED",
+              provider:
+                session.provider,
+            }
+          );
+        }
+
+        if (
+          result.rate_limited ||
+          result.state ===
+            "RATE_LIMITED"
+        ) {
+          throw new GarpError(
+            GarpErrorCode.PROVIDER_RATE_LIMIT,
+            "Provider rate limit detected",
+            {
+              state: "RATE_LIMITED",
+              retryable: true,
+              provider:
+                session.provider,
+            }
+          );
+        }
+
+        if (
+          result.input_ready === true
+        ) {
+          session.state = "READY";
+          return result;
+        }
+
+        session.state = "PREPARING";
+      } catch (error) {
+        const code =
+          error?.code || "";
+
+        if (
+          code !==
+            GarpErrorCode.NAVIGATION_CHANGED &&
+          code !==
+            GarpErrorCode.DOM_UNSUPPORTED
+        ) {
+          throw error;
+        }
+
+        /*
+         * Navigation/actor replacement is expected while a provider page
+         * is loading. callChild() will reacquire the current actor on the
+         * next iteration.
+         */
+        session.state =
+          "PREPARING";
+      }
+
+      await sleep(
+        intervalMs
+      );
+    }
+  }
+
+  async runPrompt(request) {
+    const session =
+      this.sessionManager.get(
+        request.sessionId
+      );
+
+    const adapter =
+      this.providerRegistry.get(
+        session.provider
+      );
+
+    if (!adapter) {
+      throw new GarpError(
+        GarpErrorCode.PROVIDER_NOT_FOUND,
+        `Provider not found: ${session.provider}`
+      );
+    }
+
+    /*
+     * Important:
+     *
+     * CREATE_SESSION initially creates a PREPARING session and the browser
+     * may replace its actor while the provider page loads. Never attempt
+     * prompt injection until the CURRENT actor reports input_ready=true.
+     */
+    await this.waitForSessionReady(
+      session,
+      request
+    );
+
+    /*
+     * Capture the provider state only after readiness has been established.
+     * callChild() also verifies/reacquires the current actor and updates
+     * page_generation if the actor changed.
+     */
+    const snapshot =
+      await this.service.callChild(
+        session,
+        "CaptureSnapshot",
+        {
+          provider:
+            session.provider,
+        }
+      );
+
+    if (snapshot?.error) {
+      throw this.errorFromChild(
+        snapshot
+      );
+    }
+
+    request.lastMessageCount =
+      Number(
+        snapshot?.last_message_count || 0
+      );
+
+    request.lastText =
+      String(
+        snapshot?.last_message_text || ""
+      );
+
+    session.lastMessageCount =
+      request.lastMessageCount;
+
+    session.lastMessageText =
+      request.lastText;
+
+    request.pageGeneration =
+      session.pageGeneration;
+
+    request.messageId =
+      crypto.randomUUID();
+
+    /*
+     * Inject first.
+     *
+     * Do NOT emit generation_started before we know the input was actually
+     * accepted by the provider page.
+     */
+    const inject =
+      await this.service.callChild(
+        session,
+        "InjectPrompt",
+        {
+          provider:
+            session.provider,
+          prompt:
+            request.prompt,
+          forceFocus:
+            !!request.options.force_focus,
+          simulateEnter:
+            !!request.options.simulate_enter,
+        }
+      );
+
+    if (inject?.error) {
+      throw this.errorFromChild(
+        inject
+      );
+    }
+
+    /*
+     * callChild() may detect an actor replacement during injection.
+     * Always use the current generation when reporting the event.
+     */
+    request.pageGeneration =
+      session.pageGeneration;
+
+    request.state =
+      "STREAMING";
+
+    session.generationState =
+      "STREAMING";
+
+    this.emit(
+      request,
+      "input_submitted",
+      {
+        state: "SUBMITTED",
+        input_method:
+          inject.input_method ||
+          "dom_event",
+        submit_method:
+          inject.submit_method ||
+          "button_click",
+        input_verified:
+          inject.input_verified !== false,
+        input_text_length:
+          Number(
+            inject.input_text_length ||
+            request.prompt.length
+          ),
+      }
+    );
+
+    this.emit(
+      request,
+      "generation_started",
+      {
+        state: "STARTING",
+        submission_snapshot:
+          snapshot,
+      }
+    );
+
+    this.observe(
+      request
+    ).catch(
+      error =>
+        this.fail(
+          request,
+          error
+        )
+    );
+  }
+
+  errorFromChild(result) {
+    return new GarpError(
+      result.code ||
+        GarpErrorCode.GENERATION_FAILED,
+      result.error ||
+        "Firefox child actor operation failed",
+      {
+        state:
+          result.state ||
+          "ERROR",
+        retryable:
+          !!result.retryable,
+        details:
+          result,
+      }
+    );
+  }
+
+  async observe(request) {
+    const session =
+      this.sessionManager.get(
+        request.sessionId
+      );
+
+    const timeout =
+      Number(
+        request.options.timeout_ms ||
+        180000
+      );
+
+    const intervalMs = 500;
+    const settleTicks = 6;
+
+    let lastObserved =
+      request.lastText;
+
+    let stableTicks = 0;
+    let ticks = 0;
+
+    for (;;) {
+      if (
+        !this.requests.has(
+          request.requestId
+        )
+      ) {
+        return;
+      }
+
+      if (
+        request.state === "CANCELLED" ||
+        request.state === "COMPLETE" ||
+        request.state === "FAILED"
+      ) {
+        return;
+      }
+
+      ticks++;
+
+      if (
+        Date.now() -
+          request.startedAt >
+        timeout
+      ) {
+        throw new GarpError(
+          GarpErrorCode.GENERATION_TIMEOUT,
+          "Generation timeout",
+          {
+            retryable: true,
+            state: "TIMEOUT",
+          }
+        );
+      }
+
+      const currentTab =
+        this.sessionManager.getTabForSession(
+          session
+        );
+
+      session.markPageGeneration(
+        session.pageGeneration,
+        currentTab.linkedBrowser.currentURI.spec
+      );
+
+      request.pageGeneration =
+        session.pageGeneration;
+
+      const result =
+        await this.service.callChild(
+          session,
+          "ObserveGeneration",
+          {
+            provider:
+              session.provider,
+            previous_message_count:
+              request.lastMessageCount,
+            previous_message_text:
+              request.lastText,
+          }
+        );
+
+      if (result?.error) {
+        throw this.errorFromChild(
+          result
+        );
+      }
+
+      if (
+        Number(
+          result.page_generation ||
+          session.pageGeneration
+        ) >
+        session.pageGeneration
+      ) {
+        session.markPageGeneration(
+          Number(
+            result.page_generation
+          ),
+          currentTab.linkedBrowser.currentURI.spec
+        );
+
+        request.pageGeneration =
+          session.pageGeneration;
+      }
+
+      const text =
+        String(
+          result.text || ""
+        );
+
+      const done =
+        !!result.done;
+
+      const continued =
+        !!result.continued;
+
+      const count =
+        Number(
+          result.message_count || 0
+        );
+
+      if (
+        result.authenticated === false ||
+        result.state ===
+          "AUTH_REQUIRED"
+      ) {
+        throw new GarpError(
+          GarpErrorCode.AUTH_REQUIRED,
+          "Provider authentication required",
+          {
+            state:
+              "AUTH_REQUIRED",
+            provider:
+              session.provider,
+          }
+        );
+      }
+
+      if (result.rate_limited) {
+        throw new GarpError(
+          GarpErrorCode.PROVIDER_RATE_LIMIT,
+          "Provider rate limit detected",
+          {
+            state:
+              "RATE_LIMITED",
+            retryable: true,
+            provider:
+              session.provider,
+          }
+        );
+      }
+
+      if (
+        result.message_id &&
+        request.message_id_authoritative !== true
+      ) {
+        request.messageId =
+          result.message_id;
+
+        request.message_id_authoritative =
+          true;
+      }
+
+      if (continued) {
+        request.continuationCount += 1;
+
+        this.emit(
+          request,
+          "continuation_submitted",
+          {
+            count:
+              request.continuationCount,
+            reason:
+              result.continuation_reason ||
+              "provider_length_limit",
+          }
+        );
+
+        stableTicks = 0;
+      }
+
+      const responseIdentified =
+        !request.responseStarted &&
+        (
+          count >
+            request.lastMessageCount ||
+          (
+            text &&
+            text !==
+              request.lastText
+          )
+        );
+
+      if (responseIdentified) {
+        request.responseStarted =
+          true;
+      }
+
+      if (
+        request.responseStarted &&
+        text &&
+        text !== lastObserved
+      ) {
+        stableTicks = 0;
+        lastObserved = text;
+        request.text = text;
+
+        this.emit(
+          request,
+          "generation_delta",
+          {
+            text_delta:
+              this.delta(
+                request.lastText,
+                text
+              ),
+            text_revision:
+              ticks,
+          }
+        );
+
+        request.lastText =
+          text;
+      } else if (
+        request.responseStarted &&
+        text
+      ) {
+        stableTicks += 1;
+      }
+
+      if (
+        result.continuation_required
+      ) {
+        request.state =
+          "CONTINUATION_REQUIRED";
+
+        this.emit(
+          request,
+          "continuation_required",
+          {
+            reason:
+              result.continuation_reason ||
+              "provider_length_limit",
+          }
+        );
+
+        if (
+          request.options.auto_continue ===
+          false
+        ) {
+          request.state =
+            "COMPLETE";
+
+          request.completedAt =
+            Date.now();
+
+          this.complete(
+            request,
+            session,
+            result
+          );
+
+          return;
+        }
+
+        if (
+          request.continuationCount >=
+          Number(
+            request.options.max_continuations ||
+            8
+          )
+        ) {
+          throw new GarpError(
+            GarpErrorCode.CONTINUATION_FAILED,
+            "Maximum automatic continuations exceeded",
+            {
+              state:
+                "CONTINUATION_REQUIRED",
+            }
+          );
+        }
+
+        const continuedResult =
+          await this.service.callChild(
+            session,
+            "ContinueGeneration",
+            {
+              provider:
+                session.provider,
+              reason:
+                result.continuation_reason ||
+                "provider_length_limit",
+            }
+          );
+
+        if (
+          continuedResult?.error
+        ) {
+          throw this.errorFromChild(
+            continuedResult
+          );
+        }
+
+        request.continuationCount +=
+          1;
+
+        request.state =
+          "STREAMING";
+
+        this.emit(
+          request,
+          "continuation_submitted",
+          {
+            count:
+              request.continuationCount,
+            reason:
+              result.continuation_reason ||
+              "provider_length_limit",
+          }
+        );
+      } else if (
+        request.responseStarted &&
+        done &&
+        text &&
+        stableTicks >=
+          Math.max(
+            2,
+            settleTicks
+          )
+      ) {
+        this.complete(
+          request,
+          session,
+          result
+        );
+
+        return;
+      } else if (
+        request.responseStarted &&
+        done &&
+        text &&
+        stableTicks >= 2
+      ) {
+        this.complete(
+          request,
+          session,
+          result
+        );
+
+        return;
+      }
+
+      await sleep(
+        intervalMs
+      );
+    }
+  }
+
+  delta(previous, current) {
+    if (!previous) {
+      return current;
+    }
+
+    if (
+      current.startsWith(
+        previous
+      )
+    ) {
+      return current.slice(
+        previous.length
+      );
+    }
+
+    return current;
+  }
+
+  complete(
+    request,
+    session,
+    result
+  ) {
+    request.state =
+      "COMPLETE";
+
+    request.completedAt =
+      Date.now();
+
+    session.state =
+      "READY";
+
+    session.generationState =
+      "IDLE";
+
+    session.activeRequestId =
+      null;
+
+    if (request.messageId) {
+      session.lastMessageId =
+        request.messageId;
+    }
+
+    session.lastMessageText =
+      request.text;
+
+    session.lastMessageCount =
+      Number(
+        result.message_count ||
+        session.lastMessageCount
+      );
+
+    this.emit(
+      request,
+      "generation_completed",
+      {
+        content:
+          request.text,
+        format:
+          "text",
+        finish_reason:
+          result.finish_reason ||
+          "stop",
+        provider_state:
+          result.provider_state ||
+          "idle",
+        response_identity: {
+          message_id:
+            request.messageId,
+          message_count:
+            session.lastMessageCount,
+        },
+      }
+    );
+  }
+
+  fail(request, error) {
+    if (
+      request.state === "COMPLETE" ||
+      request.state === "CANCELLED"
+    ) {
+      return;
+    }
+
+    request.state =
+      "FAILED";
+
+    request.completedAt =
+      Date.now();
+
+    request.error = {
+      code:
+        error?.code ||
+        GarpErrorCode.GENERATION_FAILED,
+      message:
+        error?.message ||
+        String(error),
+    };
+
+    const session =
+      this.sessionManager.sessions.get(
+        request.sessionId
+      );
+
+    if (session) {
+      session.state =
+        error?.state ===
+        "AUTH_REQUIRED"
+          ? "AUTH_REQUIRED"
+          : "ERROR";
+
+      session.generationState =
+        "FAILED";
+
+      session.activeRequestId =
+        null;
+    }
+
+    this.emit(
+      request,
+      "generation_failed",
+      request.error
+    );
+  }
+
+  cancel(
+    requestId,
+    reason = "cancelled"
+  ) {
+    const request =
+      this.get(requestId);
+
+    const session =
+      this.sessionManager.get(
+        request.sessionId
+      );
+
+    if (
+      request.state === "COMPLETE" ||
+      request.state === "FAILED" ||
+      request.state === "CANCELLED"
+    ) {
+      return request;
+    }
+
+    request.state =
+      "CANCELLED";
+
+    request.completedAt =
+      Date.now();
+
+    this.service.callChild(
+      session,
+      "CancelGeneration",
+      {
+        provider:
+          session.provider,
+      }
+    ).catch(() => {});
+
+    session.state =
+      "READY";
+
+    session.generationState =
+      "IDLE";
+
+    session.activeRequestId =
+      null;
+
+    return request;
+  }
+} 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\sessions\AIAutomationSession.sys.mjs 
+import { GarpError, GarpErrorCode } from "../garp/GarpErrors.sys.mjs";
+
+export class AIAutomationSession {
+  constructor({ sessionId, provider, tabId, conversationId = null, pageGeneration = 1 }) {
+    this.sessionId = sessionId;
+    this.provider = provider;
+    this.model = null;
+    this.tabId = tabId;
+    this.conversationId = conversationId;
+    this.pageGeneration = pageGeneration;
+    this.state = "NEW";
+    this.inputState = "UNKNOWN";
+    this.generationState = "IDLE";
+    this.lastRequestId = null;
+    this.lastMessageId = null;
+    this.lastMessageText = "";
+    this.lastMessageCount = 0;
+    this.activeRequestId = null;
+    this.pageURL = "";
+  }
+
+  assertIdle() {
+    if (this.activeRequestId) {
+      throw new GarpError(GarpErrorCode.SESSION_BUSY, "Session already has an active prompt", {
+        provider: this.provider,
+        state: "BUSY",
+      });
+    }
+  }
+
+  markPageGeneration(value, url = "") {
+    const numeric = Number(value);
+    if (Number.isInteger(numeric) && numeric > this.pageGeneration) {
+      this.pageGeneration = numeric;
+    }
+    if (url) this.pageURL = url;
+  }
+
+  snapshot() {
+    return {
+      session_id: this.sessionId,
+      provider: this.provider,
+      model: this.model,
+      tab_id: this.tabId,
+      conversation_id: this.conversationId,
+      page_generation: this.pageGeneration,
+      input_ready: this.inputState === "READY",
+      input_state: this.inputState,
+      generation_state: this.generationState,
+      last_request_id: this.lastRequestId,
+      last_message_id: this.lastMessageId,
+      last_message_count: this.lastMessageCount,
+      url: this.pageURL,
+      state: this.state,
+    };
+  }
+}
+ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\browser\components\aistarter\sessions\AIAutomationSessionManager.sys.mjs 
+import { AIAutomationSession } from "./AIAutomationSession.sys.mjs";
+import { GarpError, GarpErrorCode } from "../garp/GarpErrors.sys.mjs";
+
+function uuid() {
+  return crypto.randomUUID();
+}
+
+export class AIAutomationSessionManager {
+  constructor(service, providerRegistry) {
+    this.service = service;
+    this.providerRegistry = providerRegistry;
+    this.sessions = new Map();
+    this.tabIds = new WeakMap();
+    this.tabsById = new Map();
+  }
+
+  getTopWindow() {
+    return this.service.getTopWindow();
+  }
+
+  getStableTabId(tab) {
+    if (!tab) return null;
+    let id = this.tabIds.get(tab);
+    if (!id) {
+      id = uuid();
+      this.tabIds.set(tab, id);
+      this.tabsById.set(id, tab);
+    }
+    return id;
+  }
+
+  resolveTab(tabSpec) {
+    const win = this.getTopWindow();
+    if (!win) throw new GarpError(GarpErrorCode.TAB_NOT_FOUND, "No browser window found");
+
+    if (this.tabsById.has(tabSpec)) {
+      const tab = this.tabsById.get(tabSpec);
+      if (tab && win.gBrowser.tabs.indexOf(tab) >= 0) return tab;
+      this.tabsById.delete(tabSpec);
+    }
+
+    if (typeof tabSpec === "number" || (typeof tabSpec === "string" && /^\d+$/.test(tabSpec))) {
+      const index = Number.parseInt(tabSpec, 10);
+      const tab = win.gBrowser.tabs[index];
+      if (tab) return tab;
+    }
+
+    const text = String(tabSpec || "");
+    for (const tab of win.gBrowser.tabs) {
+      if (tab.label === text || tab.linkedBrowser?.currentURI?.spec === text) return tab;
+    }
+    for (const tab of win.gBrowser.tabs) {
+      if (tab.label?.toLowerCase().includes(text.toLowerCase()) || tab.linkedBrowser?.currentURI?.spec?.toLowerCase().includes(text.toLowerCase())) return tab;
+    }
+    throw new GarpError(GarpErrorCode.TAB_NOT_FOUND, `Tab not found: ${tabSpec}`);
+  }
+
+  listTabs() {
+    const win = this.getTopWindow();
+    if (!win) throw new GarpError(GarpErrorCode.TAB_NOT_FOUND, "No browser window found");
+    const result = [];
+    for (let index = 0; index < win.gBrowser.tabs.length; index++) {
+      const tab = win.gBrowser.tabs[index];
+      const tabId = this.getStableTabId(tab);
+      const session = [...this.sessions.values()].find(item => item.tabId === tabId) || null;
+      result.push({
+        tab_id: tabId,
+        index,
+        title: tab.label,
+        url: tab.linkedBrowser.currentURI.spec,
+        selected: tab.selected,
+        ...(session ? { provider: session.provider, session_id: session.sessionId, state: session.state } : {}),
+      });
+    }
+    return result;
+  }
+
+  openTab(url) {
+    const win = this.getTopWindow();
+    if (!win) throw new GarpError(GarpErrorCode.TAB_NOT_FOUND, "No browser window found");
+    const tab = win.gBrowser.addTrustedTab(url);
+    win.gBrowser.selectedTab = tab;
+    return { tab_id: this.getStableTabId(tab), index: win.gBrowser.tabs.indexOf(tab), url };
+  }
+
+  closeTab(tabSpec) {
+    const win = this.getTopWindow();
+    const tab = this.resolveTab(tabSpec);
+    const tabId = this.getStableTabId(tab);
+    const sessions = [...this.sessions.values()].filter(item => item.tabId === tabId);
+    for (const session of sessions) this.closeSession(session.sessionId);
+    win.gBrowser.removeTab(tab);
+    this.tabsById.delete(tabId);
+    return { success: true, tab_id: tabId };
+  }
+
+  selectTab(tabSpec) {
+    const win = this.getTopWindow();
+    const tab = this.resolveTab(tabSpec);
+    win.gBrowser.selectedTab = tab;
+    return { success: true, tab_id: this.getStableTabId(tab), index: win.gBrowser.tabs.indexOf(tab) };
+  }
+
+  createSession(providerName, tabSpec = null) {
+    const adapter = this.providerRegistry.get(providerName);
+    if (!adapter) throw new GarpError(GarpErrorCode.PROVIDER_NOT_FOUND, `Provider not found: ${providerName}`);
+
+    let tab;
+    if (tabSpec !== null && tabSpec !== undefined) {
+      tab = this.resolveTab(tabSpec);
+    } else {
+      const win = this.getTopWindow();
+      tab = win.gBrowser.addTrustedTab(adapter.url);
+      win.gBrowser.selectedTab = tab;
+    }
+
+    const session = new AIAutomationSession({
+      sessionId: uuid(),
+      provider: providerName,
+      tabId: this.getStableTabId(tab),
+      pageGeneration: 1,
+    });
+    session.state = "PREPARING";
+    session.pageURL = tab.linkedBrowser.currentURI.spec;
+    this.sessions.set(session.sessionId, session);
+    return session;
+  }
+
+  attachSession(sessionId, tabSpec) {
+    const session = this.get(sessionId);
+    const tab = this.resolveTab(tabSpec);
+    session.tabId = this.getStableTabId(tab);
+    session.state = "PREPARING";
+    session.markPageGeneration(session.pageGeneration + 1, tab.linkedBrowser.currentURI.spec);
+    return session;
+  }
+
+  detachSession(sessionId) {
+    const session = this.get(sessionId);
+    session.state = "NEW";
+    session.activeRequestId = null;
+    return session;
+  }
+
+  closeSession(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    session.state = "CLOSED";
+    session.activeRequestId = null;
+    this.sessions.delete(sessionId);
+  }
+
+  resetSession(sessionId) {
+    const session = this.get(sessionId);
+    session.assertIdle();
+    session.generationState = "IDLE";
+    session.lastRequestId = null;
+    session.lastMessageId = null;
+    session.lastMessageText = "";
+    session.lastMessageCount = 0;
+    session.conversationId = null;
+    session.state = "PREPARING";
+    session.markPageGeneration(session.pageGeneration + 1);
+    return session;
+  }
+
+  get(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new GarpError(GarpErrorCode.SESSION_NOT_FOUND, `Session not found: ${sessionId}`);
+    return session;
+  }
+
+  getTabForSession(session) {
+    return this.resolveTab(session.tabId);
+  }
+}
+ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\integration\BrowserGlue.integration.txt 
+# GARP/1.01 BrowserGlue integration
+
+## 1. Add to the existing ChromeUtils.defineESModuleGetters(lazy, {...}) block:
+
+AIAutomationService: "resource:///modules/aistarter/AIAutomation.sys.mjs",
+
+## 2. In BrowserGlue.prototype._init, after core browser state exists:
+
+try {
+  this.aiAutomationService = new lazy.AIAutomationService();
+  this.aiAutomationService.init();
+} catch (ex) {
+  Cu.reportError("AIAutomationService init failed: " + ex);
+}
+
+Do not create a second AIAutomationService instance elsewhere.
+ 
+FILE: K:\Delphi\Technology\Grisp\github version 0.18 cleanup\Grisp\Grisp AI Relay Protocol\(For Firefox) version 1.04 fix race conditions and bugs\integration\DesktopActorRegistry.integration.txt 

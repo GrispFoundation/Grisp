@@ -1,0 +1,3200 @@
+﻿// File 1: browser\components\aistarter\AIAutomation.sys.mjs
+import {
+  GarpConnectionScopedTypes,
+  GarpMessageType,
+  GarpFeature,
+  GARP_PROTOCOL,
+  GARP_SEMANTIC_VERSION,
+  GARP_WIRE_VERSION,
+  GARP_APPLICATION_LIMIT_DEFAULT,
+  GARP_HANDSHAKE_TIMEOUT_MS,
+  GARP_DEFAULT_RESPONSE_RETENTION_MS,
+  GARP_DEFAULT_RECOVERY_DEADLINE_MS,
+} from "./garp/GarpRegistry.sys.mjs";
+import { GarpConnection } from "./garp/GarpConnection.sys.mjs";
+import { GarpReplayStore } from "./garp/GarpReplayStore.sys.mjs";
+import { GarpError, GarpErrorCode } from "./garp/GarpErrors.sys.mjs";
+import {
+  base64UrlDecode,
+  base64UrlEncode,
+  constantTimeEqualBytes,
+  encodeTranscript,
+  encodeTranscriptCore,
+  hmacSha256,
+  monotonicNow,
+  sha256,
+  sortedUtf8,
+  textEncoder,
+  uuid,
+} from "./garp/GarpUtil.sys.mjs";
+import { validateMessagePayload, validateEnvelope, capabilitiesObject } from "./garp/GarpSchema.sys.mjs";
+import { AIAutomationSessionManager } from "./sessions/AIAutomationSessionManager.sys.mjs";
+import { GarpRequestManager } from "./requests/GarpRequestManager.sys.mjs";
+import { ProviderRegistry } from "./providers/ProviderRegistry.sys.mjs";
+
+const GARP_PORT = 9999;
+
+function readConfiguredSecret() {
+  const value = Services.env.get("GARP_SECRET");
+  if (!value) throw new GarpError(GarpErrorCode.AUTH_FAILED, "GARP_SECRET is required; GARP/1.24 does not generate or persist a deployment secret");
+  const bytes = textEncoder.encode(value);
+  if (bytes.length < 32) throw new GarpError(GarpErrorCode.AUTH_FAILED, "GARP_SECRET must encode to at least 32 raw bytes");
+  return bytes;
+}
+
+export class AIAutomationService {
+  constructor() {
+    this.serverSocket = null;
+    this.connections = new Set();
+    this.providerRegistry = new ProviderRegistry();
+    this.sessionManager = new AIAutomationSessionManager(this, this.providerRegistry);
+    this.requestManager = new GarpRequestManager(this, this.sessionManager, this.providerRegistry);
+    this.replayStore = new GarpReplayStore();
+    this.serverId = uuid();
+    this.serverName = "GarpGateway";
+    this.serverVersion = "1.24.0";
+    this.authSecret = null;
+    this.authDisabled = false;
+    this.capabilities = capabilitiesObject(this.providerRegistry);
+    this.browserStatus = null;
+    this.pruneTimer = null;
+    this.statusTimer = null;
+    this.initializing = false;
+  }
+
+  async initializeSecurityState() {
+    this.authSecret = readConfiguredSecret();
+    await this.replayStore.load();
+    if (!this.replayStore.replayStateAvailable) {
+      this.authDisabled = true;
+      dump("GARP/1.24: authentication replay state unavailable; configured secret is disabled until deployment rotates it.\n");
+    }
+  }
+
+  init() {
+    if (this.serverSocket || this.initializing) return;
+    this.initializing = true;
+    this.initializeSecurityState().then(() => {
+      this.serverSocket = Cc["@mozilla.org/network/server-socket;1"].createInstance(Ci.nsIServerSocket);
+      try {
+        this.serverSocket.init(GARP_PORT, true, -1);
+        this.serverSocket.asyncListen(this);
+        dump(`GARP/1.24: listening on 127.0.0.1:${GARP_PORT}\n`);
+        this.pruneTimer = setInterval(() => this.requestManager.prune(Number(this.capabilities.limits.response_retention_ms)), 60000);
+        this.statusTimer = setInterval(() => this.updateBrowserStatus(), 500);
+        this.updateBrowserStatus(true);
+      } catch (error) {
+        this.serverSocket = null;
+        Cu.reportError(`GARP/1.24 startup failed: ${error}`);
+      } finally {
+        this.initializing = false;
+      }
+    }).catch(error => {
+      this.initializing = false;
+      Cu.reportError(`GARP/1.24 security initialization failed: ${error}`);
+    });
+  }
+
+  shutdown() {
+    try { clearInterval(this.pruneTimer); } catch (_) {}
+    try { clearInterval(this.statusTimer); } catch (_) {}
+    this.pruneTimer = null;
+    this.statusTimer = null;
+    for (const connection of [...this.connections]) connection.close();
+    this.connections.clear();
+    for (const session of this.sessionManager.sessions.values()) session.state = "CLOSED";
+    if (this.serverSocket) { try { this.serverSocket.close(); } catch (_) {} this.serverSocket = null; }
+  }
+
+  onSocketAccepted(_socket, transport) { this.connections.add(new GarpConnection(transport, this)); }
+  onStopListening(_socket, _status) { this.serverSocket = null; }
+  removeConnection(connection) {
+    this.connections.delete(connection);
+    this.requestManager.unsubscribeConnection(connection);
+    for (const session of this.sessionManager.sessions.values()) if (session.ownerConnection === connection) session.ownerConnection = null;
+  }
+
+  getTopWindow() {
+    const { BrowserWindowTracker } = ChromeUtils.importESModule("resource:///modules/BrowserWindowTracker.sys.mjs");
+    return BrowserWindowTracker.getTopWindow();
+  }
+
+  updateBrowserStatus(force = false) {
+    const win = this.getTopWindow();
+    const activeTab = win?.gBrowser?.selectedTab;
+    const activeTabId = activeTab ? this.sessionManager.getStableTabId(activeTab) : null;
+    const next = { state: win ? "READY" : "FAILED", active_tab_id: activeTabId };
+    const changed = !this.browserStatus || JSON.stringify(this.browserStatus) !== JSON.stringify(next);
+    this.browserStatus = next;
+    if (!force && !changed) return;
+    for (const connection of this.connections) {
+      if (connection.authenticated) {
+        connection.send("BROWSER_STATUS", next, { request_id: null, session_id: null, sequence: null });
+      }
+    }
+  }
+
+  browserStatusPayload() {
+    this.updateBrowserStatus(false);
+    return this.browserStatus || { state: "FAILED", active_tab_id: null };
+  }
+
+  emitInitialBrowserStatus(connection) {
+    const payload = this.browserStatusPayload();
+    connection.send("BROWSER_STATUS", payload, { request_id: null, session_id: null, sequence: null });
+  }
+
+  localFeatures() { return sortedUtf8(GarpFeature); }
+
+  negotiateFeatures(offered) {
+    const supported = new Set(GarpFeature);
+    const final = [];
+    for (const raw of offered) {
+      const required = raw.startsWith("!");
+      const name = required ? raw.slice(1) : raw;
+      if (supported.has(name)) final.push(`${required ? "!" : ""}${name}`);
+      else if (required) throw new GarpError(GarpErrorCode.UNSUPPORTED_FEATURE, `Required feature unsupported: ${name}`);
+    }
+    return sortedUtf8(final);
+  }
+
+  async handleGarpMessage(connection, decoded) {
+    const message = decoded.message;
+    const type = decoded.type;
+
+    if (type === "HELLO") return this.handleHello(connection, decoded);
+    if (type === "HELLO_AUTH") return this.handleHelloAuth(connection, decoded);
+
+    if (type === "CAPABILITIES") {
+      if (!connection.authenticated) throw new GarpError(GarpErrorCode.AUTH_REQUIRED, "Authentication required");
+      validateMessagePayload("CAPABILITIES", message.payload);
+      connection.setPeerCapabilities(message.payload);
+      return;
+    }
+
+    if (type === "PONG") {
+      if (!connection.negotiatedFeatures.includes("ext-pong")) throw new GarpError(GarpErrorCode.UNSUPPORTED_FEATURE, "PONG extension not negotiated");
+      return;
+    }
+
+    if (!connection.authenticated) throw new GarpError(GarpErrorCode.AUTH_REQUIRED, "Authentication required");
+
+    switch (type) {
+      case "PING": connection.sendResponse(decoded.request_id, null, { success: true }); break;
+      case "GET_CAPABILITIES": connection.sendResponse(decoded.request_id, null, { success: true, ...this.capabilities }); break;
+      case "BROWSER_STATUS": throw new GarpError(GarpErrorCode.UNKNOWN_MESSAGE_TYPE, "BROWSER_STATUS is an event, not a command");
+      case "LIST_TABS": connection.sendResponse(decoded.request_id, null, { success: true, tabs: this.sessionManager.listTabs() }); this.updateBrowserStatus(); break;
+      case "OPEN_TAB": connection.sendResponse(decoded.request_id, null, { success: true, ...this.sessionManager.openTab(message.payload.url) }); this.updateBrowserStatus(); break;
+      case "CLOSE_TAB": connection.sendResponse(decoded.request_id, null, this.sessionManager.closeTab(message.payload.tab_id)); this.updateBrowserStatus(); break;
+      case "SELECT_TAB": connection.sendResponse(decoded.request_id, null, this.sessionManager.selectTab(message.payload.tab_id)); this.updateBrowserStatus(); break;
+      case "CREATE_SESSION": await this.handleCreateSession(connection, decoded); break;
+      case "ATTACH_SESSION": await this.handleAttachSession(connection, decoded); break;
+      case "DETACH_SESSION": await this.handleSessionCommand(connection, decoded, "detach"); break;
+      case "CLOSE_SESSION": await this.handleSessionCommand(connection, decoded, "close"); break;
+      case "RESET_SESSION": await this.handleSessionCommand(connection, decoded, "reset"); break;
+      case "GET_SESSION": await this.handleGetSession(connection, decoded); break;
+      case "PROMPT": await this.handlePrompt(connection, decoded); break;
+      case "CANCEL_PROMPT": await this.handleCancel(connection, decoded); break;
+      case "GET_PROMPT_STATUS": await this.handleGetPromptStatus(connection, decoded); break;
+      case "GET_RESPONSE": await this.handleGetResponse(connection, decoded); break;
+      case "SUBSCRIBE_RESPONSE": await this.handleSubscribe(connection, decoded); break;
+      case "CONTINUE_PROMPT": await this.handleContinue(connection, decoded); break;
+      case "GET_EVENTS": await this.handleGetEvents(connection, decoded); break;
+      default: throw new GarpError(GarpErrorCode.UNKNOWN_MESSAGE_TYPE, `Unsupported GARP message type: ${type}`);
+    }
+  }
+
+  async handleHello(connection, decoded) {
+    if (this.authDisabled) throw new GarpError(GarpErrorCode.AUTH_FAILED, "Authentication is disabled because replay state cannot be trusted");
+    if (connection.authState !== "NEW") throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "HELLO received in invalid connection state");
+    const payload = decoded.message.payload;
+    const clientNonce = base64UrlDecode(payload.client_nonce, 16);
+    const finalFeatures = this.negotiateFeatures(payload.features);
+    connection.clientName = payload.client_name;
+    connection.clientVersion = payload.client_version;
+    connection.clientNonce = clientNonce;
+    connection.offeredFeatures = sortedUtf8(payload.features);
+    connection.serverNonce = crypto.getRandomValues(new Uint8Array(16));
+    connection.negotiatedFeatures = finalFeatures;
+    connection.authState = "CHALLENGE_SENT";
+    connection.handshakeRequestId = decoded.request_id;
+    connection.serverChallenge = {
+      server_name: this.serverName,
+      server_version: this.serverVersion,
+      selected_version: GARP_SEMANTIC_VERSION,
+      selected_wire_version: GARP_WIRE_VERSION,
+      features: finalFeatures,
+      server_nonce: base64UrlEncode(connection.serverNonce),
+    };
+    connection.send("HELLO_CHALLENGE", connection.serverChallenge, { request_id: decoded.request_id, session_id: null, sequence: null });
+  }
+
+  async handleHelloAuth(connection, decoded) {
+    if (connection.authState !== "CHALLENGE_SENT" || decoded.request_id !== connection.handshakeRequestId) throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "HELLO_AUTH received outside active handshake transaction");
+    connection.authState = "AUTH_VERIFYING";
+    const proof = base64UrlDecode(decoded.message.payload.client_proof, 32);
+    const transcript = encodeTranscript(`${GARP_PROTOCOL}/client-proof`, connection.clientNonce, connection.serverNonce, GARP_SEMANTIC_VERSION, GARP_WIRE_VERSION, connection.offeredFeatures, connection.negotiatedFeatures, connection.clientName, connection.clientVersion, this.serverName, this.serverVersion);
+    const key = await connection.replayKey();
+    if (await this.replayStore.has(key)) throw new GarpError(GarpErrorCode.AUTH_REPLAY, "Authentication transcript has already been used");
+    const expected = await hmacSha256(this.authSecret, transcript);
+    if (!constantTimeEqualBytes(expected, proof)) throw new GarpError(GarpErrorCode.AUTH_FAILED, "Client authentication proof failed");
+    await this.replayStore.remember(key);
+    connection.authState = "AUTHENTICATED_PENDING_ACK";
+    const serverTranscript = encodeTranscript(`${GARP_PROTOCOL}/server-proof`, connection.clientNonce, connection.serverNonce, GARP_SEMANTIC_VERSION, GARP_WIRE_VERSION, connection.offeredFeatures, connection.negotiatedFeatures, connection.clientName, connection.clientVersion, this.serverName, this.serverVersion);
+    const serverProof = await hmacSha256(this.authSecret, serverTranscript);
+    connection.send("HELLO_ACK", { server_proof: base64UrlEncode(serverProof), selected_version: GARP_SEMANTIC_VERSION, selected_wire_version: GARP_WIRE_VERSION, features: connection.negotiatedFeatures }, { request_id: decoded.request_id, session_id: null, sequence: null, isCommandResponse: true });
+    connection.authenticated = true;
+    connection.authState = "AUTHENTICATED";
+    // CAPABILITIES and BROWSER_STATUS are deliberately emitted only after HELLO_ACK is committed.
+    connection.send("CAPABILITIES", this.capabilities, { request_id: null, session_id: null, sequence: null });
+    connection.send("BROWSER_STATUS", this.browserStatusPayload(), { request_id: null, session_id: null, sequence: null });
+  }
+
+  async handleCreateSession(connection, decoded) {
+    const session = this.sessionManager.createSession(decoded.message.payload.provider, decoded.message.payload.tab_id ?? null);
+    session.ownerConnection = connection;
+    connection.sendResponse(decoded.request_id, null, { success: true, session_id: session.sessionId, state: "PREPARING" });
+    this.prepareSession(session).catch(error => this.failSessionPreparation(session, error));
+  }
+
+  async handleAttachSession(connection, decoded) {
+    const session = this.sessionManager.attachSession(decoded.session_id, connection);
+    connection.sendResponse(decoded.request_id, session.sessionId, { success: true, ...session.snapshot(), state: session.state === "CREATED" ? "PREPARING" : session.state });
+    if (session.state === "PREPARING" || session.state === "AUTH_REQUIRED" || session.state === "RATE_LIMITED") this.prepareSession(session).catch(error => this.failSessionPreparation(session, error));
+  }
+
+  async handleSessionCommand(connection, decoded, operation) {
+    const session = this.sessionManager.get(decoded.session_id);
+    if (session.ownerConnection && session.ownerConnection !== connection) throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "Connection does not own session");
+    let result;
+    if (operation === "detach") result = this.sessionManager.detachSession(session.sessionId, connection);
+    else if (operation === "close") {
+      await this.requestManager.abortForSessionReset(session, "SESSION_CLOSE");
+      result = this.sessionManager.closeSession(session.sessionId);
+    } else {
+      await this.requestManager.abortForSessionReset(session, "SESSION_RESET");
+      result = this.sessionManager.resetSession(session.sessionId, connection);
+      this.commitSessionEvent(session, "SESSION_CHANGED", { changed: ["page_generation"], page_generation: String(session.pageGeneration) });
+    }
+    connection.sendResponse(decoded.request_id, decoded.session_id, { success: true, ...(operation === "close" || operation === "detach" ? {} : { session_id: result.sessionId, state: result.state }) });
+  }
+
+  async handleGetSession(connection, decoded) {
+    const session = this.sessionManager.get(decoded.session_id);
+    connection.sendResponse(decoded.request_id, session.sessionId, { success: true, ...session.snapshot() });
+  }
+
+  async prepareSession(session) {
+    try {
+      const result = await this.callChild(session, "PrepareSession", { provider: session.provider, prompt_request_id: null });
+      if (result.error) throw this.errorFromChild(result);
+      if (result.provider && result.provider !== session.provider) this.applyProviderChange(session, result.provider, result.authoritative_fencing);
+      session.inputState = result.input_state || (result.input_ready ? "READY" : "NOT_READY");
+      if (result.authenticated === false) { session.state = "AUTH_REQUIRED"; this.commitSessionEvent(session, "PROVIDER_AUTH_REQUIRED", { provider: session.provider, reason: "LOGIN_REQUIRED", page_generation: String(session.pageGeneration) }); }
+      else if (result.rate_limited) session.state = "RATE_LIMITED";
+      else if (result.input_ready) session.state = "READY";
+      else session.state = "PREPARING";
+      this.commitSessionEvent(session, "SESSION_READY", { provider: session.provider, tab_id: session.tabId, url: result.url || session.pageURL, page_generation: String(session.pageGeneration) });
+    } catch (error) { throw error; }
+  }
+
+  failSessionPreparation(session, error) {
+    if (session.state === "CLOSED") return;
+    session.state = error?.code === GarpErrorCode.PROVIDER_AUTH_REQUIRED ? "AUTH_REQUIRED" : error?.code === GarpErrorCode.PROVIDER_RATE_LIMITED ? "RATE_LIMITED" : "FAILED";
+    this.commitSessionEvent(session, "DIAGNOSTIC", { level: "ERROR", stage: "SESSION", code: error?.code || GarpErrorCode.PROVIDER_ERROR, message: error?.message || String(error), details: {}, actor_instance: session.actorInstance || uuid() });
+  }
+
+  errorFromChild(result) { return new GarpError(result.code || GarpErrorCode.PROVIDER_ERROR, result.error || "Provider operation failed"); }
+
+  async handlePrompt(connection, decoded) {
+    const session = this.sessionManager.get(decoded.session_id);
+    if (session.ownerConnection && session.ownerConnection !== connection) throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "Connection does not own session");
+    const request = this.requestManager.startPrompt(connection, decoded.session_id, decoded.request_id, decoded.message.payload.prompt, decoded.message.payload.options);
+    connection.sendResponse(decoded.request_id, session.sessionId, { success: true, command_state: "ACCEPTED", prompt_state: request.state });
+  }
+
+  async handleCancel(connection, decoded) {
+    const request = await this.requestManager.cancel(connection, decoded.session_id, decoded.message.payload.prompt_request_id);
+    connection.sendResponse(decoded.request_id, decoded.session_id, { success: true, command_state: "ACCEPTED" });
+  }
+
+  async handleContinue(connection, decoded) {
+    await this.requestManager.continuePrompt(connection, decoded.session_id, decoded.message.payload.prompt_request_id);
+    connection.sendResponse(decoded.request_id, decoded.session_id, { success: true, command_state: "ACCEPTED" });
+  }
+
+  async handleGetPromptStatus(connection, decoded) {
+    const request = this.requestManager.getForSession(decoded.session_id, decoded.message.payload.prompt_request_id);
+    connection.sendResponse(decoded.request_id, decoded.session_id, request.snapshot());
+  }
+
+  async handleGetResponse(connection, decoded) {
+    const request = this.requestManager.getForSession(decoded.session_id, decoded.message.payload.prompt_request_id);
+    connection.sendResponse(decoded.request_id, decoded.session_id, this.requestManager.getResponse(request));
+  }
+
+  async handleSubscribe(connection, decoded) {
+    const request = this.requestManager.subscribe(decoded.message.payload.prompt_request_id, connection);
+    connection.sendResponse(decoded.request_id, decoded.session_id, { success: true });
+  }
+
+  async handleGetEvents(connection, decoded) {
+    if (!connection.negotiatedFeatures.includes("ext-replay-store")) throw new GarpError(GarpErrorCode.UNSUPPORTED_FEATURE, "ext-replay-store is not negotiated");
+    const session = this.sessionManager.get(decoded.session_id);
+    const from = BigInt(decoded.message.payload.from_sequence);
+    const maxEvents = decoded.message.payload.max_events;
+    const snapshot = session.eventHistory.map(event => structuredClone(event));
+    const currentLast = session.lastSequence();
+    if (from > currentLast + 1n) throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, "from_sequence is beyond the current sequence plus one");
+    if (from < session.oldestSequence()) throw new GarpError(GarpErrorCode.EVENT_HISTORY_EXPIRED, "Requested event history has expired");
+    const events = snapshot.filter(event => BigInt(event.sequence) >= from && BigInt(event.sequence) <= currentLast).slice(0, maxEvents);
+    const next = events.length ? BigInt(events[events.length - 1].sequence) + 1n : from;
+    const complete = events.length ? BigInt(events[events.length - 1].sequence) === currentLast : from === currentLast + 1n;
+    connection.sendResponse(decoded.request_id, session.sessionId, { success: true, events, complete, next_sequence: String(next) });
+  }
+
+  commitSessionEvent(session, type, payload, { broadcast = true } = {}) {
+    const envelopeBase = { garp: GARP_SEMANTIC_VERSION, type, request_id: null, session_id: session.sessionId, timestamp: new Date().toISOString(), sequence: null, payload };
+    let committed;
+    try {
+      committed = session.commitEvent(envelopeBase);
+    } catch (error) {
+      if (error?.code === GarpErrorCode.EVENT_QUEUE_OVERFLOW || error?.code === GarpErrorCode.EVENT_SEQUENCE_OVERFLOW) session.state = "FAILED";
+      throw error;
+    }
+    if (broadcast) {
+      for (const connection of this.connections) {
+        if (connection.authenticated && session.ownerConnection === connection) connection.sendEnvelope(committed, false);
+      }
+    }
+    return committed;
+  }
+
+  applyProviderChange(session, provider, _fencing = null) {
+    const previous = session.provider;
+    session.provider = provider;
+    session.authoritativeProvider = provider;
+    this.commitSessionEvent(session, "PROVIDER_CHANGED", { previous_provider: previous, provider, page_generation: String(session.pageGeneration) });
+  }
+
+  async recoverSession(session, reason) {
+    if (session.state === "CLOSED") return;
+    session.state = "RECOVERING";
+    const deadline = monotonicNow() + Number(GARP_DEFAULT_RECOVERY_DEADLINE_MS);
+    this.commitSessionEvent(session, "RECOVERY_STATE", { state: "RECOVERING", reason, deadline_remaining_ms: String(GARP_DEFAULT_RECOVERY_DEADLINE_MS) });
+    while (monotonicNow() < deadline && session.state === "RECOVERING") {
+      try {
+        const result = await this.callChild(session, "InspectReady", { provider: session.provider, prompt_request_id: null });
+        if (result.input_ready && result.authenticated !== false && !result.rate_limited) {
+          session.inputState = "READY";
+          session.state = session.activeRequestId ? "BUSY" : "READY";
+          this.commitSessionEvent(session, "RECOVERY_STATE", { state: "RECOVERED", reason, deadline_remaining_ms: "0" });
+          this.commitSessionEvent(session, "SESSION_READY", { provider: session.provider, tab_id: session.tabId, url: session.pageURL, page_generation: String(session.pageGeneration) });
+          return;
+        }
+      } catch (_) {}
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    const activeRequestId = session.activeRequestId;
+    if (activeRequestId) {
+      const request = this.requestManager.requests.get(activeRequestId);
+      if (request && !request.terminalCommitted) {
+        await this.requestManager.failCandidate(request, GarpErrorCode.RECOVERY_FAILED, "Recovery deadline expired");
+      }
+    }
+    session.state = "FAILED";
+    this.commitSessionEvent(session, "RECOVERY_STATE", { state: "FAILED", reason, deadline_remaining_ms: "0" });
+  }
+
+  async callChild(session, operation, payload = {}) {
+    const tab = this.sessionManager.getTabForSession(session);
+    const browser = tab.linkedBrowser;
+    const windowGlobal = browser?.browsingContext?.currentWindowGlobal;
+    if (!windowGlobal) throw new GarpError(GarpErrorCode.TAB_UNAVAILABLE, "Browser content is not ready", { retryable: true });
+    const actor = windowGlobal.getActor("AIAutomation");
+    if (!actor) throw new GarpError(GarpErrorCode.STALE_ACTOR, "AIAutomation actor unavailable", { retryable: true });
+
+    if (session.actorObject && session.actorObject !== actor) {
+      session.incrementPageGeneration(browser.currentURI.spec);
+      session.actorInstance = null;
+      this.commitSessionEvent(session, "NAVIGATION", { page_generation: String(session.pageGeneration), url: browser.currentURI.spec });
+    } else if (session.pageURL && session.pageURL !== browser.currentURI.spec) {
+      session.incrementPageGeneration(browser.currentURI.spec);
+      this.commitSessionEvent(session, "NAVIGATION_DRIFT", { page_generation: String(session.pageGeneration), reason: "UNEXPECTED_URL" });
+      if (session.activeRequestId) throw new GarpError(GarpErrorCode.NAVIGATION_DRIFT, "URL changed during active prompt", { reason: "UNEXPECTED_URL" });
+    }
+    session.actorObject = actor;
+    session.pageURL = browser.currentURI.spec;
+    const capturedActor = actor;
+    const capturedGeneration = session.pageGeneration;
+    const expectedActorInstance = session.actorInstance;
+    const result = await capturedActor.sendQuery(`GARP:${operation}`, {
+      ...payload,
+      session_id: session.sessionId,
+      page_generation: String(capturedGeneration),
+      actor_instance: expectedActorInstance,
+      prompt_request_id: payload.prompt_request_id ?? null,
+      provider: payload.provider ?? null,
+    });
+    if (session.actorObject !== capturedActor || session.pageGeneration !== capturedGeneration) throw new GarpError(GarpErrorCode.STALE_ACTOR, "Result returned by stale browser actor", { retryable: true });
+    if (!result || typeof result !== "object") throw new GarpError(GarpErrorCode.PROVIDER_ERROR, "Child actor returned invalid result");
+    if (result.fencing?.session_id && result.fencing.session_id !== session.sessionId) throw new GarpError(GarpErrorCode.STALE_ACTOR, "Result session fence mismatch");
+    if (result.fencing?.page_generation !== undefined && BigInt(result.fencing.page_generation) !== session.pageGeneration) throw new GarpError(GarpErrorCode.STALE_ACTOR, "Result page generation fence mismatch");
+    if (result.fencing?.actor_instance) {
+      if (session.actorInstance && session.actorInstance !== result.fencing.actor_instance) throw new GarpError(GarpErrorCode.STALE_ACTOR, "Actor instance mismatch");
+      session.actorInstance = result.fencing.actor_instance;
+    }
+    if (payload.provider && result.fencing?.provider && result.fencing.provider !== session.provider) throw new GarpError(GarpErrorCode.STALE_ACTOR, "Provider fence mismatch");
+    return result;
+  }
+}
+
+export { GARP_APPLICATION_LIMIT_DEFAULT };
+
+
+// File 2: browser\components\aistarter\actors\AIAutomationChild.sys.mjs
+import { ProviderRegistry } from "../providers/ProviderRegistry.sys.mjs";
+
+const providers = new ProviderRegistry();
+
+export class AIAutomationChild extends JSWindowActorChild {
+  constructor() {
+    super();
+    this.actorInstance = crypto.randomUUID();
+    this.lastInjectedPrompt = "";
+    this.lastObservedMessageText = "";
+  }
+
+  fencing(data) {
+    return {
+      session_id: data?.session_id ?? null,
+      provider: data?.provider ?? null,
+      page_generation: data?.page_generation ?? null,
+      actor_instance: this.actorInstance,
+      prompt_request_id: data?.prompt_request_id ?? null,
+    };
+  }
+
+  validateFencing(data) {
+    if (data?.actor_instance && data.actor_instance !== this.actorInstance) {
+      return { error: "STALE_ACTOR", code: "STALE_ACTOR" };
+    }
+    return null;
+  }
+
+  async receiveMessage(message) {
+    try {
+      const stale = this.validateFencing(message.data);
+      if (stale) return stale;
+      switch (message.name) {
+        case "GARP:PrepareSession": return this.prepareSession(message.data);
+        case "GARP:InspectReady": return this.inspectReady(message.data);
+        case "GARP:CaptureSnapshot": return this.captureSnapshot(message.data);
+        case "GARP:InjectPrompt": return await this.injectPrompt(message.data);
+        case "GARP:ObserveGeneration": return this.observeGeneration(message.data);
+        case "GARP:ContinueGeneration": return await this.continueGeneration(message.data);
+        case "GARP:CancelGeneration": return this.cancelGeneration(message.data);
+        case "GARP:InspectProviderState": return this.inspectProviderState(message.data);
+        default: return { error: `Unknown child operation: ${message.name}`, code: "UNKNOWN_MESSAGE_TYPE" };
+      }
+    } catch (error) {
+      dump(`AIAutomationChild GARP ERROR: ${error.message}\n${error.stack || ""}\n`);
+      return { error: error.message, code: error.code || "PROVIDER_ERROR", details: error.details || undefined };
+    }
+  }
+
+  getAdapter(providerName) {
+    const adapter = providers.get(providerName);
+    if (!adapter) throw Object.assign(new Error(`Provider adapter unavailable: ${providerName}`), { code: "PROVIDER_UNAVAILABLE" });
+    return adapter;
+  }
+
+  result(data, payload) { return { ...payload, fencing: this.fencing(data) }; }
+
+  prepareSession(data) {
+    const adapter = this.getAdapter(data.provider);
+    const inspection = adapter.inspect(this.document);
+    return this.result(data, {
+      provider: adapter.name,
+      adapter_version: adapter.adapter_version,
+      selector_strategy_version: adapter.selector_strategy_version,
+      input_strategies: adapter.inputStrategies(this.document),
+      supported_features: [...adapter.supported_features],
+      ...inspection,
+      url: this.document.location?.href || "",
+    });
+  }
+
+  inspectReady(data) {
+    const adapter = this.getAdapter(data.provider);
+    return this.result(data, {
+      ...adapter.inspect(this.document),
+      state: adapter.isAuthenticated(this.document) === false ? "AUTH_REQUIRED" : adapter.isRateLimited(this.document) ? "RATE_LIMITED" : adapter.input(this.document) ? "READY" : "NOT_READY",
+    });
+  }
+
+  responseNodes(adapter) {
+    return Array.from(adapter.responseNodes(this.document) || []).filter(node => node && typeof node.textContent === "string");
+  }
+
+  captureSnapshot(data) {
+    const adapter = this.getAdapter(data.provider);
+    const nodes = this.responseNodes(adapter);
+    const last = nodes.length ? nodes[nodes.length - 1].textContent : "";
+    this.lastObservedMessageText = last;
+    return this.result(data, {
+      provider: adapter.name,
+      url: this.document.location?.href || "",
+      input_ready: !!adapter.input(this.document),
+      authenticated: adapter.isAuthenticated(this.document),
+      rate_limited: adapter.isRateLimited(this.document),
+      last_message_count: nodes.length,
+      last_message_text: last,
+    });
+  }
+
+  async injectPrompt(data) {
+    const adapter = this.getAdapter(data.provider);
+    const input = adapter.input(this.document);
+    if (!input) return this.result(data, { error: "Input not ready", code: "INPUT_VERIFICATION_FAILED", state: "PREPARING" });
+    if (!adapter.isAuthenticated(this.document)) return this.result(data, { error: "Provider authentication required", code: "PROVIDER_AUTH_REQUIRED", state: "AUTH_REQUIRED" });
+    if (adapter.isRateLimited(this.document)) return this.result(data, { error: "Provider rate limit detected", code: "PROVIDER_RATE_LIMITED", state: "RATE_LIMITED" });
+    this.lastInjectedPrompt = String(data.prompt ?? "");
+    if (!this.lastInjectedPrompt) return this.result(data, { error: "Prompt is empty", code: "INVALID_ARGUMENT", state: "FAILED" });
+    const inputResult = await adapter.inject(input, this.lastInjectedPrompt, { forceFocus: !!data.forceFocus });
+    if (inputResult?.error) return this.result(data, inputResult);
+    if (data.forceFocus && !inputResult.focus_verified) return this.result(data, { error: "Focus verification failed", code: "INPUT_VERIFICATION_FAILED", state: "FAILED" });
+    const submit = await adapter.submitVerified(input, this.document, { simulateEnter: !!data.simulateEnter });
+    if (submit?.error) return this.result(data, submit);
+    return this.result(data, { ...inputResult, ...submit, provider_submission_verified: submit.provider_submission_verified === true, strategy: submit.strategy || inputResult.strategy || "provider_native_send" });
+  }
+
+  continuationButton(adapter) { return adapter.findContinueButton(this.document); }
+
+  observeGeneration(data) {
+    const adapter = this.getAdapter(data.provider);
+    const inspection = adapter.inspect(this.document);
+    const nodes = this.responseNodes(adapter);
+    const last = nodes.length ? nodes[nodes.length - 1].textContent : "";
+    const continueButton = this.continuationButton(adapter);
+    if (inspection.authenticated === false) return this.result(data, { error: "Provider authentication required", code: "PROVIDER_AUTH_REQUIRED", state: "AUTH_REQUIRED" });
+    if (inspection.rate_limited) return this.result(data, { error: "Provider rate limit detected", code: "PROVIDER_RATE_LIMITED", state: "RATE_LIMITED" });
+    const previousCount = Number(data.previous_message_count || 0);
+    const messageChanged = nodes.length > previousCount || (last && last !== String(data.previous_message_text || ""));
+    const authoritativeStarted = messageChanged;
+    const authoritativeCompletion = !inspection.streaming && !!last;
+    return this.result(data, {
+      provider: adapter.name,
+      text: last,
+      done: authoritativeCompletion && !continueButton,
+      continuation_required: !!continueButton,
+      continuation_supported: adapter.supportsContinuation(this.document),
+      continuation_available: !!continueButton,
+      continuation_reason: continueButton ? "provider_length_limit" : null,
+      message_count: nodes.length,
+      message_changed: messageChanged,
+      authoritative_generation_started: authoritativeStarted,
+      authoritative_completion: authoritativeCompletion,
+      provider_state: inspection.provider_state,
+      streaming: inspection.streaming,
+      page_url: this.document.location?.href || "",
+    });
+  }
+
+  async continueGeneration(data) {
+    const adapter = this.getAdapter(data.provider);
+    if (!adapter.supportsContinuation(this.document)) return this.result(data, { error: "Continuation is not available", code: "CONTINUATION_NOT_AVAILABLE" });
+    const button = this.continuationButton(adapter);
+    if (!button) return this.result(data, { error: "Continuation button not found", code: "CONTINUATION_NOT_AVAILABLE" });
+    button.focus();
+    button.click();
+    const verified = await adapter.verifyContinuationSubmission(this.document);
+    return this.result(data, { provider_submission_verified: verified, strategy: verified ? "provider_native_send" : "provider_native_send" });
+  }
+
+  async cancelGeneration(data) {
+    const adapter = this.getAdapter(data.provider);
+    const stopped = adapter.cancel(this.document);
+    return this.result(data, { cancel_requested: stopped, state: stopped ? "CANCEL_REQUESTED" : "CANCEL_UNAVAILABLE" });
+  }
+
+  inspectProviderState(data) {
+    const adapter = this.getAdapter(data.provider);
+    return this.result(data, { ...adapter.inspectProviderExecution(this.document, data) });
+  }
+}
+
+
+// File 3: browser\components\aistarter\actors\AIAutomationParent.sys.mjs
+export class AIAutomationParent extends JSWindowActorParent {
+  receiveMessage(_message) {}
+}
+
+
+// File 4: browser\components\aistarter\diagnostics\AIAutomationDiagnostics.sys.mjs
+export class AIAutomationDiagnostics {
+  static providerState(provider, state, details = {}, actorInstance = crypto.randomUUID()) {
+    return { provider, state, timestamp: new Date().toISOString(), details, actor_instance: actorInstance };
+  }
+
+  static error(provider, stage, code, message, details = {}, actorInstance = crypto.randomUUID()) {
+    return { provider, stage, code, message, details, timestamp: new Date().toISOString(), actor_instance: actorInstance };
+  }
+}
+
+
+// File 5: browser\components\aistarter\garp\GarpConnection.sys.mjs
+import { encodeGarpEnvelope, decodeGarpFrame, peekHeader } from "./GarpFrame.sys.mjs";
+import {
+  GARP_HANDSHAKE_LIMIT,
+  GARP_HANDSHAKE_TIMEOUT_MS,
+  GARP_MAX_OUTSTANDING_REQUESTS,
+  messageTypeName,
+} from "./GarpRegistry.sys.mjs";
+import { GarpError, GarpErrorCode } from "./GarpErrors.sys.mjs";
+import { encodeTranscriptCore, monotonicNow, sha256 } from "./GarpUtil.sys.mjs";
+
+const COMMAND_TYPES = new Set([
+  "HELLO", "HELLO_AUTH", "LIST_TABS", "OPEN_TAB", "CLOSE_TAB", "SELECT_TAB", "GET_CAPABILITIES", "CREATE_SESSION", "ATTACH_SESSION", "DETACH_SESSION", "CLOSE_SESSION", "RESET_SESSION", "GET_SESSION", "PROMPT", "CANCEL_PROMPT", "GET_PROMPT_STATUS", "GET_RESPONSE", "SUBSCRIBE_RESPONSE", "CONTINUE_PROMPT", "GET_EVENTS", "PING",
+]);
+
+function mergeBytes(left, right) {
+  const output = new Uint8Array(left.length + right.length);
+  output.set(left, 0); output.set(right, left.length); return output;
+}
+
+export class GarpConnection {
+  constructor(transport, service) {
+    this.transport = transport;
+    this.service = service;
+    this.outStream = transport.openOutputStream(0, 0, 0);
+    this.inStream = transport.openInputStream(0, 0, 0);
+    this.buffer = new Uint8Array(0);
+    this.closed = false;
+    this.authenticated = false;
+    this.authState = "NEW";
+    this.peerCapabilitiesValidated = false;
+    this.peerCapabilities = null;
+    this.lastOutboundProtocolTime = monotonicNow();
+    this.lastInboundAuthenticatedTime = monotonicNow();
+    this.dispatchQueue = Promise.resolve();
+    this.outstanding = new Map();
+    this.completedResponses = new Map();
+    this.seenRequestIds = new Map();
+    this.negotiatedFeatures = [];
+    this.handshakeDeadline = monotonicNow() + GARP_HANDSHAKE_TIMEOUT_MS;
+    this.lastError = null;
+
+    this.pump = Cc["@mozilla.org/network/input-stream-pump;1"].createInstance(Ci.nsIInputStreamPump);
+    this.pump.init(this.inStream, 0, 0, false);
+    this.pump.asyncRead(this);
+
+    this.timer = setInterval(() => this.tick(), 250);
+  }
+
+  currentInboundLimit() { return this.peerCapabilitiesValidated ? Math.min(this.peerCapabilities?.limits?.max_payload_bytes ?? GARP_HANDSHAKE_LIMIT, 0xffffffff) : GARP_HANDSHAKE_LIMIT; }
+
+  async replayKey() {
+    const core = encodeTranscriptCore(
+      this.clientNonce,
+      this.serverNonce,
+      "1.24",
+      "0x00",
+      this.offeredFeatures,
+      this.negotiatedFeatures,
+      this.clientName,
+      this.clientVersion,
+      this.service.serverName,
+      this.service.serverVersion
+    );
+    const digest = await sha256(core);
+    return [...digest].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+
+  tick() {
+    if (this.closed) return;
+    const now = monotonicNow();
+    if (!this.authenticated && now >= this.handshakeDeadline) {
+      this.sendError(new GarpError(GarpErrorCode.HANDSHAKE_TIMEOUT, "GARP handshake timeout"), null, null, false);
+      this.close(); return;
+    }
+    for (const [id, entry] of this.completedResponses) { if (monotonicNow() - entry.committedAt > Number(this.service.capabilities.limits.response_retention_ms)) this.completedResponses.delete(id); }
+    if (this.authenticated && this.negotiatedFeatures.includes("ext-pong")) {
+      const keep = this.service.capabilities.keepalive;
+      if (keep.enabled && now - this.lastOutboundProtocolTime >= Number(keep.interval_ms)) {
+        this.send("PONG", {}, { request_id: null, session_id: null, sequence: null, maxPayloadBytes: this.currentInboundLimit() });
+      }
+      if (now - this.lastInboundAuthenticatedTime >= Number(keep.idle_timeout_ms)) {
+        this.close();
+      }
+    }
+  }
+
+  onStartRequest() {}
+
+  onDataAvailable(_request, stream, _offset, count) {
+    if (this.closed) return;
+    const binaryStream = Cc["@mozilla.org/binaryinputstream;1"].createInstance(Ci.nsIBinaryInputStream);
+    binaryStream.setInputStream(stream);
+    const bytes = new Uint8Array(binaryStream.readByteArray(count));
+    if (this.buffer.length + bytes.length > this.currentInboundLimit() + 48 + 65536) {
+      this.fail(new GarpError(GarpErrorCode.FRAME_TOO_LARGE, "Inbound buffering limit exceeded")); return;
+    }
+    this.buffer = mergeBytes(this.buffer, bytes);
+    this.processFrames();
+  }
+
+  onStopRequest(_request, _status) { this.close(); }
+
+  processFrames() {
+    while (!this.closed) {
+      if (this.buffer.length < 48) return;
+      const header = peekHeader(this.buffer);
+      if (this.buffer[0] !== 0x47 || this.buffer[1] !== 0x41 || this.buffer[2] !== 0x52 || this.buffer[3] !== 0x50) { this.fail(new GarpError(GarpErrorCode.PROTOCOL_ERROR, "Invalid GARP magic")); return; }
+      if (header.wireVersion !== 0) { this.fail(new GarpError(GarpErrorCode.UNSUPPORTED_WIRE_VERSION, "Unsupported wire version")); return; }
+      if (header.headerLength !== 48) { this.fail(new GarpError(GarpErrorCode.INVALID_ARGUMENT, "Header length must be 48")); return; }
+      const limit = this.currentInboundLimit();
+      if (header.payloadLength > limit) { this.fail(new GarpError(GarpErrorCode.FRAME_TOO_LARGE, `Frame payload exceeds ${limit} byte receive limit`)); return; }
+      const frameLength = 48 + header.payloadLength;
+      if (this.buffer.length < frameLength) return;
+      const frame = this.buffer.slice(0, frameLength);
+      this.buffer = this.buffer.slice(frameLength);
+      let decoded;
+      try { decoded = decodeGarpFrame(frame); } catch (error) { this.fail(error); return; }
+      this.dispatchQueue = this.dispatchQueue.then(() => this.dispatchDecoded(decoded)).catch(error => this.handleDispatchError(error, decoded));
+    }
+  }
+
+  async dispatchDecoded(decoded) {
+    const message = decoded.message;
+    const type = decoded.type;
+    const isCommand = COMMAND_TYPES.has(type);
+
+    if (this.authenticated && !this.peerCapabilitiesValidated && type !== "CAPABILITIES" && decoded.payloadLength > GARP_HANDSHAKE_LIMIT) throw new GarpError(GarpErrorCode.FRAME_TOO_LARGE, "Handshake receive limit exceeded");
+
+    if (this.authenticated) this.lastInboundAuthenticatedTime = monotonicNow();
+
+    if (isCommand) {
+      if (type === "HELLO_AUTH") {
+        // Handshake transaction is one request-ID entry.
+        if (!this.outstanding.has(decoded.request_id)) {
+          // HELLO is parsed first and owns the entry.
+          throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "HELLO_AUTH does not match active handshake transaction");
+        }
+      } else if (type === "HELLO") {
+        this.admitRequest(decoded.request_id, type, message);
+      } else if (type !== "CAPABILITIES" && type !== "PONG" && !this.authenticated) {
+        throw new GarpError(GarpErrorCode.AUTH_REQUIRED, "Authentication required");
+      } else if (type !== "CAPABILITIES" && type !== "PONG") {
+        if (!this.admitRequest(decoded.request_id, type, message)) return;
+      }
+    }
+
+    await this.service.handleGarpMessage(this, decoded);
+  }
+
+  semanticFingerprint(message) {
+    const clone = JSON.parse(JSON.stringify(message));
+    if (clone.timestamp !== undefined) delete clone.timestamp;
+    return JSON.stringify(clone);
+  }
+
+  admitRequest(requestId, type, message) {
+    if (!requestId) throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, "Command request_id must be non-nil");
+    const prior = this.completedResponses.get(requestId);
+    const seen = this.seenRequestIds.get(requestId);
+    if (this.outstanding.has(requestId) || prior || seen) {
+      if (prior && prior.fingerprint === this.semanticFingerprint(message)) {
+        this.sendEnvelope(prior.envelope, false);
+        return false;
+      }
+      throw new GarpError(GarpErrorCode.DUPLICATE_REQUEST, "Duplicate request_id");
+    }
+    if (this.outstanding.size >= GARP_MAX_OUTSTANDING_REQUESTS) throw new GarpError(GarpErrorCode.OUTSTANDING_REQUEST_LIMIT, "Maximum outstanding requests reached");
+    const fingerprint = this.semanticFingerprint(message);
+    this.seenRequestIds.set(requestId, { type, fingerprint, seenAt: monotonicNow() });
+    this.outstanding.set(requestId, { type, fingerprint, acceptedAt: monotonicNow() });
+    return true;
+  }
+
+  commitRequestResponse(requestId, envelope) {
+    if (!requestId) return;
+    const pending = this.outstanding.get(requestId);
+    const seen = this.seenRequestIds.get(requestId);
+    const fingerprint = pending?.fingerprint || seen?.fingerprint || null;
+    this.outstanding.delete(requestId);
+    this.completedResponses.set(requestId, {
+      fingerprint,
+      envelope: structuredClone(envelope),
+      committedAt: monotonicNow(),
+    });
+  }
+
+  send(type, payload = {}, options = {}) {
+    if (this.closed) return false;
+    const requestId = options.request_id ?? null;
+    const sessionId = options.session_id ?? null;
+    const sequence = options.sequence ?? null;
+    const envelope = {
+      garp: "1.24",
+      type: typeof type === "number" ? messageTypeName(type) : String(type).toUpperCase(),
+      request_id: requestId,
+      session_id: sessionId,
+      timestamp: options.timestamp || new Date().toISOString(),
+      sequence,
+      payload,
+    };
+    try {
+      return this.sendEnvelope(envelope, options.isCommandResponse === true);
+    } catch (error) {
+      this.fail(error);
+      return false;
+    }
+  }
+
+  sendEnvelope(envelope, isCommandResponse = false) {
+    if (this.closed) return false;
+    const outboundLimit = this.peerCapabilitiesValidated ? Math.min(this.peerCapabilities?.limits?.max_payload_bytes ?? GARP_HANDSHAKE_LIMIT, 0xffffffff) : GARP_HANDSHAKE_LIMIT;
+    const frame = encodeGarpEnvelope(envelope, { enforceMaxPayload: outboundLimit });
+    if (isCommandResponse && envelope.request_id) {
+      this.commitRequestResponse(envelope.request_id, envelope);
+    }
+    const output = Cc["@mozilla.org/binaryoutputstream;1"].createInstance(Ci.nsIBinaryOutputStream);
+    output.setOutputStream(this.outStream);
+    output.writeByteArray(frame, frame.length);
+    this.lastOutboundProtocolTime = monotonicNow();
+    return true;
+  }
+
+  setPeerCapabilities(payload) { this.peerCapabilities = payload; this.peerCapabilitiesValidated = true; }
+
+  sendResponse(requestId, sessionId, payload) {
+    return this.send("RESPONSE", payload, { request_id: requestId, session_id: sessionId, sequence: null, isCommandResponse: true });
+  }
+
+  sendError(error, requestId = null, sessionId = null, commandCorrelated = false) {
+    const payload = { code: error?.code || GarpErrorCode.PROVIDER_ERROR, message: error?.message || String(error) };
+    if (error?.details) payload.details = error.details;
+    return this.send("ERROR", payload, { request_id: requestId, session_id: sessionId, sequence: null, isCommandResponse: commandCorrelated });
+  }
+
+  handleDispatchError(error, decoded) {
+    this.lastError = error;
+    const requestId = decoded?.request_id || null;
+    const sessionId = decoded?.session_id || null;
+    const commandCorrelated = !!requestId && this.outstanding.has(requestId);
+    this.sendError(error, commandCorrelated ? requestId : null, commandCorrelated ? sessionId : null, commandCorrelated);
+    if (!this.authenticated || [GarpErrorCode.UNSUPPORTED_WIRE_VERSION, GarpErrorCode.PROTOCOL_ERROR].includes(error?.code)) this.close();
+  }
+
+  fail(error) {
+    this.sendError(error, null, null, false);
+    this.close();
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    try { clearInterval(this.timer); } catch (_) {}
+    try { this.pump.cancel(0x804B0002); } catch (_) {}
+    try { this.inStream.close(); } catch (_) {}
+    try { this.outStream.close(); } catch (_) {}
+    this.service.removeConnection(this);
+  }
+}
+
+
+// File 6: browser\components\aistarter\garp\GarpErrors.sys.mjs
+export class GarpError extends Error {
+  constructor(code, message, options = {}) {
+    super(String(message || code));
+    this.name = "GarpError";
+    this.code = code;
+    this.retryable = !!options.retryable;
+    this.state = options.state || "ERROR";
+    this.provider = options.provider ?? null;
+    this.details = options.details ?? null;
+    this.requestId = options.requestId ?? null;
+    this.sessionId = options.sessionId ?? null;
+  }
+}
+
+export const GarpErrorCode = Object.freeze({
+  INVALID_ARGUMENT: "INVALID_ARGUMENT",
+  INVALID_ENVELOPE: "INVALID_ENVELOPE",
+  UNKNOWN_MESSAGE_TYPE: "UNKNOWN_MESSAGE_TYPE",
+  UNKNOWN_MESSAGE_ID: "UNKNOWN_MESSAGE_ID",
+  HEADER_JSON_MISMATCH: "HEADER_JSON_MISMATCH",
+  UNSUPPORTED_VERSION: "UNSUPPORTED_VERSION",
+  UNSUPPORTED_WIRE_VERSION: "UNSUPPORTED_WIRE_VERSION",
+  UNSUPPORTED_FEATURE: "UNSUPPORTED_FEATURE",
+
+  AUTH_REQUIRED: "AUTH_REQUIRED",
+  AUTH_FAILED: "AUTH_FAILED",
+  AUTH_REPLAY: "AUTH_REPLAY",
+  HANDSHAKE_TIMEOUT: "HANDSHAKE_TIMEOUT",
+
+  DUPLICATE_REQUEST: "DUPLICATE_REQUEST",
+  REVISION_GAP: "REVISION_GAP",
+  EVENT_SEQUENCE_GAP: "EVENT_SEQUENCE_GAP",
+  EVENT_SEQUENCE_OVERFLOW: "EVENT_SEQUENCE_OVERFLOW",
+  PAGE_GENERATION_OVERFLOW: "PAGE_GENERATION_OVERFLOW",
+  INVALID_MESSAGE_STATE: "INVALID_MESSAGE_STATE",
+
+  SESSION_NOT_FOUND: "SESSION_NOT_FOUND",
+  SESSION_CLOSED: "SESSION_CLOSED",
+  SESSION_BUSY: "SESSION_BUSY",
+  OUTSTANDING_REQUEST_LIMIT: "OUTSTANDING_REQUEST_LIMIT",
+
+  TAB_NOT_FOUND: "TAB_NOT_FOUND",
+  TAB_UNAVAILABLE: "TAB_UNAVAILABLE",
+
+  PROMPT_NOT_FOUND: "PROMPT_NOT_FOUND",
+  PROMPT_NOT_ACTIVE: "PROMPT_NOT_ACTIVE",
+  PROMPT_ALREADY_TERMINAL: "PROMPT_ALREADY_TERMINAL",
+  PROMPT_TIMEOUT: "PROMPT_TIMEOUT",
+  PROMPT_CANCELLED: "PROMPT_CANCELLED",
+  RESPONSE_NOT_READY: "RESPONSE_NOT_READY",
+
+  INPUT_VERIFICATION_FAILED: "INPUT_VERIFICATION_FAILED",
+  SUBMISSION_FAILED: "SUBMISSION_FAILED",
+  STALE_ACTOR: "STALE_ACTOR",
+  NAVIGATION_DRIFT: "NAVIGATION_DRIFT",
+
+  PROVIDER_UNAVAILABLE: "PROVIDER_UNAVAILABLE",
+  PROVIDER_AUTH_REQUIRED: "PROVIDER_AUTH_REQUIRED",
+  PROVIDER_RATE_LIMITED: "PROVIDER_RATE_LIMITED",
+  PROVIDER_ERROR: "PROVIDER_ERROR",
+  RESPONSE_TOO_LARGE: "RESPONSE_TOO_LARGE",
+  GENERATION_BUFFER_LIMIT: "GENERATION_BUFFER_LIMIT",
+
+  CONTINUATION_NOT_ALLOWED: "CONTINUATION_NOT_ALLOWED",
+  CONTINUATION_LIMIT_REACHED: "CONTINUATION_LIMIT_REACHED",
+  CONTINUATION_TIMEOUT: "CONTINUATION_TIMEOUT",
+  CONTINUATION_NOT_AVAILABLE: "CONTINUATION_NOT_AVAILABLE",
+
+  RECOVERY_FAILED: "RECOVERY_FAILED",
+  EVENT_QUEUE_OVERFLOW: "EVENT_QUEUE_OVERFLOW",
+  EVENT_HISTORY_EXPIRED: "EVENT_HISTORY_EXPIRED",
+});
+
+
+// File 7: browser\components\aistarter\garp\GarpFrame.sys.mjs
+import {
+  GARP_APPLICATION_LIMIT_DEFAULT,
+  GARP_FIXED_HEADER_LENGTH,
+  GARP_HANDSHAKE_LIMIT,
+  GARP_MAX_ERROR_DETAILS_BYTES,
+  GARP_MAX_DIAGNOSTIC_DETAILS_BYTES,
+  GARP_PROTOCOL,
+  GARP_SEMANTIC_VERSION,
+  GARP_VERSION_BYTE,
+  messageTypeId,
+  messageTypeName,
+} from "./GarpRegistry.sys.mjs";
+import { GarpError, GarpErrorCode } from "./GarpErrors.sys.mjs";
+import { assertNoDuplicateObjectMembers } from "./GarpJson.sys.mjs";
+import { textDecoder, textEncoder, uuidToBytes, bytesToUuid } from "./GarpUtil.sys.mjs";
+import { validateEnvelope } from "./GarpSchema.sys.mjs";
+
+export function encodeGarpEnvelope(envelope, { enforceMaxPayload = GARP_APPLICATION_LIMIT_DEFAULT } = {}) {
+  const text = JSON.stringify(envelope);
+  const payloadBytes = textEncoder.encode(text);
+  if (payloadBytes.length > enforceMaxPayload) throw new GarpError(GarpErrorCode.FRAME_TOO_LARGE, "GARP payload exceeds negotiated limit");
+  validateEnvelope(envelope, envelope.type);
+  const numericType = messageTypeId(envelope.type);
+  if (!numericType) throw new GarpError(GarpErrorCode.UNKNOWN_MESSAGE_TYPE, `Unknown GARP message type ${envelope.type}`);
+  const frame = new Uint8Array(GARP_FIXED_HEADER_LENGTH + payloadBytes.length);
+  const view = new DataView(frame.buffer);
+  frame.set([0x47, 0x41, 0x52, 0x50], 0);
+  view.setUint8(4, GARP_VERSION_BYTE);
+  view.setUint8(5, 0);
+  view.setUint16(6, GARP_FIXED_HEADER_LENGTH, false);
+  view.setUint32(8, payloadBytes.length, false);
+  view.setUint16(12, numericType, false);
+  view.setUint16(14, 0, false);
+  frame.set(uuidToBytes(envelope.request_id), 16);
+  frame.set(uuidToBytes(envelope.session_id), 32);
+  frame.set(payloadBytes, GARP_FIXED_HEADER_LENGTH);
+  return frame;
+}
+
+export function encodeGarpMessage(type, payload = {}, options = {}) {
+  const now = options.timestamp || new Date().toISOString();
+  const envelope = {
+    garp: GARP_SEMANTIC_VERSION,
+    type: typeof type === "number" ? messageTypeName(type) : String(type).toUpperCase(),
+    request_id: options.request_id ?? null,
+    session_id: options.session_id ?? null,
+    timestamp: now,
+    sequence: options.sequence ?? null,
+    payload,
+  };
+  validateEnvelope(envelope, envelope.type);
+  return encodeGarpEnvelope(envelope, { enforceMaxPayload: options.maxPayloadBytes ?? GARP_APPLICATION_LIMIT_DEFAULT });
+}
+
+export function decodeGarpFrame(frame) {
+  if (!(frame instanceof Uint8Array)) frame = new Uint8Array(frame);
+  if (frame.length < GARP_FIXED_HEADER_LENGTH) throw new GarpError(GarpErrorCode.PROTOCOL_ERROR, "GARP frame shorter than fixed header");
+  if (frame[0] !== 0x47 || frame[1] !== 0x41 || frame[2] !== 0x52 || frame[3] !== 0x50) throw new GarpError(GarpErrorCode.PROTOCOL_ERROR, "Invalid GARP magic");
+  const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+  const wireVersion = view.getUint8(4);
+  if (wireVersion !== GARP_VERSION_BYTE) throw new GarpError(GarpErrorCode.UNSUPPORTED_WIRE_VERSION, `Unsupported wire version 0x${wireVersion.toString(16).padStart(2, "0")}`);
+  const headerLength = view.getUint16(6, false);
+  if (headerLength !== GARP_FIXED_HEADER_LENGTH) throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, "GARP header length must be exactly 48");
+  const payloadLength = view.getUint32(8, false);
+  if (frame.length !== headerLength + payloadLength) throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, "GARP payload length mismatch");
+  if (view.getUint8(5) !== 0) throw new GarpError(GarpErrorCode.UNSUPPORTED_FEATURE, "Unknown or unnegotiated GARP flag bit");
+  if (view.getUint16(14, false) !== 0) throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, "Reserved header field is nonzero");
+  const numericType = view.getUint16(12, false);
+  const type = messageTypeName(numericType);
+  if (!type) throw new GarpError(GarpErrorCode.UNKNOWN_MESSAGE_TYPE, `Unknown GARP message type 0x${numericType.toString(16).padStart(4, "0")}`);
+  let text;
+  try { text = textDecoder.decode(frame.subarray(headerLength)); } catch (error) { throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `Invalid UTF-8 payload: ${error.message}`); }
+  try { assertNoDuplicateObjectMembers(text); } catch (error) { throw error; }
+  let json;
+  try { json = JSON.parse(text); } catch (error) { throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `Invalid JSON payload: ${error.message}`); }
+  const requestId = bytesToUuid(frame, 16);
+  const sessionId = bytesToUuid(frame, 32);
+  if (!json || typeof json.type !== "string" || !messageTypeId(json.type)) throw new GarpError(GarpErrorCode.UNKNOWN_MESSAGE_TYPE, "Unknown envelope message type");
+  validateEnvelope(json, type, { request_id: requestId, session_id: sessionId });
+  return { numericType, type, request_id: requestId, session_id: sessionId, message: json, payloadLength };
+}
+
+export function peekHeader(buffer) {
+  if (buffer.length < GARP_FIXED_HEADER_LENGTH) return null;
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  return {
+    wireVersion: view.getUint8(4),
+    flags: view.getUint8(5),
+    headerLength: view.getUint16(6, false),
+    payloadLength: view.getUint32(8, false),
+    messageType: view.getUint16(12, false),
+  };
+}
+
+
+// File 8: browser\components\aistarter\garp\GarpJson.sys.mjs
+import { GarpError, GarpErrorCode } from "./GarpErrors.sys.mjs";
+
+/*
+ * JSON.parse() does not expose duplicate-member detection. This scanner
+ * validates object member uniqueness before JSON.parse() is allowed to run.
+ * JSON syntax itself remains delegated to the platform parser.
+ */
+export function assertNoDuplicateObjectMembers(text) {
+  let index = 0;
+
+  const fail = message => {
+    throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `Invalid JSON: ${message}`);
+  };
+
+  const skipWhitespace = () => {
+    while (index < text.length && /[\u0009\u000A\u000D\u0020]/.test(text[index])) index++;
+  };
+
+  const parseStringToken = () => {
+    if (text[index] !== '"') fail("string expected");
+    index++;
+    const start = index - 1;
+    while (index < text.length) {
+      const char = text[index++];
+      if (char === '"') return { raw: text.slice(start, index), value: JSON.parse(text.slice(start, index)) };
+      if (char === '\\') {
+        if (index >= text.length) fail("unterminated escape");
+        const escape = text[index++];
+        if (escape === 'u') {
+          for (let i = 0; i < 4; i++) {
+            if (index >= text.length || !/[0-9A-Fa-f]/.test(text[index++])) fail("invalid unicode escape");
+          }
+        } else if (!'"\\/bfnrt'.includes(escape)) {
+          fail("invalid escape");
+        }
+      } else if (char < ' ') {
+        fail("control character in string");
+      }
+    }
+    fail("unterminated string");
+  };
+
+  const skipPrimitive = () => {
+    const start = index;
+    while (index < text.length && !/[\u0009\u000A\u000D\u0020,\]}]/.test(text[index])) index++;
+    if (index === start) fail("value expected");
+  };
+
+  const skipValue = depth => {
+    if (depth > 256) fail("JSON nesting too deep");
+    skipWhitespace();
+    const char = text[index];
+    if (char === '"') { parseStringToken(); return; }
+    if (char === '{') { parseObject(depth + 1); return; }
+    if (char === '[') { parseArray(depth + 1); return; }
+    skipPrimitive();
+  };
+
+  const parseArray = depth => {
+    index++;
+    skipWhitespace();
+    if (text[index] === ']') { index++; return; }
+    while (true) {
+      skipValue(depth);
+      skipWhitespace();
+      if (text[index] === ']') { index++; return; }
+      if (text[index] !== ',') fail("expected comma in array");
+      index++;
+    }
+  };
+
+  const parseObject = depth => {
+    index++;
+    const keys = new Set();
+    skipWhitespace();
+    if (text[index] === '}') { index++; return; }
+    while (true) {
+      skipWhitespace();
+      const token = parseStringToken();
+      if (keys.has(token.value)) fail(`duplicate object member ${token.value}`);
+      keys.add(token.value);
+      skipWhitespace();
+      if (text[index] !== ':') fail("expected colon in object");
+      index++;
+      skipValue(depth);
+      skipWhitespace();
+      if (text[index] === '}') { index++; return; }
+      if (text[index] !== ',') fail("expected comma in object");
+      index++;
+    }
+  };
+
+  skipWhitespace();
+  skipValue(0);
+  skipWhitespace();
+  if (index !== text.length) fail("trailing data");
+}
+
+
+// File 9: browser\components\aistarter\garp\GarpRegistry.sys.mjs
+export const GARP_PROTOCOL = "GARP/1.24";
+export const GARP_SEMANTIC_VERSION = "1.24";
+export const GARP_WIRE_VERSION = "0x00";
+export const GARP_VERSION_BYTE = 0x00;
+export const GARP_FIXED_HEADER_LENGTH = 48;
+export const GARP_HANDSHAKE_LIMIT = 1024 * 1024;
+export const GARP_APPLICATION_LIMIT_DEFAULT = 16 * 1024 * 1024;
+export const GARP_UINT64_MAX = 18446744073709551615n;
+export const GARP_HANDSHAKE_TIMEOUT_MS = 10000;
+export const GARP_DEFAULT_RESPONSE_RETENTION_MS = 86400000n;
+export const GARP_DEFAULT_CONTINUATION_WAIT_MS = 300000n;
+export const GARP_DEFAULT_RECOVERY_DEADLINE_MS = 300000n;
+export const GARP_DEFAULT_IDLE_TIMEOUT_MS = 30000n;
+export const GARP_DEFAULT_INTERVAL_MS = 10000n;
+export const GARP_MAX_PROMPT_SIZE = 1048576;
+export const GARP_MAX_RESPONSE_SIZE = 16777216;
+export const GARP_MAX_OUTSTANDING_REQUESTS = 128;
+export const GARP_MAX_QUEUED_EVENTS = 8192;
+export const GARP_MAX_EVENT_HISTORY_MEMORY_MB = 64;
+export const GARP_MAX_GENERATION_BUFFER_MB = 32;
+export const GARP_MAX_ERROR_DETAILS_BYTES = 65536;
+export const GARP_MAX_DIAGNOSTIC_DETAILS_BYTES = 65536;
+
+export const GarpMessageType = Object.freeze({
+  HELLO: 0x0001,
+  HELLO_CHALLENGE: 0x0002,
+  HELLO_AUTH: 0x0003,
+  HELLO_ACK: 0x0004,
+  RESPONSE: 0x0005,
+  ERROR: 0x0006,
+
+  CAPABILITIES: 0x0010,
+  BROWSER_STATUS: 0x0011,
+  LIST_TABS: 0x0012,
+  OPEN_TAB: 0x0013,
+  CLOSE_TAB: 0x0014,
+  SELECT_TAB: 0x0015,
+  GET_CAPABILITIES: 0x0016,
+
+  CREATE_SESSION: 0x0020,
+  ATTACH_SESSION: 0x0021,
+  DETACH_SESSION: 0x0022,
+  CLOSE_SESSION: 0x0023,
+  RESET_SESSION: 0x0024,
+  GET_SESSION: 0x0025,
+
+  PROMPT: 0x0030,
+  CANCEL_PROMPT: 0x0031,
+  GET_PROMPT_STATUS: 0x0032,
+  GET_RESPONSE: 0x0033,
+  SUBSCRIBE_RESPONSE: 0x0034,
+  CONTINUE_PROMPT: 0x0035,
+
+  SESSION_READY: 0x0040,
+  SESSION_CHANGED: 0x0041,
+  NAVIGATION: 0x0042,
+  NAVIGATION_DRIFT: 0x0043,
+  RECOVERY_STATE: 0x0044,
+  PROVIDER_CHANGED: 0x0045,
+
+  INPUT_SUBMITTED: 0x0050,
+  GENERATION_STARTED: 0x0051,
+  GENERATION_DELTA: 0x0052,
+  GENERATION_PROGRESS: 0x0053,
+  CONTINUATION_REQUIRED: 0x0054,
+  CONTINUATION_SUBMITTED: 0x0055,
+  GENERATION_COMPLETED: 0x0056,
+  GENERATION_FAILED: 0x0057,
+  GENERATION_CANCELLED: 0x0058,
+
+  PROVIDER_ERROR: 0x0060,
+  PROVIDER_AUTH_REQUIRED: 0x0061,
+  PROVIDER_RATE_LIMITED: 0x0062,
+  DIAGNOSTIC: 0x0063,
+
+  PING: 0x0070,
+  PONG: 0x0071,
+
+  GET_EVENTS: 0x0100,
+});
+
+const TYPE_NAME_BY_ID = new Map(
+  Object.entries(GarpMessageType).map(([name, id]) => [id, name])
+);
+
+const TYPE_ID_BY_NAME = new Map(
+  Object.entries(GarpMessageType).map(([name, id]) => [name, id])
+);
+
+export function messageTypeName(id) {
+  return TYPE_NAME_BY_ID.get(id) || null;
+}
+
+export function messageTypeId(name) {
+  return TYPE_ID_BY_NAME.get(String(name || "").toUpperCase()) || 0;
+}
+
+export const GarpFeature = Object.freeze([
+  "ext-pong",
+  "ext-replay-store",
+]);
+
+export const GarpSessionEventTypes = new Set([
+  "SESSION_READY",
+  "SESSION_CHANGED",
+  "NAVIGATION",
+  "NAVIGATION_DRIFT",
+  "RECOVERY_STATE",
+  "PROVIDER_CHANGED",
+  "INPUT_SUBMITTED",
+  "GENERATION_STARTED",
+  "GENERATION_DELTA",
+  "GENERATION_PROGRESS",
+  "CONTINUATION_REQUIRED",
+  "CONTINUATION_SUBMITTED",
+  "GENERATION_COMPLETED",
+  "GENERATION_FAILED",
+  "GENERATION_CANCELLED",
+  "PROVIDER_ERROR",
+  "PROVIDER_AUTH_REQUIRED",
+  "PROVIDER_RATE_LIMITED",
+  "DIAGNOSTIC",
+]);
+
+export const GarpConnectionScopedTypes = new Set([
+  "HELLO",
+  "HELLO_CHALLENGE",
+  "HELLO_AUTH",
+  "HELLO_ACK",
+  "CAPABILITIES",
+  "BROWSER_STATUS",
+  "LIST_TABS",
+  "OPEN_TAB",
+  "CLOSE_TAB",
+  "SELECT_TAB",
+  "GET_CAPABILITIES",
+  "CREATE_SESSION",
+  "PING",
+  "PONG",
+]);
+
+export const GarpSessionScopedCommandTypes = new Set([
+  "ATTACH_SESSION",
+  "DETACH_SESSION",
+  "CLOSE_SESSION",
+  "RESET_SESSION",
+  "GET_SESSION",
+  "PROMPT",
+  "CANCEL_PROMPT",
+  "GET_PROMPT_STATUS",
+  "GET_RESPONSE",
+  "SUBSCRIBE_RESPONSE",
+  "CONTINUE_PROMPT",
+  "GET_EVENTS",
+]);
+
+
+// File 10: browser\components\aistarter\garp\GarpReplayStore.sys.mjs
+import { IOUtils } from "resource://gre/modules/IOUtils.sys.mjs";
+import { PathUtils } from "resource://gre/modules/PathUtils.sys.mjs";
+import { GarpError, GarpErrorCode } from "./GarpErrors.sys.mjs";
+import { monotonicNow, sha256, textEncoder } from "./GarpUtil.sys.mjs";
+
+const RETENTION_MS = 24 * 60 * 60 * 1000;
+
+async function digestHex(text) {
+  const bytes = await sha256(textEncoder.encode(text));
+  return [...bytes].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+export class GarpReplayStore {
+  constructor() {
+    this.path = PathUtils.join(PathUtils.profileDir, "garp-auth-replay.json");
+    this.markerPath = PathUtils.join(PathUtils.profileDir, "garp-auth-replay.initialized");
+    this.entries = new Map();
+    this.loaded = false;
+    this.replayStateAvailable = true;
+    this.writePromise = Promise.resolve();
+  }
+
+  async load() {
+    if (this.loaded) return;
+    try {
+      const exists = await IOUtils.exists(this.path);
+      const markerExists = await IOUtils.exists(this.markerPath);
+      if (!exists && markerExists) {
+        this.replayStateAvailable = false;
+        return;
+      }
+      if (exists) {
+        const text = await IOUtils.readUTF8(this.path);
+        const parsed = JSON.parse(text);
+        if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.entries)) throw new Error("invalid replay state");
+        for (const entry of parsed.entries) {
+          if (typeof entry.key !== "string" || !Number.isFinite(entry.expiresAt)) throw new Error("invalid replay entry");
+          if (entry.expiresAt > Date.now()) this.entries.set(entry.key, entry.expiresAt);
+        }
+      }
+      await IOUtils.writeUTF8(this.markerPath, "GARP/1.24 replay state initialized\n", { tmpPath: `${this.markerPath}.tmp`, backupFile: `${this.markerPath}.bak` });
+      await this.persist();
+      this.loaded = true;
+    } catch (error) {
+      this.replayStateAvailable = false;
+      Cu.reportError(`GARP/1.24 replay store unavailable: ${error}`);
+    }
+  }
+
+  async keyFromTranscriptCore(transcriptCore) {
+    const digest = await sha256(transcriptCore);
+    return [...digest].map(b => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  has(key) {
+    this.pruneExpired();
+    return this.entries.has(key);
+  }
+
+  async remember(key) {
+    if (!this.replayStateAvailable) throw new GarpError(GarpErrorCode.AUTH_REPLAY, "Authentication replay state is unavailable; configured secret is disabled");
+    this.pruneExpired();
+    this.entries.set(key, Date.now() + RETENTION_MS);
+    try {
+      await this.persist();
+    } catch (error) {
+      this.replayStateAvailable = false;
+      throw new GarpError(GarpErrorCode.AUTH_REPLAY, "Authentication replay state could not be durably persisted; configured secret is disabled");
+    }
+  }
+
+  pruneExpired() {
+    const now = Date.now();
+    for (const [key, expiresAt] of this.entries) if (expiresAt <= now) this.entries.delete(key);
+  }
+
+  async persist() {
+    if (!this.replayStateAvailable) return;
+    const data = JSON.stringify({ version: 1, entries: [...this.entries].map(([key, expiresAt]) => ({ key, expiresAt })) });
+    this.writePromise = this.writePromise.then(() => IOUtils.writeUTF8(this.path, data, { tmpPath: `${this.path}.tmp`, backupFile: `${this.path}.bak` }));
+    return this.writePromise;
+  }
+}
+
+
+// File 11: browser\components\aistarter\garp\GarpSchema.sys.mjs
+import {
+  GarpConnectionScopedTypes,
+  GarpSessionEventTypes,
+  GarpSessionScopedCommandTypes,
+  GARP_APPLICATION_LIMIT_DEFAULT,
+  GARP_DEFAULT_CONTINUATION_WAIT_MS,
+  GARP_HANDSHAKE_TIMEOUT_MS,
+  GARP_DEFAULT_IDLE_TIMEOUT_MS,
+  GARP_DEFAULT_INTERVAL_MS,
+  GARP_DEFAULT_RECOVERY_DEADLINE_MS,
+  GARP_DEFAULT_RESPONSE_RETENTION_MS,
+  GARP_MAX_GENERATION_BUFFER_MB,
+  GARP_MAX_EVENT_HISTORY_MEMORY_MB,
+  GARP_MAX_OUTSTANDING_REQUESTS,
+  GARP_MAX_PROMPT_SIZE,
+  GARP_MAX_QUEUED_EVENTS,
+  GARP_MAX_RESPONSE_SIZE,
+  GARP_PROTOCOL,
+  GARP_SEMANTIC_VERSION,
+  GARP_WIRE_VERSION,
+} from "./GarpRegistry.sys.mjs";
+import { GarpError, GarpErrorCode } from "./GarpErrors.sys.mjs";
+import { byteLength, durationMs, isUuid, sortedUtf8, u32, uint64, utf8ByteCompare } from "./GarpUtil.sys.mjs";
+
+const TOP_KEYS = new Set(["garp", "type", "request_id", "session_id", "timestamp", "sequence", "payload"]);
+const FEATURE_RE = /^!?[a-z0-9][a-z0-9._-]{0,127}$/;
+const STRATEGY_RE = /^[a-z][a-z0-9_]{0,63}$/;
+const ISO_MS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+function invalid(message) { throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, message); }
+function ensureObject(value, name) { if (!value || typeof value !== "object" || Array.isArray(value)) invalid(`${name} must be an object`); }
+function exactKeys(object, required, allowed = required, name = "object") {
+  ensureObject(object, name);
+  for (const key of required) if (!Object.prototype.hasOwnProperty.call(object, key)) throw new GarpError(GarpErrorCode.INVALID_ENVELOPE, `${name} missing required member ${key}`);
+  for (const key of Object.keys(object)) if (!allowed.includes(key)) invalid(`${name} contains unknown member ${key}`);
+}
+function stringBound(value, name, min, max) {
+  if (typeof value !== "string") invalid(`${name} must be a string`);
+  const length = byteLength(value);
+  if (length < min || length > max) invalid(`${name} length is outside ${min}..${max} bytes`);
+  return value;
+}
+function bool(value, name) { if (typeof value !== "boolean") invalid(`${name} must be boolean`); }
+function arrayUnique(array, name) {
+  const set = new Set(array);
+  if (set.size !== array.length) invalid(`${name} contains duplicates`);
+}
+function validateFeatureList(features, name) {
+  if (!Array.isArray(features)) invalid(`${name} must be an array`);
+  const canonical = [];
+  for (const feature of features) {
+    if (typeof feature !== "string" || !FEATURE_RE.test(feature)) invalid(`${name} contains invalid feature name`);
+    canonical.push(feature);
+  }
+  arrayUnique(canonical.map(v => v.startsWith("!") ? v.slice(1) : v), name);
+  const sorted = sortedUtf8(canonical);
+  for (let i = 0; i < canonical.length; i++) if (canonical[i] !== sorted[i]) invalid(`${name} must be UTF-8 byte sorted`);
+  return canonical;
+}
+function validateTimestamp(value) { if (typeof value !== "string" || !ISO_MS_RE.test(value)) invalid("timestamp must be RFC3339 UTC with millisecond precision"); }
+function validateIdentity(value, name) {
+  if (value !== null && !isUuid(value)) invalid(`${name} must be UUID or null`);
+}
+function validateSequence(value, sessionScoped) {
+  if (sessionScoped) { if (typeof value !== "string") invalid("sequence must be uint64-string for session events"); uint64(value, "sequence"); }
+  else if (value !== null) invalid("sequence must be null for connection-scoped messages and commands");
+}
+
+function validateCapabilitiesPayload(payload) {
+  exactKeys(payload, ["protocol", "wire_version", "limits", "keepalive", "providers", "extensions"], ["protocol", "wire_version", "limits", "keepalive", "providers", "extensions"], "CAPABILITIES payload");
+  stringBound(payload.protocol, "protocol", 4, 16);
+  if (payload.protocol !== GARP_SEMANTIC_VERSION) invalid("CAPABILITIES.protocol mismatch");
+  if (payload.wire_version !== GARP_WIRE_VERSION) invalid("CAPABILITIES.wire_version mismatch");
+  ensureObject(payload.limits, "limits");
+  const uint32Names = ["max_payload_bytes", "max_prompt_size", "max_response_size", "max_outstanding_requests", "max_queued_events", "max_event_history_memory_mb", "max_generation_buffer_mb", "max_error_details_bytes", "max_diagnostic_details_bytes"];
+  const uint64Names = ["handshake_timeout_ms", "response_retention_ms", "continuation_wait_ms", "recovery_deadline_ms"];
+  for (const name of uint32Names) u32(payload.limits[name], `limits.${name}`);
+  for (const name of uint64Names) durationMs(payload.limits[name], `limits.${name}`);
+  if (payload.limits.handshake_timeout_ms !== "10000") invalid("CAPABILITIES.handshake_timeout_ms must advertise the enforced 10000 ms limit");
+  if (payload.limits.max_payload_bytes > 0xffffffff) invalid("max_payload_bytes invalid");
+  ensureObject(payload.keepalive, "keepalive");
+  exactKeys(payload.keepalive, ["enabled", "idle_timeout_ms", "interval_ms"], undefined, "keepalive");
+  bool(payload.keepalive.enabled, "keepalive.enabled");
+  durationMs(payload.keepalive.idle_timeout_ms, "keepalive.idle_timeout_ms");
+  durationMs(payload.keepalive.interval_ms, "keepalive.interval_ms");
+  if (payload.keepalive.enabled) {
+    if (BigInt(payload.keepalive.interval_ms) <= 0n || BigInt(payload.keepalive.idle_timeout_ms) <= 0n || BigInt(payload.keepalive.interval_ms) >= BigInt(payload.keepalive.idle_timeout_ms)) invalid("keepalive intervals are invalid");
+  }
+  if (!Array.isArray(payload.providers)) invalid("providers must be an array");
+  const ids = [];
+  for (const entry of payload.providers) {
+    exactKeys(entry, ["id", "version", "state", "input_strategies", "capabilities"], undefined, "provider entry");
+    stringBound(entry.id, "provider.id", 1, 64); stringBound(entry.version, "provider.version", 1, 64);
+    if (!["AVAILABLE", "UNAVAILABLE", "AUTH_REQUIRED", "RATE_LIMITED", "DEGRADED"].includes(entry.state)) invalid("invalid provider state");
+    if (!Array.isArray(entry.input_strategies) || entry.input_strategies.length < 1) invalid("provider.input_strategies must contain at least one strategy");
+    for (const strategy of entry.input_strategies) if (typeof strategy !== "string" || !STRATEGY_RE.test(strategy) || byteLength(strategy) > 64) invalid("invalid provider input strategy");
+    arrayUnique(entry.input_strategies, "provider.input_strategies");
+    const sortedStrategies = sortedUtf8(entry.input_strategies); for (let i = 0; i < sortedStrategies.length; i++) if (entry.input_strategies[i] !== sortedStrategies[i]) invalid("input_strategies must be UTF-8 byte sorted");
+    exactKeys(entry.capabilities, ["streaming", "cancellation", "continuation", "diagnostics"], undefined, "provider.capabilities");
+    for (const key of ["streaming", "cancellation", "continuation", "diagnostics"]) bool(entry.capabilities[key], `provider.capabilities.${key}`);
+    ids.push(entry.id);
+  }
+  const sortedIds = sortedUtf8(ids); for (let i = 0; i < sortedIds.length; i++) if (ids[i] !== sortedIds[i]) invalid("providers must be UTF-8 byte sorted");
+  arrayUnique(ids, "providers");
+  if (!Array.isArray(payload.extensions)) invalid("extensions must be an array");
+  for (const ext of payload.extensions) { exactKeys(ext, ["name", "version"], undefined, "extension entry"); stringBound(ext.name, "extension.name", 1, 128); stringBound(ext.version, "extension.version", 1, 64); }
+  const extNames = payload.extensions.map(v => v.name); const sortedExt = sortedUtf8(extNames); for (let i = 0; i < sortedExt.length; i++) if (extNames[i] !== sortedExt[i]) invalid("extensions must be UTF-8 byte sorted");
+}
+
+function validatePromptOptions(options) {
+  ensureObject(options, "PROMPT.options");
+  const allowed = ["timeout_ms", "auto_continue", "max_continuations", "force_focus", "simulate_enter", "_extensions"];
+  exactKeys(options, [], allowed, "PROMPT.options");
+  const timeout = options.timeout_ms ?? "0"; durationMs(timeout, "timeout_ms", 86400000n);
+  const auto = options.auto_continue ?? false; bool(auto, "auto_continue");
+  const max = options.max_continuations ?? 8; u32(max, "max_continuations"); if (max > 1024) invalid("max_continuations exceeds 1024");
+  const ff = options.force_focus ?? false; bool(ff, "force_focus");
+  const se = options.simulate_enter ?? false; bool(se, "simulate_enter");
+  if (Object.prototype.hasOwnProperty.call(options, "_extensions")) ensureObject(options._extensions, "PROMPT.options._extensions");
+}
+
+export function validateEnvelope(json, expectedType = null, header = null) {
+  ensureObject(json, "Common Envelope");
+  exactKeys(json, ["garp", "type", "request_id", "session_id", "timestamp", "sequence", "payload"], [...TOP_KEYS], "Common Envelope");
+  if (json.garp !== GARP_SEMANTIC_VERSION) throw new GarpError(GarpErrorCode.UNSUPPORTED_VERSION, `Unsupported semantic version: ${json.garp}`);
+  if (typeof json.type !== "string" || !/^[A-Z][A-Z0-9_]{0,63}$/.test(json.type)) throw new GarpError(GarpErrorCode.INVALID_ENVELOPE, "Envelope.type is invalid");
+  if (expectedType && json.type !== expectedType) throw new GarpError(GarpErrorCode.HEADER_JSON_MISMATCH, "Envelope type does not match binary header");
+  validateIdentity(json.request_id, "request_id"); validateIdentity(json.session_id, "session_id"); validateTimestamp(json.timestamp);
+  const sessionEvent = GarpSessionEventTypes.has(json.type); const sessionCommand = GarpSessionScopedCommandTypes.has(json.type);
+  validateSequence(json.sequence, sessionEvent);
+  ensureObject(json.payload, "payload");
+  if (sessionEvent) { if (json.request_id !== null) throw new GarpError(GarpErrorCode.INVALID_ENVELOPE, "Session event request_id must be null"); if (json.session_id === null) throw new GarpError(GarpErrorCode.INVALID_ENVELOPE, "Session event session_id must be non-null"); }
+  if (GarpConnectionScopedTypes.has(json.type)) { if (json.session_id !== null) throw new GarpError(GarpErrorCode.INVALID_ENVELOPE, "Connection-scoped message must have null session_id"); }
+  if (sessionCommand && json.session_id === null) throw new GarpError(GarpErrorCode.INVALID_ENVELOPE, "Session-scoped command requires session_id");
+  if (header) {
+    const hRequest = header.request_id; const hSession = header.session_id;
+    if ((json.request_id ?? null) !== (hRequest ?? null) || (json.session_id ?? null) !== (hSession ?? null)) throw new GarpError(GarpErrorCode.HEADER_JSON_MISMATCH, "Header/envelope UUID mismatch");
+  }
+  validateMessagePayload(json.type, json.payload);
+  return json;
+}
+
+export function validateMessagePayload(type, payload) {
+  switch (type) {
+    case "HELLO":
+      exactKeys(payload, ["client_name", "client_version", "versions", "wire_versions", "features", "client_nonce"], undefined, "HELLO payload");
+      stringBound(payload.client_name, "client_name", 1, 64); stringBound(payload.client_version, "client_version", 1, 64);
+      if (!Array.isArray(payload.versions) || payload.versions.length < 1) invalid("HELLO.versions invalid"); if (!payload.versions.includes(GARP_SEMANTIC_VERSION)) invalid("HELLO does not offer GARP/1.24");
+      if (!Array.isArray(payload.wire_versions) || payload.wire_versions.length < 1) invalid("HELLO.wire_versions invalid"); if (!payload.wire_versions.includes("0x00")) throw new GarpError(GarpErrorCode.UNSUPPORTED_WIRE_VERSION, "HELLO does not offer wire version 0x00");
+      validateFeatureList(payload.features, "HELLO.features");
+      if (typeof payload.client_nonce !== "string") invalid("HELLO.client_nonce invalid");
+      break;
+    case "HELLO_CHALLENGE":
+      exactKeys(payload, ["server_name", "server_version", "selected_version", "selected_wire_version", "features", "server_nonce"], undefined, "HELLO_CHALLENGE payload");
+      stringBound(payload.server_name, "server_name", 1, 64); stringBound(payload.server_version, "server_version", 1, 64);
+      if (payload.selected_version !== GARP_SEMANTIC_VERSION) throw new GarpError(GarpErrorCode.UNSUPPORTED_VERSION, "Unsupported selected version");
+      if (payload.selected_wire_version !== "0x00") throw new GarpError(GarpErrorCode.UNSUPPORTED_WIRE_VERSION, "Unsupported selected wire version");
+      validateFeatureList(payload.features, "HELLO_CHALLENGE.features"); if (typeof payload.server_nonce !== "string") invalid("HELLO_CHALLENGE.server_nonce invalid"); break;
+    case "HELLO_AUTH": exactKeys(payload, ["client_proof"], undefined, "HELLO_AUTH payload"); if (typeof payload.client_proof !== "string") invalid("client_proof invalid"); break;
+    case "HELLO_ACK": exactKeys(payload, ["server_proof", "selected_version", "selected_wire_version", "features"], undefined, "HELLO_ACK payload"); if (typeof payload.server_proof !== "string") invalid("server_proof invalid"); if (payload.selected_version !== GARP_SEMANTIC_VERSION || payload.selected_wire_version !== "0x00") invalid("HELLO_ACK selection invalid"); validateFeatureList(payload.features, "HELLO_ACK.features"); break;
+    case "CAPABILITIES": validateCapabilitiesPayload(payload); break;
+    case "BROWSER_STATUS": exactKeys(payload, ["state", "active_tab_id"], undefined, "BROWSER_STATUS payload"); if (!["STARTING", "READY", "DEGRADED", "FAILED"].includes(payload.state)) invalid("invalid browser state"); if (payload.active_tab_id !== null) stringBound(payload.active_tab_id, "active_tab_id", 1, 64); break;
+    case "LIST_TABS": exactKeys(payload, [], undefined, "LIST_TABS payload"); break;
+    case "OPEN_TAB": exactKeys(payload, ["url"], undefined, "OPEN_TAB payload"); stringBound(payload.url, "url", 1, 4096); { let url; try { url = new URL(payload.url); } catch (_) { invalid("OPEN_TAB.url invalid"); } if (!['http:', 'https:'].includes(url.protocol)) invalid("OPEN_TAB only permits http/https"); } break;
+    case "CLOSE_TAB": case "SELECT_TAB": exactKeys(payload, ["tab_id"], undefined, `${type} payload`); stringBound(payload.tab_id, "tab_id", 1, 64); break;
+    case "GET_CAPABILITIES": exactKeys(payload, [], undefined, "GET_CAPABILITIES payload"); break;
+    case "CREATE_SESSION": exactKeys(payload, ["provider", "options"], ["provider", "tab_id", "options"], "CREATE_SESSION payload"); stringBound(payload.provider, "provider", 1, 64); exactKeys(payload.options, [], [], "CREATE_SESSION.options"); if (Object.prototype.hasOwnProperty.call(payload, "tab_id")) stringBound(payload.tab_id, "tab_id", 1, 64); break;
+    case "ATTACH_SESSION": case "DETACH_SESSION": case "CLOSE_SESSION": case "GET_SESSION": case "RESET_SESSION": exactKeys(payload, type === "ATTACH_SESSION" || type === "RESET_SESSION" ? ["options"] : [], type === "ATTACH_SESSION" || type === "RESET_SESSION" ? ["options"] : [], `${type} payload`); if (payload.options !== undefined) exactKeys(payload.options, [], [], `${type}.options`); break;
+    case "PROMPT": exactKeys(payload, ["prompt", "options"], undefined, "PROMPT payload"); if (typeof payload.prompt !== "string") invalid("PROMPT.prompt must be string"); if (byteLength(payload.prompt) > GARP_MAX_PROMPT_SIZE) invalid("prompt exceeds max_prompt_size"); validatePromptOptions(payload.options); break;
+    case "CANCEL_PROMPT": case "GET_PROMPT_STATUS": case "GET_RESPONSE": case "SUBSCRIBE_RESPONSE": case "CONTINUE_PROMPT": exactKeys(payload, ["prompt_request_id"], undefined, `${type} payload`); if (!isUuid(payload.prompt_request_id)) invalid("prompt_request_id must be UUID"); break;
+    case "PING": exactKeys(payload, [], undefined, "PING payload"); break;
+    case "RESPONSE": ensureObject(payload, "RESPONSE payload"); if (typeof payload.success !== "boolean") invalid("RESPONSE.success must be boolean"); break;
+    case "ERROR": ensureObject(payload, "ERROR payload"); exactKeys(payload, ["code", "message"], ["code", "message", "details"], "ERROR payload"); stringBound(payload.code, "error.code", 1, 64); stringBound(payload.message, "error.message", 0, 1024); if (payload.details !== undefined) { ensureObject(payload.details, "ERROR.details"); if (byteLength(JSON.stringify(payload.details)) > GARP_MAX_ERROR_DETAILS_BYTES) invalid("ERROR.details too large"); } break;
+    case "SESSION_READY": exactKeys(payload, ["provider", "tab_id", "url", "page_generation"], undefined, type); stringBound(payload.provider, "provider", 1, 64); stringBound(payload.tab_id, "tab_id", 1, 64); stringBound(payload.url, "url", 1, 4096); uint64(payload.page_generation, "page_generation"); break;
+    case "SESSION_CHANGED": exactKeys(payload, ["changed", "page_generation"], undefined, type); if (!Array.isArray(payload.changed) || payload.changed.length < 1 || payload.changed.length > 4) invalid("changed invalid"); arrayUnique(payload.changed, "changed"); for (const v of payload.changed) if (!["provider", "tab_id", "url", "page_generation"].includes(v)) invalid("invalid changed member"); uint64(payload.page_generation, "page_generation"); break;
+    case "NAVIGATION": exactKeys(payload, ["page_generation", "url"], undefined, type); uint64(payload.page_generation, "page_generation"); stringBound(payload.url, "url", 1, 4096); break;
+    case "NAVIGATION_DRIFT": exactKeys(payload, ["page_generation", "reason"], undefined, type); uint64(payload.page_generation, "page_generation"); if (!["UNEXPECTED_URL", "DOCUMENT_REPLACED", "PROVIDER_CONTEXT_LOST", "ACTOR_CONTEXT_STALE"].includes(payload.reason)) invalid("invalid navigation drift reason"); break;
+    case "RECOVERY_STATE": exactKeys(payload, ["state", "reason", "deadline_remaining_ms"], undefined, type); if (!["RECOVERING", "RECOVERED", "FAILED"].includes(payload.state)) invalid("invalid recovery state"); if (!["ACTOR_REPLACED", "DOCUMENT_REPLACED", "UNEXPECTED_URL", "PROVIDER_CONTEXT_LOST", "CANCELLATION_UNVERIFIED", "PROVIDER_RECOVERY", "INTERNAL_DESYNC"].includes(payload.reason)) invalid("invalid recovery reason"); durationMs(payload.deadline_remaining_ms, "deadline_remaining_ms"); break;
+    case "PROVIDER_CHANGED": exactKeys(payload, ["previous_provider", "provider", "page_generation"], undefined, type); if (payload.previous_provider !== null) stringBound(payload.previous_provider, "previous_provider", 1, 64); stringBound(payload.provider, "provider", 1, 64); uint64(payload.page_generation, "page_generation"); break;
+    case "INPUT_SUBMITTED": exactKeys(payload, ["prompt_request_id", "page_generation", "strategy"], undefined, type); if (!isUuid(payload.prompt_request_id)) invalid("prompt_request_id invalid"); uint64(payload.page_generation, "page_generation"); stringBound(payload.strategy, "strategy", 1, 64); if (!STRATEGY_RE.test(payload.strategy)) invalid("strategy invalid"); break;
+    case "GENERATION_STARTED": exactKeys(payload, ["prompt_request_id", "message_id", "revision", "page_generation"], undefined, type); if (!isUuid(payload.prompt_request_id) || !isUuid(payload.message_id)) invalid("generation ids invalid"); if (uint64(payload.revision, "revision") !== 0n) invalid("GENERATION_STARTED revision must be 0"); uint64(payload.page_generation, "page_generation"); break;
+    case "GENERATION_DELTA": exactKeys(payload, ["prompt_request_id", "message_id", "revision", "delta", "mode", "page_generation"], undefined, type); if (!isUuid(payload.prompt_request_id) || !isUuid(payload.message_id)) invalid("generation ids invalid"); uint64(payload.revision, "revision"); if (payload.delta === undefined || typeof payload.delta !== "string") invalid("delta invalid"); if (!["APPEND", "REPLACE"].includes(payload.mode)) invalid("mode invalid"); uint64(payload.page_generation, "page_generation"); break;
+    case "GENERATION_PROGRESS": exactKeys(payload, ["prompt_request_id", "message_count", "page_generation"], undefined, type); if (!isUuid(payload.prompt_request_id)) invalid("prompt_request_id invalid"); u32(payload.message_count, "message_count"); uint64(payload.page_generation, "page_generation"); break;
+    case "CONTINUATION_REQUIRED": exactKeys(payload, ["prompt_request_id", "continuation_count", "max_continuations", "page_generation"], undefined, type); if (!isUuid(payload.prompt_request_id)) invalid("prompt_request_id invalid"); u32(payload.continuation_count, "continuation_count"); u32(payload.max_continuations, "max_continuations"); uint64(payload.page_generation, "page_generation"); break;
+    case "CONTINUATION_SUBMITTED": exactKeys(payload, ["prompt_request_id", "page_generation", "continuation_count", "strategy"], undefined, type); if (!isUuid(payload.prompt_request_id)) invalid("prompt_request_id invalid"); uint64(payload.page_generation, "page_generation"); u32(payload.continuation_count, "continuation_count"); stringBound(payload.strategy, "strategy", 1, 64); break;
+    case "GENERATION_COMPLETED": validateGenerationTerminalPayload(payload, false); break;
+    case "GENERATION_FAILED": validateGenerationTerminalPayload(payload, true); break;
+    case "GENERATION_CANCELLED": validateCancelledPayload(payload); break;
+    case "PROVIDER_ERROR": exactKeys(payload, ["provider", "code", "message", "retryable", "prompt_request_id", "page_generation"], undefined, type); stringBound(payload.provider, "provider", 1, 64); stringBound(payload.code, "code", 1, 64); stringBound(payload.message, "message", 0, 1024); bool(payload.retryable, "retryable"); if (payload.prompt_request_id !== null && !isUuid(payload.prompt_request_id)) invalid("prompt_request_id invalid"); uint64(payload.page_generation, "page_generation"); break;
+    case "PROVIDER_AUTH_REQUIRED": exactKeys(payload, ["provider", "reason", "page_generation"], undefined, type); stringBound(payload.provider, "provider", 1, 64); stringBound(payload.reason, "reason", 1, 64); uint64(payload.page_generation, "page_generation"); break;
+    case "PROVIDER_RATE_LIMITED": exactKeys(payload, ["provider", "retry_after_ms", "page_generation"], undefined, type); stringBound(payload.provider, "provider", 1, 64); durationMs(payload.retry_after_ms, "retry_after_ms"); uint64(payload.page_generation, "page_generation"); break;
+    case "DIAGNOSTIC": exactKeys(payload, ["level", "stage", "code", "message", "details", "actor_instance"], undefined, type); if (!["TRACE", "DEBUG", "INFO", "WARN", "ERROR"].includes(payload.level)) invalid("diagnostic level invalid"); if (!["TRANSPORT", "AUTHENTICATION", "SESSION", "SUBMISSION", "GENERATION", "CONTINUATION", "CANCELLATION", "RECOVERY", "PROVIDER"].includes(payload.stage)) invalid("diagnostic stage invalid"); stringBound(payload.code, "diagnostic.code", 1, 64); stringBound(payload.message, "diagnostic.message", 0, 1024); ensureObject(payload.details, "diagnostic.details"); if (byteLength(JSON.stringify(payload.details)) > GARP_MAX_DIAGNOSTIC_DETAILS_BYTES) invalid("diagnostic details too large"); stringBound(payload.actor_instance, "diagnostic.actor_instance", 1, 64); break;
+    case "GET_EVENTS": exactKeys(payload, ["from_sequence", "max_events"], undefined, type); if (uint64(payload.from_sequence, "from_sequence") < 1n) invalid("from_sequence must be >= 1"); u32(payload.max_events, "max_events"); if (payload.max_events < 1 || payload.max_events > 4096) invalid("max_events out of range"); break;
+    case "PONG": exactKeys(payload, [], undefined, "PONG payload"); break;
+    default: break;
+  }
+}
+
+function validateGenerationTerminalPayload(payload, failed) {
+  if (Array.isArray(payload.messages)) {
+    const allowed = ["prompt_request_id", "error", "partial", "messages", "page_generation"];
+    exactKeys(payload, failed ? ["prompt_request_id", "error", "partial", "messages", "page_generation"] : ["prompt_request_id", "messages", "page_generation"], allowed, failed ? "GENERATION_FAILED payload" : "GENERATION_COMPLETED payload");
+    if (!isUuid(payload.prompt_request_id)) invalid("prompt_request_id invalid");
+    if (failed) validateErrorObject(payload.error);
+    if (failed !== undefined && typeof payload.partial === "boolean" === false && failed) invalid("partial invalid");
+    if (!Array.isArray(payload.messages)) invalid("messages must be array");
+    for (const message of payload.messages) { exactKeys(message, ["message_id", "revision", "response"], undefined, "message result"); if (!isUuid(message.message_id)) invalid("message_id invalid"); uint64(message.revision, "revision"); if (typeof message.response !== "string") invalid("message.response invalid"); }
+    uint64(payload.page_generation, "page_generation"); return;
+  }
+  if (failed) {
+    exactKeys(payload, ["prompt_request_id", "error", "partial", "response", "page_generation"], undefined, "GENERATION_FAILED payload");
+    if (!isUuid(payload.prompt_request_id)) invalid("prompt_request_id invalid"); validateErrorObject(payload.error); bool(payload.partial, "partial"); if (payload.response !== null && typeof payload.response !== "string") invalid("response invalid"); uint64(payload.page_generation, "page_generation"); if (payload.response === null && payload.partial) invalid("partial cannot be true without response content");
+  } else {
+    exactKeys(payload, ["prompt_request_id", "message_id", "revision", "response", "page_generation"], undefined, "GENERATION_COMPLETED payload");
+    if (!isUuid(payload.prompt_request_id) || !isUuid(payload.message_id)) invalid("generation ids invalid"); uint64(payload.revision, "revision"); if (typeof payload.response !== "string") invalid("response invalid"); uint64(payload.page_generation, "page_generation");
+  }
+}
+function validateCancelledPayload(payload) {
+  if (Array.isArray(payload.messages)) {
+    exactKeys(payload, ["prompt_request_id", "cancel_verified", "partial", "messages", "page_generation"], undefined, "GENERATION_CANCELLED payload");
+    if (!isUuid(payload.prompt_request_id)) invalid("prompt_request_id invalid"); bool(payload.cancel_verified, "cancel_verified"); if (!payload.cancel_verified) invalid("cancel_verified must be true"); bool(payload.partial, "partial"); for (const msg of payload.messages) { exactKeys(msg, ["message_id", "revision", "response"], undefined, "cancelled message"); if (!isUuid(msg.message_id)) invalid("message_id invalid"); uint64(msg.revision, "revision"); if (typeof msg.response !== "string") invalid("message response invalid"); } uint64(payload.page_generation, "page_generation"); return;
+  }
+  exactKeys(payload, ["prompt_request_id", "message_id", "revision", "cancel_verified", "partial", "response", "page_generation"], undefined, "GENERATION_CANCELLED payload");
+  if (!isUuid(payload.prompt_request_id) || !isUuid(payload.message_id)) invalid("generation ids invalid"); uint64(payload.revision, "revision"); bool(payload.cancel_verified, "cancel_verified"); if (!payload.cancel_verified) invalid("cancel_verified must be true"); bool(payload.partial, "partial"); if (typeof payload.response !== "string") invalid("response invalid"); uint64(payload.page_generation, "page_generation");
+}
+function validateErrorObject(error) { ensureObject(error, "error"); exactKeys(error, ["code", "message"], undefined, "error"); stringBound(error.code, "error.code", 1, 64); stringBound(error.message, "error.message", 0, 1024); }
+
+export function capabilitiesObject(providerRegistry) {
+  const providers = providerRegistry.list().sort((a, b) => utf8ByteCompare(a.id, b.id));
+  for (const provider of providers) provider.input_strategies = sortedUtf8(provider.input_strategies);
+  return {
+    protocol: GARP_SEMANTIC_VERSION,
+    wire_version: GARP_WIRE_VERSION,
+    limits: {
+      handshake_timeout_ms: String(GARP_HANDSHAKE_TIMEOUT_MS),
+      max_payload_bytes: GARP_APPLICATION_LIMIT_DEFAULT,
+      max_prompt_size: GARP_MAX_PROMPT_SIZE,
+      max_response_size: GARP_MAX_RESPONSE_SIZE,
+      max_outstanding_requests: GARP_MAX_OUTSTANDING_REQUESTS,
+      max_queued_events: GARP_MAX_QUEUED_EVENTS,
+      max_event_history_memory_mb: GARP_MAX_EVENT_HISTORY_MEMORY_MB,
+      max_generation_buffer_mb: GARP_MAX_GENERATION_BUFFER_MB,
+      response_retention_ms: String(GARP_DEFAULT_RESPONSE_RETENTION_MS),
+      continuation_wait_ms: String(GARP_DEFAULT_CONTINUATION_WAIT_MS),
+      recovery_deadline_ms: String(GARP_DEFAULT_RECOVERY_DEADLINE_MS),
+      max_error_details_bytes: GARP_MAX_ERROR_DETAILS_BYTES,
+      max_diagnostic_details_bytes: GARP_MAX_DIAGNOSTIC_DETAILS_BYTES,
+    },
+    keepalive: {
+      enabled: true,
+      idle_timeout_ms: String(GARP_DEFAULT_IDLE_TIMEOUT_MS),
+      interval_ms: String(GARP_DEFAULT_INTERVAL_MS),
+    },
+    providers,
+    extensions: [
+      { name: "ext-pong", version: "1.0" },
+      { name: "ext-replay-store", version: "1.0" },
+    ],
+  };
+}
+
+export { GARP_DEFAULT_CONTINUATION_WAIT_MS, GARP_DEFAULT_RECOVERY_DEADLINE_MS };
+
+
+// File 12: browser\components\aistarter\garp\GarpUtil.sys.mjs
+import { GARP_UINT64_MAX } from "./GarpRegistry.sys.mjs";
+import { GarpError, GarpErrorCode } from "./GarpErrors.sys.mjs";
+
+export const textEncoder = new TextEncoder();
+export const textDecoder = new TextDecoder("utf-8", { fatal: true });
+
+export function monotonicNow() {
+  return globalThis.performance?.now?.() ?? Date.now();
+}
+
+export function byteLength(value) {
+  return textEncoder.encode(String(value ?? "")).length;
+}
+
+export function utf8ByteCompare(left, right) {
+  const a = textEncoder.encode(String(left));
+  const b = textEncoder.encode(String(right));
+  const count = Math.min(a.length, b.length);
+  for (let i = 0; i < count; i++) {
+    if (a[i] < b[i]) return -1;
+    if (a[i] > b[i]) return 1;
+  }
+  return a.length - b.length;
+}
+
+export function sortedUtf8(values) {
+  return [...values].sort(utf8ByteCompare);
+}
+
+export function isUuid(value) {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+export function isNilUuid(value) {
+  return value === null || value === "00000000-0000-0000-0000-000000000000";
+}
+
+export function uuid() {
+  return crypto.randomUUID();
+}
+
+export function uuidToBytes(value) {
+  if (value === null || value === undefined) return new Uint8Array(16);
+  if (!isUuid(value)) throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `Invalid UUID: ${value}`);
+  const hex = value.replaceAll("-", "").toLowerCase();
+  const bytes = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return bytes;
+}
+
+export function bytesToUuid(bytes, offset = 0) {
+  let allZero = true;
+  for (let i = 0; i < 16; i++) {
+    if (bytes[offset + i] !== 0) { allZero = false; break; }
+  }
+  if (allZero) return null;
+  const hex = [];
+  for (let i = 0; i < 16; i++) hex.push(bytes[offset + i].toString(16).padStart(2, "0"));
+  const text = hex.join("");
+  return `${text.slice(0, 8)}-${text.slice(8, 12)}-${text.slice(12, 16)}-${text.slice(16, 20)}-${text.slice(20)}`;
+}
+
+export function uint64(value, fieldName = "uint64") {
+  const text = String(value);
+  if (!/^(0|[1-9][0-9]{0,19})$/.test(text)) {
+    throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `${fieldName} must be a uint64-string`);
+  }
+  const result = BigInt(text);
+  if (result > GARP_UINT64_MAX) {
+    throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `${fieldName} exceeds uint64`);
+  }
+  return result;
+}
+
+export function u32(value, fieldName = "uint32") {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+    throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `${fieldName} must be uint32`);
+  }
+  return value;
+}
+
+export function durationMs(value, fieldName, max = 864000000n) {
+  const parsed = uint64(value, fieldName);
+  if (parsed > max) {
+    throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, `${fieldName} exceeds allowed duration`);
+  }
+  return parsed;
+}
+
+export function base64UrlEncode(bytes) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+}
+
+export function base64UrlDecode(text, expectedLength = null) {
+  if (typeof text !== "string" || !/^[A-Za-z0-9_-]*$/.test(text)) {
+    throw new GarpError(GarpErrorCode.AUTH_FAILED, "Invalid Base64URL nonce/proof");
+  }
+  if (text.length % 4 === 1) throw new GarpError(GarpErrorCode.AUTH_FAILED, "Invalid Base64URL length");
+  const padded = text.replaceAll("-", "+").replaceAll("_", "/") + "===".slice((text.length + 3) % 4);
+  let binary;
+  try { binary = atob(padded); } catch (_) { throw new GarpError(GarpErrorCode.AUTH_FAILED, "Invalid Base64URL encoding"); }
+  const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+  if (expectedLength !== null && bytes.length !== expectedLength) {
+    throw new GarpError(GarpErrorCode.AUTH_FAILED, "Decoded value has invalid length");
+  }
+  return bytes;
+}
+
+export function constantTimeEqualBytes(a, b) {
+  if (!(a instanceof Uint8Array) || !(b instanceof Uint8Array)) return false;
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+
+export async function sha256(bytes) {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+}
+
+export async function hmacSha256(keyBytes, dataBytes) {
+  const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return new Uint8Array(await crypto.subtle.sign("HMAC", key, dataBytes));
+}
+
+export function appendU32(list, value) {
+  const view = new DataView(new ArrayBuffer(4));
+  view.setUint32(0, value, false);
+  list.push(...new Uint8Array(view.buffer));
+}
+
+export function appendBytes(list, bytes) {
+  appendU32(list, bytes.length);
+  list.push(...bytes);
+}
+
+export function encodeTranscript(domain, clientNonce, serverNonce, selectedVersion, selectedWireVersion, offeredFeatures, finalFeatures, clientName, clientVersion, serverName, serverVersion) {
+  const list = [];
+  appendBytes(list, textEncoder.encode(domain));
+  appendBytes(list, clientNonce);
+  appendBytes(list, serverNonce);
+  appendBytes(list, textEncoder.encode(selectedVersion));
+  appendBytes(list, textEncoder.encode(selectedWireVersion));
+  appendU32(list, offeredFeatures.length);
+  for (const feature of offeredFeatures) appendBytes(list, textEncoder.encode(feature));
+  appendU32(list, finalFeatures.length);
+  for (const feature of finalFeatures) appendBytes(list, textEncoder.encode(feature));
+  appendBytes(list, textEncoder.encode(clientName));
+  appendBytes(list, textEncoder.encode(clientVersion));
+  appendBytes(list, textEncoder.encode(serverName));
+  appendBytes(list, textEncoder.encode(serverVersion));
+  return new Uint8Array(list);
+}
+
+export function encodeTranscriptCore(clientNonce, serverNonce, selectedVersion, selectedWireVersion, offeredFeatures, finalFeatures, clientName, clientVersion, serverName, serverVersion) {
+  const list = [];
+  appendBytes(list, clientNonce);
+  appendBytes(list, serverNonce);
+  appendBytes(list, textEncoder.encode(selectedVersion));
+  appendBytes(list, textEncoder.encode(selectedWireVersion));
+  appendU32(list, offeredFeatures.length);
+  for (const feature of offeredFeatures) appendBytes(list, textEncoder.encode(feature));
+  appendU32(list, finalFeatures.length);
+  for (const feature of finalFeatures) appendBytes(list, textEncoder.encode(feature));
+  appendBytes(list, textEncoder.encode(clientName));
+  appendBytes(list, textEncoder.encode(clientVersion));
+  appendBytes(list, textEncoder.encode(serverName));
+  appendBytes(list, textEncoder.encode(serverVersion));
+  return new Uint8Array(list);
+}
+
+
+// File 13: browser\components\aistarter\providers\ChatGPTAdapter.sys.mjs
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class ChatGPTAdapter extends ProviderAdapter {
+  constructor() { super("chatgpt", "https://chatgpt.com/"); }
+  input(doc) { return this.findBySelectors(doc, ["#prompt-textarea", 'textarea', '[contenteditable="true"][role="textbox"]']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[data-testid*="send"]', 'button[aria-label*="Send"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, ['[data-message-author-role="assistant"] .markdown', '.agent-turn .markdown']); }
+  isStreaming(doc) { return !!doc.querySelector('[data-testid="stop-button"], .result-streaming'); }
+  isAuthenticated(doc) { return !/(auth0|login|signin)/i.test(doc.location?.href || ""); }
+}
+
+
+// File 14: browser\components\aistarter\providers\ClaudeAdapter.sys.mjs
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class ClaudeAdapter extends ProviderAdapter {
+  constructor() { super("claude", "https://claude.ai/"); }
+  input(doc) { return this.findBySelectors(doc, ['div[contenteditable="true"]', 'textarea', '[aria-label*="Claude"]']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label*="Send"]', 'button[type="submit"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, [".font-claude-message", ".markdown"]); }
+  isStreaming(doc) { return !!doc.querySelector('.loading-indicator, [class*="streaming"]'); }
+  isAuthenticated(doc) { return !/(login|signin)/i.test(doc.location?.href || ""); }
+}
+
+
+// File 15: browser\components\aistarter\providers\CopilotAdapter.sys.mjs
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class CopilotAdapter extends ProviderAdapter {
+  constructor() { super("copilot", "https://copilot.microsoft.com/"); }
+  input(doc) { return this.findBySelectors(doc, ['textarea#userInput', 'textarea[placeholder*="Message"]', 'textarea[placeholder*="Ask"]', '[data-testid="composer-input"] textarea', '[data-testid="chat-input"] textarea', '.cib-text-input', 'textarea[aria-label*="Ask"]', '[aria-label*="Copilot"] textarea', 'div[contenteditable="true"][role="textbox"]', 'textarea']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label*="Submit"]', 'button[aria-label*="Send"]', 'button[data-testid*="send"]', 'button[type="submit"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, ['cib-message-group[source="bot"] cib-message .content', '.cib-message-content', '[data-testid="ai-response"]', '.response-message', '.bot-message', '.response-text', '.answer-text']); }
+  isStreaming(doc) { return this.findAllBySelectors(doc, ['.loading-dots', '.typing-indicator', '[data-testid="stop-button"]', 'button[aria-label*="Stop"]', '.cib-stop-responding-button']).length > 0; }
+}
+
+
+// File 16: browser\components\aistarter\providers\DeepSeekAdapter.sys.mjs
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+
+export class DeepSeekAdapter extends ProviderAdapter {
+  constructor() { super("deepseek", "https://chat.deepseek.com/"); }
+  input(doc) { return this.findBySelectors(doc, ["textarea.ds-input__input", "textarea#chat-input", 'textarea[placeholder*="DeepSeek"]', "textarea"]); }
+  sendButton(doc) { return this.findBySelectors(doc, ['div[role="button"].ds-icon-button', "button.ds-icon-button", 'button[aria-label*="Send"]', '[data-testid*="send"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, [".ds-markdown", ".ds-message-bubble"]); }
+  isStreaming(doc) { return !!doc.querySelector('.ds-loading, [class*="loading"], .spinner, [class*="spinner"], [data-streaming="true"]'); }
+  isAuthenticated(doc) { return !/(login|sign_in|auth)/i.test(doc.location?.href || ""); }
+  isRateLimited(doc) { return /rate.?limit|too many requests/i.test(doc.body?.innerText || ""); }
+}
+
+
+// File 17: browser\components\aistarter\providers\GeminiAdapter.sys.mjs
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class GeminiAdapter extends ProviderAdapter {
+  constructor() { super("gemini", "https://gemini.google.com/app"); }
+  input(doc) { return this.findBySelectors(doc, [".ql-editor", 'textarea', '[contenteditable="true"]']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label*="Send"]', 'button[aria-label*="send"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, ["model-response .markdown", ".model-response-text .markdown", ".response-container .markdown", "model-response", ".message-content.model .markdown"]); }
+  isStreaming(doc) { return !!doc.querySelector('button[aria-label*="Stop"], .loading-indicator, mat-progress-bar, .response-loading'); }
+  isAuthenticated(doc) { return !/(accounts.google.com|signin)/i.test(doc.location?.href || ""); }
+}
+
+
+// File 18: browser\components\aistarter\providers\GrokAdapter.sys.mjs
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class GrokAdapter extends ProviderAdapter {
+  constructor() { super("grok", "https://grok.com/"); }
+  input(doc) { return this.findBySelectors(doc, ['.tiptap.ProseMirror', 'textarea[placeholder*="know"]', 'textarea[placeholder*="What"]', 'textarea']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label="Submit"]', 'button[data-testid*="send"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, [".items-start .response-content-markdown"]); }
+  isStreaming(doc) { return !!doc.querySelector('[data-streaming="true"], .loading-indicator, .spinner'); }
+}
+
+
+// File 19: browser\components\aistarter\providers\InceptionAdapter.sys.mjs
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class InceptionAdapter extends ProviderAdapter {
+  constructor() { super("inception", "https://chat.inceptionlabs.ai/"); }
+  input(doc) { return this.findBySelectors(doc, ["textarea", '[contenteditable="true"]']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label*="Send"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, [".prose-chat", ".markdown"]); }
+  isStreaming(doc) { return !!doc.querySelector('.loading-indicator, [class*="loading"]'); }
+}
+
+
+// File 20: browser\components\aistarter\providers\PerplexityAdapter.sys.mjs
+import { ProviderAdapter } from "./ProviderAdapter.sys.mjs";
+export class PerplexityAdapter extends ProviderAdapter {
+  constructor() { super("perplexity", "https://www.perplexity.ai/"); }
+  input(doc) { return this.findBySelectors(doc, ['textarea', '[contenteditable="true"]', '[placeholder*="Ask"]', '[placeholder*="anything"]']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label*="Submit"]', 'button[class*="send"]', 'button[aria-label*="Send"]', 'button[aria-label*="Ask"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, [".prose", ".markdown", ".break-words"]); }
+  isStreaming(doc) { return !!doc.querySelector('.loading-indicator, [class*="loading"]'); }
+}
+
+
+// File 21: browser\components\aistarter\providers\ProviderAdapter.sys.mjs
+export class ProviderAdapter {
+  constructor(name, url) {
+    this.name = name;
+    this.url = url;
+    this.adapter_version = "1.24.0";
+    this.selector_strategy_version = "1.24.0";
+    this.supported_features = ["streaming", "cancel", "continuation", "diagnostics"];
+  }
+
+  inputStrategies(_doc) {
+    return ["keyboard_enter", "provider_native_send"];
+  }
+
+  supportsContinuation(_doc) { return true; }
+
+  matchesDocument(doc) {
+    try {
+      const expected = new URL(this.url);
+      const actual = new URL(doc.location?.href || "");
+      return actual.protocol === expected.protocol && (actual.hostname === expected.hostname || actual.hostname.endsWith(`.${expected.hostname}`));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  deepQuerySelectorAll(doc, selector) {
+    const results = Array.from(doc.querySelectorAll(selector));
+    const seenRoots = new Set();
+    const walk = root => {
+      if (!root || seenRoots.has(root)) return;
+      seenRoots.add(root);
+      for (const element of root.querySelectorAll?.("*") || []) {
+        if (element.shadowRoot) {
+          results.push(...element.shadowRoot.querySelectorAll(selector));
+          walk(element.shadowRoot);
+        }
+      }
+    };
+    walk(doc);
+    return [...new Set(results)];
+  }
+
+  visible(element) {
+    if (!element) return false;
+    return !!((element.offsetWidth > 0 || element.offsetHeight > 0 || element.getClientRects?.().length > 0) && element.style?.display !== "none" && element.style?.visibility !== "hidden");
+  }
+
+  enabled(element) { return !!element && !element.disabled && element.getAttribute("aria-disabled") !== "true"; }
+
+  findBySelectors(doc, selectors) {
+    for (const selector of selectors) for (const element of this.deepQuerySelectorAll(doc, selector)) if (this.visible(element) && this.enabled(element)) return element;
+    return null;
+  }
+
+  findAllBySelectors(doc, selectors) {
+    const result = [];
+    for (const selector of selectors) result.push(...this.deepQuerySelectorAll(doc, selector));
+    return [...new Set(result)].filter(element => this.visible(element));
+  }
+
+  findContinueButton(doc) {
+    const selectors = ['button[data-testid*="continue"]', 'button[aria-label*="Continue"]', 'button[aria-label*="continue"]', 'button[aria-label*="继续"]', "button", "[role=button]"];
+    const isContinue = text => {
+      const value = String(text || "").trim().toLowerCase();
+      return value === "continue" || value.startsWith("continue") || value === "继续" || value.includes("继续生成") || value === "continuer" || value === "continuar" || value === "weiter";
+    };
+    for (const element of this.findAllBySelectors(doc, selectors).reverse()) if (isContinue(element.textContent) || isContinue(element.getAttribute("aria-label"))) return element;
+    return null;
+  }
+
+  input(doc) { return this.findBySelectors(doc, ["textarea", '[contenteditable="true"]']); }
+  sendButton(doc) { return this.findBySelectors(doc, ['button[aria-label*="Send"]', 'button[aria-label*="Submit"]', 'button[type="submit"]', '[data-testid*="send"]']); }
+  responseNodes(doc) { return this.findAllBySelectors(doc, [".markdown", '[data-message-author-role="assistant"]']); }
+  isStreaming(doc) { return !!doc.querySelector('[data-streaming="true"], .loading-indicator, .spinner, button[aria-label*="Stop"], [data-testid*="stop"]'); }
+  isAuthenticated(_doc) { return true; }
+  isRateLimited(_doc) { return false; }
+
+  dispatchInputEvent(input, prompt) {
+    const win = input.ownerDocument.defaultView;
+    try {
+      input.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "insertText", data: prompt }));
+    } catch (_) {
+      input.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
+    }
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    return win;
+  }
+
+  async inject(input, prompt, options = {}) {
+    if (!input) throw Object.assign(new Error("Input element is unavailable"), { code: "INPUT_VERIFICATION_FAILED" });
+    const doc = input.ownerDocument;
+    const win = doc.defaultView;
+    input.focus();
+    const focusVerified = doc.activeElement === input || input.isContentEditable;
+    if (options.forceFocus && !focusVerified) return { error: "Focus verification failed", code: "INPUT_VERIFICATION_FAILED" };
+
+    if ("value" in input) {
+      const prototype = Object.getPrototypeOf(input);
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+      if (descriptor?.set) descriptor.set.call(input, prompt); else input.value = prompt;
+      this.dispatchInputEvent(input, prompt);
+      await new Promise(resolve => win.setTimeout(resolve, 50));
+      const actual = String(input.value ?? "");
+      if (actual !== prompt) return { error: `Input verification failed: expected ${prompt.length}, got ${actual.length}`, code: "INPUT_VERIFICATION_FAILED" };
+      return { input_method: "native_value_setter", input_verified: true, input_text_length: new TextEncoder().encode(actual).length, focus_verified: focusVerified, strategy: "provider_native_send" };
+    }
+
+    if (input.isContentEditable || input.getAttribute("contenteditable") === "true") {
+      const selection = win.getSelection();
+      const range = doc.createRange();
+      range.selectNodeContents(input);
+      selection.removeAllRanges(); selection.addRange(range);
+      let inserted = false;
+      try { inserted = doc.execCommand("insertText", false, prompt); } catch (_) {}
+      if (!inserted) input.textContent = prompt;
+      this.dispatchInputEvent(input, prompt);
+      await new Promise(resolve => win.setTimeout(resolve, 50));
+      const actual = String(input.textContent || "");
+      if (actual !== prompt) return { error: "Contenteditable verification failed", code: "INPUT_VERIFICATION_FAILED" };
+      return { input_method: "contenteditable", input_verified: true, input_text_length: new TextEncoder().encode(actual).length, focus_verified: focusVerified, strategy: "provider_native_send" };
+    }
+    return { error: "Unsupported input element", code: "INPUT_VERIFICATION_FAILED" };
+  }
+
+  async submitVerified(input, doc, options = {}) {
+    let method = "provider_native_send";
+    if (options.simulateEnter) {
+      if (!this.inputStrategies(doc).includes("keyboard_enter")) return { error: "Keyboard Enter strategy unavailable", code: "SUBMISSION_FAILED" };
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
+      input.dispatchEvent(new KeyboardEvent("keypress", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
+      input.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
+      method = "keyboard_enter";
+    } else {
+      const button = this.sendButton(doc);
+      if (!button) return { error: "Provider send action unavailable", code: "SUBMISSION_FAILED" };
+      button.focus(); button.click();
+      method = "provider_native_send";
+    }
+    const verified = await this.verifySubmission(doc, input);
+    if (!verified) return { error: "Provider submission could not be positively verified", code: "SUBMISSION_FAILED" };
+    return { provider_submission_verified: true, submit_method: method === "keyboard_enter" ? "keyboard_enter" : "button_click", strategy: method };
+  }
+
+  async verifySubmission(doc, input) {
+    const beforeText = input && "value" in input ? String(input.value || "") : String(input?.textContent || "");
+    const beforeCount = this.responseNodes(doc).length;
+    const win = doc.defaultView;
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      if (this.isStreaming(doc)) return true;
+      if (this.responseNodes(doc).length > beforeCount) return true;
+      const afterText = input && "value" in input ? String(input.value || "") : String(input?.textContent || "");
+      if (afterText !== beforeText) return true;
+      await new Promise(resolve => win.setTimeout(resolve, 100));
+    }
+    return false;
+  }
+
+  async verifyContinuationSubmission(doc) {
+    const win = doc.defaultView;
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      if (this.isStreaming(doc)) return true;
+      await new Promise(resolve => win.setTimeout(resolve, 100));
+    }
+    return false;
+  }
+
+  cancel(doc) {
+    const stop = this.findBySelectors(doc, ['button[aria-label*="Stop"]', 'button[data-testid*="stop"]', '[data-testid="stop-button"]']);
+    if (!stop) return false;
+    stop.click();
+    this._cancelIssuedAt = Date.now();
+    return true;
+  }
+
+  inspect(doc) {
+    const nodes = this.responseNodes(doc);
+    const last = nodes.length ? nodes[nodes.length - 1] : null;
+    return {
+      provider_context_valid: this.matchesDocument(doc),
+      input_ready: !!this.input(doc),
+      input_state: this.input(doc) ? "READY" : "NOT_READY",
+      authenticated: this.isAuthenticated(doc),
+      rate_limited: this.isRateLimited(doc),
+      message_count: nodes.length,
+      last_message_text: last?.textContent || "",
+      streaming: this.isStreaming(doc),
+      provider_state: this.isStreaming(doc) ? "busy" : "idle",
+    };
+  }
+
+  inspectProviderExecution(doc, context = {}) {
+    const inspection = this.inspect(doc);
+    const baselineCount = Number(context.previous_message_count ?? 0);
+    const baselineText = String(context.previous_message_text ?? "");
+    const currentText = String(inspection.last_message_text || "");
+    const newResponseEvidence = inspection.message_count > baselineCount || currentText !== baselineText;
+    return {
+      ...inspection,
+      authoritative_cessation: !!this._cancelIssuedAt && !inspection.streaming,
+      authoritative_completion: !inspection.streaming && newResponseEvidence,
+    };
+  }
+}
+
+
+// File 22: browser\components\aistarter\providers\ProviderRegistry.sys.mjs
+import { DeepSeekAdapter } from "./DeepSeekAdapter.sys.mjs";
+import { GeminiAdapter } from "./GeminiAdapter.sys.mjs";
+import { ChatGPTAdapter } from "./ChatGPTAdapter.sys.mjs";
+import { ClaudeAdapter } from "./ClaudeAdapter.sys.mjs";
+import { GrokAdapter } from "./GrokAdapter.sys.mjs";
+import { CopilotAdapter } from "./CopilotAdapter.sys.mjs";
+import { PerplexityAdapter } from "./PerplexityAdapter.sys.mjs";
+import { InceptionAdapter } from "./InceptionAdapter.sys.mjs";
+import { sortedUtf8 } from "../garp/GarpUtil.sys.mjs";
+
+export class ProviderRegistry {
+  constructor() {
+    this.adapters = new Map();
+    for (const adapter of [new ChatGPTAdapter(), new ClaudeAdapter(), new CopilotAdapter(), new DeepSeekAdapter(), new GeminiAdapter(), new GrokAdapter(), new InceptionAdapter(), new PerplexityAdapter()]) this.adapters.set(adapter.name, adapter);
+  }
+
+  get(name) { return this.adapters.get(String(name || "").toLowerCase()) || null; }
+
+  list() {
+    return sortedUtf8([...this.adapters.values()].map(adapter => adapter.name)).map(name => {
+      const adapter = this.adapters.get(name);
+      const inputStrategies = sortedUtf8(adapter.inputStrategies(null));
+      return {
+        id: adapter.name,
+        version: adapter.adapter_version,
+        state: "AVAILABLE",
+        input_strategies: inputStrategies,
+        capabilities: {
+          streaming: adapter.supported_features.includes("streaming"),
+          cancellation: adapter.supported_features.includes("cancel"),
+          continuation: adapter.supported_features.includes("continuation"),
+          diagnostics: adapter.supported_features.includes("diagnostics"),
+        },
+      };
+    });
+  }
+}
+
+
+// File 23: browser\components\aistarter\requests\GarpRequest.sys.mjs
+import { GARP_UINT64_MAX } from "../garp/GarpRegistry.sys.mjs";
+import { GarpError, GarpErrorCode } from "../garp/GarpErrors.sys.mjs";
+
+export class GarpRequest {
+  constructor(requestId, sessionId, prompt, options = {}) {
+    this.requestId = requestId;
+    this.sessionId = sessionId;
+    this.prompt = prompt;
+    this.options = Object.freeze({ ...options });
+    this.state = "PENDING";
+    this.messageId = crypto.randomUUID();
+    this.revision = 0n;
+    this.content = "";
+    this.lastObservedText = "";
+    this.lastMessageCount = 0;
+    this.baselineMessageCount = 0;
+    this.baselineMessageText = "";
+    this.startedAt = performance?.now?.() ?? Date.now();
+    this.completedAt = null;
+    this.continuationCount = 0;
+    this.maxContinuations = Number(options.max_continuations ?? 8);
+    this.continuationWaitDeadline = null;
+    this.promptDeadline = null;
+    this.responseStarted = false;
+    this.partial = false;
+    this.terminalCommitted = false;
+    this.terminalCandidate = null;
+    this.providerOperationEpoch = 0;
+    this.continuationEpoch = 0;
+    this.cancelAccepted = false;
+    this.cancellationVerified = false;
+    this.lastPageGeneration = 1n;
+    this.actorInstance = null;
+    this.provider = null;
+    this.error = null;
+  }
+
+  get contentCommitted() { return this.partial || this.revision > 0n || this.content.length > 0; }
+  get terminal() { return this.state === "COMPLETED" || this.state === "FAILED" || this.state === "CANCELLED"; }
+
+  nextRevision() {
+    if (this.revision >= GARP_UINT64_MAX) throw new GarpError(GarpErrorCode.REVISION_GAP, "Message revision overflow");
+    this.revision += 1n;
+    return this.revision;
+  }
+
+  snapshot() {
+    return {
+      success: true,
+      prompt_request_id: this.requestId,
+      state: this.state,
+      page_generation: String(this.lastPageGeneration),
+      message_id: this.messageId,
+      revision: String(this.revision),
+      continuation_count: this.continuationCount,
+      max_continuations: this.maxContinuations,
+      partial: this.partial,
+      ...(this.error ? { error: this.error } : {}),
+    };
+  }
+}
+
+
+// File 24: browser\components\aistarter\requests\GarpRequestManager.sys.mjs
+import { GarpRequest } from "./GarpRequest.sys.mjs";
+import { GarpError, GarpErrorCode } from "../garp/GarpErrors.sys.mjs";
+import {
+  GARP_DEFAULT_CONTINUATION_WAIT_MS,
+  GARP_DEFAULT_RECOVERY_DEADLINE_MS,
+  GARP_MAX_GENERATION_BUFFER_MB,
+  GARP_MAX_RESPONSE_SIZE,
+} from "../garp/GarpRegistry.sys.mjs";
+import { byteLength, monotonicNow, uuid } from "../garp/GarpUtil.sys.mjs";
+
+const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
+const ACTIVE = new Set(["PENDING", "SUBMITTING", "GENERATING", "WAITING_CONTINUATION", "CANCELLING"]);
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+export class GarpRequestManager {
+  constructor(service, sessionManager, providerRegistry) {
+    this.service = service;
+    this.sessionManager = sessionManager;
+    this.providerRegistry = providerRegistry;
+    this.requests = new Map();
+    this.subscribers = new Map();
+  }
+
+  get(requestId) {
+    const request = this.requests.get(requestId);
+    if (!request) throw new GarpError(GarpErrorCode.PROMPT_NOT_FOUND, `Prompt not found: ${requestId}`);
+    return request;
+  }
+
+  getForSession(sessionId, requestId) {
+    const request = this.get(requestId);
+    if (request.sessionId !== sessionId) throw new GarpError(GarpErrorCode.PROMPT_NOT_FOUND, `Prompt not found in session: ${requestId}`);
+    return request;
+  }
+
+  subscribe(requestId, connection) {
+    const request = this.get(requestId);
+    let set = this.subscribers.get(requestId);
+    if (!set) { set = new Set(); this.subscribers.set(requestId, set); }
+    set.add(connection);
+    return request;
+  }
+
+  unsubscribeConnection(connection) {
+    for (const set of this.subscribers.values()) set.delete(connection);
+  }
+
+  emitEvent(request, type, payload) {
+    const session = this.sessionManager.get(request.sessionId);
+    return session.enqueue(`event:${type}`, () => this.commitEventNow(request, session, type, payload));
+  }
+
+  commitEventNow(request, session, type, payload) {
+    if (request.terminalCommitted && !["GENERATION_COMPLETED", "GENERATION_FAILED", "GENERATION_CANCELLED"].includes(type)) return null;
+    try {
+      const envelope = this.service.commitSessionEvent(session, type, payload, { broadcast: false });
+      const subscribers = this.subscribers.get(request.requestId) || new Set();
+      for (const connection of subscribers) connection.sendEnvelope(envelope, false);
+      return envelope;
+    } catch (error) {
+      if (error?.code === GarpErrorCode.EVENT_QUEUE_OVERFLOW) session.state = "FAILED";
+      throw error;
+    }
+  }
+
+  startPrompt(connection, sessionId, requestId, prompt, options = {}) {
+    const session = this.sessionManager.get(sessionId);
+    session.assertIdle();
+    if (this.requests.has(requestId)) throw new GarpError(GarpErrorCode.DUPLICATE_REQUEST, "Prompt request ID already exists");
+    const request = new GarpRequest(requestId || uuid(), sessionId, prompt, options);
+    request.provider = session.provider;
+    request.lastPageGeneration = session.pageGeneration;
+    request.actorInstance = session.actorInstance;
+    session.reservePrompt(request.requestId);
+    request.state = "PENDING";
+    this.requests.set(request.requestId, request);
+    this.subscribe(request.requestId, connection);
+
+    const timeout = BigInt(options.timeout_ms || "0");
+    if (timeout > 0n) {
+      const deadline = monotonicNow() + Number(timeout);
+      request.promptDeadline = deadline;
+      this.scheduleDeadline(request, deadline, GarpErrorCode.PROMPT_TIMEOUT, "Prompt timeout");
+    }
+
+    this.runPrompt(request).catch(error => this.failCandidate(request, error?.code || GarpErrorCode.PROVIDER_ERROR, error?.message || String(error), error));
+    return request;
+  }
+
+  scheduleDeadline(request, deadline, code, message) {
+    const delay = Math.max(0, deadline - monotonicNow());
+    setTimeout(() => {
+      if (!this.requests.has(request.requestId) || request.terminalCommitted) return;
+      if (monotonicNow() + 1 < deadline) return this.scheduleDeadline(request, deadline, code, message);
+      this.failCandidate(request, code, message, new GarpError(code, message, { state: "FAILED" }));
+    }, Math.min(delay + 10, 0x7fffffff));
+  }
+
+  async waitForReady(session, request) {
+    const timeout = Number(request.options.ready_timeout_ms ?? request.options.timeout_ms ?? 30000);
+    const deadline = monotonicNow() + timeout;
+    while (monotonicNow() < deadline) {
+      if (request.cancelAccepted) throw new GarpError(GarpErrorCode.PROMPT_CANCELLED, "Prompt cancelled during preparation");
+      if (request.terminalCommitted) return false;
+      try {
+        const result = await this.service.callChild(session, "InspectReady", { provider: session.provider, prompt_request_id: request.requestId });
+        if (result.error) throw this.errorFromChild(result);
+        if (result.authenticated === false || result.state === "AUTH_REQUIRED") throw new GarpError(GarpErrorCode.PROVIDER_AUTH_REQUIRED, "Provider authentication required");
+        if (result.rate_limited || result.state === "RATE_LIMITED") throw new GarpError(GarpErrorCode.PROVIDER_RATE_LIMITED, "Provider rate limited");
+        session.inputState = result.input_state || (result.input_ready ? "READY" : "NOT_READY");
+        if (result.input_ready) { if (session.state === "PREPARING" || session.state === "RETRYING") session.transition("READY"); return true; }
+      } catch (error) {
+        if (![GarpErrorCode.STALE_ACTOR, GarpErrorCode.NAVIGATION_DRIFT, GarpErrorCode.TAB_UNAVAILABLE].includes(error?.code)) throw error;
+      }
+      await sleep(250);
+    }
+    throw new GarpError(GarpErrorCode.PROMPT_TIMEOUT, "Provider input did not become ready before timeout");
+  }
+
+  async runPrompt(request) {
+    const session = this.sessionManager.get(request.sessionId);
+    await this.waitForReady(session, request);
+    if (request.terminalCommitted) return;
+    request.state = "SUBMITTING";
+    const snapshot = await this.service.callChild(session, "CaptureSnapshot", { provider: session.provider, prompt_request_id: request.requestId });
+    if (snapshot.error) throw this.errorFromChild(snapshot);
+    request.lastMessageCount = Number(snapshot.last_message_count || 0);
+    request.baselineMessageCount = request.lastMessageCount;
+    request.lastObservedText = String(snapshot.last_message_text || "");
+    request.baselineMessageText = request.lastObservedText;
+    request.lastPageGeneration = session.pageGeneration;
+    request.actorInstance = session.actorInstance;
+
+    const inject = await this.service.callChild(session, "InjectPrompt", {
+      provider: session.provider,
+      prompt: request.prompt,
+      forceFocus: !!request.options.force_focus,
+      simulateEnter: !!request.options.simulate_enter,
+      prompt_request_id: request.requestId,
+    });
+    if (inject.error) throw this.errorFromChild(inject);
+    if (!inject.provider_submission_verified) throw new GarpError(GarpErrorCode.SUBMISSION_FAILED, "Provider submission was not positively verified");
+    request.state = "SUBMITTING";
+    await this.emitEvent(request, "INPUT_SUBMITTED", { prompt_request_id: request.requestId, page_generation: String(session.pageGeneration), strategy: inject.strategy || "provider_native_send" });
+    if (request.cancelAccepted) {
+      this.startCancellationResolution(request, session);
+      return;
+    }
+    this.observe(request).catch(error => this.failCandidate(request, error?.code || GarpErrorCode.PROVIDER_ERROR, error?.message || String(error), error));
+  }
+
+  async observe(request) {
+    const session = this.sessionManager.get(request.sessionId);
+    const timeout = Number(request.options.timeout_ms || 0);
+    const deadline = timeout > 0 ? request.promptDeadline : null;
+    let stableTicks = 0;
+    let previousText = request.lastObservedText;
+
+    for (;;) {
+      if (!this.requests.has(request.requestId) || request.terminalCommitted) return;
+      if (deadline !== null && monotonicNow() >= deadline) { this.failCandidate(request, GarpErrorCode.PROMPT_TIMEOUT, "Prompt timeout"); return; }
+      if (request.state === "CANCELLING") { await this.resolveCancellationStep(request, session); return; }
+
+      let result;
+      try {
+        result = await this.service.callChild(session, "ObserveGeneration", { provider: session.provider, previous_message_count: request.lastMessageCount, previous_message_text: request.lastObservedText, prompt_request_id: request.requestId });
+      } catch (error) {
+        if (error?.code === GarpErrorCode.NAVIGATION_DRIFT || error?.code === GarpErrorCode.STALE_ACTOR) { await this.handleNavigationDrift(request, session, error); return; }
+        throw error;
+      }
+      if (result.provider_context_valid === false) {
+        await this.service.commitSessionEvent(session, "NAVIGATION_DRIFT", { page_generation: String(session.pageGeneration), reason: "PROVIDER_CONTEXT_LOST" });
+        this.failCandidate(request, GarpErrorCode.PROVIDER_UNAVAILABLE, "Authoritative provider context was lost", null, request.partial);
+        this.service.recoverSession(session, "PROVIDER_CONTEXT_LOST").catch(() => {});
+        return;
+      }
+      if (result.error) {
+        const code = result.code || GarpErrorCode.PROVIDER_ERROR;
+        if (code === GarpErrorCode.PROVIDER_AUTH_REQUIRED) {
+          await this.service.commitSessionEvent(session, "PROVIDER_AUTH_REQUIRED", { provider: session.provider, reason: "LOGIN_REQUIRED", page_generation: String(session.pageGeneration) });
+        } else if (code === GarpErrorCode.PROVIDER_RATE_LIMITED) {
+          await this.service.commitSessionEvent(session, "PROVIDER_RATE_LIMITED", { provider: session.provider, retry_after_ms: "0", page_generation: String(session.pageGeneration) });
+        } else {
+          await this.service.commitSessionEvent(session, "PROVIDER_ERROR", { provider: session.provider, code, message: result.error || "Provider error", retryable: !!result.retryable, prompt_request_id: request.requestId, page_generation: String(session.pageGeneration) });
+        }
+        this.failCandidate(request, code, result.error);
+        return;
+      }
+      request.lastPageGeneration = session.pageGeneration;
+      request.actorInstance = session.actorInstance;
+      const observedCount = Number(result.message_count || request.lastMessageCount);
+      const previousCount = request.lastMessageCount;
+      request.lastMessageCount = observedCount;
+      const text = String(result.text ?? "");
+      const textChanged = text !== request.lastObservedText;
+      const responseIdentified = !request.responseStarted && (observedCount > previousCount || textChanged || result.authoritative_generation_started === true);
+
+      if (!request.responseStarted && (responseIdentified || result.message_changed === true)) {
+        const started = await session.enqueue("generation-started", () => {
+          if (request.terminalCommitted || session.activeRequestId !== request.requestId) return false;
+          request.responseStarted = true;
+          request.state = "GENERATING";
+          this.commitEventNow(request, session, "GENERATION_STARTED", { prompt_request_id: request.requestId, message_id: request.messageId, revision: "0", page_generation: String(session.pageGeneration) });
+          return true;
+        });
+        if (!started) return;
+      }
+
+      if (request.responseStarted && textChanged) {
+        const previous = request.content;
+        let mode = "REPLACE";
+        let delta = text;
+        if (text.startsWith(previous)) { mode = "APPEND"; delta = text.slice(previous.length); }
+        const bytes = byteLength(text);
+        const transientBytes = byteLength(text);
+        if (bytes > GARP_MAX_RESPONSE_SIZE) { this.failCandidate(request, GarpErrorCode.RESPONSE_TOO_LARGE, "Response exceeds max_response_size", null, request.partial); return; }
+        if (transientBytes > GARP_MAX_GENERATION_BUFFER_MB * 1024 * 1024) { this.failCandidate(request, GarpErrorCode.GENERATION_BUFFER_LIMIT, "Generation buffer limit exceeded", null, request.partial); return; }
+        const committed = await session.enqueue("generation-delta", () => {
+          if (request.terminalCommitted || session.activeRequestId !== request.requestId) return false;
+          const revision = request.revision + 1n;
+          if (revision > 18446744073709551615n) throw new GarpError(GarpErrorCode.REVISION_GAP, "Message revision overflow");
+          const envelope = this.commitEventNow(request, session, "GENERATION_DELTA", { prompt_request_id: request.requestId, message_id: request.messageId, revision: String(revision), delta, mode, page_generation: String(session.pageGeneration) });
+          request.revision = revision;
+          request.content = text;
+          request.lastObservedText = text;
+          request.partial = request.partial || text.length > 0;
+          return !!envelope;
+        });
+        if (committed) stableTicks = 0;
+      } else if (request.responseStarted && text) stableTicks++;
+
+      await this.emitEvent(request, "GENERATION_PROGRESS", { prompt_request_id: request.requestId, message_count: request.lastMessageCount, page_generation: String(session.pageGeneration) });
+
+      if (result.continuation_required) {
+        await this.handleContinuationRequired(request, session, result);
+        return;
+      }
+
+      if (request.responseStarted && result.done && stableTicks >= 2) {
+        await this.completeCandidate(request, session, result);
+        return;
+      }
+      previousText = text;
+      await sleep(500);
+    }
+  }
+
+  async handleContinuationRequired(request, session, result) {
+    if (!request.responseStarted && !request.content) request.partial = false;
+    if (request.options.max_continuations === undefined) request.maxContinuations = 8;
+    if (request.cancelAccepted) { this.startCancellationResolution(request, session); return; }
+    if (!result.continuation_supported && !result.continuation_available) { this.failCandidate(request, GarpErrorCode.CONTINUATION_NOT_AVAILABLE, "Provider continuation is unavailable"); return; }
+    if (request.maxContinuations === 0) { this.failCandidate(request, GarpErrorCode.CONTINUATION_NOT_ALLOWED, "Continuation is disabled", null, request.partial); return; }
+    if (request.continuationCount >= request.maxContinuations) { this.failCandidate(request, GarpErrorCode.CONTINUATION_LIMIT_REACHED, "Continuation limit reached", null, request.partial); return; }
+    request.state = "WAITING_CONTINUATION";
+    request.continuationWaitDeadline = monotonicNow() + Number(BigInt(this.service.capabilities.limits.continuation_wait_ms));
+    await this.emitEvent(request, "CONTINUATION_REQUIRED", { prompt_request_id: request.requestId, continuation_count: request.continuationCount, max_continuations: request.maxContinuations, page_generation: String(session.pageGeneration) });
+    this.scheduleDeadline(request, request.continuationWaitDeadline, GarpErrorCode.CONTINUATION_TIMEOUT, "Continuation timeout");
+    if (request.options.auto_continue === true) this.autoContinue(request, session);
+  }
+
+  async autoContinue(request, session) {
+    if (!this.requests.has(request.requestId) || request.terminalCommitted) return;
+    try {
+      const reserved = await this.reserveContinuation(request, session, "auto");
+      if (!reserved) return;
+      this.runContinuation(request, session, reserved.epoch).catch(error => this.failCandidate(request, error?.code || GarpErrorCode.PROVIDER_ERROR, error?.message || String(error), error));
+    } catch (_) {}
+  }
+
+  async continuePrompt(connection, sessionId, promptRequestId) {
+    const session = this.sessionManager.get(sessionId);
+    const request = this.getForSession(sessionId, promptRequestId);
+    if (request.terminal) throw new GarpError(GarpErrorCode.PROMPT_ALREADY_TERMINAL, "Prompt is terminal");
+    if (request.state !== "WAITING_CONTINUATION") throw new GarpError(GarpErrorCode.PROMPT_NOT_ACTIVE, "Prompt is not waiting for continuation");
+    if (session.ownerConnection && session.ownerConnection !== connection) throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "Connection does not own session");
+    const reserved = await this.reserveContinuation(request, session, "explicit");
+    if (!reserved) throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "Continuation reservation lost");
+    this.runContinuation(request, session, reserved.epoch).catch(error => this.failCandidate(request, error?.code || GarpErrorCode.PROVIDER_ERROR, error?.message || String(error), error));
+    return true;
+  }
+
+  async reserveContinuation(request, session, source) {
+    return session.enqueue(`continue-reserve:${source}`, () => {
+      if (request.terminalCommitted) return false;
+      if (request.state !== "WAITING_CONTINUATION") {
+        if (source === "auto") return false;
+        throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "Continuation reservation lost");
+      }
+      if (request.continuationCount >= request.maxContinuations) throw new GarpError(GarpErrorCode.CONTINUATION_LIMIT_REACHED, "Continuation limit reached");
+      const epoch = ++request.continuationEpoch;
+      request.state = "SUBMITTING";
+      return { epoch };
+    });
+  }
+
+  async runContinuation(request, session, epoch) {
+    try {
+      const result = await this.service.callChild(session, "ContinueGeneration", {
+        provider: session.provider,
+        prompt_request_id: request.requestId,
+        continuation_epoch: epoch,
+        reason: "provider_length_limit",
+      });
+      if (request.cancelAccepted || epoch !== request.continuationEpoch || request.terminalCommitted) return;
+      if (result.error) throw this.errorFromChild(result);
+      if (!result.provider_submission_verified) throw new GarpError(GarpErrorCode.SUBMISSION_FAILED, "Continuation submission was not positively verified");
+      request.continuationCount += 1;
+      request.state = "GENERATING";
+      await this.emitEvent(request, "CONTINUATION_SUBMITTED", {
+        prompt_request_id: request.requestId,
+        page_generation: String(session.pageGeneration),
+        continuation_count: request.continuationCount,
+        strategy: result.strategy || "provider_native_send",
+      });
+      this.observe(request).catch(error => this.failCandidate(request, error?.code || GarpErrorCode.PROVIDER_ERROR, error?.message || String(error), error));
+    } catch (error) {
+      if (request.cancelAccepted || request.terminalCommitted) return;
+      this.failCandidate(request, error?.code || GarpErrorCode.PROVIDER_ERROR, error?.message || String(error), error);
+    }
+  }
+
+  async cancel(connection, sessionId, promptRequestId) {
+    const session = this.sessionManager.get(sessionId);
+    const request = this.getForSession(sessionId, promptRequestId);
+    if (session.ownerConnection && session.ownerConnection !== connection) throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "Connection does not own session");
+    if (request.terminal) throw new GarpError(GarpErrorCode.PROMPT_ALREADY_TERMINAL, "Prompt is terminal");
+    if (request.state === "CANCELLING") throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "Cancellation already in progress");
+    if (!ACTIVE.has(request.state)) throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, `Cannot cancel from ${request.state}`);
+    request.cancelAccepted = true;
+    request.state = "CANCELLING";
+    request.continuationEpoch += 1;
+    await session.enqueue("cancel-accept", () => {
+      if (session.state === "BUSY") session.transition("RECOVERING");
+    });
+    this.startCancellationResolution(request, session);
+    return request;
+  }
+
+  startCancellationResolution(request, session) { this.resolveCancellationStep(request, session).catch(error => this.failCandidate(request, GarpErrorCode.RECOVERY_FAILED, error.message, error)); }
+
+  async resolveCancellationStep(request, session) {
+    if (request.terminalCommitted) return;
+    const deadline = monotonicNow() + Number(BigInt(this.service.capabilities.limits.recovery_deadline_ms));
+    let cancelIssued = false;
+    while (monotonicNow() < deadline && !request.terminalCommitted) {
+      try {
+        if (!cancelIssued) {
+          cancelIssued = true;
+          await this.service.callChild(session, "CancelGeneration", { provider: session.provider, prompt_request_id: request.requestId });
+        }
+        const state = await this.service.callChild(session, "InspectProviderState", { provider: session.provider, prompt_request_id: request.requestId, previous_message_count: request.baselineMessageCount, previous_message_text: request.baselineMessageText });
+        if (state?.error) throw this.errorFromChild(state);
+        if (state.streaming === false && state.authoritative_cessation === true) {
+          request.cancellationVerified = true;
+          await this.cancelCandidate(request, session);
+          return;
+        }
+        if (state.streaming === false && state.authoritative_completion === true && request.responseStarted) {
+          await this.completeCandidate(request, session, state);
+          return;
+        }
+      } catch (error) {
+        if (error?.code === GarpErrorCode.STALE_ACTOR || error?.code === GarpErrorCode.NAVIGATION_DRIFT) {
+          await sleep(250); continue;
+        }
+      }
+      await sleep(250);
+    }
+    if (!request.terminalCommitted) this.failCandidate(request, GarpErrorCode.RECOVERY_FAILED, "Cancellation state could not be authoritatively established", null, request.partial);
+  }
+
+  async completeCandidate(request, session, result) {
+    const candidate = { kind: "COMPLETED", request, session, fencing: this.currentFencing(request, session) };
+    await session.enqueue("terminal-completed", () => this.commitTerminalCandidate(candidate, { content: request.content, revision: request.revision, result }));
+  }
+
+  async cancelCandidate(request, session) {
+    const candidate = { kind: "CANCELLED", request, session, fencing: this.currentFencing(request, session) };
+    await session.enqueue("terminal-cancelled", () => this.commitTerminalCandidate(candidate, null));
+  }
+
+  failCandidate(request, code, message, error = null, partialOverride = null) {
+    const session = this.sessionManager.sessions.get(request.sessionId);
+    if (!session || request.terminalCommitted) return Promise.resolve(false);
+    const candidate = { kind: "FAILED", request, session, fencing: this.currentFencing(request, session), code, message, partial: partialOverride === null ? request.partial : !!partialOverride };
+    return session.enqueue(`terminal-failed:${code}`, () => this.commitTerminalCandidate(candidate, { error: { code, message } }));
+  }
+
+  currentFencing(request, session) { return { session_id: session.sessionId, provider: session.provider, prompt_request_id: request.requestId, page_generation: session.pageGeneration, actor_instance: session.actorInstance, message_id: request.messageId }; }
+
+  async commitTerminalCandidate(candidate, data) {
+    const { request, session } = candidate;
+    if (request.terminalCommitted) return false;
+    if (request.sessionId !== session.sessionId || session.activeRequestId !== request.requestId) return false;
+    if (candidate.fencing.provider !== session.provider || candidate.fencing.prompt_request_id !== request.requestId || candidate.fencing.message_id !== request.messageId) return false;
+    if ((candidate.kind === "COMPLETED" || candidate.kind === "CANCELLED") && (candidate.fencing.page_generation !== session.pageGeneration || candidate.fencing.actor_instance !== session.actorInstance || !candidate.fencing.actor_instance)) return false;
+    request.terminalCommitted = true;
+    request.completedAt = monotonicNow();
+    request.partial = request.partial || !!candidate.partial || request.content.length > 0;
+
+    if (candidate.kind === "COMPLETED") {
+      request.state = "COMPLETED";
+      session.lastMessageId = request.messageId;
+      session.lastMessageText = request.content;
+      session.lastMessageCount = Math.max(session.lastMessageCount, request.lastMessageCount);
+      session.clearActivePrompt();
+      this.commitEventNow(request, session, "GENERATION_COMPLETED", { prompt_request_id: request.requestId, message_id: request.messageId, revision: String(request.revision), response: request.content, page_generation: String(session.pageGeneration) });
+    } else if (candidate.kind === "CANCELLED") {
+      request.state = "CANCELLED";
+      session.clearActivePrompt();
+      this.commitEventNow(request, session, "GENERATION_CANCELLED", { prompt_request_id: request.requestId, message_id: request.messageId, revision: String(request.revision), cancel_verified: true, partial: request.partial, response: request.content, page_generation: String(session.pageGeneration) });
+    } else {
+      request.state = "FAILED";
+      request.error = { code: candidate.code, message: candidate.message };
+      session.activeRequestId = null;
+      session.generationState = "IDLE";
+      if (candidate.code === GarpErrorCode.PROVIDER_AUTH_REQUIRED) session.state = "AUTH_REQUIRED";
+      else if (candidate.code === GarpErrorCode.PROVIDER_RATE_LIMITED) session.state = "RATE_LIMITED";
+      else if ([GarpErrorCode.RECOVERY_FAILED, GarpErrorCode.NAVIGATION_DRIFT, GarpErrorCode.PROVIDER_UNAVAILABLE, GarpErrorCode.RESPONSE_TOO_LARGE, GarpErrorCode.GENERATION_BUFFER_LIMIT].includes(candidate.code)) session.state = "RECOVERING";
+      else if (candidate.code === GarpErrorCode.EVENT_QUEUE_OVERFLOW) session.state = "FAILED";
+      else if (session.state !== "CLOSED") session.state = "READY";
+      this.commitEventNow(request, session, "GENERATION_FAILED", { prompt_request_id: request.requestId, error: { code: candidate.code, message: candidate.message }, partial: request.partial, response: request.content.length ? request.content : null, page_generation: String(session.pageGeneration) });
+    }
+    return true;
+  }
+
+  async handleNavigationDrift(request, session, error) {
+    if (request.terminalCommitted) return;
+    if (session.state !== "RECOVERING" && session.state !== "CLOSED") session.state = "RECOVERING";
+    await this.emitEvent(request, "NAVIGATION_DRIFT", { page_generation: String(session.pageGeneration), reason: error?.reason || "DOCUMENT_REPLACED" });
+    await this.failCandidate(request, GarpErrorCode.NAVIGATION_DRIFT, "Navigation drift invalidated active prompt", error, request.partial);
+    this.service.recoverSession(session, "DOCUMENT_REPLACED").catch(() => {});
+  }
+
+  async abortForSessionReset(session, reason = "SESSION_RESET") {
+    const requestId = session.activeRequestId;
+    if (!requestId) return;
+    const request = this.requests.get(requestId);
+    if (!request || request.terminalCommitted) return;
+    try {
+      await session.enqueue("reset-prompt", () => this.commitTerminalCandidate({
+        kind: "FAILED",
+        request,
+        session,
+        fencing: this.currentFencing(request, session),
+        code: GarpErrorCode.RECOVERY_FAILED,
+        message: reason === "SESSION_CLOSE" ? "Session closed while prompt was active" : "Prompt invalidated by RESET_SESSION",
+        partial: request.partial,
+      }, null));
+    } catch (_) {}
+    this.service.callChild(session, "CancelGeneration", { provider: session.provider, prompt_request_id: requestId }).catch(() => {});
+  }
+
+  errorFromChild(result) { return new GarpError(result.code || GarpErrorCode.PROVIDER_ERROR, result.error || "Provider operation failed"); }
+
+  getResponse(request) {
+    if (!TERMINAL.has(request.state)) throw new GarpError(GarpErrorCode.RESPONSE_NOT_READY, "The response is not terminally available");
+    return { success: true, state: request.state, partial: request.partial, response: request.content.length ? request.content : null, ...(request.state === "FAILED" ? { error: request.error } : {}) };
+  }
+
+  prune(retentionMs) {
+    const now = monotonicNow();
+    for (const [id, request] of this.requests) {
+      if (request.terminalCommitted && request.completedAt !== null && now - request.completedAt > retentionMs) { this.requests.delete(id); this.subscribers.delete(id); }
+    }
+  }
+}
+
+
+// File 25: browser\components\aistarter\sessions\AIAutomationSession.sys.mjs
+import {
+  GARP_MAX_EVENT_HISTORY_MEMORY_MB,
+  GARP_MAX_QUEUED_EVENTS,
+  GARP_UINT64_MAX,
+} from "../garp/GarpRegistry.sys.mjs";
+import { GarpError, GarpErrorCode } from "../garp/GarpErrors.sys.mjs";
+import { byteLength, uint64, uuid } from "../garp/GarpUtil.sys.mjs";
+
+const TERMINAL_PROMPT_STATES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
+
+const VALID_TRANSITIONS = Object.freeze({
+  CREATED: new Set(["PREPARING", "FAILED", "CLOSED"]),
+  PREPARING: new Set(["READY", "AUTH_REQUIRED", "RATE_LIMITED", "RETRYING", "RECOVERING", "FAILED", "CLOSED"]),
+  READY: new Set(["BUSY", "PREPARING", "AUTH_REQUIRED", "RATE_LIMITED", "RECOVERING", "FAILED", "CLOSED"]),
+  BUSY: new Set(["READY", "PREPARING", "RETRYING", "AUTH_REQUIRED", "RATE_LIMITED", "RECOVERING", "FAILED", "CLOSED"]),
+  AUTH_REQUIRED: new Set(["PREPARING", "FAILED", "CLOSED"]),
+  RATE_LIMITED: new Set(["PREPARING", "FAILED", "CLOSED"]),
+  RECOVERING: new Set(["READY", "BUSY", "RETRYING", "FAILED", "CLOSED"]),
+  RETRYING: new Set(["BUSY", "PREPARING", "FAILED", "CLOSED"]),
+  FAILED: new Set(["PREPARING", "CLOSED"]),
+  CLOSED: new Set(),
+});
+
+export class AIAutomationSession {
+  constructor({ sessionId, provider, tabId, pageGeneration = 1n }) {
+    this.sessionId = sessionId || uuid();
+    this.provider = provider;
+    this.model = null;
+    this.tabId = tabId;
+    this.pageGeneration = BigInt(pageGeneration);
+    this.state = "CREATED";
+    this.inputState = "UNKNOWN";
+    this.generationState = "IDLE";
+    this.lastRequestId = null;
+    this.lastMessageId = null;
+    this.lastMessageText = "";
+    this.lastMessageCount = 0;
+    this.activeRequestId = null;
+    this.pageURL = "";
+    this.actorInstance = null;
+    this.actorObject = null;
+    this.authoritativeProvider = provider;
+    this.ownerConnection = null;
+    this.eventSequence = 0n;
+    this.eventHistory = [];
+    this.eventHistoryBytes = 0;
+    this.arbiterTail = Promise.resolve();
+  }
+
+  static isTerminalPromptState(state) { return TERMINAL_PROMPT_STATES.has(state); }
+
+  enqueue(label, operation) {
+    const run = this.arbiterTail.then(async () => operation());
+    this.arbiterTail = run.catch(() => {});
+    return run;
+  }
+
+  transition(nextState) {
+    if (nextState === this.state) return;
+    if (!VALID_TRANSITIONS[this.state]?.has(nextState)) {
+      throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, `Invalid session transition ${this.state} -> ${nextState}`, { state: this.state });
+    }
+    this.state = nextState;
+  }
+
+  assertMutable() {
+    if (this.state === "CLOSED") throw new GarpError(GarpErrorCode.SESSION_CLOSED, "Session is closed", { state: "CLOSED" });
+  }
+
+  assertIdle() {
+    this.assertMutable();
+    if (this.activeRequestId) throw new GarpError(GarpErrorCode.SESSION_BUSY, "Session already has an active prompt", { provider: this.provider, state: "BUSY" });
+    if (this.state !== "READY") throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, `Session is not READY: ${this.state}`, { state: this.state });
+  }
+
+  reservePrompt(requestId) {
+    this.assertIdle();
+    if (this.activeRequestId) throw new GarpError(GarpErrorCode.SESSION_BUSY, "Prompt reservation already exists");
+    this.activeRequestId = requestId;
+    this.lastRequestId = requestId;
+    this.transition("BUSY");
+  }
+
+  clearActivePrompt() {
+    this.activeRequestId = null;
+    this.generationState = "IDLE";
+    if (this.state === "BUSY" || this.state === "RECOVERING" || this.state === "RETRYING") this.state = "READY";
+  }
+
+  incrementPageGeneration(url = "") {
+    if (this.pageGeneration >= GARP_UINT64_MAX) throw new GarpError(GarpErrorCode.PAGE_GENERATION_OVERFLOW, "Page generation exceeded uint64");
+    this.pageGeneration += 1n;
+    if (url) this.pageURL = url;
+    this.actorInstance = null;
+    this.actorObject = null;
+    return this.pageGeneration;
+  }
+
+  markPageGeneration(value, url = "") {
+    const next = uint64(String(value), "page_generation");
+    if (next > this.pageGeneration) this.pageGeneration = next;
+    if (url) this.pageURL = url;
+  }
+
+  commitEvent(envelope) {
+    if (this.eventSequence >= GARP_UINT64_MAX) throw new GarpError(GarpErrorCode.EVENT_SEQUENCE_OVERFLOW, "Session event sequence overflow");
+    if (this.eventHistory.length >= GARP_MAX_QUEUED_EVENTS) throw new GarpError(GarpErrorCode.EVENT_QUEUE_OVERFLOW, "Session event queue limit exceeded");
+    this.eventSequence += 1n;
+    const committed = structuredClone({ ...envelope, sequence: String(this.eventSequence) });
+    const size = byteLength(JSON.stringify(committed));
+    const maxBytes = GARP_MAX_EVENT_HISTORY_MEMORY_MB * 1024 * 1024;
+    if (size > maxBytes) throw new GarpError(GarpErrorCode.EVENT_QUEUE_OVERFLOW, "Single event exceeds event history memory budget");
+    while (this.eventHistoryBytes + size > maxBytes && this.eventHistory.length) {
+      const removed = this.eventHistory.shift();
+      this.eventHistoryBytes -= byteLength(JSON.stringify(removed));
+    }
+    this.eventHistory.push(committed);
+    this.eventHistoryBytes += size;
+    return committed;
+  }
+
+  oldestSequence() { return this.eventHistory.length ? BigInt(this.eventHistory[0].sequence) : this.eventSequence + 1n; }
+  lastSequence() { return this.eventSequence; }
+
+  snapshot() {
+    return {
+      session_id: this.sessionId,
+      provider: this.provider,
+      model: this.model,
+      tab_id: this.tabId,
+      url: this.pageURL || "",
+      page_generation: String(this.pageGeneration),
+      active_prompt_request_id: this.activeRequestId,
+      state: this.state,
+      input_state: this.inputState,
+      generation_state: this.generationState,
+      last_request_id: this.lastRequestId,
+      last_message_id: this.lastMessageId,
+      last_message_count: this.lastMessageCount,
+      event_sequence: String(this.eventSequence),
+    };
+  }
+}
+
+
+// File 26: browser\components\aistarter\sessions\AIAutomationSessionManager.sys.mjs
+import { AIAutomationSession } from "./AIAutomationSession.sys.mjs";
+import { GarpError, GarpErrorCode } from "../garp/GarpErrors.sys.mjs";
+import { uuid } from "../garp/GarpUtil.sys.mjs";
+
+function validateTabUrl(url) {
+  let parsed;
+  try { parsed = new URL(url); } catch (_) { throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, "Invalid URL"); }
+  if (!["http:", "https:"].includes(parsed.protocol)) throw new GarpError(GarpErrorCode.INVALID_ARGUMENT, "Only http:// and https:// URLs are permitted");
+}
+
+export class AIAutomationSessionManager {
+  constructor(service, providerRegistry) {
+    this.service = service;
+    this.providerRegistry = providerRegistry;
+    this.sessions = new Map();
+    this.tabIds = new WeakMap();
+    this.tabsById = new Map();
+  }
+
+  getTopWindow() {
+    const win = this.service.getTopWindow();
+    if (!win) throw new GarpError(GarpErrorCode.TAB_UNAVAILABLE, "No browser window available");
+    return win;
+  }
+
+  getStableTabId(tab) {
+    if (!tab) throw new GarpError(GarpErrorCode.TAB_NOT_FOUND, "Tab is unavailable");
+    let id = this.tabIds.get(tab);
+    if (!id) { id = uuid(); this.tabIds.set(tab, id); }
+    this.tabsById.set(id, tab);
+    return id;
+  }
+
+  resolveTab(tabId) {
+    if (typeof tabId !== "string" || tabId.length < 1) throw new GarpError(GarpErrorCode.TAB_NOT_FOUND, "tab_id is required");
+    const win = this.getTopWindow();
+    const tab = this.tabsById.get(tabId);
+    if (!tab || win.gBrowser.tabs.indexOf(tab) < 0) {
+      if (tab) this.tabsById.delete(tabId);
+      throw new GarpError(GarpErrorCode.TAB_NOT_FOUND, `Tab not found: ${tabId}`);
+    }
+    if (tab.linkedBrowser?.isRemoteBrowser === false || tab.linkedBrowser?.browsingContext?.discarded) throw new GarpError(GarpErrorCode.TAB_UNAVAILABLE, `Tab unavailable: ${tabId}`);
+    return tab;
+  }
+
+  listTabs() {
+    const win = this.getTopWindow();
+    const tabs = [];
+    for (const tab of win.gBrowser.tabs) {
+      const tabId = this.getStableTabId(tab);
+      tabs.push({ tab_id: tabId, url: tab.linkedBrowser?.currentURI?.spec || "about:blank", title: tab.label || "", active: !!tab.selected });
+    }
+    return tabs;
+  }
+
+  findSessionByTab(tabId) { return [...this.sessions.values()].find(session => session.tabId === tabId) || null; }
+
+  openTab(url) {
+    validateTabUrl(url);
+    const win = this.getTopWindow();
+    const tab = win.gBrowser.addTrustedTab(url);
+    win.gBrowser.selectedTab = tab;
+    return { tab_id: this.getStableTabId(tab), url };
+  }
+
+  closeTab(tabId) {
+    const win = this.getTopWindow();
+    const tab = this.resolveTab(tabId);
+    const stableId = this.getStableTabId(tab);
+    for (const session of [...this.sessions.values()]) if (session.tabId === stableId) this.closeSession(session.sessionId);
+    win.gBrowser.removeTab(tab);
+    this.tabsById.delete(stableId);
+    return { success: true };
+  }
+
+  selectTab(tabId) {
+    const win = this.getTopWindow();
+    const tab = this.resolveTab(tabId);
+    win.gBrowser.selectedTab = tab;
+    return { success: true, tab_id: this.getStableTabId(tab) };
+  }
+
+  createSession(providerName, tabId = null) {
+    const adapter = this.providerRegistry.get(providerName);
+    if (!adapter) throw new GarpError(GarpErrorCode.PROVIDER_UNAVAILABLE, `Provider adapter unavailable: ${providerName}`);
+    let tab;
+    if (tabId !== null) tab = this.resolveTab(tabId);
+    else {
+      const win = this.getTopWindow();
+      tab = win.gBrowser.addTrustedTab(adapter.url);
+      win.gBrowser.selectedTab = tab;
+    }
+    const session = new AIAutomationSession({ sessionId: uuid(), provider: adapter.name, tabId: this.getStableTabId(tab), pageGeneration: 1n });
+    session.state = "PREPARING";
+    session.pageURL = tab.linkedBrowser?.currentURI?.spec || "";
+    this.sessions.set(session.sessionId, session);
+    return session;
+  }
+
+  attachSession(sessionId, connection) {
+    const session = this.get(sessionId);
+    session.assertMutable();
+    if (session.ownerConnection && session.ownerConnection !== connection) throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "Session is attached exclusively to another connection");
+    session.ownerConnection = connection;
+    if (session.state === "CLOSED") throw new GarpError(GarpErrorCode.SESSION_CLOSED, "Session is closed");
+    return session;
+  }
+
+  detachSession(sessionId, connection) {
+    const session = this.get(sessionId);
+    if (session.ownerConnection && session.ownerConnection !== connection) throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "Connection does not own session");
+    session.ownerConnection = null;
+    return session;
+  }
+
+  closeSession(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return null;
+    if (session.state !== "CLOSED") session.state = "CLOSED";
+    session.activeRequestId = null;
+    session.ownerConnection = null;
+    session.actorObject = null;
+    session.actorInstance = null;
+    return session;
+  }
+
+  resetSession(sessionId, connection) {
+    const session = this.get(sessionId);
+    if (session.ownerConnection && session.ownerConnection !== connection) throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "Connection does not own session");
+    session.assertMutable();
+    session.state = "PREPARING";
+    session.inputState = "UNKNOWN";
+    session.generationState = "IDLE";
+    session.lastRequestId = null; session.lastMessageId = null; session.lastMessageText = ""; session.lastMessageCount = 0;
+    session.conversationId = null;
+    session.incrementPageGeneration(session.pageURL);
+    return session;
+  }
+
+  get(sessionId) {
+    if (typeof sessionId !== "string") throw new GarpError(GarpErrorCode.SESSION_NOT_FOUND, "session_id is required");
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new GarpError(GarpErrorCode.SESSION_NOT_FOUND, `Session not found: ${sessionId}`);
+    if (session.state === "CLOSED") throw new GarpError(GarpErrorCode.SESSION_CLOSED, "Session is closed");
+    return session;
+  }
+
+  getTabForSession(session) { return this.resolveTab(session.tabId); }
+}
+
+
+// File 27: tests\Garp124Conformance.mjs
+import assert from "node:assert/strict";
+import { GarpError, GarpErrorCode } from "../browser/components/aistarter/garp/GarpErrors.sys.mjs";
+import { encodeGarpMessage, decodeGarpFrame } from "../browser/components/aistarter/garp/GarpFrame.sys.mjs";
+import { GarpMessageType, GARP_FIXED_HEADER_LENGTH, GARP_VERSION_BYTE } from "../browser/components/aistarter/garp/GarpRegistry.sys.mjs";
+import {
+  base64UrlEncode,
+  encodeTranscript,
+  hmacSha256,
+  textEncoder,
+} from "../browser/components/aistarter/garp/GarpUtil.sys.mjs";
+import { validateMessagePayload } from "../browser/components/aistarter/garp/GarpSchema.sys.mjs";
+
+const TEST_SECRET = textEncoder.encode("0123456789abcdef0123456789abcdef");
+const CLIENT_NONCE = Uint8Array.from([
+  0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+  0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+]);
+const SERVER_NONCE = Uint8Array.from([
+  0x10, 0x0f, 0x0e, 0x0d, 0x0c, 0x0b, 0x0a, 0x09,
+  0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+]);
+
+function hex(bytes) {
+  return [...bytes].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function expectCode(fn, code) {
+  assert.throws(fn, error => error instanceof GarpError && error.code === code);
+}
+
+async function testAuthenticationTranscript() {
+  const common = [
+    CLIENT_NONCE,
+    SERVER_NONCE,
+    "1.24",
+    "0x00",
+    ["!ext-pong"],
+    ["!ext-pong"],
+    "GARPClient",
+    "1.24.0",
+    "GarpGateway",
+    "1.24.0",
+  ];
+  const clientTranscript = encodeTranscript("GARP/1.24/client-proof", ...common);
+  const serverTranscript = encodeTranscript("GARP/1.24/server-proof", ...common);
+  assert.equal(clientTranscript.length, 165);
+  assert.equal(serverTranscript.length, 165);
+  const clientProof = await hmacSha256(TEST_SECRET, clientTranscript);
+  const serverProof = await hmacSha256(TEST_SECRET, serverTranscript);
+  assert.equal(hex(clientProof), "e11893ab64943f5e603a9d5a96a21174c05433b42fe02319a9110c5d7e1e7d0b");
+  assert.equal(base64UrlEncode(clientProof), "4RiTq2SUP15gOp1alqIRdMBUM7Qv4CMZqREMXX4efQs");
+  assert.equal(hex(serverProof), "88569356861b9ffa5be720821ce4e9014c9fcc56829175ca80b01ba4c5fa71f2");
+  assert.equal(base64UrlEncode(serverProof), "iFaTVoYbn_pb5yCCHOTpAUyfzFaCkXXKgLAbpMX6cfI");
+}
+
+function testPingVector() {
+  const requestId = "00000000-0000-0000-0000-000000000001";
+  const frame = encodeGarpMessage("PING", {}, {
+    request_id: requestId,
+    session_id: null,
+    timestamp: "2026-01-01T00:00:00.000Z",
+    sequence: null,
+  });
+  const expectedJson = "{\"garp\":\"1.24\",\"type\":\"PING\",\"request_id\":\"00000000-0000-0000-0000-000000000001\",\"session_id\":null,\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"sequence\":null,\"payload\":{}}";
+  assert.equal(frame.length - GARP_FIXED_HEADER_LENGTH, 167);
+  assert.equal(new TextDecoder().decode(frame.subarray(GARP_FIXED_HEADER_LENGTH)), expectedJson);
+  assert.equal(frame[4], GARP_VERSION_BYTE);
+  assert.equal(frame[5], 0);
+  assert.deepEqual([...frame.subarray(0, 16)], [
+    0x47, 0x41, 0x52, 0x50, 0x00, 0x00, 0x00, 0x30,
+    0x00, 0x00, 0x00, 0xa7, 0x00, 0x70, 0x00, 0x00,
+  ]);
+  const decoded = decodeGarpFrame(frame);
+  assert.equal(decoded.type, "PING");
+  assert.equal(decoded.request_id, requestId);
+  assert.equal(decoded.session_id, null);
+}
+
+function testHeaderValidation() {
+  const frame = encodeGarpMessage("PING", {}, {
+    request_id: "00000000-0000-0000-0000-000000000002",
+    session_id: null,
+    timestamp: "2026-01-01T00:00:00.000Z",
+    sequence: null,
+  });
+
+  const badMagic = frame.slice();
+  badMagic[0] = 0;
+  expectCode(() => decodeGarpFrame(badMagic), GarpErrorCode.PROTOCOL_ERROR);
+
+  const badVersion = frame.slice();
+  badVersion[4] = 1;
+  expectCode(() => decodeGarpFrame(badVersion), GarpErrorCode.UNSUPPORTED_WIRE_VERSION);
+
+  const badHeader = frame.slice();
+  badHeader[6] = 0;
+  badHeader[7] = 0x31;
+  expectCode(() => decodeGarpFrame(badHeader), GarpErrorCode.INVALID_ARGUMENT);
+
+  const badReserved = frame.slice();
+  badReserved[14] = 1;
+  expectCode(() => decodeGarpFrame(badReserved), GarpErrorCode.INVALID_ARGUMENT);
+
+  const badRequestBinding = frame.slice();
+  const text = new TextDecoder().decode(badRequestBinding.subarray(48));
+  const changed = text.replace("00000000-0000-0000-0000-000000000002", "00000000-0000-0000-0000-000000000003");
+  const bytes = textEncoder.encode(changed);
+  badRequestBinding.set(bytes, 48);
+  expectCode(() => decodeGarpFrame(badRequestBinding), GarpErrorCode.HEADER_JSON_MISMATCH);
+}
+
+function testDuplicateKeys() {
+  const payload = "{\"garp\":\"1.24\",\"type\":\"PING\",\"request_id\":null,\"session_id\":null,\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"sequence\":null,\"payload\":{},\"payload\":{}}";
+  const bytes = textEncoder.encode(payload);
+  const frame = new Uint8Array(48 + bytes.length);
+  const view = new DataView(frame.buffer);
+  frame.set([0x47, 0x41, 0x52, 0x50], 0);
+  view.setUint8(4, 0);
+  view.setUint8(5, 0);
+  view.setUint16(6, 48, false);
+  view.setUint32(8, bytes.length, false);
+  view.setUint16(12, GarpMessageType.PING, false);
+  view.setUint16(14, 0, false);
+  frame.set(bytes, 48);
+  expectCode(() => decodeGarpFrame(frame), GarpErrorCode.INVALID_ARGUMENT);
+}
+
+function testPromptOpacityAndOptions() {
+  const prompt = "  A\r\nB\nC\r\nCafe\u0301  ";
+  assert.equal(new TextEncoder().encode(prompt).length, 18);
+  validateMessagePayload("PROMPT", {
+    prompt,
+    options: {
+      timeout_ms: "0",
+      auto_continue: false,
+      max_continuations: 8,
+      force_focus: false,
+      simulate_enter: false,
+      _extensions: {},
+    },
+  });
+}
+
+function testStrictSchemas() {
+  expectCode(() => validateMessagePayload("OPEN_TAB", { url: "file:///tmp/a" }), GarpErrorCode.INVALID_ARGUMENT);
+  expectCode(() => validateMessagePayload("PROMPT", {
+    prompt: "ok",
+    options: { auto_continue: "false" },
+  }), GarpErrorCode.INVALID_ARGUMENT);
+}
+
+await testAuthenticationTranscript();
+testPingVector();
+testHeaderValidation();
+testDuplicateKeys();
+testPromptOpacityAndOptions();
+testStrictSchemas();
+
+console.log("GARP/1.24 conformance unit vectors: PASS");
+
+

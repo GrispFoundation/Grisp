@@ -1,0 +1,966 @@
+16 september 2026 by Skybuck Flying:
+
+My implementation = from ChatGPT 5.6 luna
+Other AI = deepseek v4 max
+
+
+I compared both implementations against GARP/1.24 as written, including the state machine, fencing, authentication, framing, replay, schemas, continuation, cancellation, and failure semantics.
+
+The useful result is that the other AI does have a few implementation ideas worth importing, but the strongest parts of your implementation are substantially closer to the actual freeze-candidate contract. I would build a hybrid rather than replace yours.
+
+## 1. Overall comparison
+
+I would assess them approximately like this, where the score is **implementation/conformance quality against GARP/1.24**, not code style:
+
+| Area                          | My implementation | Other AI | Result        |
+| ----------------------------- | ----------------: | -------: | ------------- |
+| Binary framing                |              9/10 |     5/10 | Mine          |
+| Envelope/schema enforcement   |              9/10 |     3/10 | Mine          |
+| Duplicate-key rejection       |              9/10 |     5/10 | Mine          |
+| Authentication transcript     |              9/10 |     8/10 | Mine          |
+| Authentication vectors        |              9/10 |     6/10 | Mine          |
+| Persistent replay protection  |              9/10 |     1/10 | Mine          |
+| Request deduplication         |              8/10 |     2/10 | Mine          |
+| Outstanding-request limit     |              8/10 |     1/10 | Mine          |
+| Session arbiter               |              8/10 |     2/10 | Mine          |
+| Terminal arbitration          |              8/10 |     1/10 | Mine          |
+| Cancellation semantics        |              7/10 |     1/10 | Mine          |
+| Continuation arbitration      |              8/10 |     3/10 | Mine          |
+| Timeout fencing               |              6/10 |     2/10 | Mine          |
+| Actor fencing                 |              8/10 |     4/10 | Mine          |
+| Provider identity fencing     |              8/10 |     2/10 | Mine          |
+| Replay extension              |              8/10 |     0/10 | Mine          |
+| Capability negotiation        |              8/10 |     4/10 | Mine          |
+| Keepalive                     |              8/10 |     3/10 | Mine          |
+| Browser/session lifecycle     |              7/10 |     5/10 | Mine          |
+| Provider adapters             |              7/10 |     7/10 | Roughly equal |
+| Practical browser injection   |              8/10 |     7/10 | Mine          |
+| Multi-message generation      |              3/10 |     2/10 | Neither       |
+| Completion revision integrity |              7/10 |     3/10 | Mine          |
+| Recovery                      |              7/10 |     2/10 | Mine          |
+| Specification traceability    |              9/10 |     6/10 | Mine          |
+
+### Overall
+
+**My implementation: ~7.8/10**
+
+**Other AI: ~3.9/10**
+
+That is not because the other implementation is useless. It has some good architectural instincts. It is because it omits or violates several requirements that GARP/1.24 deliberately hardened.
+
+---
+
+# 2. What I specifically like from the other AI
+
+There are several things I would take.
+
+### A. Separate authentication module
+
+The other AI introduced:
+
+```text
+GarpAuth.sys.mjs
+```
+
+I like this separation.
+
+Our authentication logic is currently split between `AIAutomation.sys.mjs` and `GarpUtil.sys.mjs`.
+
+I'd keep the actual cryptographic primitives in `GarpUtil`, but move the protocol-level authentication machinery into a dedicated `GarpAuth.sys.mjs`:
+
+```text
+validateAndCanonicaliseFeatures()
+negotiateFeatures()
+buildTranscript()
+buildTranscriptCore()
+verifyProof()
+createProof()
+```
+
+That makes the handshake considerably easier to audit.
+
+### B. Explicit feature token representation
+
+The other AI distinguishes:
+
+```text
+raw
+canonical
+required
+```
+
+This is a good idea.
+
+Instead of passing around strings and repeatedly stripping `!`, I would internally represent:
+
+```js
+{
+  raw: "!ext-pong",
+  canonical: "ext-pong",
+  required: true
+}
+```
+
+while still serializing the normative raw feature token.
+
+That reduces the chance of accidentally dropping the `!` during negotiation.
+
+### C. Cleaner naming around binary protocol values
+
+The other implementation separates:
+
+```text
+GARP_WIRE_VERSION
+GARP_WIRE_VERSION_BYTE
+```
+
+We already effectively do this, but I'd standardize the naming and use it everywhere.
+
+### D. Provider registry capability construction
+
+The other implementation explicitly has:
+
+```text
+capabilityEntries()
+```
+
+This is conceptually cleaner than making the registry's `list()` simultaneously serve multiple unrelated consumers.
+
+I'd add a dedicated:
+
+```js
+getCapabilityEntries()
+```
+
+to our registry.
+
+### E. Explicit prompt-state enumeration
+
+The other AI has:
+
+```js
+export const PromptState = Object.freeze(...)
+```
+
+That's a good improvement over repeated literal strings.
+
+I would adopt it.
+
+### F. Dedicated session subscriber collection
+
+The other implementation has:
+
+```js
+session.subscribers
+```
+
+Our implementation currently puts subscription semantics mainly around prompts.
+
+I would retain our prompt-specific subscriber model but also make session event recipients explicit.
+
+That becomes particularly useful for:
+
+```text
+ATTACH_SESSION
+DETACH_SESSION
+multiple observers
+```
+
+### G. Stronger separation between "prompt text" and "observed response text"
+
+The other implementation keeps:
+
+```text
+request.prompt
+request.lastText
+request.text
+```
+
+That's a reasonable structure.
+
+Our implementation already does something similar, but I'll clean the request model around:
+
+```text
+submittedPrompt
+observedContent
+committedContent
+lastObservedProviderText
+```
+
+to make the distinction explicit.
+
+---
+
+# 3. What I would NOT import
+
+There are some ideas that look attractive but actually weaken conformance.
+
+## Authentication fallback secret
+
+The other AI does:
+
+```js
+// Development fallback: generate a random 32-byte secret
+```
+
+and dumps it.
+
+I would absolutely **not** import this.
+
+Your specification says the secret is deployment-provisioned. The current version of my implementation correctly fails when `GARP_SECRET` isn't available.
+
+That is safer and much more deterministic.
+
+---
+
+## In-memory replay protection
+
+The other implementation explicitly has:
+
+```js
+this.replayStore = new Set();
+```
+
+and even acknowledges that it is incomplete.
+
+This is directly contrary to:
+
+```text
+I24 authentication replay state survives restart
+I25 lost authentication replay state requires secret rotation
+```
+
+Our persistent `GarpReplayStore` is substantially better.
+
+---
+
+## Immediate cancellation
+
+The other implementation does:
+
+```js
+request.promptState = PromptState.CANCELLED;
+...
+cancel_verified: true
+```
+
+immediately after requesting cancellation.
+
+That is exactly what §73 and §72.1 were designed to prevent.
+
+We keep the stronger approach.
+
+---
+
+## No terminal arbiter
+
+The other implementation essentially has:
+
+```text
+complete()
+fail()
+cancel()
+```
+
+racing in ordinary JavaScript.
+
+GARP explicitly requires:
+
+```text
+first valid terminal candidate that commits wins
+```
+
+Our `commitTerminalCandidate()` + session arbiter architecture is much closer to the specification.
+
+---
+
+# 4. The biggest problems in the other implementation
+
+There are several particularly serious defects.
+
+## 4.1 It does not validate the Common Envelope properly
+
+Its `decodeFrame()` does not enforce the full GARP envelope schema.
+
+It does not properly validate things such as:
+
+```text
+timestamp
+sequence
+UUID syntax
+connection/session scope
+event request_id rules
+message-specific payload schema
+```
+
+This is a major difference.
+
+Our:
+
+```js
+validateEnvelope()
+validateMessagePayload()
+```
+
+is therefore a component worth keeping.
+
+---
+
+## 4.2 Its duplicate-key parser is weaker
+
+Its parser does this:
+
+```js
+if (jsonText[i] === "\\") {
+    s += jsonText[i + 1];
+    i += 2;
+}
+```
+
+That is not equivalent to JSON string decoding.
+
+For example, escaped Unicode can create semantically identical names that this scanner can treat as different.
+
+Our `GarpJson.sys.mjs` is materially stronger.
+
+---
+
+## 4.3 It buffers attacker-controlled payloads before applying the limit
+
+The other implementation does:
+
+```js
+this.append(bytes);
+this.processFrames();
+```
+
+before using the payload length to protect buffering.
+
+That's dangerous.
+
+An attacker can announce a huge payload length and cause unnecessary buffering.
+
+Our implementation at least checks:
+
+```js
+if (header.payloadLength > limit)
+```
+
+before waiting for the full payload.
+
+I'd strengthen this further in the hybrid.
+
+---
+
+## 4.4 Its outbound limit handling is wrong
+
+It always sends:
+
+```js
+encodeFrame(envelope, { effectiveLimit: GARP_HANDSHAKE_LIMIT });
+```
+
+Thus application messages are effectively capped at 1 MiB forever.
+
+GARP requires the negotiated application limit after the local peer has processed peer CAPABILITIES.
+
+Our implementation is better here.
+
+---
+
+## 4.5 Replay extension isn't actually implemented
+
+The registry says:
+
+```text
+GET_EVENTS = 0x0100
+```
+
+but the other service does not implement it.
+
+And it doesn't negotiate:
+
+```text
+ext-replay-store
+```
+
+either.
+
+Our implementation does.
+
+---
+
+## 4.6 HELLO_AUTH correlation is incomplete
+
+The other side checks state:
+
+```js
+if (connection.state !== "CHALLENGE_SENT")
+```
+
+but does not properly enforce:
+
+```text
+HELLO request_id == HELLO_CHALLENGE request_id == HELLO_AUTH request_id
+```
+
+Our implementation explicitly stores:
+
+```js
+connection.handshakeRequestId
+```
+
+and verifies it.
+
+That is important.
+
+---
+
+## 4.7 Its server identity breaks the published authentication vector
+
+The other implementation chooses:
+
+```js
+this.serverName = "FirefoxAIAutomation";
+```
+
+while the supplied normative test vector specifies:
+
+```text
+GarpGateway
+```
+
+Since server identity is inside the HMAC transcript, that means its proof does **not** reproduce the normative test vector unless the implementation substitutes the vector identity during testing.
+
+Our implementation uses:
+
+```js
+this.serverName = "GarpGateway";
+```
+
+which is the appropriate reference implementation choice.
+
+---
+
+# 5. The biggest problems in my implementation
+
+I don't want to pretend our version is finished. There are several things I would now fix using the comparison.
+
+## 5.1 The browser child fencing can be made cleaner
+
+Our child returns:
+
+```js
+fencing: this.fencing(data)
+```
+
+where the fencing data is constructed by the child from the request.
+
+The stronger model is:
+
+```text
+parent-supplied fence
++
+child-observed actor identity
+```
+
+with those two explicitly separated.
+
+The other AI's:
+
+```text
+parent_actor_instance
+child_actor_instance
+```
+
+idea is useful here.
+
+I would adopt that.
+
+The child should return something like:
+
+```js
+_fencing: {
+    session_id,
+    prompt_request_id,
+    page_generation,
+    provider,
+    parent_actor_instance,
+    child_actor_instance,
+}
+```
+
+Then the parent checks **both** sides.
+
+---
+
+# 6. A very important bug in our current provider cancellation design
+
+This one is actually more important than several of the differences between the two implementations.
+
+Our `ProviderAdapter` currently has:
+
+```js
+this._cancelIssuedAt = Date.now();
+```
+
+inside the adapter singleton.
+
+But `ProviderRegistry` keeps adapter instances globally.
+
+That means cancellation state can accidentally become associated with the wrong browser/session.
+
+For example:
+
+```text
+DeepSeek session A
+    CANCEL
+        ↓
+DeepSeekAdapter._cancelIssuedAt
+
+DeepSeek session B
+    InspectProviderExecution()
+        ↓
+    sees old cancellation marker
+```
+
+That is wrong.
+
+### Hybrid fix
+
+Cancellation state needs to belong to the **actor/session operation context**, not to the singleton provider adapter.
+
+I would remove:
+
+```js
+this._cancelIssuedAt
+```
+
+from the adapter.
+
+The child actor should maintain operation-local state such as:
+
+```js
+this.cancelContexts = new Map();
+```
+
+keyed by:
+
+```text
+prompt_request_id
+```
+
+or a generated provider-operation epoch.
+
+That is a substantial improvement.
+
+---
+
+# 7. Another important issue: our timeout candidate needs a generation token
+
+Our timeout scheduler currently does:
+
+```js
+this.failCandidate(
+    request,
+    GarpErrorCode.CONTINUATION_TIMEOUT,
+    ...
+)
+```
+
+A previously scheduled timeout can potentially fire after the operation has progressed into another phase.
+
+The candidate should be fenced by an operation token.
+
+For example:
+
+```js
+request.timeoutEpoch += 1;
+```
+
+and:
+
+```js
+scheduleDeadline(request, deadline, code, message, epoch)
+```
+
+with:
+
+```js
+if (epoch !== request.timeoutEpoch)
+    return;
+```
+
+That prevents stale timer callbacks from becoming valid terminal candidates.
+
+This fits perfectly with the overall fencing philosophy.
+
+---
+
+# 8. Our provider-change handling needs strengthening
+
+This is the biggest session-level weakness in my version.
+
+Currently:
+
+```js
+applyProviderChange(...)
+```
+
+updates:
+
+```text
+session.provider
+session.authoritativeProvider
+```
+
+and emits the event.
+
+But §42.1 requires the stronger sequence:
+
+```text
+provider context invalidation
+        ↓
+atomic arbiter operation
+        ↓
+terminal candidate
+        +
+session transition
+```
+
+with:
+
+```text
+BUSY -> PREPARING
+```
+
+when cessation is authoritatively established,
+
+or:
+
+```text
+BUSY -> RECOVERING
+```
+
+when it is ambiguous.
+
+I would make provider invalidation a first-class session-arbiter operation instead of letting `applyProviderChange()` just mutate the provider.
+
+---
+
+# 9. Our PREPARING logic has an actual semantic bug
+
+Our current:
+
+```js
+prepareSession()
+```
+
+can end with:
+
+```js
+session.state = "AUTH_REQUIRED";
+```
+
+or:
+
+```js
+session.state = "RATE_LIMITED";
+```
+
+but then still emits:
+
+```js
+SESSION_READY
+```
+
+That is incorrect.
+
+`SESSION_READY` means the session is actually READY.
+
+So the hybrid implementation should only emit:
+
+```text
+SESSION_READY
+```
+
+when:
+
+```text
+session.state == READY
+```
+
+Otherwise it should emit the appropriate provider/recovery/status event.
+
+This is one change I would make immediately.
+
+---
+
+# 10. Multi-message generation remains the major missing subsystem
+
+Both implementations are weak here.
+
+GARP/1.24 explicitly supports:
+
+```json
+"messages": [
+    {
+        "message_id": "...",
+        "revision": "3",
+        "response": "..."
+    }
+]
+```
+
+but both implementations mostly assume:
+
+```text
+one prompt = one message
+```
+
+Our current implementation has:
+
+```js
+request.messageId
+request.content
+request.revision
+```
+
+only.
+
+That is insufficient for real multi-message generation.
+
+### Hybrid architecture
+
+I'd change the request model to:
+
+```js
+request.messages = new Map();
+```
+
+where each message contains:
+
+```js
+{
+    messageId,
+    revision,
+    content,
+    lastObservedText,
+    partial,
+    terminalContent
+}
+```
+
+Then the generation engine becomes capable of:
+
+```text
+message discovery
+message ordering
+revision tracking per message
+APPEND
+REPLACE
+completion snapshots
+partial failures
+cancellation snapshots
+```
+
+That is the largest remaining functional upgrade.
+
+---
+
+# 11. The hybrid architecture I would use
+
+The resulting implementation should look like:
+
+```text
+AIAutomationService
+        |
+        +-- GarpConnection
+        |       |
+        |       +-- GarpFrame
+        |       +-- GarpSchema
+        |       +-- GarpAuth
+        |       +-- GarpReplayStore
+        |
+        +-- AIAutomationSessionManager
+        |       |
+        |       +-- AIAutomationSession
+        |       |       |
+        |       |       +-- serialized arbiter
+        |       |       +-- event history
+        |       |       +-- fencing state
+        |       |
+        |       +-- stable tabs
+        |
+        +-- GarpRequestManager
+        |       |
+        |       +-- prompt lifecycle
+        |       +-- terminal candidates
+        |       +-- timeout epochs
+        |       +-- continuation arbitration
+        |       +-- cancellation arbitration
+        |       +-- multi-message state
+        |
+        +-- ProviderRegistry
+                |
+                +-- ProviderAdapter
+                        |
+                        +-- DeepSeek
+                        +-- Gemini
+                        +-- ChatGPT
+                        +-- Claude
+                        +-- Grok
+                        +-- Copilot
+                        +-- Perplexity
+                        +-- Inception
+```
+
+That preserves the strong parts of our implementation while importing the useful modularity from the other AI.
+
+---
+
+# 12. Concrete changes I would make to our implementation
+
+### Keep unchanged or mostly unchanged
+
+```text
+GarpFrame.sys.mjs
+GarpJson.sys.mjs
+GarpReplayStore.sys.mjs
+GarpErrors.sys.mjs
+GarpSchema.sys.mjs
+GarpUtil.sys.mjs
+```
+
+These are among the strongest pieces.
+
+### Improve
+
+```text
+AIAutomation.sys.mjs
+GarpConnection.sys.mjs
+GarpRequest.sys.mjs
+GarpRequestManager.sys.mjs
+AIAutomationSession.sys.mjs
+AIAutomationSessionManager.sys.mjs
+AIAutomationChild.sys.mjs
+ProviderAdapter.sys.mjs
+ProviderRegistry.sys.mjs
+```
+
+### Add
+
+```text
+GarpAuth.sys.mjs
+```
+
+and ideally:
+
+```text
+GarpFencing.sys.mjs
+```
+
+so actor/provider/session fencing is not scattered through several modules.
+
+---
+
+# 13. The most important hybrid improvements, in order
+
+I'd prioritize them this way:
+
+```text
+1. Multi-message generation state
+2. Correct cancellation evidence model
+3. Timeout/continuation stale-operation fencing
+4. Provider-change atomic invalidation
+5. Child actor parent-vs-child fence identity
+6. Per-operation cancellation context
+7. Correct PREPARING/READY event emission
+8. Dedicated GarpAuth module
+9. Explicit session subscriber management
+10. More exhaustive conformance tests
+```
+
+The first seven are substantive correctness improvements. The last three are architectural/auditability improvements.
+
+---
+
+# 14. One thing from the other AI that I would explicitly copy
+
+I particularly like the **parent actor instance vs child actor instance** concept.
+
+Instead of our current somewhat ambiguous model:
+
+```js
+actorInstance
+```
+
+I'd make the fence explicit:
+
+```js
+{
+    session_id,
+    prompt_request_id,
+    page_generation,
+    provider,
+    parent_actor_instance,
+    child_actor_instance
+}
+```
+
+Then acceptance becomes:
+
+```text
+session_id matches
+AND
+page_generation matches
+AND
+provider matches
+AND
+prompt_request_id matches active prompt
+AND
+child_actor_instance is current
+AND
+parent actor expectation is current
+```
+
+That gives us a much better diagnostic story as well as stronger stale-actor protection.
+
+---
+
+# 15. Final result
+
+So I would **not** replace the current implementation with the other AI's implementation.
+
+I would keep the core of ours:
+
+```text
+persistent replay
+strict schema
+strict framing
+request deduplication
+outstanding request accounting
+session arbiter
+terminal candidate arbitration
+continuation race arbitration
+stale-actor checks
+provider fencing
+replay
+sequence history
+```
+
+and import the other implementation's useful structural ideas:
+
+```text
+dedicated authentication module
+explicit feature token model
+explicit PromptState enum
+capabilityEntries()
+parent_actor_instance / child_actor_instance fencing
+cleaner separation of prompt/observation data
+explicit session subscribers
+```
+
+The most important point is that the hybrid should become **more strict than either implementation**, not compromise the current implementation to resemble the other one.
+
+And there are already several concrete weaknesses in our implementation that the comparison exposed—particularly **multi-message generation, cancellation context leakage, stale timeout candidates, provider-change atomicity, and the erroneous `SESSION_READY` emission**. Those are the places I would fix before calling the implementation a serious GARP/1.24 freeze candidate.
