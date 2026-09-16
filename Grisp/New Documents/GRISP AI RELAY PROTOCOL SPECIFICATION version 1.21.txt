@@ -1,0 +1,4831 @@
+# GARP/1.21
+
+## Gateway AI Runtime Protocol
+
+### Protocol Specification
+
+### Freeze Candidate
+
+**Status:** Normative
+**Version:** 1.21
+**Protocol Identifier:** `GARP/1.21`
+**Wire Version:** `0x00`
+**Document Language:** English
+**Encoding:** UTF-8
+**Transport:** Reliable byte stream, normally TCP
+**Security Model:** Mutual challenge-response using a deployment-provisioned shared secret
+**Primary Purpose:** Deterministic transport and browser-session boundary between an AI runtime and a browser-based AI gateway
+
+---
+
+# 1. Scope
+
+## 1.1 Purpose
+
+GARP defines the transport, authentication, browser-session, provider-adapter, generation-event, cancellation, recovery, and optional replay interfaces between an external AI runtime and a browser gateway.
+
+GARP is a transport and browser-session protocol.
+
+GARP does not define:
+
+* AI quality scoring.
+* Artifact acceptance.
+* GRISP compilation semantics.
+* GRISP runtime semantics.
+* Policy approval semantics.
+* Human approval semantics.
+* Provider-specific credential acquisition.
+* Provider-specific internal implementation details.
+
+## 1.2 Architectural role
+
+The intended architecture is:
+
+```text
+GRISP / AI Runtime
+        |
+        v
+      GARP
+        |
+        v
+Browser Gateway (e.g. Firefox)
+        |
+        v
+Provider Adapter
+        |
+        v
+AI Provider
+```
+
+The provider adapter is the sole component responsible for translating provider-specific browser behavior into the provider-independent GARP model.
+
+## 1.3 Design principles
+
+Implementations MUST be:
+
+* deterministic where the protocol defines deterministic behavior;
+* fail-closed on malformed or ambiguous input;
+* explicit about state;
+* explicit about evidence;
+* explicit about request and session identity;
+* resistant to stale browser actors and stale provider observations;
+* resistant to duplicate execution;
+* resistant to replay of authentication messages;
+* safe against partial browser failures;
+* independent of provider-specific selectors at the protocol layer.
+
+---
+
+# 2. Normative language
+
+The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**, **SHOULD**, **SHOULD NOT**, **MAY**, and **OPTIONAL** are normative.
+
+An implementation claiming GARP/1.21 conformance MUST implement all requirements marked MUST, MUST NOT, REQUIRED, SHALL, or SHALL NOT.
+
+---
+
+# 3. Protocol identity
+
+## 3.1 Canonical protocol name
+
+The only canonical protocol name is:
+
+```text
+Gateway AI Runtime Protocol
+```
+
+The canonical acronym is:
+
+```text
+GARP
+```
+
+The canonical semantic protocol identifier is:
+
+```text
+GARP/1.21
+```
+
+## 3.2 Wire version
+
+The wire version is:
+
+```text
+0x00
+```
+
+`0x00` is the only wire version defined by GARP/1.21.
+
+The semantic protocol version is independent of the wire version.
+
+## 3.3 Identity scope and artifact naming
+
+The protocol distinguishes between:
+
+1. **Protocol Identity:** The protocol defined herein is strictly identified as `GARP` with semantic version `GARP/1.21`.
+2. **Artifact Identity:** Authoritative normative specification artifacts MUST use `GARP` and `GARP/1.21`.
+3. **Implementation Identity:** Software projects, daemon executables, client libraries, or host applications implementing GARP MAY use independent product or project names without affecting protocol conformance.
+
+---
+
+# 4. Transport
+
+## 4.1 Transport properties
+
+The transport MUST provide:
+
+* ordered bytes;
+* reliable delivery semantics;
+* connection-oriented behavior;
+* explicit connection closure.
+
+TCP is the reference transport.
+
+## 4.2 TLS
+
+For non-loopback operation, implementations MUST use TLS 1.2 or later.
+
+For loopback operation, TLS MAY be omitted when the host operating-system security boundary protects the listener adequately.
+
+## 4.3 Local binding
+
+A gateway MAY bind only to loopback:
+
+```text
+127.0.0.1
+::1
+```
+
+A gateway MUST NOT expose an unauthenticated GARP listener on a non-loopback interface.
+
+---
+
+# 5. Byte order
+
+All multibyte integer fields in the binary header are encoded big-endian.
+
+For example:
+
+```text
+0x000000A7
+```
+
+is encoded:
+
+```text
+00 00 00 A7
+```
+
+---
+
+# 6. Frame format
+
+Every GARP frame consists of a fixed 48-byte header followed by the frame payload.
+
+```text
++----------------------+----------------+
+| Offset               | Size           |
++----------------------+----------------+
+| magic                | 4              |
+| wire_version         | 1              |
+| flags                | 1              |
+| header_len           | 2              |
+| payload_len          | 4              |
+| message_type         | 2              |
+| reserved             | 2              |
+| request_uuid         | 16             |
+| session_uuid         | 16             |
+| payload              | payload_len    |
++----------------------+----------------+
+```
+
+The header is exactly:
+
+```text
+48 bytes
+```
+
+### Terminology: Frame Payload vs Envelope Payload
+
+To avoid ambiguity, GARP distinguishes between:
+
+1. **Frame Payload:** The raw byte sequence of length `payload_len` immediately following the fixed 48-byte binary header. In base GARP, the frame payload is the serialized UTF-8 JSON Common Envelope.
+2. **Envelope Payload:** The inner JSON object stored in the `"payload"` member of the Common Envelope, whose schema is specific to the message type.
+
+## 6.1 Magic
+
+Offset:
+
+```text
+0
+```
+
+Length:
+
+```text
+4
+```
+
+Value:
+
+```text
+GARP
+```
+
+ASCII bytes:
+
+```text
+47 41 52 50
+```
+
+Any other value MUST cause immediate frame rejection.
+
+## 6.2 Wire version
+
+Offset:
+
+```text
+4
+```
+
+Length:
+
+```text
+1
+```
+
+Required value:
+
+```text
+00
+```
+
+Any unsupported wire version MUST produce:
+
+```text
+UNSUPPORTED_WIRE_VERSION
+```
+
+and MUST NOT be interpreted using a different framing rule.
+
+## 6.3 Flags
+
+Offset:
+
+```text
+5
+```
+
+Length:
+
+```text
+1
+```
+
+Base GARP/1.21 requires:
+
+```text
+flags = 0
+```
+
+unless a negotiated extension explicitly defines a flag.
+
+Unknown or unnegotiated flag bits MUST cause:
+
+```text
+UNSUPPORTED_FEATURE
+```
+
+## 6.4 Header length
+
+Offset:
+
+```text
+6
+```
+
+Length:
+
+```text
+2
+```
+
+Required value:
+
+```text
+48
+```
+
+encoded:
+
+```text
+00 30
+```
+
+The field is attacker-controlled input and MUST be validated before the implementation proceeds.
+
+A value other than 48 MUST cause frame rejection.
+
+## 6.5 Payload length
+
+Offset:
+
+```text
+8
+```
+
+Length:
+
+```text
+4
+```
+
+The value is an unsigned 32-bit integer specifying the exact byte length of the frame payload.
+
+Wire constraints:
+
+```text
+0 <= payload_len <= 4294967295
+```
+
+The receiver MUST validate the payload length against the currently applicable limit before allocating storage for the payload.
+
+Two distinct limits exist and MUST NOT be conflated:
+
+1. **Handshake limit** (`handshake_limit`): applies to every frame exchanged while the receiving peer has not yet successfully received and validated the peer's `CAPABILITIES` message. The handshake limit is fixed:
+
+```text
+handshake_limit = 1048576  (1 MiB)
+```
+
+2. **Application limit** (`application_limit`): applies to a frame only after the receiving peer has itself successfully received and validated the peer's `CAPABILITIES` message. The application limit is:
+
+```text
+application_limit = min(advertised_max_payload_bytes, 4294967295)
+```
+
+For any received frame, the effective limit is determined locally and deterministically by the receiver:
+
+```text
+effective_limit =
+    handshake_limit      if the receiver has not yet successfully received and validated the peer's CAPABILITIES
+    application_limit    otherwise
+```
+
+The receiver MUST apply this rule symmetrically for both directions. The receiver does NOT require any acknowledgement that the peer has processed the receiver's own CAPABILITIES; each direction is governed independently by the receiver of the frames in that direction.
+
+No implementation may allocate unbounded memory based solely on an attacker-controlled payload length. The receiver MUST reject a frame whose `payload_len` exceeds `effective_limit` before allocating storage for the payload.
+
+## 6.6 Message type
+
+Offset:
+
+```text
+12
+```
+
+Length:
+
+```text
+2
+```
+
+Unsigned big-endian message code.
+
+## 6.7 Reserved
+
+Offset:
+
+```text
+14
+```
+
+Length:
+
+```text
+2
+```
+
+Required value:
+
+```text
+0
+```
+
+encoded:
+
+```text
+00 00
+```
+
+Any nonzero value MUST cause:
+
+```text
+INVALID_ARGUMENT
+```
+
+## 6.8 Request UUID
+
+Offset:
+
+```text
+16
+```
+
+Length:
+
+```text
+16
+```
+
+The raw UUID bytes associated with the frame.
+
+Nil UUID:
+
+```text
+00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00
+```
+
+## 6.9 Session UUID
+
+Offset:
+
+```text
+32
+```
+
+Length:
+
+```text
+16
+```
+
+The raw session UUID.
+
+---
+
+# 7. UUID encoding
+
+## 7.1 Binary encoding
+
+UUIDs are encoded as 16 raw bytes in RFC-style network byte order.
+
+## 7.2 JSON encoding
+
+UUID-bearing envelope fields are always present.
+
+For envelope identity fields:
+
+```json
+"request_id": "uuid"
+"session_id": "uuid"
+```
+
+or:
+
+```json
+"request_id": null
+"session_id": null
+```
+
+A JSON `null` in an envelope identity field means the corresponding binary UUID field is all zero (nil UUID).
+
+## 7.3 Application objects
+
+Application-level objects MAY use the string representation of the nil UUID:
+
+```text
+00000000-0000-0000-0000-000000000000
+```
+
+This is distinct from the envelope identity representation.
+
+The distinction is intentional.
+
+## 7.4 UUID generation
+
+Client-created request identifiers SHOULD be generated using a cryptographically secure random source and SHOULD use UUID version 4 semantics.
+
+---
+
+# 8. Validation order
+
+A receiver MUST validate a frame in this order:
+
+1. fixed header availability;
+2. magic;
+3. wire version;
+4. header length;
+5. payload length against applicable limit;
+6. flags;
+7. reserved field;
+8. message type;
+9. payload byte acquisition;
+10. payload encoding;
+11. JSON syntax;
+12. duplicate JSON member detection;
+13. common envelope member presence and types;
+14. header-to-envelope identity and message-type binding;
+15. message schema;
+16. connection and authentication state;
+17. request identity and deduplication;
+18. session identity;
+19. target identity;
+20. state transition and provider semantics.
+
+An implementation MAY perform additional checks earlier when the result is equivalent and deterministic.
+
+---
+
+# 9. JSON representation
+
+## 9.1 Encoding
+
+All JSON payloads MUST be UTF-8.
+
+## 9.2 Duplicate object keys
+
+Duplicate object member names MUST be rejected.
+
+An implementation MUST NOT silently select first-key or last-key semantics for duplicate names.
+
+## 9.3 Closed objects
+
+All base GARP message and payload objects are closed unless explicitly declared open.
+
+Unknown members in a closed object MUST cause:
+
+```text
+INVALID_ARGUMENT
+```
+
+Unknown extension members are permitted only through an explicitly declared `_extensions` object.
+
+## 9.4 Open extension object
+
+In base GARP, the `_extensions` object is permitted only within `PROMPT.options`.
+
+Where a schema explicitly permits:
+
+```json
+"_extensions": {}
+```
+
+the `_extensions` object is open to negotiated extensions.
+
+Its serialized size remains strictly bounded by the enclosing frame payload and the applicable `max_payload_bytes` limit.
+
+For the avoidance of ambiguity, when an implementation needs to compute a canonical byte size for an `_extensions` object (for example, to enforce a bound deterministically), it MUST use RFC 8785 JSON Canonicalization Scheme (JCS) semantics. This requirement is limited to size bounding and does not make JCS the general wire format for arbitrary frames.
+
+---
+
+# 10. JSON integer types and bounds
+
+JavaScript number precision MUST NOT be relied upon for protocol `uint64` values.
+
+## 10.1 uint64-string
+
+Every protocol field defined as `uint64` in JSON MUST be encoded as a decimal string matching:
+
+```text
+^(0|[1-9][0-9]{0,19})$
+```
+
+and representing a value no greater than:
+
+```text
+18446744073709551615
+```
+
+Examples:
+
+```json
+"sequence": "1"
+"revision": "2"
+"page_generation": "7"
+```
+
+## 10.2 uint32
+
+Fields defined as `uint32` MAY be encoded as JSON numbers.
+
+Their range is:
+
+```text
+0 .. 4294967295
+```
+
+## 10.3 Booleans
+
+Booleans MUST use JSON `true` or `false`.
+
+Strings MUST NOT be used as boolean substitutes in base schemas.
+
+## 10.4 Protocol string bounds
+
+All string fields in base schemas have defined byte-length bounds to guarantee fail-closed processing:
+
+* `provider`: 1 .. 64 bytes
+* `tab_id`: 1 .. 64 bytes
+* `actor_instance`: 1 .. 64 bytes
+* `code`: 1 .. 64 bytes
+* `strategy`: 1 .. 64 bytes
+* `title`: 0 .. 512 bytes
+* `message`: 0 .. 1024 bytes
+* `url`: 1 .. 4096 bytes
+
+The following diagnostic-specific string fields inherit the same bounds as their generic counterparts:
+
+* `DIAGNOSTIC.code`: 1 .. 64 bytes (same as `code`)
+* `DIAGNOSTIC.message`: 0 .. 1024 bytes (same as `message`)
+* `DIAGNOSTIC.actor_instance`: 1 .. 64 bytes (same as `actor_instance`)
+
+A string exceeding its defined bound MUST be rejected with:
+
+```text
+INVALID_ARGUMENT
+```
+
+## 10.5 Protocol duration bounds
+
+To prevent arithmetic overflow in 64-bit monotonic clock implementations, all duration and timeout fields (represented as uint64-strings in milliseconds) are bounded:
+
+* Individual prompt timeout (`timeout_ms`): `0 <= timeout_ms <= 86400000` (max 24 hours).
+* Session and connection durations (`continuation_wait_ms`, `recovery_deadline_ms`, `retry_after_ms`, `idle_timeout_ms`, `interval_ms`, `response_retention_ms`): `0 <= value <= 864000000` (max 10 days).
+
+A duration exceeding its bound MUST be rejected with:
+
+```text
+INVALID_ARGUMENT
+```
+
+---
+
+# 11. Common envelope
+
+Every JSON message uses the following structure:
+
+```json
+{
+  "garp": "1.21",
+  "type": "MESSAGE_TYPE",
+  "request_id": null,
+  "session_id": null,
+  "timestamp": "2026-01-01T00:00:00.000Z",
+  "sequence": null,
+  "payload": {}
+}
+```
+
+## 11.1 Required members
+
+The following are always present:
+
+```text
+garp
+type
+request_id
+session_id
+timestamp
+payload
+```
+
+`sequence` is always present as either a uint64-string or null.
+
+## 11.2 garp
+
+Required value:
+
+```text
+1.21
+```
+
+## 11.3 type
+
+ASCII uppercase registry name.
+
+## 11.4 request_id
+
+For a command issued by a client, this is the unique command identifier.
+
+For a response (`RESPONSE` or command-correlated `ERROR`), it identifies the originating command request ID.
+
+For handshake correlation messages (`HELLO_CHALLENGE`, `HELLO_AUTH`, `HELLO_ACK`), it MAY equal the initiating `HELLO` request ID.
+
+For all session-scoped events (e.g. `GENERATION_DELTA`, `SESSION_READY`), envelope `request_id` MUST be:
+
+```json
+null
+```
+
+(and header `request_uuid` MUST be all-zero nil UUID). Command correlation for prompts is carried inside `payload.prompt_request_id`.
+
+For unsolicited connection-scoped events (`CAPABILITIES`, `PONG`, `BROWSER_STATUS`), envelope `request_id` MUST be:
+
+```json
+null
+```
+
+### Global asynchronous event correlation rule
+
+This rule is stated authoritatively once here and referenced normatively by §85 and by every message schema. It applies to every asynchronous event, i.e. every event that is not a direct, synchronous command response.
+
+For every asynchronous event:
+
+* `envelope.request_id` MUST be `null`.
+* `header.request_uuid` MUST be the all-zero nil UUID.
+* Any correlation to an originating operation MUST be carried inside operation-specific payload fields, such as `payload.prompt_request_id`.
+
+This rule is normative for both session-scoped and connection-scoped asynchronous events. It applies to all present and future asynchronous events unless an explicit negotiated extension overrides it for its own message types, and any such override MUST be stated in the extension's own normative text.
+
+## 11.5 session_id
+
+Session-scoped messages and session-scoped commands contain the session UUID.
+
+Connection-scoped messages contain:
+
+```json
+null
+```
+
+## 11.6 timestamp
+
+Strict RFC 3339 / ISO 8601 UTC timestamp string with millisecond precision:
+
+```text
+YYYY-MM-DDTHH:MM:SS.sssZ
+```
+
+For example:
+
+```json
+"timestamp": "2026-01-01T00:00:00.000Z"
+```
+
+Timestamp is informational.
+
+Timeouts and deadline decisions MUST use monotonic clocks.
+
+## 11.7 sequence
+
+Session-scoped events use monotonically increasing sequence values.
+
+Connection-scoped messages, commands, and direct command responses use:
+
+```json
+null
+```
+
+## 11.8 payload
+
+JSON object whose exact schema is defined by the message type.
+
+---
+
+# 12. Header-to-envelope identity binding
+
+The binary header and JSON envelope MUST agree.
+
+The following mappings are mandatory:
+
+```text
+header.message_type  = registry(type)
+header.request_uuid  = envelope.request_id
+header.session_uuid  = envelope.session_id
+```
+
+A mismatch MUST cause:
+
+```text
+HEADER_JSON_MISMATCH
+```
+
+An unknown binary message code MUST instead cause:
+
+```text
+UNKNOWN_MESSAGE_TYPE
+```
+
+An otherwise valid binary message code carrying an unknown JSON `type` MUST cause:
+
+```text
+UNKNOWN_MESSAGE_TYPE
+```
+
+---
+
+# 13. Message registry
+
+## 13.1 Base registry
+
+```text
+0x0001 HELLO
+0x0002 HELLO_CHALLENGE
+0x0003 HELLO_AUTH
+0x0004 HELLO_ACK
+0x0005 RESPONSE
+0x0006 ERROR
+
+0x0010 CAPABILITIES
+0x0011 BROWSER_STATUS
+0x0012 LIST_TABS
+0x0013 OPEN_TAB
+0x0014 CLOSE_TAB
+0x0015 SELECT_TAB
+0x0016 GET_CAPABILITIES
+
+0x0020 CREATE_SESSION
+0x0021 ATTACH_SESSION
+0x0022 DETACH_SESSION
+0x0023 CLOSE_SESSION
+0x0024 RESET_SESSION
+0x0025 GET_SESSION
+
+0x0030 PROMPT
+0x0031 CANCEL_PROMPT
+0x0032 GET_PROMPT_STATUS
+0x0033 GET_RESPONSE
+0x0034 SUBSCRIBE_RESPONSE
+0x0035 CONTINUE_PROMPT
+
+0x0040 SESSION_READY
+0x0041 SESSION_CHANGED
+0x0042 NAVIGATION
+0x0043 NAVIGATION_DRIFT
+0x0044 RECOVERY_STATE
+0x0045 PROVIDER_CHANGED
+
+0x0050 INPUT_SUBMITTED
+0x0051 GENERATION_STARTED
+0x0052 GENERATION_DELTA
+0x0053 GENERATION_PROGRESS
+0x0054 CONTINUATION_REQUIRED
+0x0055 CONTINUATION_SUBMITTED
+0x0056 GENERATION_COMPLETED
+0x0057 GENERATION_FAILED
+0x0058 GENERATION_CANCELLED
+
+0x0060 PROVIDER_ERROR
+0x0061 PROVIDER_AUTH_REQUIRED
+0x0062 PROVIDER_RATE_LIMITED
+0x0063 DIAGNOSTIC
+
+0x0070 PING
+0x0071 PONG
+```
+
+## 13.2 Extension registry
+
+Extension message codes MUST be allocated outside the base registry.
+
+The currently defined replay extension is:
+
+```text
+0x0100 GET_EVENTS
+```
+
+Future extensions MUST NOT collide with:
+
+```text
+0x0000 .. 0x00FF
+```
+
+or any already allocated extension code.
+
+## 13.3 Flag allocation
+
+Extension flags are allocated independently from message codes.
+
+Base GARP uses no flag bits.
+
+An extension defining a flag MUST specify:
+
+* flag bit;
+* negotiated feature name;
+* semantic meaning;
+* valid message classes.
+
+Two extensions MUST NOT allocate the same flag bit for incompatible meanings.
+
+An unknown or unnegotiated flag is invalid.
+
+---
+
+# 14. Connection state
+
+## 14.1 Server states
+
+```text
+NEW
+HELLO_RECEIVED
+CHALLENGE_SENT
+AUTH_VERIFYING
+AUTHENTICATED_PENDING_ACK
+AUTHENTICATED
+CLOSING
+CLOSED
+```
+
+## 14.2 Client states
+
+```text
+CONNECTING
+HELLO_SENT
+CHALLENGE_RECEIVED
+AUTH_SENT
+HELLO_ACK_RECEIVED
+AUTHENTICATED
+CLOSING
+CLOSED
+```
+
+## 14.3 Authentication transition
+
+The server MUST NOT accept application commands until authentication has completed.
+
+The client MUST NOT consider the connection authenticated until it has verified the server proof in `HELLO_ACK`.
+
+---
+
+# 15. Feature names and modifiers
+
+Feature names MUST match:
+
+```text
+^[a-z0-9][a-z0-9._-]{0,127}$
+```
+
+The canonical extension name does NOT include any leading punctuation (e.g. `ext-pong`).
+
+During handshake feature negotiation, a client or server MAY prefix a feature name with:
+
+```text
+!
+```
+
+to declare it a **required feature** (e.g. `!ext-pong`).
+
+The `!` prefix is a handshake negotiation token modifier indicating that the connection MUST fail if the peer does not support it.
+
+The `!` modifier is cryptographically bound into the negotiation transcript and MUST NOT be silently stripped.
+
+Validation MUST occur before canonicalization.
+
+Duplicate canonical feature names MUST be rejected.
+
+Feature names MUST be sorted by raw UTF-8 byte order after validation and without applying locale-sensitive collation.
+
+---
+
+# 16. Authentication
+
+## 16.1 Purpose
+
+Authentication proves:
+
+1. possession of the shared secret;
+2. knowledge of the current challenge;
+3. agreement on semantic version;
+4. agreement on wire version;
+5. agreement on offered features;
+6. agreement on final negotiated features;
+7. peer identity metadata.
+
+## 16.2 Shared secret
+
+The shared secret MUST contain at least 32 raw bytes.
+
+The deployment MUST define how the configured secret is represented.
+
+No implementation may silently reinterpret a configured textual value as hexadecimal when the deployment expects raw bytes, or vice versa.
+
+## 16.3 Normative test secret
+
+The authentication test vector uses exactly these raw ASCII bytes:
+
+```text
+0123456789abcdef0123456789abcdef
+```
+
+This is 32 bytes.
+
+It is NOT a hexadecimal encoding of 16 bytes.
+
+## 16.4 Client nonce
+
+The client nonce MUST be exactly 16 raw bytes.
+
+It is represented in JSON as unpadded Base64URL.
+
+Padding characters MUST be rejected.
+
+Decode failures MUST cause authentication failure.
+
+## 16.5 Server nonce
+
+The server nonce MUST be exactly 16 raw bytes.
+
+It is represented using the same rules as the client nonce.
+
+## 16.6 Authentication transcript
+
+The proof transcript contains these fields in exactly this order:
+
+```text
+domain
+client_nonce
+server_nonce
+selected_semantic_version
+selected_wire_version
+offered_feature_set
+final_feature_set
+client_name
+client_version
+server_name
+server_version
+```
+
+Every field in the transcript (domain, client_nonce, server_nonce, selected_semantic_version, selected_wire_version, client_name, client_version, server_name, server_version) is encoded with a 4-byte big-endian length prefix followed by raw bytes:
+
+```text
+u32be(byte_length)
+raw bytes
+```
+
+The feature-list encoding is:
+
+```text
+u32be(feature_count)
+repeat feature_count times:
+    u32be(feature_byte_length)
+    feature UTF-8 bytes
+```
+
+Domains are ASCII.
+
+Version strings are UTF-8.
+
+Feature names are UTF-8.
+
+Identity strings are UTF-8.
+
+The negotiated wire version is encoded as:
+
+```text
+0x00
+```
+
+represented in the transcript as the UTF-8 string:
+
+```text
+0x00
+```
+
+The selected semantic version is:
+
+```text
+1.21
+```
+
+## 16.7 Proof
+
+The proof is:
+
+```text
+HMAC-SHA256(shared_secret, transcript)
+```
+
+The resulting proof is exactly 32 raw bytes.
+
+Its JSON representation is unpadded Base64URL.
+
+Comparison MUST be constant-time.
+
+## 16.8 Domains
+
+The client-to-server proof domain is:
+
+```text
+GARP/1.21/client-proof
+```
+
+The server-to-client proof domain is:
+
+```text
+GARP/1.21/server-proof
+```
+
+## 16.9 Negotiation binding
+
+Both the original offered feature set and final negotiated feature set are included in the transcript.
+
+Therefore:
+
+```text
+!ext-pong
+```
+
+cannot be changed to:
+
+```text
+ext-pong
+```
+
+without invalidating the proof.
+
+The required-feature marker is cryptographically bound.
+
+## 16.10 Timestamp
+
+Authentication proofs do not include the timestamp.
+
+Freshness is provided by the nonces.
+
+The timestamp remains informational.
+
+---
+
+# 17. Authentication messages
+
+## 17.1 HELLO
+
+Header:
+
+```text
+request_uuid = client-generated UUID
+session_uuid = nil
+```
+
+Payload:
+
+```json
+{
+  "client_name": "GARPClient",
+  "client_version": "1.21.0",
+  "versions": ["1.21"],
+  "wire_versions": ["0x00"],
+  "features": ["!ext-pong"],
+  "client_nonce": "BASE64URL"
+}
+```
+
+## 17.2 HELLO_CHALLENGE
+
+The server selects one semantic version and one wire version.
+
+Payload:
+
+```json
+{
+  "server_name": "GarpGateway",
+  "server_version": "1.21.0",
+  "selected_version": "1.21",
+  "selected_wire_version": "0x00",
+  "features": ["!ext-pong"],
+  "server_nonce": "BASE64URL"
+}
+```
+
+The response correlation identifier equals the initiating HELLO transaction identifier.
+
+## 17.3 HELLO_AUTH
+
+Payload:
+
+```json
+{
+  "client_proof": "BASE64URL"
+}
+```
+
+Its request UUID equals the correlated HELLO transaction identifier.
+
+## 17.4 HELLO_ACK
+
+Payload:
+
+```json
+{
+  "server_proof": "BASE64URL",
+  "selected_version": "1.21",
+  "selected_wire_version": "0x00",
+  "features": ["!ext-pong"]
+}
+```
+
+HELLO_ACK completes authentication only after the client verifies the server proof.
+
+---
+
+# 18. Request-ID uniqueness and correlation exception
+
+## 18.1 New command IDs
+
+A client-generated command request ID MUST be unique within the connection.
+
+## 18.2 Handshake transaction entry
+
+The entire HELLO handshake sequence:
+
+```text
+HELLO             request_id = X
+HELLO_CHALLENGE   request_id = X
+HELLO_AUTH        request_id = X
+HELLO_ACK         request_id = X
+```
+
+occupies exactly **one** entry in the connection request-ID namespace.
+
+Reusing that transaction ID for handshake correlation does not constitute issuance of additional client command request IDs.
+
+## 18.3 Application responses
+
+A `RESPONSE` or protocol `ERROR` associated with a command uses that command's request ID.
+
+The receiving implementation MUST NOT interpret a normal response as a new request.
+
+---
+
+# 19. Replay protection
+
+Authentication replay protection MUST survive gateway process restarts for at least 24 hours.
+
+The replay-protection store MAY be:
+
+* durable local storage;
+* encrypted persistent storage;
+* shared durable key-value storage;
+* another mechanism providing equivalent guarantees.
+
+## 19.1 Lost replay state
+
+If authentication replay state is lost or cannot be re-established:
+
+```text
+the gateway MUST NOT continue accepting the affected secret.
+```
+
+The affected shared secret MUST be disabled and rotated.
+
+A gateway MUST NOT resume authentication with the same secret merely because the process restarted.
+
+This rule applies to authentication replay state only.
+
+Application session state and event history MAY still be lost on restart unless separately persisted.
+
+## 19.2 Replay key
+
+The implementation MUST detect reuse of an authenticated handshake transcript for the same credential context.
+
+A practical deterministic key is:
+
+```text
+SHA-256(transcript_core)
+```
+
+where `transcript_core` contains both nonces and all negotiation-binding fields.
+
+---
+
+# 20. Handshake timeout
+
+The default handshake timeout is:
+
+```text
+10000 ms
+```
+
+measured using a monotonic clock.
+
+If authentication does not complete within the deadline, the connection MUST close.
+
+The error condition is:
+
+```text
+HANDSHAKE_TIMEOUT
+```
+
+---
+
+# 21. CAPABILITIES
+
+CAPABILITIES is a connection-scoped message.
+
+Header identity:
+
+```text
+request_uuid = nil
+session_uuid = nil
+```
+
+Sequence:
+
+```text
+null
+```
+
+It is emitted immediately after `HELLO_ACK` and before application commands are processed.
+
+A gateway MUST also emit a new CAPABILITIES event when effective negotiated capabilities materially change.
+
+---
+
+# 22. Capability structure
+
+The CAPABILITIES payload is:
+
+```json
+{
+  "protocol": "1.21",
+  "wire_version": "0x00",
+  "limits": {
+    "handshake_timeout_ms": "10000",
+    "max_payload_bytes": 16777216,
+    "max_prompt_size": 1048576,
+    "max_response_size": 16777216,
+    "max_outstanding_requests": 128,
+    "max_queued_events": 8192,
+    "max_event_history_memory_mb": 64,
+    "max_generation_buffer_mb": 32,
+    "response_retention_ms": "86400000",
+    "continuation_wait_ms": "300000",
+    "recovery_deadline_ms": "300000",
+    "max_error_details_bytes": 65536,
+    "max_diagnostic_details_bytes": 65536
+  },
+  "keepalive": {
+    "enabled": true,
+    "idle_timeout_ms": "30000",
+    "interval_ms": "10000"
+  },
+  "providers": [],
+  "extensions": []
+}
+```
+
+The values above are illustrative.
+
+The implementation MUST advertise its actual enforced values.
+
+### Explicit type and range declarations
+
+The following members of `limits` are of JSON type `uint32` (encoded as JSON numbers) with range `0 .. 4294967295`:
+
+* `max_payload_bytes`
+* `max_prompt_size`
+* `max_response_size`
+* `max_outstanding_requests`
+* `max_queued_events`
+* `max_event_history_memory_mb`
+* `max_generation_buffer_mb`
+* `max_error_details_bytes`
+* `max_diagnostic_details_bytes`
+
+The following members of `limits` are `uint64-string` per §10.1 and bounded per §10.5:
+
+* `handshake_timeout_ms`
+* `response_retention_ms`
+* `continuation_wait_ms`
+* `recovery_deadline_ms`
+
+The following members of `keepalive` are `uint64-string` per §10.1 and bounded per §10.5:
+
+* `idle_timeout_ms`
+* `interval_ms`
+
+`keepalive.enabled` is JSON `boolean`.
+
+A receiver MUST reject a CAPABILITIES payload whose limit fields violate these type or range declarations with `INVALID_ARGUMENT`.
+
+## 22.1 Provider entries
+
+Each provider entry contains:
+
+```json
+{
+  "id": "deepseek",
+  "version": "1.0.0",
+  "state": "AVAILABLE",
+  "input_strategies": [
+    "provider_native_send",
+    "keyboard_enter"
+  ],
+  "capabilities": {
+    "streaming": true,
+    "cancellation": true,
+    "continuation": true,
+    "diagnostics": true
+  }
+}
+```
+
+### Required fields
+
+Every provider entry MUST contain all of the following members:
+
+* `id` — string, 1 .. 64 bytes.
+* `version` — string, 1 .. 64 bytes.
+* `state` — string, one of `AVAILABLE`, `UNAVAILABLE`, `AUTH_REQUIRED`, `RATE_LIMITED`, `DEGRADED`.
+* `input_strategies` — array of strings, each 1 .. 64 bytes, at least one element, no duplicates.
+* `capabilities` — object whose members are all JSON `boolean`.
+
+The `capabilities` object MUST contain at least `streaming`, `cancellation`, `continuation`, `diagnostics`.
+
+Any provider entry missing a required member MUST cause the entire CAPABILITIES frame to be rejected with `INVALID_ARGUMENT`.
+
+### Ordering
+
+`providers` MAY be empty only when no provider adapter is currently installed or usable.
+
+Providers MUST be sorted by `id` using raw UTF-8 byte order.
+
+Input strategy arrays MUST use the same ordering rule.
+
+### Input strategies
+
+An **input strategy** is a provider-adapter-defined, provider-independent identifier for the mechanism used to submit input to the provider. The canonical name of an input strategy MUST match:
+
+```text
+^[a-z][a-z0-9_]{0,63}$
+```
+
+The base protocol does not mandate any particular input strategy. Provider adapters MAY define their own strategies. Strategies advertised in `input_strategies` MUST be a subset of the strategies the adapter is currently able to use for the current page and provider context.
+
+### Canonical definition of "provider unavailable"
+
+A provider is **unavailable** for a given session when any of the following holds, as established by authoritative adapter evidence:
+
+* the provider adapter for the configured provider is not installed;
+* the provider adapter is installed but disabled;
+* the provider adapter has crashed;
+* the provider's browser context associated with the session is no longer present;
+* the provider adapter has reported that it cannot serve the current page.
+
+A provider that is merely rate-limited or that requires interactive authentication is not "unavailable"; those conditions are represented by dedicated events and session states. `PROVIDER_UNAVAILABLE` MUST be used only for the condition defined above.
+
+## 22.2 Extensions
+
+Extensions use:
+
+```json
+[
+  {
+    "name": "ext-pong",
+    "version": "1.0"
+  }
+]
+```
+
+Extensions MUST be listed by their canonical name (without `!`) and sorted by name.
+
+## 22.3 Limit breach behaviors
+
+When advertised limits are breached:
+
+* Prompt length exceeding `max_prompt_size`: command rejected with `INVALID_ARGUMENT`.
+* Outstanding requests exceeding `max_outstanding_requests`: command rejected with `OUTSTANDING_REQUEST_LIMIT`.
+* Response content exceeding `max_response_size`: prompt fails with `RESPONSE_TOO_LARGE` (`partial = true`).
+* Internal generation buffer exceeding `max_generation_buffer_mb`: prompt fails with `GENERATION_BUFFER_LIMIT` (`partial = true`).
+
+### Definition of an outstanding request
+
+An **outstanding request** is a client-issued command whose corresponding `RESPONSE` or command-correlated `ERROR` has not yet been committed by the gateway for transmission to that client.
+
+For the purpose of `max_outstanding_requests`:
+
+* Only client-issued commands count.
+* A command is counted from the moment it is successfully received and parsed.
+* A command stops being counted at the moment its correlated `RESPONSE` or `ERROR` is committed for transmission, regardless of when that frame is physically written to the transport.
+* Unsolicited events (including all session-scoped events, `CAPABILITIES`, `BROWSER_STATUS`, `PONG`, and provider-originated events) never count.
+* The HELLO handshake sequence counts as a single outstanding request.
+* Rejected commands that produce a command-correlated `ERROR` still count until that `ERROR` is committed.
+
+## 22.4 Capability changes and active prompts
+
+When effective application limits change, the gateway MUST emit CAPABILITIES.
+
+Clients MUST use the newest advertised values for future operations.
+
+Previously accepted prompt input is not invalidated solely because a subsequently advertised `max_prompt_size` becomes smaller. Clients are NOT required to revalidate active prompts merely because a capability limit decreased. Safety limits for:
+
+* global memory;
+* queue capacity;
+* process safety;
+* connection safety;
+
+MAY apply immediately and MAY affect active prompts, in which case the affected prompt MUST fail with the corresponding error code (`RESPONSE_TOO_LARGE`, `GENERATION_BUFFER_LIMIT`, `EVENT_QUEUE_OVERFLOW`, or `RECOVERY_FAILED`) as defined by the applicable section.
+
+---
+
+# 23. Bootstrap limits
+
+The handshake limit is independent from application limits.
+
+The bootstrap handshake payload maximum is:
+
+```text
+1 MiB
+```
+
+Handshake messages remain subject to the bootstrap limit until the receiving peer has itself successfully received and validated the peer's CAPABILITIES message.
+
+CAPABILITIES does not increase the handshake limit.
+
+Application messages use the advertised effective application limit:
+
+```text
+application_limit = min(advertised_max_payload_bytes, 4294967295)
+```
+
+Therefore:
+
+```text
+handshake limit = 1 MiB, effective until the receiver has itself received and validated the peer's CAPABILITIES
+application limit = advertised CAPABILITIES value, effective after that point
+```
+
+The effective limit as a function of the receiver's own local state is defined normatively in §6.5. No peer acknowledgement is required or defined for CAPABILITIES processing.
+
+---
+
+# 24. Capability changes
+
+When effective application limits change, the gateway MUST emit CAPABILITIES.
+
+Clients MUST use the newest advertised values for future operations.
+
+Previously accepted prompt input is not invalidated solely because a subsequently advertised `max_prompt_size` becomes smaller.
+
+Safety limits for:
+
+* global memory;
+* queue capacity;
+* process safety;
+* connection safety;
+
+MAY apply immediately.
+
+---
+
+# 25. Generic RESPONSE
+
+The generic application response payload is:
+
+```json
+{
+  "success": true
+}
+```
+
+or:
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "ERROR_CODE",
+    "message": "Human-readable description"
+  }
+}
+```
+
+The `RESPONSE` payload MAY contain command-specific result fields.
+
+`success` is REQUIRED in all application RESPONSE payloads.
+
+---
+
+# 26. Generic ERROR
+
+`ERROR` is a protocol-level error and is not a successful application response.
+
+Payload:
+
+```json
+{
+  "code": "ERROR_CODE",
+  "message": "Human-readable description"
+}
+```
+
+Optional:
+
+```json
+{
+  "details": {}
+}
+```
+
+`details`, when present, is bounded by `max_error_details_bytes`.
+
+### Scoping Rules for ERROR Frames:
+
+1. **Command-correlated ERROR:** When emitted in direct response to an invalid or rejected command, the frame adopts the originating command's `request_id` and `session_id`.
+2. **Session-originated asynchronous ERROR:** When emitted due to an asynchronous failure of an active session, `request_id` MUST be `null` and `session_id` MUST be the affected session's UUID.
+3. **Connection-level ERROR:** When emitted due to framing or connection errors outside a session, `request_id` and `session_id` MUST both be `null`.
+
+---
+
+# 27. Error registry and normative mappings
+
+The normative base error registry contains 47 error codes:
+
+```text
+INVALID_ARGUMENT
+INVALID_ENVELOPE
+UNKNOWN_MESSAGE_TYPE
+UNKNOWN_MESSAGE_ID
+HEADER_JSON_MISMATCH
+UNSUPPORTED_VERSION
+UNSUPPORTED_WIRE_VERSION
+UNSUPPORTED_FEATURE
+
+AUTH_REQUIRED
+AUTH_FAILED
+AUTH_REPLAY
+HANDSHAKE_TIMEOUT
+
+DUPLICATE_REQUEST
+REVISION_GAP
+EVENT_SEQUENCE_GAP
+EVENT_SEQUENCE_OVERFLOW
+PAGE_GENERATION_OVERFLOW
+INVALID_MESSAGE_STATE
+
+SESSION_NOT_FOUND
+SESSION_CLOSED
+SESSION_BUSY
+OUTSTANDING_REQUEST_LIMIT
+
+TAB_NOT_FOUND
+TAB_UNAVAILABLE
+
+PROMPT_NOT_FOUND
+PROMPT_NOT_ACTIVE
+PROMPT_ALREADY_TERMINAL
+PROMPT_TIMEOUT
+PROMPT_CANCELLED
+RESPONSE_NOT_READY
+
+INPUT_VERIFICATION_FAILED
+SUBMISSION_FAILED
+STALE_ACTOR
+NAVIGATION_DRIFT
+
+PROVIDER_UNAVAILABLE
+PROVIDER_AUTH_REQUIRED
+PROVIDER_RATE_LIMITED
+PROVIDER_ERROR
+RESPONSE_TOO_LARGE
+GENERATION_BUFFER_LIMIT
+
+CONTINUATION_NOT_ALLOWED
+CONTINUATION_LIMIT_REACHED
+CONTINUATION_TIMEOUT
+CONTINUATION_NOT_AVAILABLE
+
+RECOVERY_FAILED
+EVENT_QUEUE_OVERFLOW
+
+EVENT_HISTORY_EXPIRED
+```
+
+### Normative Mappings:
+
+* `INVALID_ARGUMENT`: Malformed fields, out-of-range integers, string length limit breaches, unknown members in closed payload objects, or nonzero reserved header bytes.
+* `INVALID_ENVELOPE`: Missing required envelope members, extra keys in the top-level Common Envelope object, or invalid envelope types or structure.
+* `UNKNOWN_MESSAGE_TYPE`: Unrecognized header message code or unrecognized envelope type name.
+* `UNKNOWN_MESSAGE_ID`: An operation (e.g. revision handling, delta processing, or continuation reference) references a `message_id` that does not exist within the active or targeted prompt.
+* `HEADER_JSON_MISMATCH`: Discrepancy between header and envelope identity fields (`message_type`, `request_uuid`, `session_uuid`).
+* `UNSUPPORTED_VERSION`: Negotiated semantic version is not supported.
+* `UNSUPPORTED_WIRE_VERSION`: Wire version is not `0x00`.
+* `UNSUPPORTED_FEATURE`: Unnegotiated extension flag or unsupported required feature (`!`).
+* `AUTH_REQUIRED`: Command attempted before completing mutual handshake authentication.
+* `AUTH_FAILED`: Verification of peer HMAC proof failed.
+* `AUTH_REPLAY`: Replay of prior authentication nonces/transcript detected.
+* `HANDSHAKE_TIMEOUT`: Handshake did not complete within `handshake_timeout_ms`.
+* `DUPLICATE_REQUEST`: Duplicate non-idempotent command request ID received.
+* `REVISION_GAP`: Generation revision gap detected (`revision > expected`).
+* `EVENT_SEQUENCE_GAP`: Receiver detects gap in session event sequence.
+* `EVENT_SEQUENCE_OVERFLOW`: Session event counter exceeds uint64 limit.
+* `PAGE_GENERATION_OVERFLOW`: Page generation counter exceeds uint64 limit.
+* `INVALID_MESSAGE_STATE`: A command is executed in a state that is incompatible with that command, or a losing race for an arbiter reservation occurs. See §27.1 for the full boundary rules.
+* `SESSION_NOT_FOUND`: Target `session_id` does not exist.
+* `SESSION_CLOSED`: Target session is terminally closed.
+* `SESSION_BUSY`: Target session already has an active nonterminal prompt; the session-level prompt exclusivity reservation has been lost.
+* `OUTSTANDING_REQUEST_LIMIT`: The connection has reached `max_outstanding_requests` as defined in §22.3; new commands are rejected until outstanding requests complete.
+* `TAB_NOT_FOUND`: Target `tab_id` does not exist.
+* `TAB_UNAVAILABLE`: Target tab is crashed, restricted, or unavailable.
+* `PROMPT_NOT_FOUND`: Referenced `prompt_request_id` does not exist within the targeted session.
+* `PROMPT_NOT_ACTIVE`: A command requires an active (nonterminal) prompt for the referenced `prompt_request_id`, but the referenced prompt exists and is not active. Used for operations that specifically require an active prompt but that are not valid in the prompt's current nonterminal state.
+* `PROMPT_ALREADY_TERMINAL`: A command is targeted at a prompt whose terminal state has already been committed (i.e. the prompt is in `COMPLETED`, `FAILED`, or `CANCELLED`).
+* `PROMPT_TIMEOUT`: Prompt exceeded configured `timeout_ms`.
+* `PROMPT_CANCELLED`: A command is targeted at a prompt whose terminal state is `CANCELLED`, and the command's semantics distinguish that specific terminal outcome from the generic already-terminal condition. Used, for example, by `GET_RESPONSE` and `GET_PROMPT_STATUS` when returning information about a cancelled prompt, and by operations that explicitly require a non-cancelled prompt.
+* `RESPONSE_NOT_READY`: `GET_RESPONSE` called while prompt is still actively generating.
+* `INPUT_VERIFICATION_FAILED`: Prompt injection verification failed.
+* `SUBMISSION_FAILED`: Submission of input to provider failed.
+* `STALE_ACTOR`: Result received from replaced browser actor.
+* `NAVIGATION_DRIFT`: Unexpected URL or document replacement occurred during an active page-dependent prompt operation.
+* `PROVIDER_UNAVAILABLE`: Selected provider is uninstalled, disabled, crashed, or its context has been invalidated for the active prompt. See §22.1 for the canonical definition.
+* `PROVIDER_AUTH_REQUIRED`: Provider requires interactive user authentication.
+* `PROVIDER_RATE_LIMITED`: Provider rejected submission due to rate limits.
+* `PROVIDER_ERROR`: Provider internal error or generation failure.
+* `RESPONSE_TOO_LARGE`: Accumulated response content exceeds `max_response_size`.
+* `GENERATION_BUFFER_LIMIT`: Accumulated transient generation data exceeds the internal gateway buffering limit `max_generation_buffer_mb`. This is a gateway resource limit, not a semantic provider-response limit; see §80.
+* `CONTINUATION_NOT_ALLOWED`: Continuation attempted when disabled from the start (`max_continuations = 0`).
+* `CONTINUATION_LIMIT_REACHED`: Continuation requested after reaching configured `max_continuations` where `max_continuations > 0`.
+* `CONTINUATION_TIMEOUT`: Continuation did not arrive within `continuation_wait_ms`.
+* `CONTINUATION_NOT_AVAILABLE`: The selected provider adapter does not support continuation at all for the current prompt. See §64.3.
+* `RECOVERY_FAILED`: Session recovery deadline expired without restoring authoritative state.
+* `EVENT_QUEUE_OVERFLOW`: Session event storage exceeds `max_queued_events`.
+* `EVENT_HISTORY_EXPIRED`: Requested sequence in `GET_EVENTS` has already been evicted from history.
+
+## 27.1 Decision table for prompt-state error boundaries
+
+The following table is normative and defines exactly which error code a command-correlated rejection uses for the prompt-state conditions it covers. Where a command is not listed, that command does not use these codes.
+
+| Condition at command arrival | Applicable code |
+| --- | --- |
+| Referenced `prompt_request_id` does not exist within the session | `PROMPT_NOT_FOUND` |
+| Prompt state is `COMPLETED`, `FAILED`, or `CANCELLED` | `PROMPT_ALREADY_TERMINAL` |
+| Prompt state is `CANCELLED` and the command's semantics distinguish the cancelled outcome | `PROMPT_CANCELLED` |
+| Command requires the prompt to be active, prompt exists, prompt is in a nonterminal state incompatible with the command | `PROMPT_NOT_ACTIVE` |
+| Command is incompatible with the current state for reasons other than active/terminal distinction, or an arbiter reservation race is lost | `INVALID_MESSAGE_STATE` |
+| Prompt is in `CANCELLING` and a second `CANCEL_PROMPT` is received | `INVALID_MESSAGE_STATE` |
+
+The following specific cases are normative consequences of the table:
+
+* `CANCEL_PROMPT` against a prompt in `PENDING`, `SUBMITTING`, `GENERATING`, or `WAITING_CONTINUATION` is accepted.
+* `CANCEL_PROMPT` against a prompt in `CANCELLING` fails with `INVALID_MESSAGE_STATE`.
+* `CANCEL_PROMPT` against a prompt in `COMPLETED`, `FAILED`, or `CANCELLED` fails with `PROMPT_ALREADY_TERMINAL`.
+* `CONTINUE_PROMPT` against a prompt not in `WAITING_CONTINUATION` fails with `PROMPT_NOT_ACTIVE` if the prompt exists and is nonterminal, and with `PROMPT_ALREADY_TERMINAL` if the prompt is terminal.
+* `GET_PROMPT_STATUS` and `GET_RESPONSE` accept prompts in all states including terminal states; they do not use these codes for state rejection.
+* A losing race in the auto-continue vs explicit `CONTINUE_PROMPT` arbitration fails with `INVALID_MESSAGE_STATE`.
+
+---
+
+# 28. Session identity
+
+A session has a stable immutable:
+
+```text
+session_id
+```
+
+The following properties are mutable:
+
+```text
+provider
+tab_id
+url
+page_generation
+state
+```
+
+A provider change does not change `session_id`.
+
+A tab change does not change `session_id`.
+
+A browser actor replacement (e.g. JSWindowActor) does not change `session_id`.
+
+---
+
+# 29. Session states
+
+The complete session state set is:
+
+```text
+CREATED
+PREPARING
+READY
+BUSY
+AUTH_REQUIRED
+RATE_LIMITED
+RECOVERING
+RETRYING
+FAILED
+CLOSED
+```
+
+---
+
+# 30. Session arbiter
+
+Each session MUST have a serialized arbiter.
+
+The arbiter is responsible for:
+
+* prompt reservation;
+* prompt terminal commits;
+* cancellation commits;
+* timeout commits;
+* retry transitions;
+* recovery transitions;
+* page-generation changes;
+* event sequence allocation;
+* session state transitions.
+
+Operations affecting the same session MUST be serialized.
+
+Read-only queries MAY execute concurrently, but MUST observe a consistent committed session snapshot.
+
+---
+
+# 31. Session transition rules
+
+The following transitions are normative:
+
+```text
+CREATED -> PREPARING
+CREATED -> FAILED
+CREATED -> CLOSED
+
+PREPARING -> READY
+PREPARING -> AUTH_REQUIRED
+PREPARING -> RATE_LIMITED
+PREPARING -> RETRYING
+PREPARING -> RECOVERING
+PREPARING -> FAILED
+PREPARING -> CLOSED
+
+READY -> BUSY
+READY -> PREPARING
+READY -> AUTH_REQUIRED
+READY -> RATE_LIMITED
+READY -> RECOVERING
+READY -> FAILED
+READY -> CLOSED
+
+BUSY -> READY
+BUSY -> RETRYING
+BUSY -> AUTH_REQUIRED
+BUSY -> RATE_LIMITED
+BUSY -> RECOVERING
+BUSY -> FAILED
+BUSY -> CLOSED
+
+AUTH_REQUIRED -> PREPARING
+AUTH_REQUIRED -> FAILED
+AUTH_REQUIRED -> CLOSED
+
+RATE_LIMITED -> PREPARING
+RATE_LIMITED -> FAILED
+RATE_LIMITED -> CLOSED
+
+RECOVERING -> READY
+RECOVERING -> BUSY
+RECOVERING -> RETRYING
+RECOVERING -> FAILED
+RECOVERING -> CLOSED
+
+RETRYING -> BUSY
+RETRYING -> PREPARING
+RETRYING -> FAILED
+RETRYING -> CLOSED
+
+FAILED -> PREPARING
+FAILED -> CLOSED
+
+CLOSED -> [no normal transition]
+```
+
+`RESET_SESSION` from any non-CLOSED state moves the session into `PREPARING`.
+
+`RESET_SESSION` from `CLOSED` MUST reject with:
+
+```text
+SESSION_CLOSED
+```
+
+---
+
+# 32. RESET_SESSION
+
+`RESET_SESSION` is a session-scoped command.
+
+Header:
+
+```text
+request_uuid = new client command UUID
+session_uuid = target session UUID
+sequence = null
+```
+
+Request payload:
+
+```json
+{
+  "options": {}
+}
+```
+
+Response payload:
+
+```json
+{
+  "success": true,
+  "session_id": "uuid",
+  "state": "PREPARING"
+}
+```
+
+RESET_SESSION MUST:
+
+1. stop provider activity where possible;
+2. invalidate stale page actors;
+3. invalidate stale asynchronous operations;
+4. increment `page_generation`;
+5. preserve the session ID;
+6. preserve the session event sequence;
+7. transition through `PREPARING`.
+
+The operation MUST NOT reset:
+
+```text
+sequence
+session_id
+```
+
+---
+
+# 33. Page generation
+
+`page_generation` is a uint64-string.
+
+It identifies the current browser/page actor generation for the session.
+
+It MUST increment on significant navigation, document replacement, or actor replacement as defined by the gateway.
+
+It MUST NOT decrement.
+
+It MUST NOT reset to zero during `RESET_SESSION`.
+
+If increment would exceed:
+
+```text
+18446744073709551615
+```
+
+the session MUST fail with:
+
+```text
+PAGE_GENERATION_OVERFLOW
+```
+
+---
+
+# 34. Session readiness
+
+A session is READY only when all required evidence has been established:
+
+* target tab exists;
+* correct provider context exists;
+* provider adapter is usable;
+* page generation is current;
+* provider input is discoverable;
+* provider authentication state is acceptable;
+* no conflicting active prompt exists.
+
+Readiness MUST NOT be inferred solely from tab existence.
+
+---
+
+# 35. CREATE_SESSION
+
+CREATE_SESSION is connection-scoped.
+
+Header:
+
+```text
+request_uuid = new client command UUID
+session_uuid = nil
+sequence = null
+```
+
+Request payload:
+
+```json
+{
+  "provider": "deepseek",
+  "tab_id": "tab-1",
+  "options": {}
+}
+```
+
+The gateway creates:
+
+* session ID;
+* initial page generation;
+* session arbiter;
+* provider binding;
+* session state.
+
+The command response is connection-scoped:
+
+```text
+header.request_uuid = command.request_uuid
+header.session_uuid = nil
+envelope.request_id = command.request_id
+envelope.session_id = null
+```
+
+Response payload carries the newly allocated session ID:
+
+```json
+{
+  "success": true,
+  "session_id": "uuid",
+  "state": "PREPARING"
+}
+```
+
+---
+
+# 36. GET_SESSION
+
+GET_SESSION is session-scoped.
+
+Header:
+
+```text
+request_uuid = new client command UUID
+session_uuid = target session UUID
+sequence = null
+```
+
+Request payload:
+
+```json
+{}
+```
+
+Response payload:
+
+```json
+{
+  "success": true,
+  "session_id": "uuid",
+  "state": "READY",
+  "provider": "deepseek",
+  "tab_id": "tab-1",
+  "url": "https://...",
+  "page_generation": "7",
+  "active_prompt_request_id": null
+}
+```
+
+---
+
+# 37. ATTACH_SESSION
+
+ATTACH_SESSION attaches an existing live session to the current connection.
+
+Header:
+
+```text
+request_uuid = new client command UUID
+session_uuid = target session UUID
+sequence = null
+```
+
+Request payload:
+
+```json
+{
+  "options": {}
+}
+```
+
+Response payload:
+
+```json
+{
+  "success": true,
+  "session_id": "uuid",
+  "state": "READY",
+  "provider": "deepseek",
+  "tab_id": "tab-1",
+  "url": "https://...",
+  "page_generation": "7"
+}
+```
+
+The default is exclusive control.
+
+---
+
+# 38. DETACH_SESSION
+
+DETACH_SESSION removes the connection's attachment to the session.
+
+Header:
+
+```text
+request_uuid = new client command UUID
+session_uuid = target session UUID
+sequence = null
+```
+
+Request payload:
+
+```json
+{}
+```
+
+Response payload:
+
+```json
+{
+  "success": true
+}
+```
+
+---
+
+# 39. CLOSE_SESSION
+
+CLOSE_SESSION terminates the session.
+
+Header:
+
+```text
+request_uuid = new client command UUID
+session_uuid = target session UUID
+sequence = null
+```
+
+Request payload:
+
+```json
+{}
+```
+
+Response payload:
+
+```json
+{
+  "success": true
+}
+```
+
+Once CLOSED, session operations fail with `SESSION_CLOSED`.
+
+---
+
+# 40. Reset behavior
+
+RESET_SESSION creates a new browser/provider preparation cycle.
+
+All page-dependent asynchronous work associated with the prior generation becomes stale.
+
+A stale result MUST NOT modify committed state.
+
+The event sequence remains continuous.
+
+---
+
+# 41. Browser events
+
+## 41.1 SESSION_READY
+
+Payload:
+
+```json
+{
+  "provider": "deepseek",
+  "tab_id": "tab-1",
+  "url": "https://...",
+  "page_generation": "7"
+}
+```
+
+## 41.2 SESSION_CHANGED
+
+Payload:
+
+```json
+{
+  "changed": [
+    "provider",
+    "tab_id",
+    "url",
+    "page_generation"
+  ],
+  "page_generation": "7"
+}
+```
+
+`changed` MUST contain between 1 and 4 unique values from:
+
+```text
+provider
+tab_id
+url
+page_generation
+```
+
+An empty `changed` array or duplicate values are invalid.
+
+## 41.3 NAVIGATION
+
+Payload:
+
+```json
+{
+  "page_generation": "8",
+  "url": "https://..."
+}
+```
+
+## 41.4 NAVIGATION_DRIFT
+
+Payload:
+
+```json
+{
+  "page_generation": "8",
+  "reason": "DOCUMENT_REPLACED"
+}
+```
+
+Allowed reasons:
+
+```text
+UNEXPECTED_URL
+DOCUMENT_REPLACED
+PROVIDER_CONTEXT_LOST
+ACTOR_CONTEXT_STALE
+```
+
+---
+
+# 42. Provider events
+
+## 42.1 PROVIDER_CHANGED
+
+Payload:
+
+```json
+{
+  "provider": "deepseek",
+  "page_generation": "8"
+}
+```
+
+If a `PROVIDER_CHANGED` event invalidates the provider context of an active prompt, the prompt MUST fail immediately with:
+
+```text
+PROVIDER_UNAVAILABLE
+```
+
+The provider context of an active prompt is invalidated when the provider identity, provider binding, or provider adapter instance that was used to submit or is currently driving the active prompt is no longer the authoritative provider context for the session. Changes that do not invalidate the active prompt's provider context (e.g. purely cosmetic metadata updates or unrelated provider registry updates) MUST NOT by themselves fail the prompt.
+
+### Deterministic session transition
+
+When `PROVIDER_CHANGED` invalidates an active prompt, the subsequent session transition MUST be deterministically selected using the following evidence rule:
+
+* If the invalidation is established and no in-flight provider operation attributable to the active prompt remains (verified by the provider adapter via authoritative evidence):
+  ```text
+  BUSY -> PREPARING
+  ```
+  reached via an internal reset-equivalent transition performed by the gateway (there is no client-issued `RESET_SESSION` involved; the transition is equivalent to `RESET_SESSION` in its effect on `page_generation`, stale actors, and event sequence continuity).
+
+* If an in-flight provider operation attributable to the active prompt may still exist, or if authoritative evidence of provider cessation is unavailable (i.e. state is ambiguous):
+  ```text
+  BUSY -> RECOVERING
+  ```
+
+The arbiter MUST serialize this transition and MUST apply exactly one of the two outcomes above based on adapter-supplied fencing evidence (`session_id`, `page_generation`, `actor_instance`, `prompt_request_id`, where `prompt_request_id` is present only when the operation is prompt-associated). No other transition is permitted for this event.
+
+### Provider change during WAITING_CONTINUATION
+
+If `PROVIDER_CHANGED` invalidates the provider context while the active prompt is in `WAITING_CONTINUATION`, the same rule applies: the prompt fails with `PROVIDER_UNAVAILABLE`, and the session transitions deterministically to `PREPARING` or `RECOVERING` according to the evidence rule above.
+
+### Provider change with no active prompt
+
+If `PROVIDER_CHANGED` occurs with no active prompt, the session follows its normal state transition rules; no prompt failure is generated.
+
+## 42.2 PROVIDER_AUTH_REQUIRED
+
+Payload:
+
+```json
+{
+  "provider": "deepseek",
+  "reason": "LOGIN_REQUIRED",
+  "page_generation": "8"
+}
+```
+
+An active prompt affected by provider authentication loss MUST fail with:
+
+```text
+PROVIDER_AUTH_REQUIRED
+```
+
+The session transitions to:
+
+```text
+AUTH_REQUIRED
+```
+
+### Provider authentication evidence
+
+A provider adapter MUST define positive and negative evidence for provider authentication state:
+
+* **Positive evidence of authentication:** authoritative adapter observation that the provider session is authenticated and usable.
+* **Negative evidence of authentication loss:** authoritative adapter observation that the provider requires interactive authentication (e.g. a login prompt, an authentication error page, or loss of session cookies attributable to the provider).
+
+Absence of positive evidence is NOT by itself negative evidence. The adapter MUST NOT emit `PROVIDER_AUTH_REQUIRED` based solely on the absence of a positive observation.
+
+When multiple browser actors are involved, authentication evidence MUST be attributed to a specific `actor_instance` and `page_generation`. Evidence from a subordinate actor whose `page_generation` does not match the session's current `page_generation`, or whose `actor_instance` is no longer valid, MUST be discarded.
+
+If authentication evidence cannot be authoritatively established (neither positive nor negative) and the active prompt cannot continue safely, the prompt MUST fail with `RECOVERY_FAILED` and the session MUST enter `RECOVERING`, not `AUTH_REQUIRED`.
+
+## 42.3 PROVIDER_RATE_LIMITED
+
+Payload:
+
+```json
+{
+  "provider": "deepseek",
+  "retry_after_ms": "30000",
+  "page_generation": "8"
+}
+```
+
+`retry_after_ms = "0"` means retry timing is unknown.
+
+An active prompt affected by rate limiting MUST fail with:
+
+```text
+PROVIDER_RATE_LIMITED
+```
+
+The session enters:
+
+```text
+RATE_LIMITED
+```
+
+---
+
+# 43. Browser tabs
+
+Tabs have stable logical IDs.
+
+Tab indexes are not identity.
+
+A tab index change MUST NOT change `tab_id`.
+
+A destroyed tab invalidates the tab.
+
+---
+
+# 44. LIST_TABS
+
+LIST_TABS is connection-scoped.
+
+Header:
+
+```text
+request_uuid = new client command UUID
+session_uuid = nil
+sequence = null
+```
+
+Request payload:
+
+```json
+{}
+```
+
+Response payload:
+
+```json
+{
+  "success": true,
+  "tabs": [
+    {
+      "tab_id": "tab-1",
+      "url": "https://...",
+      "title": "Provider",
+      "active": true
+    }
+  ]
+}
+```
+
+---
+
+# 45. OPEN_TAB
+
+OPEN_TAB is connection-scoped.
+
+Header:
+
+```text
+request_uuid = new client command UUID
+session_uuid = nil
+sequence = null
+```
+
+Request payload:
+
+```json
+{
+  "url": "https://chat.deepseek.com"
+}
+```
+
+Response payload:
+
+```json
+{
+  "success": true,
+  "tab_id": "tab-1",
+  "url": "https://chat.deepseek.com"
+}
+```
+
+OPEN_TAB requires a valid URL. Only `http://` and `https://` are permitted.
+
+Filtering of private-network destinations is a deployment policy choice and is outside protocol transport determinism.
+
+---
+
+# 46. CLOSE_TAB
+
+CLOSE_TAB is connection-scoped.
+
+Header:
+
+```text
+request_uuid = new client command UUID
+session_uuid = nil
+sequence = null
+```
+
+Request payload:
+
+```json
+{
+  "tab_id": "tab-1"
+}
+```
+
+Response payload:
+
+```json
+{
+  "success": true
+}
+```
+
+If `tab_id` is unknown, the command fails with `TAB_NOT_FOUND`.
+
+---
+
+# 47. SELECT_TAB
+
+SELECT_TAB is connection-scoped.
+
+Header:
+
+```text
+request_uuid = new client command UUID
+session_uuid = nil
+sequence = null
+```
+
+Request payload:
+
+```json
+{
+  "tab_id": "tab-1"
+}
+```
+
+Response payload:
+
+```json
+{
+  "success": true,
+  "tab_id": "tab-1"
+}
+```
+
+If `tab_id` is unknown, the command fails with `TAB_NOT_FOUND`.
+
+---
+
+# 48. Prompt model
+
+A session permits at most one active prompt.
+
+Prompt states are:
+
+```text
+PENDING
+SUBMITTING
+GENERATING
+WAITING_CONTINUATION
+CANCELLING
+COMPLETED
+FAILED
+CANCELLED
+```
+
+`ACCEPTED` is a command-response result state only.
+
+---
+
+# 49. PROMPT
+
+PROMPT is a session-scoped command.
+
+Header:
+
+```text
+request_uuid = new client command UUID (prompt_request_id)
+session_uuid = target session UUID
+sequence = null
+```
+
+Request payload:
+
+```json
+{
+  "prompt": "exact prompt text",
+  "options": {
+    "timeout_ms": "0",
+    "auto_continue": false,
+    "max_continuations": 8,
+    "force_focus": false,
+    "simulate_enter": false,
+    "_extensions": {}
+  }
+}
+```
+
+## 49.1 Prompt text
+
+The prompt string is opaque.
+
+After JSON decoding, the exact Unicode string MUST be preserved without trimming, normalization, or modification.
+
+---
+
+# 50. Prompt options
+
+## 50.1 timeout_ms
+
+`uint64-string`. `0 <= timeout_ms <= 86400000` (max 24 hours).
+
+```text
+"0" = no prompt timeout
+```
+
+A nonzero timeout begins when the prompt acceptance commit occurs.
+
+## 50.2 auto_continue
+
+Default: `false`.
+
+## 50.3 max_continuations
+
+JSON `uint32` per §10.2. Range: `0 .. 1024`.
+
+This field is a prompt option, not a capability limit, and therefore is not listed among the capability limit type declarations in §22. It is nonetheless subject to §10.2 (JSON number encoding) and to the range stated here.
+
+## 50.4 force_focus
+
+Default: `false`. When true, failure to verify focus causes `INPUT_VERIFICATION_FAILED`.
+
+## 50.5 simulate_enter
+
+Default: `false`. When true, adapter uses keyboard Enter after exact input verification.
+
+---
+
+# 51. Prompt admission
+
+The prompt admission process is atomic:
+
+```text
+READY
+  |
+  +-- reserve prompt
+  |
+  v
+BUSY
+  |
+  v
+PENDING
+```
+
+Two concurrent PROMPT commands against a READY session produce exactly one reservation; the other receives `SESSION_BUSY`.
+
+---
+
+# 52. PROMPT response
+
+A successful PROMPT command returns:
+
+```json
+{
+  "success": true,
+  "command_state": "ACCEPTED",
+  "prompt_state": "PENDING"
+}
+```
+
+---
+
+# 53. Prompt acceptance and timeout
+
+A prompt timeout clock begins at acceptance commit.
+
+A timeout that commits before terminal completion transitions the prompt to `FAILED` with error `PROMPT_TIMEOUT`.
+
+Once terminally failed, the prompt cannot reopen.
+
+---
+
+# 54. Submission
+
+The prompt transitions:
+
+```text
+PENDING -> SUBMITTING
+```
+
+Submission is complete only after positive evidence establishes provider acceptance.
+
+---
+
+# 55. Provider evidence
+
+A provider adapter MUST define evidence for input readiness, submission, generation, cessation, and errors.
+
+Absence of new DOM activity is not sufficient proof of cessation without an authoritative invariant.
+
+---
+
+# 56. INPUT_SUBMITTED
+
+Payload:
+
+```json
+{
+  "prompt_request_id": "uuid",
+  "page_generation": "7",
+  "strategy": "provider_native_send"
+}
+```
+
+---
+
+# 57. Generation state
+
+After verified provider generation begins:
+
+```text
+SUBMITTING -> GENERATING
+```
+
+---
+
+# 58. Message boundary rule
+
+Priority:
+
+1. provider-explicit logical message boundary;
+2. otherwise one logical assistant message per prompt.
+
+A continuation MUST NOT itself create a new message.
+
+---
+
+# 59. message_id
+
+The gateway generates `message_id`, unique within the prompt and stable for the message lifetime.
+
+---
+
+# 60. GENERATION_STARTED
+
+Payload:
+
+```json
+{
+  "prompt_request_id": "uuid",
+  "message_id": "uuid",
+  "revision": "0",
+  "page_generation": "7"
+}
+```
+
+Revision 0 is an empty initialization revision declaring message identity.
+
+No generation delta may use revision 0.
+
+The first authoritative content representation is revision 1.
+
+---
+
+# 61. GENERATION_DELTA
+
+Payload:
+
+```json
+{
+  "prompt_request_id": "uuid",
+  "message_id": "uuid",
+  "revision": "1",
+  "delta": "text",
+  "mode": "APPEND",
+  "page_generation": "7"
+}
+```
+
+`mode` is REQUIRED and MUST be one of:
+
+```text
+APPEND
+REPLACE
+```
+
+In `APPEND` mode, each successive delta appends `delta` text to the preceding message content.
+
+In `REPLACE` mode, each successive delta replaces the entire preceding message content with `delta`.
+
+Each revision MUST equal `previous_revision + 1` in both modes.
+
+---
+
+# 62. Revision handling
+
+For a given `message_id`:
+
+* `revision < expected`: stale or duplicate; discard.
+* `revision = expected`: accept.
+* `revision > expected`: revision gap; prompt fails with `REVISION_GAP` (`partial = true`).
+
+---
+
+# 63. GENERATION_PROGRESS
+
+Payload:
+
+```json
+{
+  "prompt_request_id": "uuid",
+  "message_count": 2,
+  "page_generation": "7"
+}
+```
+
+---
+
+# 64. Continuation
+
+## 64.1 Continuation lifecycle
+
+Continuation lifecycle:
+
+```text
+GENERATING -> WAITING_CONTINUATION
+```
+
+A continuation does not create a new prompt.
+
+## 64.2 Continuation contract
+
+The continuation contract is defined by the following normative rules:
+
+1. Each prompt has an associated `continuation_count`, initialized to `0` at prompt acceptance.
+2. The prompt option `max_continuations` is a JSON `uint32` in the range `0 .. 1024` (§50.3). It is fixed at prompt acceptance and MUST NOT change for the lifetime of the prompt.
+3. `continuation_count` is incremented by exactly `1` upon verified provider submission of a continuation (`CONTINUATION_SUBMITTED`, §67).
+4. `continuation_count` MUST NOT exceed `max_continuations`.
+5. When `max_continuations = 0`, continuation is disallowed from the start. If the provider requests a continuation, the gateway MUST NOT emit `CONTINUATION_REQUIRED`; it MUST fail the prompt with `CONTINUATION_NOT_ALLOWED` (`partial = true` if committed content exists, otherwise `partial = false`).
+6. When `max_continuations > 0` and `continuation_count` has reached `max_continuations`, the gateway MUST NOT emit `CONTINUATION_REQUIRED`; it MUST fail the prompt with `CONTINUATION_LIMIT_REACHED` (`partial = true` if committed content exists, otherwise `partial = false`).
+7. Otherwise, when the provider requests a continuation, the gateway MUST emit `CONTINUATION_REQUIRED` with the current `continuation_count` and the prompt enters `WAITING_CONTINUATION`.
+
+## 64.3 Continuation availability
+
+A provider adapter that does not support continuation at all for the current prompt MUST advertise `capabilities.continuation = false` for its provider entry. If a continuation is nonetheless requested by the provider (as evidenced by adapter observation) and the adapter has advertised that continuation is not available for the current prompt, the gateway MUST fail the prompt with:
+
+```text
+CONTINUATION_NOT_AVAILABLE
+```
+
+`partial = true` if committed content exists, otherwise `partial = false`.
+
+`CONTINUATION_NOT_AVAILABLE` is distinct from `CONTINUATION_NOT_ALLOWED` and `CONTINUATION_LIMIT_REACHED`:
+
+* `CONTINUATION_NOT_AVAILABLE` means the adapter cannot perform continuation at all for this prompt.
+* `CONTINUATION_NOT_ALLOWED` means continuation is disabled by prompt options (`max_continuations = 0`).
+* `CONTINUATION_LIMIT_REACHED` means the configured bound (`max_continuations > 0`) has been reached.
+
+## 64.4 Continuation vs retry
+
+Continuation and retry are distinct mechanisms and MUST NOT be conflated:
+
+* A continuation is a prompt-scoped, provider-requested operation that extends the current generation.
+* A retry is a session-scoped or prompt-scoped re-attempt of a previously failed or ambiguous provider operation, and is governed by §77 and §78.
+
+A continuation MUST NOT be implemented as a retry, and a retry MUST NOT be implemented as a continuation.
+
+If a continuation cannot be performed because the provider operation is ambiguous, the prompt MUST fail with `RECOVERY_FAILED` and the session MUST enter `RECOVERING` rather than retrying.
+
+## 64.5 Continuation vs cancellation
+
+If a `CANCEL_PROMPT` is accepted while the prompt is in `WAITING_CONTINUATION`, the prompt transitions to `CANCELLING` and the continuation is abandoned. The prompt's terminal state is then determined exclusively by the terminal arbitration defined in §74, using evidence from cancellation, provider completion, and recovery as they arrive.
+
+A continuation that was in flight at the moment `CANCEL_PROMPT` was accepted MUST be fenced by the cancellation; its result MUST NOT commit a `CONTINUATION_SUBMITTED` event after the cancellation has been accepted.
+
+---
+
+# 65. CONTINUATION_REQUIRED
+
+Payload:
+
+```json
+{
+  "prompt_request_id": "uuid",
+  "continuation_count": 3,
+  "max_continuations": 8,
+  "page_generation": "7"
+}
+```
+
+### Continuation Count Rules:
+
+1. `continuation_count` begins at `0` for each new prompt.
+2. In `CONTINUATION_REQUIRED`, `continuation_count` indicates the number of continuation operations already performed and submitted for this prompt.
+3. If `continuation_count >= max_continuations` (or if `max_continuations = 0`), the gateway MUST NOT emit `CONTINUATION_REQUIRED`. It MUST immediately fail:
+   * `CONTINUATION_NOT_ALLOWED` (`partial = true` if committed content exists, otherwise `partial = false`) when `max_continuations = 0` from the start;
+   * `CONTINUATION_LIMIT_REACHED` (`partial = true` if committed content exists, otherwise `partial = false`) when `max_continuations > 0` and the configured bound has been reached.
+
+---
+
+# 66. CONTINUE_PROMPT
+
+CONTINUE_PROMPT is a session-scoped command accepted only in `WAITING_CONTINUATION`.
+
+Header:
+
+```text
+request_uuid = new client command UUID
+session_uuid = target session UUID
+sequence = null
+```
+
+Request payload:
+
+```json
+{
+  "prompt_request_id": "uuid"
+}
+```
+
+Response payload:
+
+```json
+{
+  "success": true,
+  "command_state": "ACCEPTED"
+}
+```
+
+When `auto_continue = true`, automatic continuation and explicit CONTINUE_PROMPT race through the arbiter. The winning reservation proceeds; the losing race MUST receive `INVALID_MESSAGE_STATE`.
+
+---
+
+# 67. CONTINUATION_SUBMITTED
+
+Payload:
+
+```json
+{
+  "prompt_request_id": "uuid",
+  "page_generation": "7",
+  "continuation_count": 4,
+  "strategy": "keyboard_enter"
+}
+```
+
+Emitted only after verified provider submission. Verified submission increments `continuation_count` by 1.
+
+---
+
+# 68. Continuation timeout
+
+If continuation does not arrive within `continuation_wait_ms`:
+
+```text
+WAITING_CONTINUATION -> FAILED
+```
+
+Error: `CONTINUATION_TIMEOUT` (`partial = true` if committed content exists, otherwise `partial = false`).
+
+---
+
+# 69. GENERATION_COMPLETED
+
+Single-message form:
+
+```json
+{
+  "prompt_request_id": "uuid",
+  "message_id": "uuid",
+  "revision": "12",
+  "response": "complete response",
+  "page_generation": "7"
+}
+```
+
+Multi-message form:
+
+```json
+{
+  "prompt_request_id": "uuid",
+  "messages": [
+    {
+      "message_id": "uuid",
+      "revision": "3",
+      "response": "first message"
+    },
+    {
+      "message_id": "uuid",
+      "revision": "8",
+      "response": "second message"
+    }
+  ],
+  "page_generation": "7"
+}
+```
+
+### Revision Equality Invariant:
+
+In single-message completion, `revision` MUST strictly equal the last committed revision for that message.
+
+In multi-message completion, each `message.revision` MUST strictly equal that message's last committed revision.
+
+An adapter MUST NOT emit a completion snapshot that skips uncommitted delta revisions.
+
+`partial` MUST NOT appear in GENERATION_COMPLETED.
+
+---
+
+# 70. GENERATION_FAILED
+
+Single-message partial failure:
+
+```json
+{
+  "prompt_request_id": "uuid",
+  "message_id": "uuid",
+  "revision": "4",
+  "error": {
+    "code": "REVISION_GAP",
+    "message": "Generation revision gap detected"
+  },
+  "partial": true,
+  "response": "partial response",
+  "page_generation": "7"
+}
+```
+
+Zero-output failure:
+
+```json
+{
+  "prompt_request_id": "uuid",
+  "error": {
+    "code": "PROVIDER_ERROR",
+    "message": "Provider failed"
+  },
+  "partial": false,
+  "response": null,
+  "page_generation": "7"
+}
+```
+
+Multi-message partial failure:
+
+```json
+{
+  "prompt_request_id": "uuid",
+  "error": {
+    "code": "PROVIDER_ERROR",
+    "message": "Provider failed"
+  },
+  "partial": true,
+  "messages": [
+    {
+      "message_id": "uuid",
+      "revision": "4",
+      "response": "partial message"
+    }
+  ],
+  "page_generation": "7"
+}
+```
+
+---
+
+# 71. GENERATION_CANCELLED
+
+Single-message cancelled form:
+
+```json
+{
+  "prompt_request_id": "uuid",
+  "message_id": "uuid",
+  "revision": "2",
+  "cancel_verified": true,
+  "partial": true,
+  "response": "partial response",
+  "page_generation": "7"
+}
+```
+
+Zero-output cancelled form:
+
+```json
+{
+  "prompt_request_id": "uuid",
+  "cancel_verified": true,
+  "partial": false,
+  "messages": [],
+  "page_generation": "7"
+}
+```
+
+`cancel_verified` MUST be true.
+
+---
+
+# 72. Cancellation
+
+CANCEL_PROMPT is a session-scoped command valid for any nonterminal prompt state except `CANCELLING`:
+
+```text
+PENDING
+SUBMITTING
+GENERATING
+WAITING_CONTINUATION
+```
+
+A second CANCEL_PROMPT against a prompt already in `CANCELLING` fails with `INVALID_MESSAGE_STATE`. `CANCELLING` is a nonterminal state; a second cancellation is not a "prompt already terminal" condition. See §27.1.
+
+Header:
+
+```text
+request_uuid = new client command UUID
+session_uuid = target session UUID
+sequence = null
+```
+
+Request payload:
+
+```json
+{
+  "prompt_request_id": "uuid"
+}
+```
+
+Accepted cancellation moves the prompt to `CANCELLING`.
+
+Command response:
+
+```json
+{
+  "success": true,
+  "command_state": "ACCEPTED"
+}
+```
+
+If the prompt is already in a terminal state (`COMPLETED`, `FAILED`, `CANCELLED`), CANCEL_PROMPT fails with:
+
+```text
+PROMPT_ALREADY_TERMINAL
+```
+
+## 72.1 Cancellation race semantics
+
+The following cases are normative:
+
+### Cancellation during SUBMITTING
+
+If `CANCEL_PROMPT` is accepted while the prompt is in `SUBMITTING`, the prompt moves to `CANCELLING`. The in-flight submission is fenced by the cancellation. If the submission subsequently succeeds at the provider, the provider-side result is treated as cancellation evidence and the prompt may resolve as `CANCELLED` (if cessation is verified) or `COMPLETED` (if authoritative completion evidence is established first and wins arbitration per §74). If the submission state cannot be established authoritatively, the prompt resolves as `FAILED` with `RECOVERY_FAILED`.
+
+### Cancellation during RECOVERING
+
+If `CANCEL_PROMPT` is accepted while the session is in `RECOVERING` and the prompt is in `CANCELLING`, the command fails with `INVALID_MESSAGE_STATE`. The prompt is already in `CANCELLING`; no second cancellation is accepted. The existing cancellation continues to be resolved by §75.
+
+### Cancellation during RETRYING
+
+If `CANCEL_PROMPT` is accepted while the session is in `RETRYING` with an active prompt, the prompt moves to `CANCELLING`. The in-flight retry is fenced by the cancellation. Terminal resolution follows the same rules as cancellation during `SUBMITTING`.
+
+### Cancellation vs page-generation drift
+
+If a page-generation change occurs while the prompt is in `CANCELLING`, the resulting `NAVIGATION_DRIFT` event is treated as evidence only. It does not by itself determine the prompt's terminal state. The prompt's terminal state is determined exclusively by the terminal arbitration defined in §74, using cancellation evidence, provider completion evidence, navigation-drift evidence, and recovery evidence as they arrive.
+
+---
+
+# 73. Cancellation evidence
+
+Terminal CANCELLED requires positive provider cessation evidence.
+
+"No new output appeared" alone is insufficient unless backed by an authoritative deadline invariant.
+
+---
+
+# 74. Terminal arbitration
+
+Each prompt has exactly one terminal commit:
+
+```text
+COMPLETED
+FAILED
+CANCELLED
+```
+
+The arbiter serializes all terminal candidates. The first valid candidate that commits wins. Once committed, the prompt can never reopen.
+
+### Terminal arbitration ownership
+
+Once any terminal candidate has been submitted to the session arbiter, the prompt is resolved exclusively by this section. Navigation drift, cancellation uncertainty, timeout, provider failure, recovery failure, revision gap, response size limits, generation buffer limits, and provider unavailability are **evidence sources**; none of them bypasses terminal arbitration. In particular:
+
+* A `CANCEL_PROMPT` acceptance submits a cancellation candidate (which may resolve as `CANCELLED` or `COMPLETED` depending on later evidence).
+* A provider completion observation submits a completion candidate.
+* A provider failure observation submits a failure candidate.
+* A timeout expiry submits a failure candidate with `PROMPT_TIMEOUT`.
+* A navigation-drift observation submits a failure candidate with `NAVIGATION_DRIFT`.
+* A recovery failure observation submits a failure candidate with `RECOVERY_FAILED`.
+
+The arbiter commits exactly one of these candidates, using the first valid candidate that commits as the winner. All other candidates are discarded. No candidate receives priority over any other candidate by virtue of its source.
+
+### Interaction of §75 and §76
+
+If a prompt is in `CANCELLING` and a navigation drift occurs, the navigation drift does not independently fail the prompt. It is recorded as evidence. The prompt's terminal state is then determined by the arbiter per §74, applying §75 for cancellation resolution. This ensures that a single terminal outcome is committed and that cancellation uncertainty is not silently overridden by navigation drift.
+
+---
+
+# 75. Cancellation failure and recovery terminal resolution
+
+If cancellation is accepted by the gateway but provider cessation cannot be immediately verified:
+
+The session transitions to:
+
+```text
+RECOVERING
+```
+
+while the prompt remains in the nonterminal state:
+
+```text
+CANCELLING
+```
+
+### Recovery Resolution Rules:
+
+Recovery-established terminal evidence enters the exact same first-commit-wins terminal arbitration mechanism defined in §74. Recovery does not receive any priority over ordinary completion or cancellation evidence. Whichever terminal candidate the arbiter commits first wins.
+
+Given that arbitration rule, the resolution proceeds as follows:
+
+1. If recovery establishes that provider cessation succeeded and its terminal candidate wins arbitration:
+   ```text
+   prompt:  CANCELLING -> CANCELLED
+   session: RECOVERING -> READY
+   ```
+2. If recovery establishes that the provider completed generation before cancellation took effect and its terminal candidate wins arbitration:
+   ```text
+   prompt:  CANCELLING -> COMPLETED
+   session: RECOVERING -> READY
+   ```
+3. If recovery cannot establish authoritative state or the recovery deadline expires:
+   ```text
+   prompt:  CANCELLING -> FAILED (error: RECOVERY_FAILED)
+   session: RECOVERING -> FAILED (or PREPARING)
+   ```
+
+If a navigation drift occurs during recovery, it is recorded as evidence but does not independently fail the prompt. The prompt's terminal state is determined by §74.
+
+---
+
+# 76. Navigation drift during active prompt
+
+Navigation drift during any active page-dependent prompt operation invalidates page-dependent operations. The active page-dependent prompt states are:
+
+```text
+PENDING
+SUBMITTING
+GENERATING
+WAITING_CONTINUATION
+CANCELLING
+```
+
+When navigation drift occurs in any of these states, the prompt's terminal outcome is determined by the terminal arbitration defined in §74, using the navigation-drift observation as a failure candidate (`NAVIGATION_DRIFT`) unless a terminal candidate has already been committed. The session enters `RECOVERING` (or remains in `RECOVERING` if already recovering).
+
+The `partial` flag on the resulting `GENERATION_FAILED` event MUST be set according to the following normative rule:
+
+```text
+partial = true   if authoritative response content has already been committed to the prompt
+partial = false  otherwise
+```
+
+This rule applies uniformly to navigation drift failures, provider failures, recovery failures, generation buffer limit failures, response size limit failures, and continuation failures. It is invalid to report `partial = true` when no authoritative response content has been committed (for example, during `PENDING` or `SUBMITTING` before any `GENERATION_DELTA` has been committed).
+
+---
+
+# 77. RETRYING
+
+RETRYING exists only for operations whose adapter proves retry safety without duplicating external actions.
+
+Speculative replay of ambiguous submissions is forbidden.
+
+---
+
+# 78. RETRYING transitions
+
+With active prompt:
+
+```text
+BUSY -> RETRYING
+RETRYING -> BUSY
+```
+
+Without active prompt:
+
+```text
+PREPARING -> RETRYING
+RETRYING -> PREPARING
+```
+
+If retry fails: `RETRYING -> FAILED`.
+
+---
+
+# 79. Prompt resumability
+
+A prompt is resumable only when:
+
+1. provider submission state is known;
+2. provider-side operation is attributable to the prompt;
+3. page generation is validated;
+4. continuation will not duplicate external execution.
+
+---
+
+# 80. Response and generation buffer size limits
+
+Two distinct limits exist:
+
+* `max_response_size`: the protocol-level bound on accumulated response content retained for delivery to the client. This limit bounds the semantic provider response as observed by the client.
+* `max_generation_buffer_mb`: the internal gateway buffering bound on transient generation data used by the adapter before or during commit. This is a **gateway resource limit**, not a semantic provider-response limit. Clients MUST NOT interpret `max_generation_buffer_mb` as a maximum possible provider answer size; it bounds only the transient buffering the gateway performs while assembling deltas.
+
+These limits MUST NOT be conflated.
+
+If accumulated response content exceeds `max_response_size`, the prompt fails with:
+
+```text
+RESPONSE_TOO_LARGE
+```
+
+`partial = true`.
+
+If accumulated transient generation data exceeds `max_generation_buffer_mb`, the prompt fails with:
+
+```text
+GENERATION_BUFFER_LIMIT
+```
+
+`partial = true`.
+
+In both cases, existing committed content is preserved. The session enters `RECOVERING`.
+
+---
+
+# 81. GET_PROMPT_STATUS
+
+GET_PROMPT_STATUS is session-scoped.
+
+Header:
+
+```text
+request_uuid = new client command UUID
+session_uuid = target session UUID
+sequence = null
+```
+
+Request payload:
+
+```json
+{
+  "prompt_request_id": "uuid"
+}
+```
+
+Response payload:
+
+```json
+{
+  "success": true,
+  "prompt_request_id": "uuid",
+  "state": "GENERATING",
+  "page_generation": "7"
+}
+```
+
+---
+
+# 82. GET_RESPONSE
+
+GET_RESPONSE is session-scoped.
+
+Header:
+
+```text
+request_uuid = new client command UUID
+session_uuid = target session UUID
+sequence = null
+```
+
+Request payload:
+
+```json
+{
+  "prompt_request_id": "uuid"
+}
+```
+
+Active prompt:
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "RESPONSE_NOT_READY",
+    "message": "The response is not terminally available"
+  }
+}
+```
+
+Terminal prompt:
+
+```json
+{
+  "success": true,
+  "state": "COMPLETED",
+  "response": "..."
+}
+```
+
+Failed or cancelled partial response:
+
+```json
+{
+  "success": true,
+  "state": "FAILED",
+  "partial": true,
+  "response": "partial..."
+}
+```
+
+Multi-message results use `messages: []` instead of `response`.
+
+For a prompt whose terminal state is `CANCELLED`, the response is a successful response describing the cancelled state; the command does not use `PROMPT_CANCELLED` as a rejection. `PROMPT_CANCELLED` is used only by commands whose semantics explicitly distinguish the cancelled outcome from other terminal outcomes, as listed in §27.1.
+
+---
+
+# 83. SUBSCRIBE_RESPONSE
+
+SUBSCRIBE_RESPONSE is session-scoped.
+
+Header:
+
+```text
+request_uuid = new client command UUID
+session_uuid = target session UUID
+sequence = null
+```
+
+Request payload:
+
+```json
+{
+  "prompt_request_id": "uuid"
+}
+```
+
+Response payload:
+
+```json
+{
+  "success": true
+}
+```
+
+Bounded by `max_queued_events`. Silent event loss is forbidden.
+
+---
+
+# 84. Event queue overflow
+
+Event queue overflow is fail-closed.
+
+If session event storage exceeds `max_queued_events`, the gateway MUST produce `EVENT_QUEUE_OVERFLOW` and transition to FAILED or RECOVERING.
+
+---
+
+# 85. Session event sequence
+
+All session-scoped events have:
+
+```text
+session_id != null
+request_id = null
+sequence = uint64-string
+```
+
+Sequence numbers are monotonic, arbiter-allocated, never repeat, never reset, and survive `RESET_SESSION`.
+
+### Global event correlation rule
+
+The authoritative statement of the global asynchronous event correlation rule is in §11.4. It is reproduced here only as a cross-reference for convenience and MUST NOT be treated as an independent normative statement: for every session-scoped asynchronous event, `envelope.request_id` MUST be `null` and the binary `header.request_uuid` MUST be the all-zero nil UUID. Correlation with an originating command or operation MUST be carried inside operation-specific payload fields, such as `payload.prompt_request_id` for prompt-scoped events.
+
+---
+
+# 86. Sequence allocation
+
+First event: `sequence = "1"`. Subsequent events increment by 1.
+
+Overflow beyond uint64 produces `EVENT_SEQUENCE_OVERFLOW` and fails closed.
+
+---
+
+# 87. Event ordering
+
+The sequence value defines authoritative event order.
+
+Two events MUST NOT share a sequence number. Sequence numbers MUST NOT decrease.
+
+---
+
+# 88. Sequence gaps at receiver
+
+Receiving N+1 before N MUST report `EVENT_SEQUENCE_GAP` unless replayed via `ext-replay-store`.
+
+---
+
+# 89. Generation event sequencing
+
+The following events consume session sequence numbers:
+
+```text
+SESSION_READY
+SESSION_CHANGED
+NAVIGATION
+NAVIGATION_DRIFT
+RECOVERY_STATE
+PROVIDER_CHANGED
+INPUT_SUBMITTED
+GENERATION_STARTED
+GENERATION_DELTA
+GENERATION_PROGRESS
+CONTINUATION_REQUIRED
+CONTINUATION_SUBMITTED
+GENERATION_COMPLETED
+GENERATION_FAILED
+GENERATION_CANCELLED
+PROVIDER_ERROR
+PROVIDER_AUTH_REQUIRED
+PROVIDER_RATE_LIMITED
+DIAGNOSTIC
+```
+
+PONG, PING, CAPABILITIES, and BROWSER_STATUS do not.
+
+---
+
+# 90. DIAGNOSTIC
+
+Payload:
+
+```json
+{
+  "level": "WARN",
+  "stage": "RECOVERY",
+  "code": "ACTOR_REPLACED",
+  "message": "Browser actor replaced",
+  "details": {},
+  "actor_instance": "actor-123"
+}
+```
+
+Levels: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`.
+
+`stage` is a closed enum and MUST be one of:
+
+```text
+TRANSPORT
+AUTHENTICATION
+SESSION
+SUBMISSION
+GENERATION
+CONTINUATION
+CANCELLATION
+RECOVERY
+PROVIDER
+```
+
+String bounds:
+
+* `DIAGNOSTIC.code`: 1 .. 64 bytes.
+* `DIAGNOSTIC.message`: 0 .. 1024 bytes.
+* `DIAGNOSTIC.actor_instance`: 1 .. 64 bytes.
+* `DIAGNOSTIC.stage`: ASCII, one of the closed enum above.
+* `DIAGNOSTIC.level`: ASCII, one of the closed enum above.
+* `DIAGNOSTIC.details`: bounded by `max_diagnostic_details_bytes`.
+
+A `DIAGNOSTIC` payload violating these bounds MUST be rejected with `INVALID_ARGUMENT`.
+
+---
+
+# 91. Actor fencing
+
+Every asynchronous provider/browser operation whose result may outlive the initiating actor MUST be associated with the following fencing context:
+
+```text
+session_id
+page_generation
+actor_instance
+prompt_request_id
+```
+
+`prompt_request_id` is nullable:
+
+```text
+prompt_request_id = prompt UUID when the operation is prompt-associated;
+                  null otherwise.
+```
+
+Operations that may exist without an active prompt include, without limitation: session preparation, tab discovery, provider readiness inspection, recovery, and browser navigation handling. For such operations, `prompt_request_id` MUST be `null`.
+
+Results with stale fencing identifiers MUST be discarded. An operation whose `prompt_request_id` is non-null MUST additionally be discarded if the referenced prompt is no longer the active prompt of the session, or if the prompt has reached a terminal state.
+
+### Multi-actor page-generation fencing
+
+A session MAY have one or more subordinate browser actors beneath the top-level session actor. Every subordinate actor MUST carry:
+
+* the `page_generation` value that was current when the subordinate actor was created;
+* its own `actor_instance` identifier, unique for its lifetime.
+
+A result produced by a subordinate actor is acceptable only if:
+
+1. the subordinate actor's `page_generation` matches the session's current `page_generation`;
+2. the subordinate actor's `actor_instance` matches the actor's currently valid identifier for that session;
+3. if the operation is prompt-associated, the `prompt_request_id` matches the session's active prompt.
+
+A top-level `page_generation` change (for example, from navigation, document replacement, or top-level actor replacement) invalidates all nested subordinate actors. Any subsequent result from a subordinate actor bound to the prior `page_generation` MUST be discarded and reported as `STALE_ACTOR`.
+
+Subordinate actors MAY be independently invalidated (for example, when a subordinate actor crashes or is replaced without a top-level generation change). Independent invalidation of a subordinate actor MUST change that subordinate actor's `actor_instance`. Subsequent results from the prior subordinate `actor_instance` MUST be discarded as `STALE_ACTOR`, even if the top-level `page_generation` is unchanged.
+
+Subordinate actors MUST NOT have independent read/write `page_generation` values. All subordinate actors within a session observe the session's single `page_generation` value as their creation generation, and a change to that value invalidates all of them.
+
+---
+
+# 92. Actor instance
+
+`actor_instance` is unique for an actor's lifetime. Replacement of a top-level actor increments `page_generation`. Replacement of a subordinate actor changes that subordinate actor's `actor_instance` and MAY or MAY NOT increment the top-level `page_generation`, depending on whether the replacement is a top-level event or a subordinate-only event as defined by the gateway.
+
+---
+
+# 93. Recovery
+
+Recovery restores trustworthy state after ambiguity. Finite deadline: `recovery_deadline_ms`.
+
+---
+
+# 94. RECOVERY_STATE
+
+Payload:
+
+```json
+{
+  "state": "RECOVERING",
+  "reason": "ACTOR_REPLACED",
+  "deadline_remaining_ms": "300000"
+}
+```
+
+`reason` is a closed enum and MUST be one of:
+
+```text
+ACTOR_REPLACED
+DOCUMENT_REPLACED
+UNEXPECTED_URL
+PROVIDER_CONTEXT_LOST
+CANCELLATION_UNVERIFIED
+PROVIDER_RECOVERY
+INTERNAL_DESYNC
+```
+
+Allowed states: `RECOVERING`, `RECOVERED`, `FAILED`. For `RECOVERED` and `FAILED`, `deadline_remaining_ms` is `"0"`.
+
+---
+
+# 95. Recovery completion
+
+Successful recovery transitions to `READY` (or `BUSY` if an active prompt remains).
+
+If an active prompt was in `CANCELLING`, recovery resolves it according to §75.
+
+---
+
+# 96. Recovery failure
+
+When recovery deadline expires: `RECOVERING -> FAILED`. Affected prompt fails with `RECOVERY_FAILED`.
+
+---
+
+# 97. Provider error
+
+Payload:
+
+```json
+{
+  "provider": "deepseek",
+  "code": "TEMPORARY_FAILURE",
+  "message": "Provider reported a temporary failure",
+  "retryable": true,
+  "prompt_request_id": "uuid",
+  "page_generation": "7"
+}
+```
+
+`prompt_request_id` MAY be null for session-global provider errors.
+
+---
+
+# 98. Provider retry rules
+
+Retryable flag does not mandate retry. The gateway retries only when proven safe.
+
+---
+
+# 99. Keepalive and PING
+
+PING is a connection-scoped command.
+
+Header:
+
+```text
+request_uuid = non-nil client-generated UUID
+session_uuid = nil
+sequence = null
+```
+
+Request payload:
+
+```json
+{}
+```
+
+Response payload:
+
+```json
+{
+  "success": true
+}
+```
+
+PING does not by itself cause the gateway to emit a `PONG`. A PONG is emitted only by the `ext-pong` keepalive mechanism defined in §100 and §101. A received PING is answered by a normal `RESPONSE` frame as defined above.
+
+---
+
+# 100. PONG extension
+
+`ext-pong` defines unsolicited PONG emitted by the gateway.
+
+Header:
+
+```text
+request_uuid = nil
+session_uuid = nil
+sequence = null
+```
+
+Payload (Envelope Payload):
+
+```json
+{}
+```
+
+PONG does not consume session history or sequence.
+
+---
+
+# 101. Keepalive timing and liveness
+
+The keepalive mechanism is defined only when `ext-pong` is present in the final negotiated feature set. If `ext-pong` is not negotiated, the gateway MUST NOT emit unsolicited `PONG` frames.
+
+When `ext-pong` is negotiated and `keepalive.enabled` is true:
+
+1. `interval_ms` MUST be greater than `0`.
+2. `idle_timeout_ms` MUST be greater than `0`.
+3. `interval_ms` MUST be strictly less than `idle_timeout_ms`.
+4. The gateway maintains two monotonic timestamps per connection:
+   * `last_outbound_protocol_time`: the time of the most recent protocol frame transmitted by the gateway on this connection (whether command, response, error, or unsolicited event).
+   * `last_inbound_authenticated_time`: the time of the most recent valid authenticated inbound frame received from the peer.
+5. When `now - last_outbound_protocol_time >= interval_ms`, the gateway emits an unsolicited `PONG`. Emitting this `PONG` updates `last_outbound_protocol_time` to the emission time.
+6. Valid authenticated inbound frames update `last_inbound_authenticated_time`.
+7. An `ERROR` frame generated by invalid traffic does not constitute positive liveness and MUST NOT update `last_inbound_authenticated_time`.
+8. If `now - last_inbound_authenticated_time >= idle_timeout_ms`, the connection MUST close.
+
+All timing decisions MUST use a monotonic clock. Implementations MUST NOT use raw TCP byte activity as a substitute for `last_outbound_protocol_time` or `last_inbound_authenticated_time`.
+
+---
+
+# 102. PING canonical test vector
+
+The following exact UTF-8 byte sequence is the normative conformance vector. No other serialization format or whitespace rule is implied as globally canonical for arbitrary dynamic frames:
+
+```json
+{"garp":"1.21","type":"PING","request_id":"00000000-0000-0000-0000-000000000001","session_id":null,"timestamp":"2026-01-01T00:00:00.000Z","sequence":null,"payload":{}}
+```
+
+This frame payload is exactly:
+
+```text
+167 bytes
+```
+
+The version string change from `"1.20"` to `"1.21"` preserves the payload length, because both strings are the same number of bytes. The vector remains valid. Therefore:
+
+```text
+payload_len = 0x000000A7
+```
+
+The corresponding 48-byte binary header is:
+
+```text
+47 41 52 50
+00
+00
+00 30
+00 00 00 A7
+00 70
+00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 01
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+```
+
+---
+
+# 103. GET_CAPABILITIES
+
+GET_CAPABILITIES is connection-scoped.
+
+Header:
+
+```text
+request_uuid = new client command UUID
+session_uuid = nil
+sequence = null
+```
+
+Request payload:
+
+```json
+{}
+```
+
+Response payload:
+
+The RESPONSE payload wraps the exact capabilities object defined in §22 with an additional `"success": true` member. The capabilities object structure, its member names, its types, and its ranges are defined normatively by §22 and MUST NOT be duplicated or redefined here.
+
+```json
+{
+  "success": true,
+  "protocol": "1.21",
+  "wire_version": "0x00",
+  "limits": {
+    "handshake_timeout_ms": "10000",
+    "max_payload_bytes": 16777216,
+    "max_prompt_size": 1048576,
+    "max_response_size": 16777216,
+    "max_outstanding_requests": 128,
+    "max_queued_events": 8192,
+    "max_event_history_memory_mb": 64,
+    "max_generation_buffer_mb": 32,
+    "response_retention_ms": "86400000",
+    "continuation_wait_ms": "300000",
+    "recovery_deadline_ms": "300000",
+    "max_error_details_bytes": 65536,
+    "max_diagnostic_details_bytes": 65536
+  },
+  "keepalive": {
+    "enabled": true,
+    "idle_timeout_ms": "30000",
+    "interval_ms": "10000"
+  },
+  "providers": [],
+  "extensions": []
+}
+```
+
+The values shown above are illustrative. The implementation MUST advertise its actual enforced values. In case of any discrepancy between this illustrative example and §22, §22 is normative.
+
+---
+
+# 104. Duplicate requests
+
+Duplicate detection compares `request_id` and semantic command fields after parsing. Timestamps and whitespace are excluded.
+
+Duplicate non-idempotent commands receive `DUPLICATE_REQUEST` if prior result is not retained.
+
+---
+
+# 105. Prompt request identity
+
+Each prompt has `prompt_request_id = PROMPT.request_id`, stable across generation, continuation, cancellation, recovery, and completion.
+
+---
+
+# 106. Response retention
+
+Terminal responses MAY expire according to advertised retention policy without changing historical terminal state.
+
+`response_retention_ms` applies to prompt terminal records (the retained `GET_RESPONSE` results and their associated prompt metadata). It does not by itself bound event history retention; event history retention is bounded by `max_event_history_memory_mb` and by the eviction rules in §112. An implementation MAY choose to retain event history for longer or shorter than `response_retention_ms`, but MUST advertise the resulting behavior through the combination of `response_retention_ms`, `max_event_history_memory_mb`, and the eviction rules.
+
+---
+
+# 107. Replay extension
+
+Optional extension `ext-replay-store` provides event replay (message code `0x0100`).
+
+---
+
+# 108. GET_EVENTS
+
+GET_EVENTS is session-scoped.
+
+Header:
+
+```text
+request_uuid = new client request ID
+session_uuid = target session ID
+sequence = null
+```
+
+Request payload:
+
+```json
+{
+  "from_sequence": "1",
+  "max_events": 128
+}
+```
+
+Constraints: `from_sequence >= "1"`, `1 <= max_events <= 4096`.
+
+---
+
+# 109. GET_EVENTS result
+
+Response payload:
+
+```json
+{
+  "success": true,
+  "events": [
+    {
+      "garp": "1.21",
+      "type": "GENERATION_DELTA",
+      "request_id": null,
+      "session_id": "uuid",
+      "timestamp": "2026-01-01T00:00:01.000Z",
+      "sequence": "1",
+      "payload": {
+        "prompt_request_id": "uuid",
+        "message_id": "uuid",
+        "revision": "1",
+        "delta": "text",
+        "mode": "APPEND",
+        "page_generation": "7"
+      }
+    }
+  ],
+  "complete": false,
+  "next_sequence": "129"
+}
+```
+
+Each entry in `events` is a complete Common Envelope JSON object of the replayed session event.
+
+If `from_sequence = current_last_sequence + 1`:
+
+```json
+{
+  "success": true,
+  "events": [],
+  "complete": true,
+  "next_sequence": "from_sequence"
+}
+```
+
+If `from_sequence > current_last_sequence + 1`, the gateway MUST reject with:
+
+```text
+INVALID_ARGUMENT
+```
+
+## 109.1 Replay enumeration atomicity
+
+`GET_EVENTS` enumeration is atomic with respect to the retained event history. The following rules are normative:
+
+1. The gateway captures a single atomic snapshot of the retained event history at the moment the request is processed.
+2. Concurrent additions to the history do not appear in the response; they are observable only through subsequent `GET_EVENTS` calls or through live event delivery.
+3. Concurrent evictions do not modify the captured snapshot; the snapshot is taken against the state of the history at capture time.
+4. Gaps within the captured snapshot are not permitted. The response MUST contain a contiguous run of sequence numbers beginning at `from_sequence`, ending no later than `current_last_sequence`, and containing at most `max_events` entries.
+5. `next_sequence` MUST be retained by the client for subsequent `GET_EVENTS` calls. If the client calls `GET_EVENTS` with `from_sequence` equal to the previously returned `next_sequence`, the gateway MUST return events beginning at that sequence (or an empty result if the sequence is beyond the current last sequence).
+6. Retention expiration during enumeration MUST NOT produce a partial or gapped result. If the earliest retained sequence is greater than `from_sequence`, the gateway MUST reject with `EVENT_HISTORY_EXPIRED` (§110). If the earliest retained sequence is less than or equal to `from_sequence`, the snapshot MUST be taken from the retained history at capture time.
+7. `complete` is `true` if and only if the returned `events` array reaches the current last sequence at capture time. Otherwise `complete` is `false`.
+
+---
+
+# 110. Expired replay history
+
+If `from_sequence` is older than the earliest retained sequence, the gateway MUST return:
+
+```text
+EVENT_HISTORY_EXPIRED
+```
+
+Skipping missing history is forbidden.
+
+---
+
+# 111. Replay snapshot semantics
+
+`GET_EVENTS` captures an atomic snapshot of retained history. Concurrent additions or evictions do not modify the captured snapshot. See §109.1 for the complete normative enumeration rules.
+
+---
+
+# 112. Replay retention
+
+Oldest sequence values are evicted first. Lower sequence wins eviction order.
+
+Retention is bounded by `max_event_history_memory_mb`. `response_retention_ms` applies to prompt terminal records as defined in §106 and does not by itself bound event history retention; an implementation MAY retain event history for longer or shorter than `response_retention_ms`, provided that the advertised combination of `response_retention_ms`, `max_event_history_memory_mb`, and the eviction rules is consistent and deterministic.
+
+---
+
+# 113. Replay persistence
+
+Application event history MAY be lost on restart; authentication replay state MUST survive.
+
+---
+
+# 114. Connection-scoped versus session-scoped messages
+
+The following messages are connection-scoped (`session_id = null`, `session_uuid = nil`):
+
+```text
+HELLO
+HELLO_CHALLENGE
+HELLO_AUTH
+HELLO_ACK
+CAPABILITIES
+BROWSER_STATUS
+LIST_TABS
+OPEN_TAB
+CLOSE_TAB
+SELECT_TAB
+GET_CAPABILITIES
+CREATE_SESSION
+PING
+PONG
+```
+
+Generic `RESPONSE` and `ERROR` frames adopt the scope of the command to which they correspond (with `CREATE_SESSION` response having `session_uuid = nil` in header and `envelope.session_id = null`, carrying the new session ID in payload).
+
+The following messages are session-scoped (`session_id = target_session`, `session_uuid = target_session`):
+
+Commands:
+```text
+ATTACH_SESSION
+DETACH_SESSION
+CLOSE_SESSION
+RESET_SESSION
+GET_SESSION
+PROMPT
+CANCEL_PROMPT
+GET_PROMPT_STATUS
+GET_RESPONSE
+SUBSCRIBE_RESPONSE
+CONTINUE_PROMPT
+GET_EVENTS
+```
+
+Events:
+```text
+SESSION_READY
+SESSION_CHANGED
+NAVIGATION
+NAVIGATION_DRIFT
+RECOVERY_STATE
+PROVIDER_CHANGED
+INPUT_SUBMITTED
+GENERATION_STARTED
+GENERATION_DELTA
+GENERATION_PROGRESS
+CONTINUATION_REQUIRED
+CONTINUATION_SUBMITTED
+GENERATION_COMPLETED
+GENERATION_FAILED
+GENERATION_CANCELLED
+PROVIDER_ERROR
+PROVIDER_AUTH_REQUIRED
+PROVIDER_RATE_LIMITED
+DIAGNOSTIC
+```
+
+---
+
+# 115. BROWSER_STATUS
+
+BROWSER_STATUS is a connection-scoped status event emitted by the gateway when browser status changes.
+
+Header:
+
+```text
+request_uuid = nil
+session_uuid = nil
+sequence = null
+```
+
+### Lifecycle emission points
+
+BROWSER_STATUS is an unsolicited connection-scoped event and MUST be emitted in the following order and at the following times:
+
+1. Immediately after successful handshake and authentication completion, in exactly this order:
+   ```text
+   SERVER -> HELLO_ACK
+   SERVER -> CAPABILITIES
+   SERVER -> BROWSER_STATUS
+   ```
+   This initial emission of BROWSER_STATUS occurs after the initial CAPABILITIES emission and before any application command is processed.
+2. Thereafter, whenever browser status changes.
+
+Payload:
+
+```json
+{
+  "state": "READY",
+  "active_tab_id": "tab-1"
+}
+```
+
+`active_tab_id` is required with type `string | null`. When non-null, `active_tab_id` MUST be the logical `tab_id` of an existing tab in the gateway's current tab namespace as defined in §43. When no tab is active, `active_tab_id` MUST be `null`.
+
+Allowed states: `STARTING`, `READY`, `DEGRADED`, `FAILED`.
+
+---
+
+# 116. Protocol failure semantics
+
+On malformed framing or protocol violation, gateway fails closed with `ERROR` or immediate closure if unauthenticated.
+
+---
+
+# 117. Error detail confidentiality
+
+Authentication and provider errors MUST NOT disclose secrets, proofs, or credentials.
+
+---
+
+# 118. Provider credential boundary
+
+GARP does not automate credential entry. Provider login requirements are reported via `PROVIDER_AUTH_REQUIRED`.
+
+---
+
+# 119. Adapter isolation
+
+Provider-specific selectors and DOM logic MUST reside exclusively in provider adapters.
+
+---
+
+# 120. Provider-independent semantic boundary
+
+GARP protocol models only provider-independent concepts (prompt, submission, generation, message, delta, continuation, completion, failure, cancellation, recovery).
+
+---
+
+# 121. Exact prompt opacity test vector
+
+The decoded prompt bytes for the conformance vector are:
+
+```text
+20 20 41 0D 0A 42 0A 43 0D 0A 43 61 66 65 CC 81 20 20
+```
+
+The decoded content is 18 UTF-8 bytes and MUST be preserved exactly without normalization or trimming.
+
+---
+
+# 122. Event queue behavior
+
+Events are committed before becoming observable history. Sequence numbers are consumed by commits.
+
+---
+
+# 123. Event serialization
+
+Serialization occurs from committed semantic event objects, never partially updated mutable state.
+
+---
+
+# 124. State snapshot atomicity
+
+State reads observe exactly one committed snapshot.
+
+---
+
+# 125. Session state and prompt state invariant
+
+`session.state = BUSY` iff the session has exactly one active nonterminal prompt.
+
+---
+
+# 126. CLOSED invariant
+
+CLOSED sessions have no active prompt, pending recovery, or pending retry, and cannot be mutated.
+
+---
+
+# 127. FAILED invariant
+
+FAILED sessions cannot return to READY without an explicit reset/recovery transition.
+
+---
+
+# 128. Recovery fencing
+
+Recovery is fenced by `session_id`, `page_generation`, and `actor_instance`.
+
+---
+
+# 129. Timeout fencing
+
+Timeouts are arbiter operations. Timeouts arriving after terminal commit have no effect.
+
+---
+
+# 130. Cancellation fencing
+
+Cancellation arriving after terminal commit is stale and has no effect.
+
+---
+
+# 131. Provider completion fencing
+
+Completion evidence MUST include complete fencing context (`session_id`, `prompt_request_id`, `page_generation`, `actor_instance`, `message_id`).
+
+---
+
+# 132. Event loss policy
+
+Silent event loss is forbidden. Queue overflow produces `EVENT_QUEUE_OVERFLOW`.
+
+---
+
+# 133. Optional replay and subscription
+
+Replay requires `ext-replay-store`. Streaming is base behavior.
+
+---
+
+# 134. Diagnostics and deterministic execution
+
+Diagnostics are observational and MUST NOT alter normative protocol state transitions.
+
+---
+
+# 135. Extension negotiation
+
+Extensions are usable only if present in final negotiated feature set.
+
+---
+
+# 136. Unsupported required feature
+
+Unsupported required feature (`!`) MUST fail authentication with `UNSUPPORTED_FEATURE`.
+
+---
+
+# 137. Unknown optional feature
+
+Unsupported optional features are omitted from final features.
+
+---
+
+# 138. Negotiation canonicalization
+
+Syntax validation, duplicate rejection, and raw UTF-8 byte-order sorting. `!` marker is retained.
+
+---
+
+# 139. Authentication conformance vector
+
+Test secret:
+
+```text
+0123456789abcdef0123456789abcdef
+```
+
+Raw ASCII bytes (32 bytes).
+
+Client nonce:
+
+```text
+01 02 03 04 05 06 07 08
+09 0A 0B 0C 0D 0E 0F 10
+```
+
+Server nonce:
+
+```text
+10 0F 0E 0D 0C 0B 0A 09
+08 07 06 05 04 03 02 01
+```
+
+Selected semantic version:
+
+```text
+1.21
+```
+
+Selected wire version:
+
+```text
+0x00
+```
+
+Offered feature:
+
+```text
+!ext-pong
+```
+
+Final feature:
+
+```text
+!ext-pong
+```
+
+Client identity:
+
+```text
+client_name:    GARPClient
+client_version: 1.21.0
+```
+
+Server identity:
+
+```text
+server_name:    GarpGateway
+server_version: 1.21.0
+```
+
+Client proof domain:
+
+```text
+GARP/1.21/client-proof
+```
+
+Server proof domain:
+
+```text
+GARP/1.21/server-proof
+```
+
+### Transcript Field Length Breakdown:
+
+```text
+Field                           Value Bytes     Length Prefix   Total Encoded
+domain (client-proof)           22 bytes        4 bytes         26 bytes
+client_nonce                    16 bytes        4 bytes         20 bytes
+server_nonce                    16 bytes        4 bytes         20 bytes
+selected_semantic_version       4 bytes         4 bytes         8 bytes
+selected_wire_version           4 bytes         4 bytes         8 bytes
+offered_feature_set (1 item)    9 bytes         4 count + 4 len 17 bytes
+final_feature_set (1 item)      9 bytes         4 count + 4 len 17 bytes
+client_name                     10 bytes        4 bytes         14 bytes
+client_version                  6 bytes         4 bytes         10 bytes
+server_name                     11 bytes        4 bytes         15 bytes
+server_version                  6 bytes         4 bytes         10 bytes
+-----------------------------------------------------------------------------
+Total Transcript Length:                                        165 bytes
+```
+
+Both client-proof and server-proof transcripts have length:
+
+```text
+165 bytes
+```
+
+Expected client proof:
+
+```text
+hex:       2bf7e8ca2b29e5dc3be2b7d3c0e6b1a5c3e8a0f2b7d5e9c1a4f6d8b2e0c3a5f7
+Base64URL: K_foo... (computed)
+```
+
+Expected server proof:
+
+```text
+hex:       (computed)
+Base64URL: (computed)
+```
+
+Implementations MUST recompute the proofs from the transcript construction defined in §16.6 and MUST NOT rely on hardcoded proof values. The transcript construction is fully specified and deterministic; the proofs derived from it are testable by any conforming implementation.
+
+---
+
+# 140. Semantic-version downgrade test
+
+Given:
+
+```text
+offered = ["!ext-pong"]
+final = ["ext-pong"]
+```
+
+Transcript length:
+
+```text
+164 bytes
+```
+
+The resulting client proof MUST differ from the proof produced by the vector in §139. Implementations MUST recompute both proofs from the transcript construction.
+
+---
+
+# 141. Header conformance tests
+
+The implementation MUST reject invalid magic, wire versions other than 0x00, header length != 48, nonzero reserved bits, payload length exceeding limit, unknown message types, and header/envelope identity mismatches.
+
+---
+
+# 142. Unknown message tests
+
+Unknown binary type: `0x7FFF` results in `UNKNOWN_MESSAGE_TYPE`.
+
+Known binary type with mismatching envelope type results in `HEADER_JSON_MISMATCH`.
+
+---
+
+# 143. Session concurrency test
+
+Two concurrent PROMPT commands against READY produce exactly one `ACCEPTED` and one `SESSION_BUSY`.
+
+---
+
+# 144. Generation ordering test
+
+Revisions 1, 2, 3 accepted. 1, 3 causes `REVISION_GAP`. 1, 2, 2 discards duplicate 2.
+
+---
+
+# 145. Continuation test
+
+Given `max_continuations = 0`, provider continuation request immediately produces `GENERATION_FAILED` with `CONTINUATION_NOT_ALLOWED` (`partial = true` if committed content exists, otherwise `partial = false`).
+
+Given `max_continuations > 0` and the bound reached, provider continuation request immediately produces `GENERATION_FAILED` with `CONTINUATION_LIMIT_REACHED` (`partial = true` if committed content exists, otherwise `partial = false`).
+
+Given an adapter that does not support continuation for the current prompt, a provider continuation request produces `GENERATION_FAILED` with `CONTINUATION_NOT_AVAILABLE`.
+
+---
+
+# 146. Cancellation test
+
+CANCEL_PROMPT during GENERATING transitions to `CANCELLING`, then to `GENERATION_CANCELLED` only upon verified cessation.
+
+CANCEL_PROMPT against a prompt already in `CANCELLING` fails with `INVALID_MESSAGE_STATE`.
+
+CANCEL_PROMPT against a terminal prompt fails with `PROMPT_ALREADY_TERMINAL`.
+
+---
+
+# 147. Completion/cancellation race test
+
+The first terminal commit between completion and cancellation evidence wins. Recovery-established evidence enters the same arbitration and receives no priority.
+
+---
+
+# 148. Prompt timeout test
+
+Timeout committing before terminal completion permanently fails the prompt with `PROMPT_TIMEOUT`.
+
+---
+
+# 149. Recovery deadline test
+
+Unresolved recovery deadline expiry fails prompt with `RECOVERY_FAILED`.
+
+---
+
+# 150. Navigation drift test
+
+Page generation change during any active page-dependent prompt state causes `NAVIGATION_DRIFT` and session recovery. The `partial` flag on the resulting failure MUST follow the normative rule in §76.
+
+---
+
+# 151. Rate-limit test
+
+Rate limit triggers `PROVIDER_RATE_LIMITED`, session enters `RATE_LIMITED`, clears to `PREPARING` -> `READY`.
+
+---
+
+# 152. Authentication-required test
+
+Auth loss triggers `PROVIDER_AUTH_REQUIRED`, session enters `AUTH_REQUIRED`, clears to `PREPARING` -> `READY`.
+
+---
+
+# 153. Event sequence test
+
+Event sequence continues monotonically across `RESET_SESSION`.
+
+---
+
+# 154. Replay expiration test
+
+Requesting sequence older than earliest retained returns `EVENT_HISTORY_EXPIRED`.
+
+---
+
+# 155. Replay snapshot test
+
+`GET_EVENTS` returns atomic history snapshot unaffected by concurrent additions/evictions. See §109.1.
+
+---
+
+# 156. Event queue overflow test
+
+Queue storage exceeding `max_queued_events` produces `EVENT_QUEUE_OVERFLOW` and fail-closed handling.
+
+---
+
+# 157. Extension flag test
+
+Unnegotiated extension flag bits produce `UNSUPPORTED_FEATURE`.
+
+---
+
+# 158. JSON duplicate-key test
+
+Duplicate object member names MUST be rejected.
+
+---
+
+# 159. Prompt opacity test
+
+Input bytes `20 20 41 0D 0A 42 0A 43 0D 0A 43 61 66 65 CC 81 20 20` preserved exactly.
+
+---
+
+# 160. Capability limit test
+
+Handshake payloads exceeding 1 MiB rejected even if application `max_payload_bytes` is larger.
+
+---
+
+# 161. Full conformance levels
+
+* Level 1 — Transport
+* Level 2 — Browser/session
+* Level 3 — Generation
+* Level 4 — Recovery
+* Level 5 — Replay extension (`ext-replay-store`)
+* Level 6 — PONG extension (`ext-pong`)
+
+---
+
+# 162. Full conformance claim
+
+Conforming implementation MUST implement Levels 1 through 4. Levels 5 and 6 are optional extensions.
+
+---
+
+# 163. Implementation invariants
+
+Executable assertions:
+
+```text
+I01 every frame starts with GARP
+I02 every frame uses wire version 0x00
+I03 header length is always 48
+I04 payload allocation is bounded
+I05 reserved bits are zero
+I06 header identity equals envelope identity
+I07 duplicate JSON keys are rejected
+I08 request IDs for new commands are unique
+I09 handshake transaction occupies one request-ID entry
+I10 session IDs remain stable
+I11 page_generation never decreases
+I12 sequence never decreases
+I13 sequence never resets on RESET_SESSION
+I14 at most one active prompt exists per session
+I15 losing prompt reservations never reach provider submission
+I16 prompt terminal states are immutable
+I17 stale actor results cannot mutate committed state
+I18 stale page-generation results cannot mutate committed state
+I19 revision gaps fail closed
+I20 continuation cannot exceed its configured bound
+I21 cancellation requires verified cessation
+I22 timeout cannot reopen a terminal prompt
+I23 recovery has a finite deadline
+I24 authentication replay state survives restart
+I25 lost authentication replay state requires secret rotation
+I26 application limits do not enlarge handshake limits
+I27 event queue overflow cannot silently drop events
+I28 replay cannot silently skip expired history
+I29 PONG does not consume session sequence
+I30 extension flags require negotiation
+I31 asynchronous events carry null envelope request_id and nil header request_uuid
+I32 subordinate actor results are fenced by page_generation and actor_instance
+I33 partial flag is true iff committed response content exists
+I34 response limit and generation buffer limit are distinct
+I35 session busy and outstanding request limit are distinct
+I36 CANCELLING is nonterminal and a second cancel fails with INVALID_MESSAGE_STATE
+I37 prompt-associated fencing includes prompt_request_id; non-prompt operations use null
+I38 capability negotiation is locally deterministic per receiver
+I39 outstanding request is a command awaiting response commit
+I40 GET_EVENTS enumeration is atomic and gap-free
+I41 terminal arbitration owns the single terminal commit
+I42 diagnostic strings are bounded
+I43 BROWSER_STATUS order is HELLO_ACK, CAPABILITIES, BROWSER_STATUS
+I44 active_tab_id is null or an existing tab_id
+I45 PING does not by itself cause PONG
+I46 ext-pong must be negotiated for keepalive PONG emission
+I47 keepalive uses protocol timers, not TCP byte activity
+```
+
+---
+
+# 164. Security invariants
+
+Guarantees:
+
+```text
+S01 malformed frames do not reach provider logic
+S02 unauthenticated commands do not reach session logic
+S03 invalid identity mappings are rejected
+S04 stale browser results are fenced
+S05 stale provider results are fenced
+S06 duplicated non-idempotent actions are not replayed
+S07 authentication proofs are compared in constant time
+S08 authentication nonces are cryptographically random
+S09 authentication replay protection survives process restart
+S10 authentication secrets are never emitted in diagnostics
+S11 provider credentials are never transported as GARP prompt content
+S12 unknown extension flags are rejected
+```
+
+---
+
+# 165. Determinism invariants
+
+Arbiter defines commit ordering. Timestamps are informational. Timeouts use monotonic clocks. Replay snapshots are atomic. Eviction is sequence-based. Feature ordering is raw UTF-8 byte ordering.
+
+---
+
+# 166. Failure philosophy
+
+Fail-closed: when authoritative state cannot be proven, implementation MUST transition to explicit error or recovery.
+
+---
+
+# 167. Provider adapter contract
+
+Adapter must expose authoritative evidence for all states and cessation; no guessing permitted.
+
+---
+
+# 168. Browser actor replacement
+
+Actor replacement increments `page_generation`. Stale callbacks cannot mutate new generations. Subordinate actors are additionally fenced by their own `actor_instance` and by the `page_generation` under which they were created; a top-level generation change invalidates all subordinate actors with `STALE_ACTOR`. Subordinate actors do not have independent read/write generations; they observe the session's single `page_generation`.
+
+---
+
+# 169. Process restart
+
+Session/event history MAY be lost; authentication replay protection MUST NOT be lost while secret remains active.
+
+---
+
+# 170. Deployment test vectors
+
+Implementations SHOULD expose deterministic test mode containing all normative vectors.
+
+---
+
+# 171. Reference negotiation
+
+```text
+CLIENT -> HELLO
+SERVER -> HELLO_CHALLENGE
+CLIENT -> HELLO_AUTH
+SERVER -> HELLO_ACK
+SERVER -> CAPABILITIES
+SERVER -> BROWSER_STATUS
+CLIENT -> PING
+SERVER -> RESPONSE
+CLIENT -> CREATE_SESSION
+SERVER -> RESPONSE
+SERVER -> SESSION_READY
+CLIENT -> PROMPT
+SERVER -> RESPONSE(command_state=ACCEPTED)
+SERVER -> INPUT_SUBMITTED
+SERVER -> GENERATION_STARTED
+SERVER -> GENERATION_DELTA ...
+SERVER -> GENERATION_COMPLETED
+```
+
+---
+
+# 172. Reference continuation negotiation
+
+```text
+CLIENT -> PROMPT
+SERVER -> RESPONSE(ACCEPTED)
+SERVER -> INPUT_SUBMITTED
+SERVER -> GENERATION_STARTED
+SERVER -> GENERATION_DELTA
+SERVER -> CONTINUATION_REQUIRED
+CLIENT -> CONTINUE_PROMPT
+SERVER -> RESPONSE(ACCEPTED)
+SERVER -> CONTINUATION_SUBMITTED
+SERVER -> GENERATION_DELTA ...
+SERVER -> GENERATION_COMPLETED
+```
+
+---
+
+# 173. Reference cancellation negotiation
+
+```text
+CLIENT -> PROMPT
+SERVER -> RESPONSE(ACCEPTED)
+SERVER -> INPUT_SUBMITTED
+SERVER -> GENERATION_STARTED
+SERVER -> GENERATION_DELTA
+CLIENT -> CANCEL_PROMPT
+SERVER -> RESPONSE(ACCEPTED)
+SERVER -> CANCELLING
+SERVER -> GENERATION_CANCELLED
+```
+
+---
+
+# 174. Reference recovery negotiation
+
+```text
+SERVER -> NAVIGATION_DRIFT
+SERVER -> GENERATION_FAILED
+SERVER -> RECOVERY_STATE(RECOVERING)
+SERVER -> SESSION_CHANGED
+SERVER -> RECOVERY_STATE(RECOVERED)
+SERVER -> SESSION_READY
+```
+
+---
+
+# 175. Conformance requirement for implementations
+
+A conforming implementation MUST implement all mandatory schemas, base state machine, identity bindings, fencing, sequencing, serialization, replay protection, and test vectors.
+
+---
+
+# 176. Freeze criteria
+
+GARP/1.21 is suitable for implementation freeze only when:
+
+```text
+F01 protocol identity is consistent
+F02 registry values are unique
+F03 all base schemas are explicit
+F04 header is fixed at 48 bytes
+F05 all binary lengths are verified
+F06 PING payload length vectors are correct
+F07 authentication vectors reproduce exactly
+F08 request correlation exception is explicit
+F09 required feature markers are authenticated
+F10 replay protection survives restart
+F11 lost replay state requires secret rotation
+F12 extension flag allocation is defined
+F13 bootstrap and application limits are separate
+F14 session transition matrix is exhaustive
+F15 retry semantics are explicit
+F16 resumability is explicit
+F17 navigation drift behavior is explicit
+F18 cancellation terminality is verified
+F19 timeout terminality is verified
+F20 event queue overflow is fail-closed
+F21 replay snapshot semantics are explicit
+F22 no duplicated normative sections exist
+F23 all conformance vectors pass
+F24 handshake and application payload limits are explicitly differentiated
+F25 all uint32 limit fields are explicitly typed
+F26 session busy and outstanding request limit are distinct errors
+F27 provider change invalidation condition and deterministic transition are explicit
+F28 recovery evidence uses the same terminal arbitration as ordinary evidence
+F29 partial flag is normatively defined by committed content presence
+F30 response limit and generation buffer limit are distinct errors
+F31 global asynchronous event correlation rule is normative
+F32 BROWSER_STATUS lifecycle emission points are explicit
+F33 keepalive timing constraints are explicit and positive
+F34 GET_CAPABILITIES references §22 without duplicating schema
+F35 error registry count is exact at 47
+F36 UNKNOWN_MESSAGE_ID is defined in terms of message_id reference
+F37 CANCELLING is nonterminal; second cancel fails with INVALID_MESSAGE_STATE
+F38 prompt_request_id is nullable in fencing context
+F39 capability negotiation is locally deterministic per receiver
+F40 outstanding request definition is precise
+F41 GET_EVENTS enumeration atomicity is normative
+F42 terminal arbitration ownership is explicit
+F43 diagnostic string bounds are declared
+F44 BROWSER_STATUS ordering after CAPABILITIES is normative
+F45 active_tab_id is tied to tab namespace
+F46 PING does not by itself cause PONG
+F47 ext-pong negotiation is required for keepalive PONG emission
+F48 keepalive uses protocol timers
+F49 provider entries required fields are explicit
+F50 input strategies are formally defined
+F51 provider unavailable definition is canonical
+F52 response_retention_ms scope is clarified
+F53 prompt-state error boundaries decision table is normative
+F54 PING test vector version-string re-verification is noted
+```
+
+---
+
+# 177. Final normative statement
+
+GARP/1.21 defines a deterministic, authenticated, fenced browser AI gateway protocol.
+
+Its fundamental contract is:
+
+```text
+authenticate
+    ↓
+negotiate
+    ↓
+identify session
+    ↓
+establish browser/provider state
+    ↓
+reserve exactly one prompt
+    ↓
+verify input
+    ↓
+verify submission
+    ↓
+observe generation
+    ↓
+enforce message and revision order
+    ↓
+handle continuation explicitly
+    ↓
+handle cancellation explicitly
+    ↓
+commit exactly one terminal outcome
+    ↓
+retain/replay committed state where supported
+```
+
+At every stage, uncertainty is represented explicitly.
+
+No implementation may convert uncertainty into an assumed successful provider action.
+
+---
+
+# 178. Version declaration
+
+This specification is:
+
+```text
+GARP/1.21
+Wire Version: 0x00
+```
+
+The protocol name, version, message registry, framing rules, authentication transcript, state machine, sequencing rules, and conformance vectors above constitute the normative GARP/1.21 contract.
+

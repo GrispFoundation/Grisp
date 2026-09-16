@@ -1,0 +1,303 @@
+# Generic Agent Driver Protocol (GARP) Specification — Version 1.06
+
+**Document Status:** Standard Specification Draft
+
+**Target Architecture:** Multi-Process Browser Driver & Deterministic Execution Core
+
+**Compatibility:** Backward-compatible with GARP/1.05 state transition models
+
+---
+
+## 1. Scope & Architectural Vision
+
+The Generic Agent Driver Protocol (GARP) defines a deterministic, wire-level binary transport and state machine interface between low-level browser automation actors (such as Firefox `JSWindowActor` or Chromium CDP hooks) and upstream AI execution runtimes.
+
+GARP/1.06 expands upon the state-fencing model of GARP/1.05. It introduces non-blocking sub-session multiplexing, rolling hash stream checkpoints for instant tab crash recovery, and zero-copy binary pass-through for low-latency visual and auditory telemetry.
+
+```
++-----------------------------------------------------------------------+
+|                       AI Application / GRISP Core                     |
++-----------------------------------------------------------------------+
+                                   ^
+                                   | GARP/1.06 (Multiplexed Framing)
+                                   v
++-----------------------------------------------------------------------+
+|                         GARP Gateway Server                           |
+|  [Session Multiplexer]   [State Hash Index]   [Zero-Copy Buffer Pool] |
++-----------------------------------------------------------------------+
+        |                                     |
+        v (Sub-Channel 1)                     v (Sub-Channel 2)
++-------------------------------+     +---------------------------------+
+|  DOM Actor / Tab Context A    |     |   DOM Actor / Tab Context B     |
+|  (page_generation: 1042)      |     |   (page_generation: 1042)       |
++-------------------------------+     +---------------------------------+
+
+```
+
+---
+
+## 2. Terminology & Conformance Requirements
+
+* **Gateway:** The authoritative server process managing WebSocket or IPC connections to clients and coordinating browser driver sessions.
+* **Client:** The controller or agent execution engine issuing commands and processing streaming events.
+* **Page Generation (`page_generation`):** A monotonically increasing 64-bit integer tied to the JS execution context identity. Increments on every top-level navigation, domain origin change, or process reload.
+* **Sub-Channel (`sub_channel_id`):** A virtual execution queue operating inside a parent session, permitting concurrent execution paths over a single physical transport.
+* **Checkpoint Hash:** A 64-bit rolling digest verifying the deterministic output text state at revision $R$.
+
+The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**, **SHOULD**, **RECOMMENDED**, and **MAY** in this document are to be interpreted as described in IETF RFC 2119.
+
+---
+
+## 3. Frame Layout & Binary Framing Mechanics
+
+All GARP/1.06 protocol communications MUST be framed using a fixed 48-byte binary header, followed immediately by an optional UTF-8 JSON payload or aligned raw binary media block. All multi-byte numeric fields MUST be encoded in Big-Endian (Network Byte Order).
+
+### 3.1 Fixed 48-Byte Header Structure
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| Magic (0x47, 0x41, 0x52, 0x50) | Major (1)    | Minor (6)     |  Bytes 0..5
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| Flags (16-bit)                | Sequence ID (64-bit)          |  Bytes 6..15
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| ... Sequence ID (cont)        | Page Generation Token (64-bit)|  Bytes 16..23
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| ... Page Generation (cont)    | Session Sub-Channel ID (32-bit)| Bytes 24..27
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| Compression / Schema ID       | Reserved / Media Encoding     | Bytes 28..31
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| State Checkpoint Hash (64-bit, XXH64 / Blake3-64)             | Bytes 32..39
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| Payload Length in Bytes (64-bit Unsigned Integer)             | Bytes 40..47
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+```
+
+### 3.2 Header Field Definitions
+
+* **Magic Bytes (Bytes 0..3):** Must evaluate to ASCII `'G', 'A', 'R', 'P'` (`0x47415250`).
+* **Protocol Version (Bytes 4..5):** Major version (`0x01`), Minor version (`0x06`).
+* **Flags (Bytes 6..7):** 16-bit bitmask governing transport processing:
+* `Bit 0 (0x0001)`: Payload compressed via Zstandard.
+* `Bit 1 (0x0002)`: Message contains structured JSON payload.
+* `Bit 2 (0x0004)`: Authentication signature attached.
+* `Bit 3 (0x0008)`: Zero-Copy Binary Media Payload (§6).
+* `Bits 4..15`: Reserved for future extensions; MUST be set to `0`.
+
+
+* **Sequence ID (Bytes 8..15):** Monotonically increasing 64-bit counter per transport connection.
+* **Page Generation Token (Bytes 16..23):** Current actor state token. Gateways MUST reject frames where `page_generation` does not match the active context.
+* **Session Sub-Channel ID (Bytes 24..27):** 32-bit identifier assigning frames to execution sub-pipelines ($0..2^{32}-1$).
+* **Compression / Schema ID (Bytes 28..29):** 16-bit identifier defining payload validation rules.
+* **Reserved / Media Encoding (Bytes 30..31):** Flags indicating media compression format (`0x01` = Raw RGB, `0x02` = WebP, `0x03` = Opus Audio, `0x04` = H.264 Annex B).
+* **State Checkpoint Hash (Bytes 32..39):** Rolling 64-bit hash over accumulated generation output (§5).
+* **Payload Length (Bytes 40..47):** Unsigned 64-bit integer specifying the exact byte size of the payload following the header.
+
+---
+
+## 4. Session Sub-Channel Multiplexing (§106.1)
+
+GARP/1.06 removes the limitation where a session could execute only one active prompt at a time (`SESSION_BUSY`).
+
+### 4.1 Execution Rules
+
+1. **Isolation:** Sub-channels execute independent event loops. Processing delays or long-running DOM scans on `sub_channel_id: 1` MUST NOT delay frame dispatch on `sub_channel_id: 2`.
+2. **Shared Fencing:** All sub-channels belonging to the same root session ID share the same `page_generation` token. If a navigation event triggers a `page_generation` increment, ALL active sub-channels within that root session MUST abort active prompts with `PAGE_GENERATION_MISMATCH`.
+3. **Sub-Channel Backpressure Mechanics:**
+When a sub-channel queue reaches capacity, the gateway issues a `SUB_CHANNEL_PAUSE` control event. The client MUST cease transmission on that specific sub-channel until a `SUB_CHANNEL_RESUME` event is received.
+
+```
+Client                                  Gateway                              DOM Actor
+  |                                        |                                     |
+  |-- PROMPT (Sub:1, Seq:101) ------------>|                                     |
+  |-- PROMPT (Sub:2, Seq:102) ------------>|                                     |
+  |<-- RESPONSE (Sub:1, Status: OK) -------|-- Dispatch Task 1 ----------------->|
+  |<-- RESPONSE (Sub:2, Status: OK) -------|-- Dispatch Task 2 ----------------->|
+  |<-- SUB_CHANNEL_PAUSE (Sub:2) ----------| (Buffer limit reached on Sub:2)     |
+  |                                        |<-- DELTA (Task 1) ------------------|
+  |<-- GENERATION_DELTA (Sub:1) -----------|                                     |
+  |<-- SUB_CHANNEL_RESUME (Sub:2) ---------| (Buffer cleared)                    |
+
+```
+
+---
+
+## 5. Deterministic Stream Checkpoint & Resume Protocol (§106.2)
+
+To allow stream resumption without re-running long inferences when browser tabs crash or WebSocket pipes reset, GARP/1.06 embeds state validation directly into every event frame.
+
+### 5.1 Rolling State Hash Calculation
+
+For every emitted text delta at sequence $R$, the gateway updates a rolling 64-bit digest over the total accumulated output string:
+
+$$H_R = \text{XXH64}(H_{R-1} \mathbin{\Vert} \text{Text}_{\text{chunk}, R})$$
+
+Where $H_0 = \text{0xCBF29CE484222325}$ (64-bit FNV offset basis constant), and $\mathbin{\Vert}$ denotes raw byte concatenation. The resulting $H_R$ value is embedded into Header Bytes 32..39 of every `GENERATION_DELTA` frame.
+
+### 5.2 Stream Re-synchronization Handshake
+
+Upon reconnecting after an unexpected drop, the client issues a `RESUME_STREAM` request:
+
+```json
+{
+  "command": "RESUME_STREAM",
+  "session_id": "sess_01J89F2A",
+  "sub_channel_id": 1,
+  "last_received_sequence": 1048,
+  "last_received_revision": 42,
+  "expected_checkpoint_hash": "e8d4a1b029c731f8"
+}
+
+```
+
+#### Gateway Recovery State Machine
+
+```
+                  +--------------------------------+
+                  |  RESUME_STREAM Frame Received  |
+                  +--------------------------------+
+                                   |
+                   Is (SubChannel, Revision) in Buffer?
+                                  / \
+                                 /   \
+                               Yes    No
+                               /       \
+      Check Checkpoint Hash Matches?    \
+                   / \                   \
+                  /   \                   \
+               Match  Mismatch             \
+                /       \                   \
+               v         v                   v
+      [RESUME_ACCEPTED] [STREAM_RESYNC_REQ] [SESSION_EXPIRED]
+      Resume deltas     Send full snapshot  Re-issue full prompt
+      from revision R+1 from revision 0     from initial state
+
+```
+
+---
+
+## 6. Zero-Copy Media Payload Framing (§106.3)
+
+When Bit 3 of the Flags field (`0x0008`) is enabled, the payload body uses a hybrid struct layout designed for zero-copy memory mapping (`mmap` / Direct Buffer allocation).
+
+### 6.1 Payload Body Memory Alignment
+
+```
++-----------------------------------------------------------------------+
+| 48-Byte GARP Header (Flag 0x0008 Set)                                 |
++-----------------------------------------------------------------------+
+| Media Metadata Block (JSON Format, variable length)                   |
++-----------------------------------------------------------------------+
+| Zero-Padding (Aligns Binary Media Start to 64-byte Boundary)          |
++-----------------------------------------------------------------------+
+| Raw Binary Media Data (WebP image, PCM audio, NV12 frame, H.264 stream)|
++-----------------------------------------------------------------------+
+
+```
+
+### 6.2 Media Metadata Schema
+
+```json
+{
+  "media_type": "image/webp",
+  "width": 1920,
+  "height": 1080,
+  "frame_index": 1204,
+  "timestamp_us": 1758001200000000,
+  "binary_offset_bytes": 256,
+  "binary_length_bytes": 184320
+}
+
+```
+
+* **`binary_offset_bytes`:** Absolute byte offset from the start of the payload body (immediately following byte 47 of the main header) to the first byte of raw binary data. MUST be a multiple of 64.
+
+---
+
+## 7. Canonical JSON Payload Schemas
+
+### 7.1 `PROMPT` Command Frame
+
+```json
+{
+  "command": "PROMPT",
+  "session_id": "sess_01J89F2A",
+  "sub_channel_id": 1,
+  "prompt_id": "p_99021",
+  "input": {
+    "text": "Extract all active DOM event listeners from button#submit",
+    "timeout_ms": 5000
+  },
+  "execution_profile": {
+    "allow_dom_mutation": false,
+    "capture_visual_trace": true
+  }
+}
+
+```
+
+### 7.2 `GENERATION_DELTA` Event Frame
+
+```json
+{
+  "event": "GENERATION_DELTA",
+  "session_id": "sess_01J89F2A",
+  "sub_channel_id": 1,
+  "prompt_id": "p_99021",
+  "revision": 43,
+  "mode": "DELTA",
+  "delta": "function() { return getEventListeners(document.querySelector('button#submit')); }",
+  "metrics": {
+    "actor_cpu_time_ms": 1.2,
+    "dom_nodes_scanned": 14
+  }
+}
+
+```
+
+### 7.3 `SUB_CHANNEL_CONTROL` Command Frame
+
+```json
+{
+  "command": "SUB_CHANNEL_CONTROL",
+  "session_id": "sess_01J89F2A",
+  "sub_channel_id": 2,
+  "action": "PAUSE",
+  "reason": "QUEUE_HIGH_WATERMARK_REACHED"
+}
+
+```
+
+---
+
+## 8. Complete Status & Error Code Register
+
+| Hex Code | Status Label | Layer | Description |
+| --- | --- | --- | --- |
+| `0x0000` | `OK` | Transport | Frame processed successfully. |
+| `0x0001` | `COMMAND_ACCEPTED` | Protocol | Async command registered and queued. |
+| `0x0010` | `SUB_CHANNEL_PAUSED` | Multiplexer | Flow control pause acknowledged. |
+| `0x0011` | `RESUME_ACCEPTED` | Stream | Stream resumption validated and active. |
+| `0x00E0` | `INVALID_CHECKPOINT_HASH` | Validation | Rolling state hash mismatch during resumption. |
+| `0x00E1` | `SUB_CHANNEL_LIMIT_EXCEEDED` | Resource | Session allocation cap for virtual sub-channels hit. |
+| `0x00E2` | `BINARY_ALIGNMENT_ERROR` | Transport | Payload byte offset violates 64-byte alignment rule. |
+| `0x00E3` | `SUB_CHANNEL_NOT_FOUND` | Multiplexer | Requested sub-channel ID does not exist in context. |
+| `0x00E4` | `STREAM_RESYNC_REQUIRED` | Recovery | Incremental resume impossible; full refresh required. |
+| `0x00F0` | `PAGE_GENERATION_MISMATCH` | Execution | Frame rejected due to background page navigation. |
+| `0x00F1` | `SESSION_BUSY` | Protocol | Legacy v1.05 single-channel pipeline lock error. |
+| `0x00FF` | `INTERNAL_GATEWAY_ERROR` | System | Unrecoverable error in gateway host process. |
+
+---
+
+## 9. Compatibility Matrix
+
+| Feature | GARP/1.02 | GARP/1.04 | GARP/1.05 | GARP/1.06 |
+| --- | --- | --- | --- | --- |
+| 48-Byte Binary Header Framing | No | Yes | Yes | **Yes** |
+| Page Generation Token Fencing | No | No | Yes | **Yes** |
+| Virtual Sub-Channel Multiplexing | No | No | No | **Yes** |
+| Rolling Checkpoint State Hashes | No | No | No | **Yes** |
+| Zero-Copy Aligned Media Payloads | No | No | No | **Yes** |
+| Single Active Prompt Restriction | Mandatory | Mandatory | Mandatory | **Removed (§4)** |

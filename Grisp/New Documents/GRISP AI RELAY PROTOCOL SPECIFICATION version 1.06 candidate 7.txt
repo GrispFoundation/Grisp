@@ -1,0 +1,420 @@
+# ⭐ GARP/1.06 — Gateway AI Runtime Protocol  
+### **Full Implementation‑Ready Specification**  
+### **Status:** Stable Draft  
+### **Wire Version:** `0x16`  
+### **Previous Version:** `0x15` (GARP/1.05)  
+### **Transport:** TCP  
+### **Payload:** UTF‑8 JSON (optionally compressed)  
+### **Default Endpoint:** `127.0.0.1:9999`
+
+---
+
+# Part I — Goals, Scope, and Architecture
+
+## 1. Purpose
+
+GARP/1.06 defines a deterministic, authenticated, stateful protocol between an external controller and a browser‑resident AI gateway.  
+It provides:
+
+- browser/tab control  
+- provider discovery  
+- dynamic capability negotiation  
+- session lifecycle management  
+- prompt injection & submission  
+- streaming & continuation  
+- navigation tracking  
+- DOM drift detection  
+- recovery semantics  
+- structured diagnostics  
+- authenticated transport  
+- correlation & sequencing guarantees  
+
+GARP/1.06 is designed for **real-world reliability**, including:
+
+- unpredictable provider UI changes  
+- navigation drift  
+- rate limits  
+- partial DOM failures  
+- continuation mis-sequencing  
+- multi-provider environments  
+
+## 2. Trust Boundary
+
+The browser, DOM, provider UI, and model output remain **untrusted**.  
+The gateway must treat all provider-side observations as potentially incorrect or incomplete.
+
+## 3. Architectural Model
+
+GARP/1.06 defines four message roles:
+
+- **COMMAND** — client request  
+- **RESPONSE** — synchronous result  
+- **EVENT** — asynchronous provider/gateway notification  
+- **ERROR** — protocol-level failure  
+
+The rule from 1.05 remains:
+
+> “Every ordinary command MUST have exactly one synchronous RESPONSE.”
+
+---
+
+# Part II — Versioning
+
+## 4. Protocol Identity
+
+Identifier:
+
+```
+GARP/1.06
+```
+
+Wire version:
+
+```
+0x16
+```
+
+## 5. Compatibility
+
+Peers MAY advertise:
+
+```
+["GARP/1.06", "GARP/1.05"]
+```
+
+Downgrade MUST be explicit.
+
+Mixed-version interpretation is forbidden.
+
+---
+
+# Part III — Wire Format
+
+## 6. Frame Structure
+
+```
+48-byte header
++
+UTF‑8 JSON payload (optionally compressed)
+```
+
+## 7. Compression Flags
+
+Flags byte (offset 5):
+
+- bit 0 — gzip  
+- bit 1 — zstd  
+
+If a flag is set, payload MUST decompress to ≤ 16 MiB.
+
+Unknown flags MUST be rejected.
+
+## 8. Header Layout (unchanged)
+
+Same 48-byte structure as 1.05.
+
+## 9. Payload Size
+
+Max uncompressed payload: 16 MiB  
+Max compressed payload: 16 MiB decompressed
+
+---
+
+# Part IV — Dynamic Provider Capability Negotiation
+
+## 10. CAPABILITIES (Extended)
+
+Providers now advertise **dynamic** capabilities:
+
+```json
+{
+  "provider": "string",
+  "static_features": [...],
+  "dynamic_features": {
+    "max_prompt_bytes": number,
+    "max_response_bytes": number,
+    "supports_streaming": boolean,
+    "supports_continuation": boolean,
+    "supports_cancel": boolean,
+    "supports_multi_turn": boolean,
+    "supports_dom_recovery": boolean
+  },
+  "diagnostic_levels": ["info", "warning", "error"]
+}
+```
+
+Dynamic features MAY change during a session.
+
+A new event:
+
+```
+PROVIDER_CHANGED (0x0064)
+```
+
+MUST be emitted when dynamic features change.
+
+---
+
+# Part V — Recovery Semantics
+
+## 11. Recovery States
+
+New session states:
+
+```
+RECOVERING
+RETRYING
+```
+
+## 12. DOM Drift Detection
+
+The gateway MUST detect drift when:
+
+- expected input fields disappear  
+- provider UI changes unexpectedly  
+- navigation occurs without command  
+- provider error banners appear  
+- DOM selectors fail repeatedly  
+
+Upon drift:
+
+```
+READY → RECOVERING
+BUSY  → RECOVERING
+```
+
+## 13. Recovery Flow
+
+```
+RECOVERING
+   |
+   +--> attempt DOM stabilization
+   |
+   +--> if success → PREPARING
+   |
+   +--> if failure → ERROR
+```
+
+A new event:
+
+```
+RECOVERY_STATE (0x0065)
+```
+
+---
+
+# Part VI — Continuation Rules
+
+## 14. Sequencing
+
+Continuation events MUST include:
+
+```json
+{
+  "sequence": number
+}
+```
+
+Rules:
+
+- CONTINUATION_REQUIRED(sequence=N)  
+  MUST be answered by CONTINUATION_SUBMITTED(sequence=N)
+- Out-of-order continuation MUST fail with  
+  `CONTINUATION_OUT_OF_SEQUENCE`
+- Continuation after completion MUST fail  
+- Continuation timeout MUST produce GENERATION_FAILED
+
+---
+
+# Part VII — Navigation Drift
+
+## 15. NAVIGATION_DRIFT Event
+
+New event:
+
+```
+NAVIGATION_DRIFT (0x0043)
+```
+
+Payload:
+
+```json
+{
+  "session_id": "uuid",
+  "page_generation": number,
+  "reason": "unexpected_navigation",
+  "url": "string"
+}
+```
+
+Drift MUST cause RECOVERING.
+
+---
+
+# Part VIII — Diagnostics
+
+## 16. Structured Diagnostics
+
+DIAGNOSTIC events MUST include:
+
+```json
+{
+  "level": "info" | "warning" | "error",
+  "category": "navigation" | "provider" | "input" |
+              "generation" | "transport" | "internal",
+  "message": "string",
+  "details": {}
+}
+```
+
+Gateways SHOULD throttle repeated diagnostics.
+
+---
+
+# Part IX — Session Model
+
+## 17. Session States
+
+Full list:
+
+```
+NEW
+PREPARING
+READY
+BUSY
+RECOVERING
+RETRYING
+AUTH_REQUIRED
+RATE_LIMITED
+ERROR
+CLOSED
+```
+
+## 18. Input State
+
+Same as 1.05.
+
+## 19. Generation State
+
+Same as 1.05.
+
+## 20. Formal Transitions (Extended)
+
+Key additions:
+
+```
+READY → RECOVERING (DOM drift)
+BUSY  → RECOVERING (DOM drift)
+RECOVERING → PREPARING (stabilized)
+RECOVERING → ERROR (failed)
+```
+
+---
+
+# Part X — Prompt Rules
+
+## 21. One Active Prompt Rule (Clarified)
+
+A session MAY queue prompts, but only one may be active.
+
+Queued prompts MUST receive:
+
+```
+SESSION_BUSY
+```
+
+## 22. Prompt Timeout
+
+If provider does not begin generation within the negotiated timeout, gateway MUST emit GENERATION_FAILED.
+
+---
+
+# Part XI — Handshake
+
+## 23. HELLO Extensions
+
+HELLO_ACK MAY include:
+
+```json
+{
+  "compression": ["gzip", "zstd"],
+  "diagnostic_levels": ["info", "warning", "error"],
+  "provider_capability_version": "string"
+}
+```
+
+---
+
+# Part XII — Registry Additions
+
+New identifiers:
+
+| Numeric | Name              | Category |
+|--------:|-------------------|----------|
+| 0x0043  | NAVIGATION_DRIFT  | Event    |
+| 0x0064  | PROVIDER_CHANGED  | Event    |
+| 0x0065  | RECOVERY_STATE    | Event    |
+
+---
+
+# Part XIII — Error Codes
+
+New error codes:
+
+- `RECOVERY_FAILED`  
+- `CONTINUATION_OUT_OF_SEQUENCE`  
+- `PAYLOAD_DECOMPRESSION_FAILED`  
+- `DOM_DRIFT_DETECTED`  
+- `PROVIDER_CAPABILITY_CHANGED`  
+
+---
+
+# Part XIV — Implementation Guidance
+
+## 24. DOM Stabilization Algorithm
+
+Gateways SHOULD:
+
+- re-evaluate selectors  
+- re-scan provider UI  
+- re-check authentication banners  
+- re-validate input fields  
+- re-detect streaming indicators  
+
+## 25. Provider Observation Loop
+
+Gateways MUST maintain a continuous observation loop to detect:
+
+- streaming state  
+- completion state  
+- failure banners  
+- rate limit banners  
+- authentication prompts  
+- continuation prompts  
+
+## 26. Navigation Guard
+
+Gateways MUST detect:
+
+- URL changes  
+- history changes  
+- reloads  
+- redirects  
+- provider page transitions  
+
+---
+
+# Part XV — Summary
+
+GARP/1.06 introduces:
+
+- compression  
+- dynamic provider capabilities  
+- recovery semantics  
+- DOM drift detection  
+- continuation sequencing  
+- structured diagnostics  
+- new events  
+- improved session model  
+- clarified prompt rules  
+

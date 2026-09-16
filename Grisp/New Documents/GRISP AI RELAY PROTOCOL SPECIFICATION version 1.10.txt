@@ -1,0 +1,4080 @@
+# GARP/1.10
+
+## Gateway AI Runtime Protocol
+
+**Status:** Normative / Implementation Target
+**Protocol Version:** `1.10`
+**Wire Version:** `0x19`
+
+---
+
+# 1. Scope
+
+GARP, the Gateway AI Runtime Protocol, defines an authenticated, deterministic interface between an external controller and an AI gateway operating browser-based AI providers.
+
+GARP defines:
+
+* transport framing;
+* authentication;
+* browser and tab management;
+* logical AI sessions;
+* prompt lifecycle;
+* prompt identity;
+* generation observation;
+* response retrieval;
+* cancellation;
+* provider state;
+* browser recovery;
+* navigation tracking;
+* event sequencing;
+* bounded retention;
+* optional event replay;
+* diagnostics;
+* capability negotiation;
+* protocol evolution.
+
+GARP does not define:
+
+* model reasoning;
+* AI planning;
+* semantic correctness;
+* provider internal implementation;
+* prompt policy;
+* downstream verification.
+
+Provider-specific browser automation remains an implementation concern of the gateway.
+
+---
+
+# 2. Design Principles
+
+GARP/1.10 deliberately maintains a small base protocol.
+
+The base protocol provides:
+
+1. one active prompt per session;
+2. explicit prompt identity;
+3. bounded retained prompt history;
+4. explicit target addressing;
+5. persistent session event sequencing;
+6. authoritative state snapshots;
+7. explicit provider-blocked states;
+8. page-generation fencing;
+9. deterministic cancellation arbitration;
+10. verified browser actions;
+11. optional event replay.
+
+The base protocol does not provide:
+
+* concurrent prompt execution within one session;
+* prompt queues;
+* subchannel multiplexing;
+* a separate PONG message;
+* unlimited history.
+
+Advanced functionality MAY be supplied by negotiated extensions.
+
+---
+
+# 3. Versioning
+
+GARP/1.10 uses the existing GARP binary frame layout.
+
+The wire version remains:
+
+```text
+0x19
+```
+
+because GARP/1.10 does not alter the 48-byte frame format.
+
+The JSON protocol version is:
+
+```text
+1.10
+```
+
+A compatible implementation MUST implement all mandatory GARP/1.10 behavior.
+
+GARP/1.09.1 is superseded by GARP/1.10.
+
+GARP/1.07 and earlier versions are reference/historical specifications only.
+
+---
+
+# 4. Compatibility Rule
+
+Because GARP/1.10 and GARP/1.09.1 use the same wire version, protocol-version negotiation MUST distinguish them at the JSON handshake level.
+
+A GARP/1.10 implementation:
+
+* MUST advertise `1.10` when supported;
+* MAY advertise `1.09.1` for compatibility;
+* MUST NOT claim `1.10` semantics when the negotiated protocol version is `1.09.1`.
+
+A client advertising only:
+
+```text
+1.09.1
+```
+
+MAY communicate with a GARP/1.10 gateway using 1.09.1 semantics.
+
+A client advertising only:
+
+```text
+1.09
+```
+
+MAY communicate using 1.09 semantics only if the gateway explicitly supports 1.09.
+
+A client advertising no supported version that the gateway implements MUST be rejected.
+
+The selected version is authoritative for the connection.
+
+---
+
+# 5. Core Object Model
+
+The protocol hierarchy is:
+
+```text
+Connection
+    |
+    +-- Session
+          |
+          +-- active Prompt
+          |
+          +-- retained terminal Prompts
+```
+
+A connection MAY contain multiple sessions.
+
+A session has:
+
+```text
+0 or 1 active prompt
+0 or more retained terminal prompts
+```
+
+Only one prompt may be active at any instant.
+
+Terminal prompts remain independently identifiable until retention expiry or session closure.
+
+---
+
+# 6. Prompt Identity
+
+The request UUID of a `PROMPT` command becomes the prompt request ID.
+
+Example:
+
+```text
+PROMPT
+request_id = A
+
+prompt_request_id = A
+```
+
+Every command operating on an existing prompt MUST contain:
+
+```json
+{
+  "target_request_id": "A"
+}
+```
+
+This applies to:
+
+* `CANCEL_PROMPT`;
+* `GET_PROMPT_STATUS`;
+* `GET_RESPONSE`;
+* `SUBSCRIBE_RESPONSE`.
+
+There is no implicit "current prompt" targeting.
+
+---
+
+# 7. Request Identity
+
+Every command MUST have a unique non-zero request UUID.
+
+The command's request UUID identifies the command itself.
+
+For a prompt command, it additionally becomes the prompt's identity.
+
+Example:
+
+```text
+PROMPT
+request_id = A
+
+GET_RESPONSE
+request_id = B
+target_request_id = A
+
+RESPONSE
+request_id = B
+
+result.prompt_request_id = A
+```
+
+A response MUST correlate to the command request ID.
+
+A result concerning a prompt MUST identify the target prompt where required by its schema.
+
+---
+
+# 8. UUID Scope
+
+Command request IDs MUST be unique within a live connection.
+
+Prompt request IDs MUST remain unique within the lifetime of their session.
+
+A gateway MUST reject duplicate active command request IDs.
+
+A target request ID MUST identify a prompt belonging to the command's session.
+
+---
+
+# 9. Target Resolution Precedence
+
+When resolving a target:
+
+1. If the session UUID is unknown, return `UNKNOWN_SESSION`.
+2. If `target_request_id` is absent where mandatory, return `INVALID_REQUEST`.
+3. If the target UUID is malformed, return `INVALID_ARGUMENT`.
+4. If the target UUID is not known in the session, return `UNKNOWN_PROMPT`.
+5. If the target UUID was valid but has expired, return `PROMPT_EXPIRED`.
+6. If the target exists but the requested operation is invalid for its state, return the operation-specific error such as `PROMPT_NOT_ACTIVE`.
+
+This precedence prevents ambiguous error selection.
+
+---
+
+# 10. Transport
+
+GARP operates over a reliable byte stream.
+
+Supported transports:
+
+* TCP;
+* Unix-domain sockets where available.
+
+The default deployment MUST use loopback or Unix-domain sockets.
+
+Plaintext GARP MUST NOT be exposed to non-loopback networks.
+
+TLS is REQUIRED for non-loopback TCP.
+
+GARP authentication remains mandatory even when TLS is used.
+
+---
+
+# 11. Frame Format
+
+Every GARP frame contains a fixed 48-byte header.
+
+All multi-byte numeric values use big-endian encoding.
+
+| Offset | Size | Field          |
+| -----: | ---: | -------------- |
+|      0 |    4 | Magic          |
+|      4 |    1 | Wire Version   |
+|      5 |    1 | Flags          |
+|      6 |    2 | Header Length  |
+|      8 |    4 | Payload Length |
+|     12 |    2 | Message Type   |
+|     14 |    2 | Reserved       |
+|     16 |   16 | Request UUID   |
+|     32 |   16 | Session UUID   |
+
+---
+
+# 12. Header Values
+
+Magic:
+
+```text
+GARP
+```
+
+ASCII:
+
+```text
+47 41 52 50
+```
+
+Wire version:
+
+```text
+0x19
+```
+
+Header length:
+
+```text
+48
+```
+
+Reserved:
+
+```text
+0x0000
+```
+
+Connection-level messages use the nil UUID as session UUID:
+
+```text
+00000000-0000-0000-0000-000000000000
+```
+
+---
+
+# 13. Flags
+
+GARP/1.10 defines:
+
+```text
+0x00  no flags
+0x01  EXTENSION_PRESENT
+```
+
+All other flag bits are reserved.
+
+Unknown flag bits MUST be rejected unless the extension defining them is negotiated.
+
+Compression is not part of the base protocol.
+
+---
+
+# 14. Payload
+
+The payload MUST be valid UTF-8 JSON unless an explicitly negotiated extension defines another encoding.
+
+The JSON root MUST be an object.
+
+Default maximum payload:
+
+```text
+16777216 bytes
+```
+
+or:
+
+```text
+16 MiB
+```
+
+The effective configured maximum MUST be exposed through `CAPABILITIES`.
+
+---
+
+# 15. JSON Envelope
+
+Every JSON GARP message MUST contain:
+
+```json
+{
+  "garp": "1.10",
+  "type": "message_name",
+  "timestamp": "2026-09-16T20:15:31.427Z",
+  "payload": {}
+}
+```
+
+Required fields:
+
+```text
+garp
+type
+timestamp
+payload
+```
+
+`garp` MUST equal the negotiated protocol version.
+
+---
+
+# 16. Timestamp
+
+Timestamps MUST use:
+
+```text
+YYYY-MM-DDTHH:MM:SS.sssZ
+```
+
+Example:
+
+```text
+2026-09-16T20:15:31.427Z
+```
+
+Milliseconds are exactly three decimal digits.
+
+All timestamps are UTC.
+
+A receiver MUST NOT reject a valid message solely because its timestamp differs from local time.
+
+Clock skew MAY be reported through diagnostics.
+
+Implementations SHOULD maintain reasonably synchronized clocks.
+
+---
+
+# 17. Header/JSON Consistency
+
+The binary header and JSON envelope MUST agree.
+
+Specifically:
+
+### Message type
+
+The binary `message_type` MUST correspond exactly to the JSON `type`.
+
+### Protocol version
+
+The binary wire version identifies framing.
+
+The JSON `garp` value identifies the negotiated protocol version.
+
+### Session UUID
+
+Where a JSON payload contains `session_id`, it MUST equal the binary header session UUID unless the message explicitly describes creation of a newly assigned session.
+
+### Request UUID
+
+The binary header is authoritative for command correlation.
+
+Where a message contains `request_id`, it MUST equal the binary header request UUID.
+
+Where a prompt-related event contains `prompt_request_id`, this is an application-level prompt identity and MAY differ from the binary header request UUID.
+
+A mismatch MUST produce:
+
+```text
+PROTOCOL_STATE_ERROR
+```
+
+or an equivalent protocol validation error.
+
+---
+
+# 18. RESPONSE Session Header Rule
+
+A `RESPONSE` to a session-scoped command MUST carry the same session UUID as the command.
+
+Example:
+
+```text
+GET_RESPONSE
+header.session_uuid = S
+
+RESPONSE
+header.session_uuid = S
+```
+
+A `RESPONSE` to a connection-level command uses the nil session UUID.
+
+Therefore a response is connection-level or session-level according to the command it answers.
+
+---
+
+# 19. Message Registry
+
+## Connection
+
+```text
+0x0001 HELLO
+0x0002 HELLO_CHALLENGE
+0x0003 HELLO_AUTH
+0x0004 HELLO_ACK
+0x0005 RESPONSE
+0x0006 ERROR
+```
+
+## Browser
+
+```text
+0x0010 CAPABILITIES
+0x0011 BROWSER_STATUS
+0x0012 LIST_TABS
+0x0013 OPEN_TAB
+0x0014 CLOSE_TAB
+0x0015 SELECT_TAB
+```
+
+## Session
+
+```text
+0x0020 CREATE_SESSION
+0x0021 ATTACH_SESSION
+0x0022 DETACH_SESSION
+0x0023 CLOSE_SESSION
+0x0024 RESET_SESSION
+0x0025 GET_SESSION
+```
+
+## Prompt
+
+```text
+0x0030 PROMPT
+0x0031 CANCEL_PROMPT
+0x0032 GET_PROMPT_STATUS
+0x0033 GET_RESPONSE
+0x0034 SUBSCRIBE_RESPONSE
+```
+
+## Session Events
+
+```text
+0x0040 SESSION_READY
+0x0041 SESSION_CHANGED
+0x0042 NAVIGATION
+0x0043 NAVIGATION_DRIFT
+0x0044 RECOVERY_STATE
+0x0045 PROVIDER_CHANGED
+```
+
+## Generation Events
+
+```text
+0x0050 INPUT_SUBMITTED
+0x0051 GENERATION_STARTED
+0x0052 GENERATION_DELTA
+0x0053 GENERATION_PROGRESS
+0x0054 CONTINUATION_REQUIRED
+0x0055 CONTINUATION_SUBMITTED
+0x0056 GENERATION_COMPLETED
+0x0057 GENERATION_FAILED
+0x0058 GENERATION_CANCELLED
+```
+
+## Provider and Diagnostics
+
+```text
+0x0060 PROVIDER_ERROR
+0x0061 AUTH_REQUIRED
+0x0062 RATE_LIMITED
+0x0063 DIAGNOSTIC
+```
+
+## Keepalive
+
+```text
+0x0070 PING
+```
+
+`0x0071` is reserved.
+
+---
+
+# 20. Registry Consistency
+
+Every registered message type MUST have exactly one authoritative definition.
+
+A message type MUST NOT:
+
+* have multiple numeric assignments;
+* have multiple meanings;
+* have incompatible schemas;
+* appear twice in the registry.
+
+Every normative example MUST use fields valid for that message.
+
+---
+
+# 21. Handshake
+
+The mandatory handshake is:
+
+```text
+HELLO
+    ↓
+HELLO_CHALLENGE
+    ↓
+HELLO_AUTH
+    ↓
+HELLO_ACK
+```
+
+No application command is valid before authentication succeeds.
+
+---
+
+# 22. Handshake Request UUID
+
+The handshake uses one request UUID.
+
+```text
+HELLO              request_id = H
+HELLO_CHALLENGE    request_id = H
+HELLO_AUTH         request_id = H
+HELLO_ACK          request_id = H
+```
+
+The handshake UUID MUST be a fresh non-zero UUID.
+
+The handshake messages are not `RESPONSE` messages.
+
+---
+
+# 23. HELLO
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "hello",
+  "timestamp": "2026-09-16T20:15:31.427Z",
+  "payload": {
+    "client_name": "GARP101.Client",
+    "client_version": "1.10.0",
+    "supported_versions": ["1.10", "1.09.1"],
+    "features": [],
+    "nonce": "base64url"
+  }
+}
+```
+
+---
+
+# 24. HELLO_CHALLENGE
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "hello_challenge",
+  "timestamp": "2026-09-16T20:15:31.428Z",
+  "payload": {
+    "server_name": "GARP Firefox Gateway",
+    "server_version": "1.10.0",
+    "selected_version": "1.10",
+    "nonce": "base64url",
+    "features": []
+  }
+}
+```
+
+The selected version MUST be one supported by the client.
+
+---
+
+# 25. Handshake Encoding
+
+All nonce fields and proof fields use:
+
+```text
+base64url without padding
+```
+
+using the URL-safe Base64 alphabet:
+
+```text
+A-Z
+a-z
+0-9
+-
+_
+```
+
+The `=` padding character MUST NOT appear.
+
+Nonce values represent raw random bytes before Base64URL encoding.
+
+Proof values represent raw HMAC bytes before Base64URL encoding.
+
+---
+
+# 26. Authentication Transcript
+
+The HMAC transcript is:
+
+```text
+u32be(length("GARP"))
+" GARP bytes "
+
+u32be(length(client_nonce_raw))
+client_nonce_raw
+
+u32be(length(server_nonce_raw))
+server_nonce_raw
+
+u32be(length(selected_version_utf8))
+selected_version_utf8
+
+u32be(length(client_name_utf8))
+client_name_utf8
+
+u32be(length(client_version_utf8))
+client_version_utf8
+
+u32be(length(server_name_utf8))
+server_name_utf8
+
+u32be(length(server_version_utf8))
+server_version_utf8
+```
+
+The space shown in the diagram above does not exist in the actual byte sequence. It is shown only as a visual separator.
+
+The actual transcript is the exact concatenation of the following fields:
+
+```text
+u32be(domain_length)
+domain_utf8
+
+u32be(client_nonce_length)
+client_nonce_raw
+
+u32be(server_nonce_length)
+server_nonce_raw
+
+u32be(selected_version_length)
+selected_version_utf8
+
+u32be(client_name_length)
+client_name_utf8
+
+u32be(client_version_length)
+client_version_utf8
+
+u32be(server_name_length)
+server_name_utf8
+
+u32be(server_version_length)
+server_version_utf8
+```
+
+All length fields are unsigned 32-bit big-endian byte counts.
+
+The domain is exactly:
+
+```text
+GARP
+```
+
+in UTF-8.
+
+---
+
+# 27. HELLO_AUTH
+
+The authentication proof is:
+
+```text
+HMAC-SHA256(secret, transcript)
+```
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "hello_auth",
+  "timestamp": "2026-09-16T20:15:31.429Z",
+  "payload": {
+    "proof": "base64url"
+  }
+}
+```
+
+The verifier MUST compare the expected and received HMAC values using a constant-time comparison.
+
+---
+
+# 28. HELLO_ACK
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "hello_ack",
+  "timestamp": "2026-09-16T20:15:31.430Z",
+  "payload": {
+    "authenticated": true,
+    "selected_version": "1.10",
+    "features": []
+  }
+}
+```
+
+A successful `HELLO_ACK` places the connection in:
+
+```text
+AUTHENTICATED
+```
+
+---
+
+# 29. Unsupported Version
+
+If the client advertises no version supported by the gateway, the gateway MUST reject the handshake with:
+
+```text
+UNSUPPORTED_VERSION
+```
+
+No application session may be created.
+
+Because the wire framing version is fixed, the gateway MAY encode this protocol error using the received compatible wire framing.
+
+---
+
+# 30. Authentication Replay Protection
+
+The gateway MUST:
+
+* generate unpredictable nonces;
+* reject reuse of an accepted handshake transcript;
+* expire incomplete handshakes;
+* maintain a bounded replay cache.
+
+Recommended incomplete-handshake lifetime:
+
+```text
+5 minutes
+```
+
+---
+
+# 31. Authentication Rate Limiting
+
+Authentication failures MUST be rate-limited.
+
+The gateway SHOULD provide:
+
+* endpoint throttling;
+* bounded retry delay;
+* bounded handshake state;
+* authentication timeouts.
+
+Repeated failures MUST NOT permit unbounded resource consumption.
+
+---
+
+# 32. Feature Representation
+
+In:
+
+* `HELLO`;
+* `HELLO_CHALLENGE`;
+* `HELLO_ACK`;
+
+the `features` field is always:
+
+```text
+array of strings
+```
+
+A required feature is prefixed with:
+
+```text
+!
+```
+
+Example:
+
+```json
+{
+  "features": [
+    "ext-replay-store",
+    "!ext-required-example"
+  ]
+}
+```
+
+The `!` character is not part of the feature's canonical name.
+
+---
+
+# 33. Negotiated Extensions
+
+Extension parameters are reported through `CAPABILITIES`.
+
+Example:
+
+```json
+{
+  "name": "ext-replay-store",
+  "enabled": true,
+  "parameters": {
+    "event_retention_ms": 3600000
+  }
+}
+```
+
+`features` and `extensions` have different representations by definition.
+
+---
+
+# 34. RESPONSE
+
+`RESPONSE` is the universal result of a valid command.
+
+Success:
+
+```json
+{
+  "garp": "1.10",
+  "type": "response",
+  "timestamp": "2026-09-16T20:15:31.500Z",
+  "payload": {
+    "success": true,
+    "result": {}
+  }
+}
+```
+
+Failure:
+
+```json
+{
+  "garp": "1.10",
+  "type": "response",
+  "timestamp": "2026-09-16T20:15:31.500Z",
+  "payload": {
+    "success": false,
+    "error": {
+      "code": "SESSION_BUSY",
+      "retryable": true,
+      "message": "Session already has an active prompt."
+    }
+  }
+}
+```
+
+When `success=true`, `error` MUST be absent.
+
+When `success=false`, `error` MUST be present.
+
+---
+
+# 35. ERROR
+
+`ERROR` is reserved for protocol processing failure.
+
+Examples:
+
+```text
+MALFORMED_FRAME
+INVALID_HEADER
+UNSUPPORTED_VERSION
+INVALID_JSON
+UNKNOWN_MESSAGE_TYPE
+INVALID_FLAGS
+MESSAGE_TOO_LARGE
+AUTH_REQUIRED
+AUTH_FAILED
+PROTOCOL_STATE_ERROR
+```
+
+Valid commands that fail operationally MUST use `RESPONSE(success=false)`.
+
+---
+
+# 36. Error Structure
+
+Standard operational errors contain:
+
+```json
+{
+  "code": "STALE_ACTOR",
+  "retryable": true,
+  "message": "Browser actor is no longer valid."
+}
+```
+
+`retryable` MUST be boolean.
+
+---
+
+# 37. Session State Registry
+
+```text
+CREATED
+PREPARING
+READY
+BUSY
+AUTH_REQUIRED
+RATE_LIMITED
+RECOVERING
+RETRYING
+FAILED
+CLOSED
+```
+
+---
+
+# 38. Session State Definitions
+
+### CREATED
+
+Logical session exists but is not currently prepared.
+
+### PREPARING
+
+Browser/provider context is being prepared.
+
+### READY
+
+Browser/provider context is verified and a new prompt may be accepted.
+
+### BUSY
+
+One prompt is active.
+
+### AUTH_REQUIRED
+
+User/provider authentication is required.
+
+### RATE_LIMITED
+
+Provider rate limiting currently prevents ordinary operation.
+
+### RECOVERING
+
+Gateway is actively repairing browser/provider context.
+
+### RETRYING
+
+Gateway is waiting for or performing another recovery attempt.
+
+### FAILED
+
+Automatic recovery cannot currently restore the session.
+
+### CLOSED
+
+Session is permanently closed.
+
+---
+
+# 39. Provider Authentication Loss
+
+When a provider authentication requirement occurs:
+
+```text
+session
+→ AUTH_REQUIRED
+```
+
+If an active prompt exists, that prompt MUST be terminated with:
+
+```text
+GENERATION_FAILED
+```
+
+and error:
+
+```json
+{
+  "code": "PROVIDER_AUTH_REQUIRED",
+  "retryable": false,
+  "message": "Provider authentication is required."
+}
+```
+
+The prompt remains retained as a failed terminal prompt.
+
+The session remains:
+
+```text
+AUTH_REQUIRED
+```
+
+until authentication has been positively verified.
+
+A gateway MUST NOT silently pause the prompt and later resume it as though no authentication boundary occurred.
+
+---
+
+# 40. Rate-Limit Activation
+
+When a provider rate limit prevents continuation of the active operation:
+
+```text
+session
+→ RATE_LIMITED
+```
+
+The active prompt MUST be handled according to the provider evidence:
+
+### Rate limit terminates generation
+
+The prompt MUST become:
+
+```text
+FAILED
+```
+
+with:
+
+```text
+PROVIDER_RATE_LIMITED
+```
+
+### Rate limit allows the same operation to resume
+
+The prompt MAY remain active, but the session MUST remain `RATE_LIMITED` until the provider permits continuation.
+
+The gateway MUST NOT emit `READY` during the blocked interval.
+
+The gateway SHOULD expose:
+
+```text
+retry_after_ms
+```
+
+where known.
+
+---
+
+# 41. Rate-Limit Recovery
+
+When a rate-limit condition has cleared, the gateway MUST revalidate the provider/browser context before returning to `READY` or resuming generation.
+
+The gateway MUST NOT assume that expiration of a timer alone proves provider readiness.
+
+---
+
+# 42. RECOVERING vs RETRYING
+
+`RECOVERING` means active repair.
+
+Examples:
+
+* reacquiring actor;
+* rediscovering DOM;
+* rebuilding browser context;
+* revalidating provider adapter.
+
+`RETRYING` means another attempt has been selected and is either waiting for its retry point or being executed.
+
+A transition may therefore be:
+
+```text
+RECOVERING
+    ↓
+RETRYING
+    ↓
+RECOVERING
+```
+
+Neither state may conceal:
+
+```text
+AUTH_REQUIRED
+RATE_LIMITED
+```
+
+---
+
+# 43. Session READY
+
+`SESSION_READY` is emitted whenever the session enters `READY`.
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "session_ready",
+  "timestamp": "2026-09-16T20:15:31.600Z",
+  "payload": {
+    "sequence": 12,
+    "state": "READY",
+    "provider": "deepseek",
+    "tab_id": "uuid",
+    "page_generation": 14,
+    "reason": "prepared"
+  }
+}
+```
+
+Required fields:
+
+```text
+sequence
+state
+provider
+tab_id
+page_generation
+reason
+```
+
+Allowed reasons:
+
+```text
+prepared
+recovered
+reattached
+reset_completed
+```
+
+---
+
+# 44. SESSION_CHANGED
+
+`SESSION_CHANGED` reports a session state transition not represented by a dedicated event.
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "session_changed",
+  "timestamp": "2026-09-16T20:15:31.700Z",
+  "payload": {
+    "sequence": 13,
+    "previous_state": "READY",
+    "state": "BUSY",
+    "reason": "prompt_started",
+    "page_generation": 14
+  }
+}
+```
+
+Required fields:
+
+```text
+sequence
+previous_state
+state
+reason
+page_generation
+```
+
+---
+
+# 45. SESSION_CHANGED Reason Registry
+
+The reason enumeration is closed:
+
+```text
+created
+attached
+detached
+reset
+prepared
+prompt_started
+prompt_completed
+prompt_failed
+prompt_cancelled
+auth_required
+rate_limited
+recovery_started
+recovery_retry
+recovery_failed
+provider_changed
+tab_changed
+navigation_changed
+browser_restarted
+session_failed
+session_closed
+```
+
+---
+
+# 46. GET_SESSION
+
+`GET_SESSION` is assigned:
+
+```text
+0x0025
+```
+
+It returns authoritative session state.
+
+Example:
+
+```json
+{
+  "success": true,
+  "result": {
+    "session_id": "uuid",
+    "state": "BUSY",
+    "provider": "deepseek",
+    "tab_id": "uuid",
+    "url": "https://chat.deepseek.com/",
+    "page_generation": 14,
+    "prompt_state": "GENERATING",
+    "active_prompt_request_id": "uuid",
+    "last_completed_prompt_request_id": "uuid"
+  }
+}
+```
+
+Required result fields:
+
+```text
+session_id
+state
+provider
+tab_id
+page_generation
+prompt_state
+active_prompt_request_id
+```
+
+The following MAY be included:
+
+```text
+url
+last_completed_prompt_request_id
+retry_after_ms
+```
+
+The gateway MUST NOT include a field merely because it exists internally.
+
+A snapshot field is authoritative when present.
+
+---
+
+# 47. CREATE_SESSION
+
+Example payload:
+
+```json
+{
+  "provider": "deepseek",
+  "tab_id": "uuid"
+}
+```
+
+Successful result:
+
+```json
+{
+  "success": true,
+  "result": {
+    "session_id": "uuid",
+    "state": "PREPARING"
+  }
+}
+```
+
+The session MUST subsequently produce `SESSION_READY` if preparation succeeds.
+
+---
+
+# 48. ATTACH_SESSION
+
+Attachment MUST revalidate:
+
+* tab;
+* provider;
+* browser actor;
+* page generation;
+* input capability.
+
+The session progresses through:
+
+```text
+PREPARING
+    ↓
+READY
+```
+
+---
+
+# 49. DETACH_SESSION
+
+A successful detach removes the browser context from the logical session.
+
+The session MUST NOT accept new prompts while detached.
+
+The session SHOULD enter:
+
+```text
+CREATED
+```
+
+---
+
+# 50. RESET_SESSION
+
+Reset MUST:
+
+1. stop/cancel active generation where possible;
+2. clear active prompt state;
+3. invalidate stale actors;
+4. reacquire browser/provider state;
+5. establish a valid page context;
+6. enter `PREPARING`;
+7. emit `SESSION_READY` after successful verification.
+
+Closing a session has stronger semantics defined below.
+
+---
+
+# 51. CLOSE_SESSION
+
+Closing a session:
+
+1. terminates any active prompt;
+2. prevents further prompt operations;
+3. invalidates the session's retained prompt records;
+4. releases the browser/provider resources owned by the session;
+5. transitions to `CLOSED`.
+
+After closure:
+
+```text
+GET_RESPONSE(target=A)
+```
+
+for a former prompt MUST return:
+
+```text
+UNKNOWN_SESSION
+```
+
+because the session no longer exists as an active protocol object.
+
+---
+
+# 52. Prompt States
+
+Prompt states are:
+
+```text
+NONE
+SUBMITTING
+GENERATING
+COMPLETED
+FAILED
+CANCELLED
+```
+
+Only one prompt may be active.
+
+---
+
+# 53. Prompt Record
+
+A retained prompt record contains:
+
+```text
+prompt_request_id
+state
+created_at
+updated_at
+revision
+format
+page_generation
+response
+```
+
+A record MAY additionally contain:
+
+```text
+failure_code
+failure_message
+cancel_reason
+cancel_verified
+```
+
+---
+
+# 54. Prompt Acceptance State
+
+Successful `PROMPT` acceptance MUST NOT claim that browser submission has started.
+
+The immediate command response MUST use:
+
+```text
+state = ACCEPTED
+```
+
+Example:
+
+```json
+{
+  "success": true,
+  "result": {
+    "prompt_request_id": "uuid",
+    "state": "ACCEPTED"
+  }
+}
+```
+
+`ACCEPTED` is a command-result state, not a prompt lifecycle state.
+
+The actual prompt lifecycle then transitions:
+
+```text
+ACCEPTED
+    ↓
+SUBMITTING
+    ↓
+GENERATING
+```
+
+or fails before generation.
+
+This prevents command acceptance from being confused with browser execution.
+
+---
+
+# 55. Prompt Submission
+
+The gateway MUST perform:
+
+```text
+session verification
+    ↓
+input discovery
+    ↓
+prompt injection
+    ↓
+prompt verification
+    ↓
+submit action
+    ↓
+submission verification
+    ↓
+INPUT_SUBMITTED
+    ↓
+generation detection
+    ↓
+GENERATION_STARTED
+```
+
+No later externally visible transition may be emitted without evidence for its prerequisite.
+
+---
+
+# 56. Input Injection Verification
+
+The adapter MUST distinguish:
+
+```text
+attempted
+```
+
+from:
+
+```text
+verified
+```
+
+Submission MUST NOT proceed until the intended prompt text is verified in the provider input state.
+
+---
+
+# 57. Submission Verification
+
+The adapter MUST distinguish:
+
+```text
+submit attempted
+```
+
+from:
+
+```text
+submission verified
+```
+
+Evidence MAY include:
+
+* input clearing;
+* provider state transition;
+* assistant output appearance;
+* generation indicator;
+* provider-specific verified condition.
+
+A successful DOM function call is insufficient evidence.
+
+---
+
+# 58. INPUT_SUBMITTED
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "input_submitted",
+  "timestamp": "2026-09-16T20:15:31.800Z",
+  "payload": {
+    "sequence": 20,
+    "prompt_request_id": "uuid",
+    "page_generation": 14
+  }
+}
+```
+
+This event confirms verified submission.
+
+---
+
+# 59. Response Format
+
+The format enumeration is closed:
+
+```text
+text
+markdown
+html
+unknown
+```
+
+---
+
+# 60. GENERATION_STARTED
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "generation_started",
+  "timestamp": "2026-09-16T20:15:31.900Z",
+  "payload": {
+    "sequence": 21,
+    "prompt_request_id": "uuid",
+    "page_generation": 14,
+    "format": "unknown"
+  }
+}
+```
+
+`format` MAY be `unknown` when generation begins.
+
+The gateway MAY establish a more specific format later.
+
+---
+
+# 61. Generation Message Identity
+
+A prompt MAY produce multiple logical response messages.
+
+Therefore each observed assistant message is identified by:
+
+```text
+message_id
+```
+
+within the prompt.
+
+`message_id` is unique within its prompt.
+
+Example:
+
+```text
+prompt_request_id = A
+message_id = M1
+```
+
+and later:
+
+```text
+prompt_request_id = A
+message_id = M2
+```
+
+are distinct response messages belonging to one prompt lifecycle.
+
+---
+
+# 62. Message Lifecycle
+
+For one prompt:
+
+```text
+Prompt A
+    |
+    +-- message M1
+    |
+    +-- message M2
+    |
+    +-- message M3
+```
+
+Message order is established by the session event sequence.
+
+A gateway MUST NOT reuse a `message_id` for a different logical message within the same prompt.
+
+---
+
+# 63. GENERATION_DELTA
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "generation_delta",
+  "timestamp": "2026-09-16T20:15:32.000Z",
+  "payload": {
+    "sequence": 22,
+    "prompt_request_id": "uuid",
+    "message_id": "message-1",
+    "revision": 1,
+    "format": "markdown",
+    "mode": "APPEND",
+    "delta": "Hello"
+  }
+}
+```
+
+The closed mode enumeration is:
+
+```text
+APPEND
+REPLACE
+```
+
+---
+
+# 64. APPEND Mode
+
+`APPEND` means:
+
+```text
+new_response = previous_response + delta
+```
+
+The delta MUST represent content that was not already present in the authoritative response for that message revision.
+
+---
+
+# 65. REPLACE Mode
+
+`REPLACE` means the provider observation requires the accumulated message content to be replaced.
+
+Example:
+
+```json
+{
+  "message_id": "message-1",
+  "revision": 7,
+  "format": "markdown",
+  "mode": "REPLACE",
+  "delta": "Corrected complete message."
+}
+```
+
+The value of `delta` in `REPLACE` mode is the new complete content.
+
+The resulting authoritative message content becomes exactly that value.
+
+This permits browser frameworks to rewrite streaming content without forcing the gateway to manufacture misleading append deltas.
+
+---
+
+# 66. Message Revisions
+
+Each `message_id` has an independent revision sequence.
+
+Rules:
+
+```text
+initial revision = 0
+first authoritative content = 1
+each authoritative content replacement = next revision
+```
+
+`revision` MUST increase strictly for authoritative content changes.
+
+---
+
+# 67. GENERATION_PROGRESS
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "generation_progress",
+  "timestamp": "2026-09-16T20:15:32.100Z",
+  "payload": {
+    "sequence": 23,
+    "prompt_request_id": "uuid",
+    "message_count": 1,
+    "state": "GENERATING"
+  }
+}
+```
+
+`message_count` is the number of logical response messages currently observed for the prompt.
+
+It MUST be zero or greater.
+
+---
+
+# 68. GENERATION_COMPLETED
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "generation_completed",
+  "timestamp": "2026-09-16T20:15:35.000Z",
+  "payload": {
+    "sequence": 30,
+    "prompt_request_id": "uuid",
+    "revision": 8,
+    "format": "markdown",
+    "response": "Final generated response."
+  }
+}
+```
+
+For backward simplicity, `GENERATION_COMPLETED.response` represents the canonical combined prompt response.
+
+Where multiple messages exist, their canonical representation is concatenated in provider-observed message order.
+
+The gateway SHOULD provide richer message-level data through `GET_RESPONSE`.
+
+---
+
+# 69. GET_RESPONSE
+
+The target is mandatory.
+
+Example:
+
+```json
+{
+  "target_request_id": "uuid"
+}
+```
+
+The result MUST contain:
+
+```text
+prompt_request_id
+state
+format
+revision
+response
+```
+
+Example:
+
+```json
+{
+  "success": true,
+  "result": {
+    "prompt_request_id": "uuid",
+    "state": "COMPLETED",
+    "revision": 8,
+    "format": "markdown",
+    "response": "Final generated response.",
+    "messages": []
+  }
+}
+```
+
+`messages` MAY contain logical message records.
+
+When present, each record contains at least:
+
+```text
+message_id
+revision
+format
+content
+```
+
+---
+
+# 70. GET_RESPONSE During Generation
+
+While generation is active:
+
+```text
+state = GENERATING
+```
+
+The gateway SHOULD return the latest authoritative response snapshot.
+
+If no authoritative content is yet available:
+
+```text
+RESPONSE_NOT_READY
+```
+
+MAY be returned.
+
+The returned prompt identity MUST equal the requested target.
+
+---
+
+# 71. GET_PROMPT_STATUS
+
+Example:
+
+```json
+{
+  "target_request_id": "uuid"
+}
+```
+
+Result:
+
+```json
+{
+  "success": true,
+  "result": {
+    "prompt_request_id": "uuid",
+    "state": "GENERATING",
+    "revision": 4,
+    "format": "markdown",
+    "page_generation": 14
+  }
+}
+```
+
+For multi-message prompts, `revision` represents the prompt-level aggregate revision.
+
+Message-level revisions are returned by `GET_RESPONSE` where needed.
+
+---
+
+# 72. CANCEL_PROMPT
+
+Example:
+
+```json
+{
+  "target_request_id": "uuid",
+  "reason": "user_requested"
+}
+```
+
+The target MUST identify the active prompt.
+
+Terminal prompts cannot be cancelled.
+
+---
+
+# 73. CANCEL_PROMPT Error Mapping
+
+When cancellation is requested:
+
+### Unknown target
+
+```text
+UNKNOWN_PROMPT
+```
+
+### Expired target
+
+```text
+PROMPT_EXPIRED
+```
+
+### Existing terminal target
+
+```text
+PROMPT_NOT_ACTIVE
+```
+
+### Active target
+
+Cancellation proceeds according to Section 76.
+
+---
+
+# 74. GENERATION_CANCELLED
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "generation_cancelled",
+  "timestamp": "2026-09-16T20:15:35.000Z",
+  "payload": {
+    "sequence": 30,
+    "prompt_request_id": "uuid",
+    "revision": 5,
+    "reason": "user_requested",
+    "cancel_verified": true
+  }
+}
+```
+
+`cancel_verified` MUST be boolean.
+
+---
+
+# 75. Cancellation Verification
+
+`cancel_verified=true` means the gateway has evidence that provider generation has stopped.
+
+`cancel_verified=false` means cancellation was accepted but provider cessation was not verified.
+
+The gateway MUST NOT report:
+
+```text
+cancel_verified=true
+```
+
+merely because a browser action was attempted.
+
+If cancellation is not verified, the session MUST NOT return to `READY` while provider generation may still occur.
+
+---
+
+# 76. Cancellation Arbitration
+
+The gateway MUST resolve cancellation atomically.
+
+## Case A — Completion committed before cancellation
+
+If completion is committed before cancellation is accepted:
+
+```text
+COMPLETED
+```
+
+wins.
+
+## Case B — Cancellation accepted and stop verified first
+
+If cancellation is accepted and provider stop is verified before completion is committed:
+
+```text
+CANCELLED
+```
+
+wins.
+
+## Case C — Provider completion commits first
+
+If provider completion is committed before cancellation can commit:
+
+```text
+COMPLETED
+```
+
+wins.
+
+The cancellation command returns an explicit terminal-state indication.
+
+## Case D — Cancellation accepted but stop unverified
+
+The gateway MAY commit:
+
+```text
+CANCELLED
+```
+
+with:
+
+```text
+cancel_verified=false
+```
+
+but MUST prevent overlapping new generation.
+
+It SHOULD transition the session to:
+
+```text
+RECOVERING
+```
+
+when necessary to establish provider cessation.
+
+The gateway MUST NOT return the session directly to `READY` merely because cancellation was requested.
+
+---
+
+# 77. Terminal Prompt States
+
+Exactly one terminal prompt state may be committed:
+
+```text
+COMPLETED
+FAILED
+CANCELLED
+```
+
+Terminal commitment is atomic against:
+
+* completion;
+* failure;
+* cancellation;
+* browser destruction;
+* recovery failure.
+
+---
+
+# 78. Continuation
+
+Providers that require continuation MAY emit:
+
+```text
+CONTINUATION_REQUIRED
+```
+
+Continuation remains part of the same prompt identity.
+
+Example:
+
+```text
+Prompt A
+   ↓
+CONTINUATION_REQUIRED(A)
+   ↓
+CONTINUATION_SUBMITTED(A)
+   ↓
+GENERATION_COMPLETED(A)
+```
+
+No new prompt identity is created.
+
+---
+
+# 79. SUBSCRIBE_RESPONSE
+
+Subscription requires a target:
+
+```json
+{
+  "target_request_id": "uuid",
+  "enabled": true
+}
+```
+
+There is no implicit future-prompt subscription.
+
+---
+
+# 80. Subscription Expiry
+
+When the subscribed prompt expires:
+
+1. the subscription MUST terminate;
+2. a diagnostic SHOULD be emitted;
+3. the diagnostic code MUST be `SUBSCRIPTION_EXPIRED`.
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "diagnostic",
+  "timestamp": "2026-09-17T20:15:31.000Z",
+  "payload": {
+    "sequence": 90,
+    "level": "INFO",
+    "code": "SUBSCRIPTION_EXPIRED",
+    "message": "Subscribed prompt has expired.",
+    "details": {}
+  }
+}
+```
+
+No later event may be delivered through that subscription.
+
+---
+
+# 81. Event Sequencing
+
+Each session has one persistent event sequence namespace.
+
+The sequence:
+
+```text
+starts at 1
+increments exactly by 1
+never uses 0
+```
+
+Every session event consumes exactly one sequence value.
+
+---
+
+# 82. Reconnect Sequence
+
+Disconnecting a client MUST NOT reset the session event sequence.
+
+Example:
+
+```text
+sequence 17
+sequence 18
+sequence 19
+
+disconnect
+
+reconnect
+
+sequence 20
+```
+
+A newly created session starts at sequence `1`.
+
+---
+
+# 83. Replay Extension
+
+The optional:
+
+```text
+ext-replay-store
+```
+
+extension provides historical event replay.
+
+The base protocol remains functional without it.
+
+---
+
+# 84. Replay Capability
+
+When enabled:
+
+```json
+{
+  "name": "ext-replay-store",
+  "enabled": true,
+  "parameters": {
+    "event_retention_ms": 3600000
+  }
+}
+```
+
+The advertised retention value is authoritative.
+
+---
+
+# 85. Replay
+
+A client MAY request:
+
+```json
+{
+  "target_request_id": "uuid",
+  "from_sequence": 15,
+  "enabled": true
+}
+```
+
+The gateway MUST return retained events in exact sequence order.
+
+It MUST NOT silently skip a sequence.
+
+---
+
+# 86. Replay History Expiration
+
+If requested historical events have expired:
+
+```text
+EVENT_HISTORY_EXPIRED
+```
+
+MUST be returned.
+
+The client MUST then rely on:
+
+```text
+GET_SESSION
+GET_PROMPT_STATUS
+GET_RESPONSE
+```
+
+for authoritative state recovery.
+
+---
+
+# 87. Replay Retention Reduction
+
+If effective replay retention is reduced:
+
+1. the effective capability value MUST be updated;
+2. `CAPABILITIES` MUST report the new authoritative value;
+3. the gateway SHOULD emit:
+
+```text
+REPLAY_RETENTION_REDUCED
+```
+
+through `DIAGNOSTIC`.
+
+A client receiving that diagnostic SHOULD immediately re-query `CAPABILITIES`.
+
+The client MUST treat the newly retrieved capability value as authoritative.
+
+---
+
+# 88. Event Sequence Across Replay
+
+Replay uses the original session sequence values.
+
+Example:
+
+```text
+original:
+41
+42
+43
+44
+
+disconnect
+
+replay from 42:
+42
+43
+44
+```
+
+Replay does not assign new sequence numbers.
+
+---
+
+# 89. Navigation
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "navigation",
+  "timestamp": "2026-09-16T20:30:00.000Z",
+  "payload": {
+    "sequence": 110,
+    "page_generation": 15,
+    "url": "https://chat.deepseek.com/"
+  }
+}
+```
+
+Navigation that invalidates the automation context MUST increment `page_generation`.
+
+---
+
+# 90. NAVIGATION_DRIFT
+
+Unexpected navigation affecting an operation MUST produce `NAVIGATION_DRIFT`.
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "navigation_drift",
+  "timestamp": "2026-09-16T20:30:01.000Z",
+  "payload": {
+    "sequence": 111,
+    "page_generation": 16,
+    "reason": "document_changed"
+  }
+}
+```
+
+---
+
+# 91. Page Generation
+
+`page_generation` is monotonically increasing within a session.
+
+It MUST change when the effective automation context changes, including:
+
+* navigation;
+* actor replacement;
+* document recreation;
+* browser restart;
+* reload requiring actor invalidation.
+
+A stale actor MUST NOT be silently reused.
+
+---
+
+# 92. PROVIDER_CHANGED
+
+The only provider-change message is:
+
+```text
+0x0045
+```
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "provider_changed",
+  "timestamp": "2026-09-16T20:31:00.000Z",
+  "payload": {
+    "sequence": 120,
+    "old_provider": "deepseek",
+    "new_provider": "gemini",
+    "adapter_version": "1.0.0",
+    "page_generation": 20
+  }
+}
+```
+
+---
+
+# 93. Provider State Events
+
+`AUTH_REQUIRED` and `RATE_LIMITED` are authoritative provider-state events.
+
+They MUST correspond to the session state.
+
+Diagnostics do not replace them.
+
+---
+
+# 94. Recovery State
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "recovery_state",
+  "timestamp": "2026-09-16T20:34:00.000Z",
+  "payload": {
+    "sequence": 123,
+    "state": "RECOVERING",
+    "reason": "STALE_ACTOR",
+    "attempt": 1
+  }
+}
+```
+
+Allowed recovery reasons:
+
+```text
+STALE_ACTOR
+DOM_DRIFT
+NAVIGATION_DRIFT
+ACTOR_REPLACED
+BROWSER_RESTARTED
+PROVIDER_UNAVAILABLE
+TRANSIENT_BROWSER_FAILURE
+```
+
+---
+
+# 95. Diagnostic Levels
+
+`DIAGNOSTIC.level` is closed:
+
+```text
+DEBUG
+INFO
+WARNING
+ERROR
+```
+
+---
+
+# 96. Diagnostic Codes
+
+Diagnostic codes are an open, namespaced registry.
+
+Standard codes include:
+
+```text
+SUBSCRIPTION_EXPIRED
+REPLAY_RETENTION_REDUCED
+INPUT_SELECTOR_DRIFT
+SUBMISSION_SELECTOR_DRIFT
+DOM_DRIFT
+STALE_ACTOR
+AUTH_LOST
+RATE_LIMIT_DETECTED
+RECOVERY_STARTED
+RECOVERY_RETRY
+RECOVERY_FAILED
+```
+
+Vendor-specific codes SHOULD use a vendor namespace.
+
+Example:
+
+```text
+deepseek.INPUT_SELECTOR_DRIFT
+```
+
+Unknown diagnostic codes MUST NOT invalidate a message.
+
+---
+
+# 97. Provider Adapter Contract
+
+A provider adapter MUST provide logical equivalents of:
+
+```text
+Detect
+Prepare
+GetInputState
+InjectPrompt
+VerifyPrompt
+SubmitPrompt
+VerifySubmission
+ObserveGeneration
+ReadResponse
+RequestCancel
+Recover
+Diagnose
+```
+
+---
+
+# 98. Multi-Message Adapter Semantics
+
+The adapter MUST distinguish logical response messages when provider state exposes them.
+
+Each logical response message receives:
+
+```text
+message_id
+```
+
+The adapter MUST preserve message identity across observations where provider semantics permit it.
+
+If the provider does not expose stable message identity, the adapter MAY construct deterministic gateway-local message IDs.
+
+A constructed ID MUST remain stable for the lifetime of that prompt.
+
+---
+
+# 99. Generation Observation
+
+The adapter SHOULD observe provider output using the strongest available evidence.
+
+Possible sources:
+
+* provider streaming state;
+* DOM mutation;
+* stable message containers;
+* accessibility state;
+* verified snapshot comparison.
+
+Observation mechanisms MUST NOT be allowed to produce false completion or false submission events.
+
+---
+
+# 100. Browser Security Boundary
+
+Provider page content is untrusted input.
+
+Page content MUST NOT redefine:
+
+* protocol framing;
+* authentication;
+* session identity;
+* UUID ownership;
+* state transitions;
+* authorization;
+* extension negotiation.
+
+Provider output is data.
+
+---
+
+# 101. Capability Discovery
+
+`CAPABILITIES` MUST expose actual implementation support.
+
+At minimum:
+
+```text
+protocol version
+wire version
+providers
+adapter versions
+maximum payload
+maximum prompt
+maximum outstanding commands
+response retention
+extensions
+transport security
+conformance level
+```
+
+---
+
+# 102. Capability Schema
+
+Example:
+
+```json
+{
+  "protocol": {
+    "version": "1.10",
+    "wire_version": 25
+  },
+  "limits": {
+    "max_payload_bytes": 16777216,
+    "max_prompt_bytes": 1048576,
+    "max_outstanding_commands": 64,
+    "response_retention_ms": 86400000
+  },
+  "extensions": [
+    {
+      "name": "ext-replay-store",
+      "enabled": true,
+      "parameters": {
+        "event_retention_ms": 3600000
+      }
+    }
+  ]
+}
+```
+
+---
+
+# 103. Keepalive
+
+`PING` is an ordinary command:
+
+```text
+0x0070
+```
+
+Example:
+
+```json
+{
+  "garp": "1.10",
+  "type": "ping",
+  "timestamp": "2026-09-16T20:40:00.000Z",
+  "payload": {}
+}
+```
+
+It receives:
+
+```text
+RESPONSE(success=true)
+```
+
+There is no `PONG` event.
+
+---
+
+# 104. Keepalive Timers
+
+The following defaults are normative unless overridden by an explicitly advertised implementation configuration:
+
+```text
+PING interval:        30 seconds
+PING timeout:         10 seconds
+idle connection:     120 seconds
+```
+
+`CAPABILITIES` MUST expose effective values when they differ from these defaults.
+
+A peer that fails to answer required keepalive traffic within the timeout MAY have its connection closed.
+
+---
+
+# 105. Connection State
+
+```text
+DISCONNECTED
+CONNECTING
+HELLO_SENT
+CHALLENGE_RECEIVED
+AUTH_SENT
+AUTHENTICATED
+CLOSING
+CLOSED
+```
+
+Application commands are valid only in `AUTHENTICATED`.
+
+---
+
+# 106. Flow Control
+
+Implementations MUST bound:
+
+* outstanding commands;
+* outbound event queues;
+* diagnostic buffering;
+* payload sizes.
+
+Events MUST NOT be silently discarded.
+
+The gateway MUST either:
+
+* apply backpressure;
+* or fail explicitly.
+
+---
+
+# 107. Error Registry
+
+Minimum operational error codes:
+
+```text
+INVALID_REQUEST
+INVALID_ARGUMENT
+INVALID_STATE
+INVALID_TARGET
+
+AUTH_FAILED
+AUTH_REQUIRED
+
+UNKNOWN_SESSION
+SESSION_BUSY
+SESSION_NOT_READY
+SESSION_CLOSED
+
+UNKNOWN_PROMPT
+PROMPT_EXPIRED
+PROMPT_NOT_ACTIVE
+RESPONSE_NOT_READY
+NO_RESPONSE_AVAILABLE
+
+TAB_NOT_FOUND
+TAB_NOT_ACTIVE
+
+PROVIDER_UNAVAILABLE
+PROVIDER_AUTH_REQUIRED
+PROVIDER_RATE_LIMITED
+PROVIDER_CHANGED
+
+STALE_ACTOR
+NAVIGATION_DRIFT
+DOM_DRIFT
+INPUT_NOT_FOUND
+INPUT_NOT_WRITABLE
+INPUT_VERIFICATION_FAILED
+SUBMIT_FAILED
+SUBMISSION_NOT_VERIFIED
+GENERATION_NOT_DETECTED
+
+RECOVERY_FAILED
+
+MESSAGE_TOO_LARGE
+UNKNOWN_MESSAGE_TYPE
+UNSUPPORTED_FEATURE
+UNSUPPORTED_OPERATION
+
+EVENT_HISTORY_EXPIRED
+SUBSCRIPTION_EXPIRED
+```
+
+---
+
+# 108. Retryability
+
+Each operational error includes:
+
+```text
+retryable = true | false
+```
+
+The gateway MUST evaluate retryability according to the actual operation.
+
+A retry MUST NOT be considered safe merely because the transport is available.
+
+---
+
+# 109. Session Closure and Prompt History
+
+Closing a session invalidates all retained prompt records owned by that session.
+
+Resetting a session is different:
+
+* the session UUID remains;
+* retained history MAY be retained unless explicitly cleared by reset semantics;
+* active prompt state is terminated;
+* browser/provider context is rebuilt.
+
+An implementation SHOULD document whether reset clears terminal history through `CAPABILITIES` or another explicit capability.
+
+For deterministic base behavior, reset SHOULD clear the active prompt but MAY retain completed history until normal retention expiry.
+
+---
+
+# 110. Reconnect Semantics
+
+After reconnecting, a client SHOULD:
+
+```text
+GET_SESSION
+GET_PROMPT_STATUS(target=A)
+GET_RESPONSE(target=A)
+```
+
+for the prompt it was operating on.
+
+When replay is negotiated, the client MAY additionally request missed events.
+
+Current authoritative state MUST NOT be inferred solely from the event history available after reconnect.
+
+---
+
+# 111. Gateway Process Restart
+
+The base protocol does not require sessions to survive gateway process restart.
+
+If persistent process-restart recovery is implemented, the gateway MUST preserve consistently:
+
+```text
+session UUID
+prompt request IDs
+event sequence
+prompt state
+response revisions
+```
+
+If consistency cannot be established, the gateway MUST NOT fabricate recovered history.
+
+---
+
+# 112. State Authority
+
+Authoritative state sources are ordered:
+
+```text
+current protocol state
+    >
+authoritative snapshot
+    >
+generation event
+    >
+diagnostic
+    >
+implementation log
+```
+
+A diagnostic message cannot override a session or prompt state.
+
+---
+
+# 113. Prompt-State Authority
+
+The authoritative prompt state is the retained prompt record.
+
+For an active prompt:
+
+```text
+GET_PROMPT_STATUS
+```
+
+MUST reflect the authoritative current state.
+
+Events describe transitions.
+
+They do not independently redefine the current state.
+
+---
+
+# 114. Conformance Invariants
+
+### C1 — Request identity
+
+Every command has a unique request ID.
+
+### C2 — Response correlation
+
+Every ordinary response correlates to its command request ID.
+
+### C3 — Explicit prompt targeting
+
+Existing-prompt commands require `target_request_id`.
+
+### C4 — Target session ownership
+
+A target belongs to the command session.
+
+### C5 — One active prompt
+
+A session has at most one active prompt.
+
+### C6 — Retained prompt identity
+
+Terminal prompts remain independently addressable until expiry.
+
+### C7 — Correct retrieval
+
+`GET_RESPONSE(target=A)` never returns B.
+
+### C8 — Correct cancellation
+
+`CANCEL_PROMPT(target=A)` never cancels B.
+
+### C9 — Persistent sequencing
+
+Session sequence survives reconnect.
+
+### C10 — Strict sequencing
+
+Session event sequence increments exactly by one.
+
+### C11 — Revision ordering
+
+Message revisions never decrease.
+
+### C12 — Provider state authority
+
+Authentication and rate limiting are first-class states.
+
+### C13 — Recovery distinction
+
+`RECOVERING` and `RETRYING` have distinct meanings.
+
+### C14 — Registry uniqueness
+
+Each message type has exactly one definition.
+
+### C15 — Format closure
+
+Format is one of:
+
+```text
+text
+markdown
+html
+unknown
+```
+
+### C16 — Verified submission
+
+`INPUT_SUBMITTED` requires verified submission.
+
+### C17 — Verified generation
+
+`GENERATION_STARTED` requires generation evidence.
+
+### C18 — Terminal exclusivity
+
+Exactly one terminal prompt state may be committed.
+
+### C19 — Cancellation verification
+
+`GENERATION_CANCELLED` states whether cancellation was verified.
+
+### C20 — Page-generation fencing
+
+Stale actors are never silently reused.
+
+### C21 — Diagnostic authority
+
+Diagnostics do not override authoritative state.
+
+### C22 — Replay integrity
+
+Replay never silently skips expired sequence ranges.
+
+### C23 — Capability authority
+
+Negotiated capability values are authoritative.
+
+### C24 — Header/JSON consistency
+
+Binary and JSON identity fields MUST agree.
+
+### C25 — Handshake determinism
+
+All conforming implementations use the same authentication transcript.
+
+### C26 — Message identity
+
+A logical response message has one stable `message_id` within a prompt.
+
+### C27 — Delta semantics
+
+`APPEND` and `REPLACE` have distinct, deterministic semantics.
+
+### C28 — Keepalive determinism
+
+Effective keepalive intervals are known to both peers.
+
+---
+
+# 115. Mandatory Conformance Tests
+
+## Transport
+
+The implementation MUST test:
+
+```text
+wrong magic
+wrong wire version
+wrong header length
+non-zero reserved field
+invalid payload length
+invalid JSON
+unknown message type
+unknown flag
+oversized payload
+```
+
+---
+
+# 116. Handshake Test
+
+The implementation MUST test:
+
+```text
+HELLO
+→ HELLO_CHALLENGE
+→ HELLO_AUTH
+→ HELLO_ACK
+```
+
+and independently verify the expected HMAC transcript.
+
+The test MUST verify:
+
+* u32 big-endian lengths;
+* raw nonce representation;
+* Base64URL decoding;
+* server identity fields;
+* constant-time proof verification.
+
+---
+
+# 117. Prompt Acceptance Test
+
+The implementation MUST demonstrate:
+
+```text
+PROMPT(A)
+→ RESPONSE(A, state=ACCEPTED)
+```
+
+followed by later browser lifecycle events.
+
+The initial `RESPONSE` MUST NOT claim `SUBMITTING`.
+
+---
+
+# 118. Prompt Lifecycle Test
+
+```text
+PROMPT(A)
+→ RESPONSE(A, ACCEPTED)
+→ INPUT_SUBMITTED(A)
+→ GENERATION_STARTED(A)
+→ GENERATION_DELTA(A)*
+→ GENERATION_COMPLETED(A)
+```
+
+---
+
+# 119. Prompt History Test
+
+```text
+PROMPT(A)
+→ A COMPLETED
+
+PROMPT(B)
+→ B GENERATING
+
+GET_RESPONSE(target=A)
+```
+
+MUST return A.
+
+---
+
+# 120. Multi-Message Test
+
+A provider fixture SHOULD generate:
+
+```text
+message M1
+message M2
+```
+
+for one prompt.
+
+The implementation MUST maintain distinct message IDs.
+
+The implementation MUST support:
+
+```text
+GENERATION_DELTA(M1)
+GENERATION_DELTA(M2)
+```
+
+without conflating the messages.
+
+---
+
+# 121. Delta Replacement Test
+
+A provider fixture SHOULD generate:
+
+```text
+"Hel"
+```
+
+followed by a provider rewrite:
+
+```text
+"Hello"
+```
+
+The gateway MUST be able to represent:
+
+```text
+APPEND("Hel")
+REPLACE("Hello")
+```
+
+without producing an incorrect reconstructed response.
+
+---
+
+# 122. Cancellation Test
+
+The implementation MUST test the four cancellation arbitration cases.
+
+It MUST never commit more than one terminal prompt state.
+
+---
+
+# 123. Unverified Cancellation Test
+
+The implementation MUST simulate:
+
+```text
+cancel requested
+provider stop not verified
+```
+
+and verify:
+
+```text
+cancel_verified=false
+```
+
+The session MUST NOT become `READY` while overlapping provider generation remains possible.
+
+---
+
+# 124. Authentication-State Test
+
+Provider authentication loss MUST produce:
+
+```text
+AUTH_REQUIRED
+```
+
+and an active prompt MUST terminate explicitly with:
+
+```text
+GENERATION_FAILED
+PROVIDER_AUTH_REQUIRED
+```
+
+---
+
+# 125. Rate-Limit Test
+
+Provider rate limiting MUST produce:
+
+```text
+RATE_LIMITED
+```
+
+The active prompt behavior MUST follow Section 40.
+
+The client MUST be able to distinguish rate limiting from recovery without parsing diagnostics.
+
+---
+
+# 126. Recovery Test
+
+The implementation MUST test:
+
+```text
+READY
+→ RECOVERING
+→ RETRYING
+→ RECOVERING
+→ READY
+```
+
+and:
+
+```text
+RECOVERING
+→ AUTH_REQUIRED
+```
+
+and:
+
+```text
+RECOVERING
+→ FAILED
+```
+
+where appropriate.
+
+---
+
+# 127. Reconnect Test
+
+The implementation MUST demonstrate:
+
+```text
+sequence 1
+sequence 2
+sequence 3
+
+disconnect
+
+reconnect
+
+sequence 4
+```
+
+The sequence MUST NOT restart.
+
+---
+
+# 128. Replay Test
+
+When:
+
+```text
+ext-replay-store
+```
+
+is enabled:
+
+```text
+events 1..20
+disconnect
+reconnect
+replay from 15
+```
+
+must return:
+
+```text
+15..20
+```
+
+when retained.
+
+An expired range MUST return:
+
+```text
+EVENT_HISTORY_EXPIRED
+```
+
+without silently skipping events.
+
+---
+
+# 129. Capability Retention Test
+
+The implementation MUST demonstrate:
+
+```text
+CAPABILITIES
+event_retention_ms = X
+
+retention reduced
+
+REPLAY_RETENTION_REDUCED
+
+CAPABILITIES
+event_retention_ms = Y
+```
+
+The new capability value Y is authoritative.
+
+---
+
+# 130. Session Closure Test
+
+The implementation MUST demonstrate:
+
+```text
+PROMPT(A)
+A COMPLETED
+
+CLOSE_SESSION
+
+GET_RESPONSE(target=A)
+```
+
+produces:
+
+```text
+UNKNOWN_SESSION
+```
+
+---
+
+# 131. Header Consistency Test
+
+The implementation MUST reject messages where:
+
+```text
+binary type != JSON type
+```
+
+or:
+
+```text
+binary request ID != JSON request ID
+```
+
+where JSON request ID is present.
+
+Session UUID mismatches MUST likewise be rejected.
+
+---
+
+# 132. Conformance Levels
+
+## Level 1 — Transport
+
+Requires:
+
+* framing;
+* version negotiation;
+* HMAC authentication;
+* RESPONSE;
+* ERROR;
+* PING;
+* capabilities.
+
+## Level 2 — Browser
+
+Adds:
+
+* browser status;
+* tabs;
+* sessions;
+* navigation;
+* page generation.
+
+## Level 3 — Generation
+
+Adds:
+
+* prompt creation;
+* verified input;
+* verified submission;
+* generation observation;
+* response retrieval;
+* message identities;
+* append/replace delta semantics;
+* cancellation;
+* completion;
+* failure.
+
+## Level 4 — Recovery
+
+Adds:
+
+* stale actor recovery;
+* navigation drift;
+* provider changes;
+* authentication-required handling;
+* rate-limit handling;
+* recovery states;
+* diagnostics.
+
+## Level 5 — Replay
+
+Adds:
+
+```text
+ext-replay-store
+```
+
+and reliable historical event replay.
+
+---
+
+# 133. Extension Model
+
+Future capabilities SHOULD be implemented using:
+
+```text
+optional field
+optional event
+negotiated extension
+reserved message type
+```
+
+Breaking changes to the binary frame, authentication transcript, or mandatory state semantics require a new wire version.
+
+---
+
+# 134. Reserved Extensions
+
+Possible future extensions include:
+
+```text
+ext-replay-store
+ext-compression
+ext-binary-payload
+ext-subchannels
+ext-multi-prompt
+```
+
+Only negotiated extensions have semantics.
+
+---
+
+# 135. Future Multi-Prompt Extension
+
+`ext-multi-prompt` MAY introduce concurrent prompt execution.
+
+The extension may define:
+
+* simultaneous active prompts;
+* per-prompt scheduling;
+* prompt queues;
+* independent prompt streams;
+* concurrent cancellation.
+
+The base request/target identity model remains valid.
+
+---
+
+# 136. Future Subchannel Extension
+
+`ext-subchannels` MAY add logical connection multiplexing.
+
+Subchannels are not required for base GARP/1.10.
+
+---
+
+# 137. Future Compression Extension
+
+`ext-compression` MAY define compressed payload representations.
+
+Compression MUST NOT be inferred from the extension flag alone.
+
+The extension must define the exact encoding.
+
+---
+
+# 138. Multi-Session Architecture
+
+A connection MAY contain multiple sessions.
+
+Sessions SHOULD normally correspond to independently managed browser/provider contexts.
+
+Recommended patterns include:
+
+```text
+one tab/provider context → one session
+```
+
+or:
+
+```text
+one logical conversation → one session
+```
+
+A gateway MAY choose another mapping provided session identity remains stable and deterministic.
+
+---
+
+# 139. Determinism
+
+Where multiple browser observations or automation strategies are possible, externally visible results MUST be deterministic.
+
+Examples:
+
+* selector strategy ordering;
+* capability ordering;
+* diagnostics ordering;
+* recovery strategy ordering.
+
+---
+
+# 140. Provider Adapter Strategy Ordering
+
+An adapter SHOULD attempt strategies in deterministic order, for example:
+
+```text
+semantic accessibility
+    ↓
+stable provider attributes
+    ↓
+known structural selectors
+    ↓
+fallback discovery
+```
+
+The selected strategy SHOULD be available through diagnostics.
+
+---
+
+# 141. Security Requirements
+
+A conforming gateway MUST:
+
+* authenticate peers;
+* use cryptographically strong nonces;
+* prevent replay;
+* validate all frame lengths;
+* validate JSON;
+* validate UTF-8;
+* validate UUIDs;
+* validate state transitions;
+* rate-limit authentication failures;
+* use constant-time HMAC comparison;
+* prevent diagnostic secret leakage.
+
+Secrets, cookies, access tokens, and authentication proofs MUST NOT be emitted through normal GARP diagnostics.
+
+---
+
+# 142. Browser Automation Boundary
+
+Browser content is untrusted.
+
+Provider page behavior MUST NOT be allowed to override protocol state.
+
+The gateway MUST validate automation actions before making them externally visible as successful protocol events.
+
+---
+
+# 143. Canonical Error-State Rule
+
+The protocol distinguishes:
+
+```text
+valid command, operation failed
+```
+
+from:
+
+```text
+invalid protocol message
+```
+
+The former produces:
+
+```text
+RESPONSE(success=false)
+```
+
+The latter produces:
+
+```text
+ERROR
+```
+
+This distinction MUST remain stable.
+
+---
+
+# 144. Canonical State-Snapshot Rule
+
+After reconnect, a client MUST be able to establish authoritative current state without relying on historical events.
+
+The minimum snapshot operations are:
+
+```text
+GET_SESSION
+GET_PROMPT_STATUS(target=A)
+GET_RESPONSE(target=A)
+```
+
+Replay adds historical reconstruction but does not replace these operations.
+
+---
+
+# 145. Canonical Prompt Model
+
+The base model is:
+
+```text
+Session S
+    |
+    +-- Prompt A = COMPLETED
+    |
+    +-- Prompt B = GENERATING
+```
+
+This is valid.
+
+The following is invalid:
+
+```text
+Session S
+    |
+    +-- Prompt A = GENERATING
+    |
+    +-- Prompt B = GENERATING
+```
+
+Concurrent prompts require:
+
+```text
+ext-multi-prompt
+```
+
+---
+
+# 146. Canonical Generation Model
+
+One prompt may contain multiple logical response messages:
+
+```text
+Prompt A
+    |
+    +-- Message M1
+    |      +-- revision 1
+    |      +-- revision 2
+    |
+    +-- Message M2
+           +-- revision 1
+```
+
+Prompt-level state remains:
+
+```text
+SUBMITTING
+GENERATING
+COMPLETED
+FAILED
+CANCELLED
+```
+
+Message identity does not create additional prompt identities.
+
+---
+
+# 147. Canonical Delta Model
+
+A delta is either:
+
+```text
+APPEND
+```
+
+or:
+
+```text
+REPLACE
+```
+
+`APPEND` adds new content.
+
+`REPLACE` supplies the complete new message content.
+
+This permits correct observation of browser UIs that rewrite streaming output.
+
+---
+
+# 148. Canonical Cancellation Model
+
+Cancellation is always explicitly targeted:
+
+```text
+CANCEL_PROMPT(target=A)
+```
+
+and produces a deterministic race outcome.
+
+The result must state:
+
+```text
+cancel_verified=true
+```
+
+or:
+
+```text
+cancel_verified=false
+```
+
+---
+
+# 149. Canonical Provider-State Model
+
+Provider conditions are separated:
+
+```text
+AUTH_REQUIRED
+RATE_LIMITED
+RECOVERING
+RETRYING
+FAILED
+```
+
+These states have distinct semantics.
+
+Diagnostics provide explanation.
+
+Session state provides authority.
+
+---
+
+# 150. Canonical Reconnect Model
+
+Reconnect does not recreate a session event stream.
+
+```text
+Session S
+
+sequence 100
+sequence 101
+sequence 102
+
+disconnect
+
+sequence 103
+```
+
+The session sequence remains continuous.
+
+---
+
+# 151. Canonical Extension Model
+
+The base protocol is:
+
+```text
+GARP/1.10
+```
+
+Advanced functionality is:
+
+```text
+GARP/1.10
+    +
+ext-replay-store
+    +
+ext-multi-prompt
+    +
+ext-subchannels
+    +
+ext-compression
+```
+
+Each extension is independently negotiated.
+
+---
+
+# 152. Final Canonical Rules
+
+```text
+1. Every command has request_id.
+
+2. Every response correlates to the command request_id.
+
+3. Existing-prompt operations use target_request_id.
+
+4. target_request_id belongs to the same session.
+
+5. A session has at most one active prompt.
+
+6. A session may retain multiple terminal prompts.
+
+7. PROMPT acceptance means ACCEPTED, not SUBMITTING.
+
+8. Browser submission requires verified evidence.
+
+9. Generation start requires verified generation evidence.
+
+10. Prompt identity persists through continuation.
+
+11. A prompt may contain multiple logical response messages.
+
+12. Each logical response message has a stable message_id.
+
+13. Message revisions are independent per message.
+
+14. Generation deltas use APPEND or REPLACE.
+
+15. Exactly one prompt terminal state may be committed.
+
+16. Cancellation is explicitly targeted.
+
+17. Cancellation races follow the four normative cases.
+
+18. cancel_verified accurately reports cessation verification.
+
+19. AUTH_REQUIRED is first-class state.
+
+20. RATE_LIMITED is first-class state.
+
+21. RECOVERING means active repair.
+
+22. RETRYING means retry waiting/execution.
+
+23. AUTH_REQUIRED and RATE_LIMITED must not be hidden by recovery states.
+
+24. Session sequence is persistent across reconnect.
+
+25. Sequence and revision are distinct.
+
+26. GET_SESSION, GET_PROMPT_STATUS and GET_RESPONSE are authoritative snapshots.
+
+27. Replay is optional.
+
+28. Replay never silently skips unavailable history.
+
+29. event_retention_ms is authoritative when negotiated.
+
+30. Reduced retention is surfaced through updated capabilities.
+
+31. SESSION_READY and SESSION_CHANGED have explicit schemas.
+
+32. SESSION_CHANGED reasons are closed.
+
+33. PROVIDER_CHANGED exists only at 0x0045.
+
+34. GET_SESSION exists at 0x0025.
+
+35. Response format is text/markdown/html/unknown.
+
+36. Diagnostic level is DEBUG/INFO/WARNING/ERROR.
+
+37. Diagnostic codes are open and namespaced.
+
+38. Header and JSON identity must agree.
+
+39. Session-scoped responses carry the command's session UUID.
+
+40. Handshake request UUID is shared by all handshake messages.
+
+41. Authentication transcript uses explicit u32be lengths.
+
+42. Nonces and proofs use unpadded Base64URL.
+
+43. HMAC comparison is constant-time.
+
+44. Closing a session invalidates its prompt records.
+
+45. Gateway process restart may lose state unless persistence is explicitly implemented.
+
+46. Multi-prompt remains an extension.
+
+47. Subchannels remain an extension.
+
+48. Compression remains an extension.
+
+49. Every registered message has exactly one authoritative definition.
+
+50. Protocol success is based on verified browser/provider state, not merely attempted actions.
+```
+
+---
+
+# 153. End-to-End Normal Flow
+
+```text
+CONNECT
+    ↓
+HELLO
+    ↓
+HELLO_CHALLENGE
+    ↓
+HELLO_AUTH
+    ↓
+HELLO_ACK
+    ↓
+CAPABILITIES
+    ↓
+CREATE_SESSION
+    ↓
+RESPONSE(state=PREPARING)
+    ↓
+SESSION_READY
+    ↓
+PROMPT(A)
+    ↓
+RESPONSE(state=ACCEPTED)
+    ↓
+INPUT_SUBMITTED(A)
+    ↓
+GENERATION_STARTED(A)
+    ↓
+GENERATION_DELTA(A,M1,APPEND)
+    ↓
+GENERATION_DELTA(A,M1,REPLACE)
+    ↓
+GENERATION_PROGRESS(A)
+    ↓
+GENERATION_COMPLETED(A)
+    ↓
+GET_RESPONSE(target=A)
+    ↓
+RESPONSE(A)
+```
+
+---
+
+# 154. End-to-End Cancellation Flow
+
+```text
+PROMPT(A)
+    ↓
+RESPONSE(A, ACCEPTED)
+    ↓
+INPUT_SUBMITTED(A)
+    ↓
+GENERATION_STARTED(A)
+    ↓
+CANCEL_PROMPT(target=A)
+    ↓
+RESPONSE
+    ↓
+GENERATION_CANCELLED(A)
+```
+
+with explicit:
+
+```text
+cancel_verified=true|false
+```
+
+---
+
+# 155. End-to-End Authentication Recovery
+
+```text
+GENERATION_STARTED(A)
+    ↓
+provider authentication lost
+    ↓
+AUTH_REQUIRED
+    ↓
+GENERATION_FAILED(A, PROVIDER_AUTH_REQUIRED)
+    ↓
+user authentication
+    ↓
+PREPARING
+    ↓
+SESSION_READY
+```
+
+The failed prompt does not silently resume.
+
+---
+
+# 156. End-to-End Rate-Limit Recovery
+
+```text
+GENERATION_STARTED(A)
+    ↓
+RATE_LIMITED
+```
+
+Then, depending on provider behavior:
+
+```text
+RATE_LIMITED
+    ↓
+PREPARING
+    ↓
+SESSION_READY
+```
+
+or the prompt remains active if provider semantics explicitly permit continuation.
+
+If the active operation is terminated by the provider:
+
+```text
+GENERATION_FAILED(A, PROVIDER_RATE_LIMITED)
+```
+
+---
+
+# 157. End-to-End Browser Recovery
+
+```text
+GENERATION_STARTED(A)
+    ↓
+NAVIGATION_DRIFT
+    ↓
+RECOVERING
+    ↓
+RETRYING
+    ↓
+RECOVERING
+    ↓
+READY
+```
+
+The prompt MUST either recover under the same prompt identity or fail explicitly.
+
+---
+
+# 158. End-to-End Replay Recovery
+
+```text
+events 100..120
+    ↓
+disconnect
+    ↓
+reconnect
+    ↓
+GET_SESSION
+    ↓
+GET_PROMPT_STATUS(target=A)
+    ↓
+GET_RESPONSE(target=A)
+    ↓
+replay from sequence 115
+```
+
+The replay stream uses the original sequence numbers.
+
+---
+
+# 159. Implementation Target
+
+GARP/1.10 is the implementation target.
+
+The current Firefox gateway and Delphi client SHOULD be brought into conformance with GARP/1.10 rather than preserving older protocol behavior solely for compatibility.
+
+The gateway implementation is controlled by this project and MAY be changed as necessary.
+
+Protocol design is therefore not constrained by current browser implementation details.
+
+Provider adapters, automation actors, session management, request management, and diagnostics MAY all be changed to implement the normative protocol.
+
+---
+
+# 160. Specification Status
+
+GARP/1.10 is intended to be the stable base protocol for the current gateway architecture.
+
+It combines:
+
+```text
+small base protocol
++
+explicit prompt identity
++
+bounded history
++
+verified browser execution
++
+deterministic cancellation
++
+persistent sequencing
++
+recoverable snapshots
++
+optional replay
++
+explicit provider states
++
+future extension points
+```
+
+The base protocol deliberately remains constrained.
+
+Future complexity should be introduced only when the corresponding capability is actually needed and can be specified as a deterministic extension.

@@ -1,0 +1,107 @@
+Implementation Plan: GARP Protocol Specification Version 1.20
+This plan verifies, analyzes, and incorporates all feedback points raised in Feedback 1, 2, 3, and the latest batch of 14 freeze-grade review items regarding version 1.19. We evaluate each item, confirm total agreement, ensure zero contradictions with prior architectural decisions, and outline the exact implementation strategy to author the final freeze specification: GARP/1.20 (GRISP AI RELAY PROTOCOL SPECIFICATION version 1.20.txt).
+
+Existing specifications (version 1.17.txt, version 1.18.txt, and version 1.19.txt) will remain completely untouched.
+
+Evaluation of Latest Feedback & Verification Analysis
+We have analyzed all 14 points in detail against the GARP architecture and v1.19 text. None of them conflict with our earlier conclusions or architectural invariants; in fact, they harden the specification to a true implementation-freeze standard.
+
+#	Feedback Item	Analysis & Evaluation	Agreed Verdict
+1	§6.5 vs §23 Bootstrap Limit	In v1.19, §6.5 stated effective_limit = min(advertised_max_payload_bytes, 4294967295) without acknowledging §23's 1 MiB bootstrap limit, creating an apparent contradiction where pre-auth frames might be accepted up to 4 GiB.	Agreed. §6.5 must explicitly differentiate handshake_limit = 1048576 (1 MiB) from application_limit = min(advertised_max_payload_bytes, 4294967295). Pre-auth and handshake frames are strictly bounded by handshake_limit.
+2	§22 Explicit uint32 Limits	While advertised durations are numeric strings, integer caps (max_payload_bytes, max_prompt_size, max_response_size, max_outstanding_requests, max_queued_events, max_event_history_memory_mb, max_generation_buffer_mb, max_error_details_bytes, max_diagnostic_details_bytes) lacked explicit schema type and range declarations.	Agreed. Explicitly specify JSON number type uint32 with range 0 .. 4294967295 for all integer limit attributes in §22.
+3	Overloaded SESSION_BUSY	v1.19 mapped both active prompt occupancy and reaching max_outstanding_requests to SESSION_BUSY. These represent two different resources (session-level prompt exclusivity vs connection-level request budget).	Agreed. Reserve SESSION_BUSY exclusively for session prompt exclusivity. Add OUTSTANDING_REQUEST_LIMIT to §27 for exceeding max_outstanding_requests.
+4	§42.1 PROVIDER_CHANGED Condition	Making all PROVIDER_CHANGED events during BUSY unconditionally fatal is overly aggressive for non-invalidating metadata changes.	Agreed. Refine condition: prompt fails with PROVIDER_UNAVAILABLE iff the provider change invalidates the active prompt's provider context.
+5	§42.1 Deterministic Transition	Saying "transitions through PREPARING or RECOVERING" introduced nondeterminism.	Agreed. Provide deterministic evidence rule: if provider context is known invalid but no in-flight provider operation remains 
+→
+→ BUSY -> PREPARING (via RESET_SESSION); if provider operation may still exist or state is ambiguous 
+→
+→ BUSY -> RECOVERING.
+6	§75 Recovery vs §74 Arbitration	§75 could be misconstrued as giving recovery-established completion special priority over an accepted cancellation.	Agreed. Explicitly specify that recovery evidence enters the exact same first-commit-wins terminal arbitration mechanism (§74) as ordinary completion or cancellation evidence.
+7	§76 partial = true Condition	Mandating partial = true on NAVIGATION_DRIFT is semantically invalid if navigation drift occurs during PENDING or SUBMITTING before any content is committed.	Agreed. Standardize rule: partial = true iff authoritative response content has already been committed to the prompt; partial = false otherwise. Apply consistently across navigation drift, provider failure, and recovery failure.
+8	§80 Buffer Overflow Error	In v1.19, exceeding max_generation_buffer_mb mapped to RESPONSE_TOO_LARGE, conflating protocol response limits with internal gateway buffering limits.	Agreed. Retain RESPONSE_TOO_LARGE strictly for max_response_size breaches. Introduce GENERATION_BUFFER_LIMIT for exceeding max_generation_buffer_mb.
+9	§85 & §89 Event Correlation Rule	While prompt events correctly used payload correlation, a clear universal rule was missing for asynchronous events.	Agreed. Mandate global rule: Asynchronous events MUST NOT use the originating command's request ID in the envelope (envelope.request_id = null, header.request_uuid = nil). Correlation with an originating operation MUST be carried in operation-specific payload fields (e.g. payload.prompt_request_id).
+10	§115 BROWSER_STATUS Timing	The lifecycle emission points for BROWSER_STATUS were unspecified beyond "when browser status changes".	Agreed. Explicitly specify that BROWSER_STATUS is an unsolicited connection event emitted immediately upon successful handshake/authentication completion, and thereafter whenever browser status changes.
+11	§101 Keepalive Timing	The term "outbound-idle" was ambiguous, and minimum positive constraints were missing.	Agreed. Phrase as: "when the gateway has not transmitted protocol traffic for interval_ms, it emits unsolicited PONG". Require interval_ms > 0 and idle_timeout_ms > 0 when keepalive is enabled, with interval_ms < idle_timeout_ms.
+12	§103 Capability Duplication	Repeating the entire JSON schema in §103 invited schema drift against §22.	Agreed. Reference §22 directly: the RESPONSE payload wraps the exact capabilities object from §22 with "success": true.
+13	Error Registry Count in §27	v1.19 stated 45 error codes. With the additions of OUTSTANDING_REQUEST_LIMIT and GENERATION_BUFFER_LIMIT, the registry count must be exact.	Agreed. Update the count in §27 to exactly 47 error codes, with normative mappings for all 47.
+14	UNKNOWN_MESSAGE_ID Clarification	The definition sounded ambiguous regarding whether it referred to a request ID or a message ID.	Agreed. Explicitly define: an operation (e.g. revision handling, delta processing) references a message_id that does not exist within the active or targeted prompt.
+Harmonization with Earlier Feedback Items
+All improvements agreed upon in earlier reviews are preserved and harmonized:
+
+INVALID_ENVELOPE vs INVALID_ARGUMENT:
+INVALID_ENVELOPE: Exclusively for outer envelope violations (missing envelope keys, unknown top-level envelope keys, invalid envelope structure/types).
+INVALID_ARGUMENT: For application payload violations (unknown members in closed payload objects, out-of-range integer values, string length limit breaches, or nonzero reserved header bytes).
+CONTINUATION_NOT_ALLOWED vs CONTINUATION_LIMIT_REACHED:
+CONTINUATION_NOT_ALLOWED: Continuation attempted when disabled from start (max_continuations = 0).
+CONTINUATION_LIMIT_REACHED: Continuation requested after reaching configured max_continuations > 0.
+CANCEL_PROMPT Category Error:
+Valid whenever active prompt is in a nonterminal prompt state (PENDING, SUBMITTING, GENERATING, WAITING_CONTINUATION).
+GENERATION_DELTA Mode (§61):
+Retain required mode: "APPEND" | "REPLACE".
+Explicit Closed Enums:
+RECOVERY_STATE reasons (§94): ACTOR_REPLACED, DOCUMENT_REPLACED, UNEXPECTED_URL, PROVIDER_CONTEXT_LOST, CANCELLATION_UNVERIFIED, PROVIDER_RECOVERY, INTERNAL_DESYNC.
+DIAGNOSTIC stages (§90): TRANSPORT, AUTHENTICATION, SESSION, SUBMISSION, GENERATION, CONTINUATION, CANCELLATION, RECOVERY, PROVIDER.
+RFC 8785 (JCS) Canonicalization (§9.4):
+Preserved for bounding _extensions canonical byte size.
+Multi-Actor Page-Generation Fencing (§91, §168):
+Preserved: subordinate actors require matching page_generation and valid actor_instance; top-level generation change invalidates all nested actors with STALE_ACTOR.
+Mathematically Verified Test Vectors for GARP/1.20
+All test vectors for GARP/1.20 have been pre-computed and verified:
+
+Authentication Conformance Vector (§139):
+
+Secret: 0123456789abcdef0123456789abcdef (32 raw ASCII bytes)
+Client Nonce: 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 10
+Server Nonce: 10 0F 0E 0D 0C 0B 0A 09 08 07 06 05 04 03 02 01
+Semantic Version: 1.20
+Wire Version: 0x00
+Offered Feature: !ext-pong
+Final Feature: !ext-pong
+Client Identity: GARPClient, 1.20.0
+Server Identity: GarpGateway, 1.20.0
+Client Domain: GARP/1.20/client-proof (len 22)
+Server Domain: GARP/1.20/server-proof (len 22)
+Transcript Length: exactly 165 bytes (both client and server)
+Client Proof HMAC-SHA256: 5f00b065f6bd21de32fd69ea1ace404bf50d1a8f2d95107d4ef04bb726964cee
+Client Proof Base64URL: XwCwZfa9Id4y_WnqGs5AS_UNGo8tlRB9TvBLtyaWTO4
+Server Proof HMAC-SHA256: 2d39e3eed58bbe14098183e7de02fdeba5f3b1fd0f5009be6a37117d0a6be66d
+Server Proof Base64URL: LTnj7tWLvhQJgYPn3gL966Xzsf0PUAm-ajcRfQpr5m0
+Downgrade Test Vector (§140):
+
+Transcript Length: 164 bytes
+HMAC-SHA256: 78789bd921093b734154a9cf2ff9aed761534350d095f61f34ebf944968e89b0
+Base64URL: eHib2SEJO3NBVKnPL_mu12FTQ1DQlfYfNOv5RJaOibA
+PING Canonical Test Vector (§102):
+
+JSON Envelope: {"garp":"1.20","type":"PING","request_id":"00000000-0000-0000-0000-000000000001","session_id":null,"timestamp":"2026-01-01T00:00:00.000Z","sequence":null,"payload":{}}
+Exact Length: 167 bytes (0x000000A7)
+Header Bytes: 47 41 52 50 00 00 00 30 00 00 00 A7 00 70 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+Proposed Changes
+Documentation Component
+Existing specification documents (version 1.17.txt, version 1.18.txt, and version 1.19.txt) will remain completely untouched.
+
+A brand new, full specification document will be written:
+
+[NEW] 
+GRISP AI RELAY PROTOCOL SPECIFICATION version 1.20.txt
+Complete, final freeze-grade specification for GARP/1.20.
+All 178 sections fully detailed and verified.
+Implements all 14 review improvements and prior agreed enhancements.
+Contains the 47 error codes in §27, verified test vectors in §102, §139, §140, and the exact state machines and framing.
+Verification Plan
+Automated Tests
+HMAC & Transcript Verification Script: Run compute_v20_vectors.py to confirm §139 and §140 match the generated spec byte-for-byte.
+PING Test Vector Length Script: Confirm JSON envelope in §102 serializes to 167 bytes matching 0x000000A7 and the 48-byte binary header.
+Specification Verification Suite (verify_v20_file.py):
+Check all 178 section headings sequentially.
+Verify all 47 error codes appear in §27 list and mapping.
+Verify handshake_limit = 1048576 and application_limit in §6.5 and §23.
+Verify explicit uint32 limit types in §22.
+Verify OUTSTANDING_REQUEST_LIMIT and GENERATION_BUFFER_LIMIT.
+Verify deterministic PROVIDER_CHANGED state transitions in §42.1.
+Verify partial = true iff committed content exists in §76.
+Verify global event correlation rule in §85.
+Verify BROWSER_STATUS timing in §115.
+Verify keepalive constraints in §101.
+Verify §103 referencing §22 without duplication.
+Verify file integrity: version 1.17.txt, version 1.18.txt, version 1.19.txt remain unto

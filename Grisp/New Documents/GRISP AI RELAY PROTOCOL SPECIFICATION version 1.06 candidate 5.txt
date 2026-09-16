@@ -1,0 +1,875 @@
+**GARP/1.06**
+
+## Gateway AI Runtime Protocol
+
+### Consolidated Normative Specification
+
+**Status:** Implementation-Ready  
+**Protocol Identifier:** `GARP/1.06`  
+**Wire Version:** `0x16`  
+**Previous Wire Version:** `0x15` (`GARP/1.05`)  
+**Transport:** TCP  
+**Payload:** UTF-8 JSON  
+**Default Endpoint:** `127.0.0.1:9999`
+
+---
+
+# Part I — Scope, Goals, and Architecture
+
+## 1. Purpose
+
+GARP (Gateway AI Runtime Protocol) defines an authenticated, stateful protocol between an external controller and a browser-resident AI automation gateway.
+
+GARP provides a deterministic interface for:
+
+* browser and tab management;
+* provider discovery and capability advertisement;
+* logical AI sessions;
+* browser navigation tracking;
+* provider readiness;
+* prompt injection and verification;
+* prompt submission and verification;
+* generation observation and streaming;
+* continuation;
+* cancellation;
+* provider error reporting;
+* structured diagnostics;
+* request correlation;
+* response retention and retrieval;
+* authenticated transport.
+
+GARP does **not** define:
+
+* AI semantic correctness;
+* generated-code correctness;
+* GRISP artifact acceptance;
+* compilation or runtime correctness;
+* policy acceptance;
+* model quality;
+* semantic scoring.
+
+The intended architecture is:
+
+```text
+External Controller
+       |
+       | GARP/1.06
+       v
+Firefox AI Gateway
+       |
+       v
+Provider Adapter
+       |
+       v
+Browser / Provider
+       |
+       v
+Untrusted AI Output
+       |
+       v
+GRISP / Verification Layer
+```
+
+---
+
+## 2. Trust Boundary
+
+The browser and AI provider are outside the trusted semantic core.
+
+GARP MUST treat:
+
+* browser DOM state;
+* provider UI state;
+* provider-generated text;
+* provider-generated metadata;
+* model-generated source code
+
+as observations originating from an untrusted environment.
+
+GARP transports and verifies transport-level facts.  
+It does not decide whether AI output is correct.
+
+---
+
+## 3. Architectural Model
+
+GARP/1.06 has four message roles:
+
+```text
+COMMAND
+RESPONSE
+EVENT
+PROTOCOL ERROR
+```
+
+### 3.1 Command
+A client-originated operation request.
+
+### 3.2 Response
+The universal synchronous result of an ordinary command.
+
+### 3.3 Event
+An asynchronous notification of state, progress, generation, navigation, diagnostics, or provider conditions.
+
+### 3.4 Protocol Error
+A protocol-level failure that prevents normal command processing.
+
+---
+
+## 4. Universal Command Response Rule
+
+Every ordinary command MUST have exactly one synchronous `RESPONSE`.
+
+```text
+COMMAND
+   |
+   v
+RESPONSE
+```
+
+Command-specific synchronous response message types are forbidden.
+
+Typed messages are used for asynchronous events only.
+
+---
+
+## 5. Handshake Exception
+
+The initial authentication protocol has its own state machine:
+
+```text
+HELLO
+  |
+  v
+HELLO_CHALLENGE
+  |
+  v
+HELLO_AUTH
+  |
+  v
+HELLO_ACK
+```
+
+Handshake messages are not normal command responses.  
+Ordinary command processing MUST NOT begin before authentication succeeds.
+
+---
+
+## 6. Design Principle
+
+GARP MUST distinguish:
+
+```text
+request accepted
+```
+
+from:
+
+```text
+operation executed
+```
+
+and:
+
+```text
+operation observed as successful
+```
+
+Example:
+
+```text
+PROMPT
+  |
+  +--> RESPONSE(ACCEPTED)
+  |
+  +--> INPUT_SUBMITTED
+  |
+  +--> GENERATION_STARTED
+  |
+  +--> GENERATION_COMPLETED
+```
+
+The initial `RESPONSE` establishes only gateway acceptance.
+
+---
+
+# Part II — Versioning and Compatibility
+
+## 7. Protocol Identity
+
+```text
+GARP/1.06
+```
+
+Wire version byte:
+
+```text
+0x16
+```
+
+## 8. Version Isolation
+
+The numeric registry, payload schemas, state semantics, and wire framing of GARP/1.06 form one coherent version.  
+A receiver MUST NOT mix mappings or schemas from different versions.
+
+## 9. Supported Versions
+
+`HELLO` MAY contain:
+
+```json
+{
+  "supported_versions": ["GARP/1.06", "GARP/1.05"]
+}
+```
+
+Native encoding remains `0x16`.  
+Version downgrade MUST be explicit.
+
+## 10. Version Mismatch
+
+Unsupported wire version MUST terminate protocol processing.  
+Preferred error: `UNSUPPORTED_VERSION`.
+
+---
+
+# Part III — Canonical Wire Format
+
+## 11. Frame Structure
+
+```text
+48-byte fixed header
++
+UTF-8 JSON payload
+```
+
+Frame length = `48 + payload_length`.
+
+## 12. Byte Order
+
+All integer fields in the binary header use network byte order (big-endian).  
+No platform-native struct packing is permitted.
+
+## 13. Maximum Payload
+
+```text
+16 MiB = 16,777,216 bytes
+```
+
+Maximum frame length: `16,777,264` bytes.  
+Larger payloads MUST be rejected.
+
+## 14. Fixed Header Layout
+
+| Offset | Size | Field          | Encoding          |
+|-------:|-----:|----------------|-------------------|
+| 0      | 4    | Magic          | ASCII `GARP`      |
+| 4      | 1    | Wire version   | `uint8` (`0x16`)  |
+| 5      | 1    | Flags          | `uint8`           |
+| 6      | 2    | Header length  | `uint16` BE       |
+| 8      | 4    | Payload length | `uint32` BE       |
+| 12     | 2    | Message type   | `uint16` BE       |
+| 14     | 2    | Reserved       | MUST be zero      |
+| 16     | 16   | Request ID     | UUID bytes        |
+| 32     | 16   | Session ID     | UUID bytes        |
+
+Total: 48 bytes.
+
+## 15–23. Header Field Rules
+
+- Magic MUST be `47 41 52 50` (`GARP`).
+- Wire version MUST be `0x16`.
+- Flags: all bits reserved; MUST be zero unless an explicit extension is negotiated.
+- Header length MUST be 48.
+- Payload length is the exact number of bytes following the header.
+- Message type MUST match the semantic name in the registry.
+- Request ID and Session ID in the header MUST match any corresponding JSON fields (or be the zero UUID when absent).
+- UUID binary representation MUST correspond exactly to the canonical textual form used in JSON.
+
+A mismatch between header and JSON identity fields is a protocol error (`HEADER_JSON_MISMATCH`).
+
+---
+
+# Part IV — Registry
+
+## 24. Canonical GARP/1.06 Registry
+
+Identical grouping and numeric assignments as GARP/1.05, with the same reserved blocks.
+
+(The registry table is unchanged from 1.05; all numeric identifiers remain stable.)
+
+## 25. Registry Reservation
+
+Unused identifiers in the defined ranges remain reserved.  
+Unknown reserved message types MUST NOT be reinterpreted.
+
+## 26. Removed Messages
+
+`PROMPT_ACK` and `CANCEL_ACK` remain removed.
+
+---
+
+# Part V — Message Identity Matrix
+
+## 27. Identity Rules
+
+The identity matrix from GARP/1.05 is retained and is normative.  
+All generation-related events require `request_id`, `session_id`, `message_id`, `sequence`, `page_generation`, and `timestamp`.
+
+## 28. Correlation Rule
+
+Binary header identity and JSON identity MUST be consistent.  
+Any mismatch fails closed.
+
+---
+
+# Part VI — Handshake and Authentication
+
+## 29–40. Authentication
+
+GARP/1.06 retains the mutual HMAC-SHA256 design of 1.05 with the following clarifications and hardenings:
+
+- Nonces: 32 cryptographically random bytes, encoded as 64 lowercase hex characters.
+- Transcripts remain length-prefixed and domain-separated:
+  - Client: `GARP/1.06/CLIENT-AUTH`
+  - Server: `GARP/1.06/SERVER-AUTH`
+- Constant-time comparison is mandatory.
+- Default handshake timeout: 10 seconds (configurable).
+- Failed authentication terminates the handshake; a fresh handshake with fresh nonces is required.
+- `HELLO_ACK` MUST contain a valid server proof before `authenticated` may be reported as true.
+
+Additional requirement:  
+Implementations MUST support secure storage and rotation of the shared secret.  
+Compromise of the shared secret requires immediate invalidation of all existing sessions.
+
+---
+
+# Part VII — Universal RESPONSE
+
+## 41–44. RESPONSE
+
+Unchanged in structure from 1.05.  
+`command` field uses the exact lower-case semantic name.  
+Exactly one synchronous `RESPONSE` per ordinary command.
+
+---
+
+# Part VIII — Error Protocol
+
+## 45–46. ERROR vs RESPONSE Failure
+
+`RESPONSE(success=false)` for application-level failures.  
+`ERROR` for protocol-level failures that prevent safe processing.
+
+---
+
+# Part IX — Browser and Tab Commands
+
+## 47–52. CAPABILITIES, BROWSER_STATUS, LIST_TABS, OPEN_TAB, CLOSE_TAB, SELECT_TAB
+
+Schemas and semantics retained from 1.05, with the following additions in `CAPABILITIES`:
+
+```json
+{
+  "protocol": "GARP/1.06",
+  "providers": [ /* ... */ ],
+  "limits": {
+    "max_frame_payload_bytes": 16777216,
+    "max_prompt_bytes": 1048576,
+    "max_response_bytes": 8388608,
+    "response_retention_ms": 86400000,
+    "max_outstanding_requests": 64,
+    "max_queued_events_per_request": 4096
+  },
+  "security": {
+    "auth_algorithm": "HMAC-SHA256",
+    "mutual_auth": true,
+    "secret_rotation_supported": true
+  }
+}
+```
+
+Closing a tab that has an active request returns `SESSION_BUSY` by default (force option remains optional and explicit).
+
+---
+
+# Part X — Session Commands
+
+## 53–57. CREATE_SESSION, ATTACH_SESSION, DETACH_SESSION, CLOSE_SESSION, RESET_SESSION
+
+Semantics retained.  
+`RESET_SESSION` continues to increment `page_generation` and clear transient generation state.
+
+---
+
+# Part XI — Session State Model
+
+## 58–63. States and Transitions
+
+Session, input, and generation states retained.  
+Formal transition tables from 1.05 remain normative.  
+One active prompt per session remains a hard rule (`SESSION_BUSY` on violation).
+
+---
+
+# Part XII — Readiness
+
+## 64–67. Readiness Rules
+
+Unchanged: readiness is observed state, never elapsed time.  
+`SESSION_READY` remains authoritative and may only be emitted when `input_ready = true` and `state = READY`.
+
+---
+
+# Part XIII — Page Generations and Actor Safety
+
+## 68–72. Fencing
+
+Unchanged.  
+`page_generation` is a monotonic fencing token.  
+Stale actor / stale generation results MUST be discarded or rejected with `STALE_ACTOR` / `STALE_PAGE_GENERATION`.
+
+---
+
+# Part XIV — Prompt Commands
+
+## 73–79. PROMPT, CANCEL_PROMPT, GET_PROMPT_STATUS, GET_RESPONSE, SUBSCRIBE_RESPONSE
+
+- Prompt text MUST NOT be trimmed, rewritten, or semantically mutated by the transport.
+- `SUBSCRIBE_RESPONSE` supports optional `from_sequence` for replay.
+- Subscriptions are connection-scoped.
+- Response retention default remains 24 hours (advertised in `CAPABILITIES`).
+
+---
+
+# Part XV — Input Injection
+
+## 80–86. Injection Rules
+
+Unchanged core requirements:  
+live discovery → injection → verification.  
+Controlled-framework inputs require native value setters + appropriate events.  
+Node replacement must be detected and re-queried.  
+Prompt content is never logged by default (length and optional hash only).
+
+---
+
+# Part XVI — Provider Submission
+
+## 87–91. Submission Rules
+
+Verified submission is required before `INPUT_SUBMITTED`.  
+`INPUT_SUBMITTED` MUST precede `GENERATION_STARTED`.
+
+---
+
+# Part XVII — Generation
+
+## 92–102. Generation Observation
+
+- `GENERATION_DELTA` carries explicit `mode: "DELTA" | "REPLACE"`.
+- `revision` (provider text version) is independent of `sequence` (GARP event order).
+- Revision gaps are detectable; clients SHOULD fall back to `GET_RESPONSE`.
+- Completion is based on the strategy advertised in `CAPABILITIES`.
+- `GENERATION_COMPLETED` is a transport-level terminal success only.
+
+---
+
+# Part XVIII — Continuation
+
+## 103–106. Continuation
+
+Bounded by `max_continuations` (default 8).  
+Exceeding the limit terminates with `CONTINUATION_FAILED`.
+
+---
+
+# Part XIX — Cancellation
+
+## 107–109. Cancellation Arbitration
+
+The three concrete cases from 1.05 remain normative:
+
+- Completion observed before cancellation acceptance → `COMPLETE` wins.
+- Cancellation accepted and provider stop verified → `CANCELLED` wins.
+- Cancellation accepted but provider completion observed first → `COMPLETE` wins.
+
+Exactly one authoritative terminal state per request.
+
+---
+
+# Part XX — Provider and Session Events
+
+## 110–113. NAVIGATION, PROVIDER_ERROR, AUTH_REQUIRED, RATE_LIMITED
+
+Unchanged in structure.
+
+---
+
+# Part XXI — Diagnostics
+
+## 114–122. Diagnostics
+
+Centralised, stage-aware, severity-aware.  
+Secrets, cookies, tokens, and raw prompts/responses are forbidden by default.  
+`--debug-ai-automation` levels retained.
+
+---
+
+# Part XXII — Keepalive
+
+## 123–125. PING / PONG
+
+`PING` → `RESPONSE`.  
+`PONG` remains an optional protocol event.  
+Recommended defaults: 30 s interval, 120 s idle timeout (configurable).  
+Idle timeout is not mandatory unless explicitly configured.
+
+---
+
+# Part XXIII — Concurrency and Flow Control
+
+## 126–134. Rules
+
+- Multiple outstanding requests per connection are permitted.
+- At most one active prompt per session.
+- Events for a single request have strictly increasing `sequence` (starting at 1).
+- Silent event loss is forbidden; back-pressure or explicit failure is required.
+- Buffer limits MUST be defined and SHOULD be advertised in `CAPABILITIES`.
+
+---
+
+# Part XXIV — Response Retention
+
+## 135–137. Retention
+
+Default 24 h.  
+Early eviction MUST surface `RESPONSE_EVICTED`.  
+`RESET_SESSION` may invalidate retained responses for that session.
+
+---
+
+# Part XXV — Canonical Session Snapshot
+
+## 138. Snapshot Schema
+
+Retained from 1.05 (including `last_message_text` under diagnostic policy control).
+
+---
+
+# Part XXVI — Error Taxonomy
+
+## 139–141. Error Codes
+
+The comprehensive taxonomy from 1.05 is retained and remains normative.  
+Every error carries `code`, `message`, `retryable`, and `state`.
+
+---
+
+# Part XXVII — Validation and Schema Authority
+
+## 142–146. Authority Order
+
+1. Normative prose  
+2. Normative message schemas  
+3. Identity matrix / field tables  
+4. Examples  
+
+Examples never override normative requirements.  
+Required fields must be present and correctly typed.  
+Unknown extension fields may be ignored only if they do not conflict with normative fields.
+
+---
+
+# Part XXVIII — Lifecycle Event Schemas
+
+## 147–149. SESSION_CHANGED, NAVIGATION, Generation Envelope
+
+All required identity fields from the matrix must be present.
+
+---
+
+# Part XXIX — Generation Failure Schema
+
+## 150. GENERATION_FAILED
+
+Terminal for the request.  
+Session recovery policy remains implementation-defined within the allowed state transitions.
+
+---
+
+# Part XXX — Provider Adapter Contract
+
+## 151. Required Adapter Operations (Normative Minimum)
+
+A conforming provider adapter MUST implement:
+
+```text
+discoverInput(doc) → InputHandle | null
+discoverSendControl(doc) → SendHandle | null
+discoverResponseNodes(doc) → ResponseNode[]
+isStreaming(doc) → boolean
+isAuthenticated(doc) → boolean
+isRateLimited(doc) → boolean
+inject(input, prompt) → InjectionResult
+verifyInjection(input, prompt) → boolean
+submit(input, doc) → SubmissionResult
+verifySubmission(doc) → boolean
+cancel(doc) → CancelResult
+findContinueControl(doc) → ContinueHandle | null
+inspect(doc) → ProviderSnapshot
+```
+
+## 152–154. Versioning and Isolation
+
+Every adapter MUST report `adapter_version` and `selector_strategy_version`.  
+Provider-specific selectors and logic MUST live only inside adapter implementations.
+
+---
+
+# Part XXXI — Reference Prompt Execution
+
+## 155–156. Canonical Algorithm
+
+The ordered steps from 1.05 remain normative.  
+No step may claim a later state without the required preceding verification.
+
+---
+
+# Part XXXII — Complete Successful Message Sequences
+
+## 157–159. Session and Prompt Flows
+
+Unchanged from 1.05.
+
+---
+
+# Part XXXIII — Reconnection and Connection Loss
+
+## 160–163. Policy
+
+- Connection loss does not automatically destroy logical session or request state.
+- Recommended policy: in-flight requests continue; responses remain retrievable for the retention period.
+- Subscriptions are connection-scoped and are lost on disconnect.
+- Reconnecting clients MUST perform a fresh handshake.
+- Clients discover surviving state via `GET_PROMPT_STATUS`, `GET_RESPONSE`, and `SUBSCRIBE_RESPONSE`.
+
+---
+
+# Part XXXIV — Tab and Browser Failure
+
+## 164–166. Failure Handling
+
+Unexpected tab closure or browser restart forces affected sessions into a recovery or error state and terminates active requests with a defined failure code.
+
+---
+
+# Part XXXV — Diagnostics for Automation Bugs
+
+## 167–168. Required Visibility
+
+When debug level is `VERBOSE` or `TRACE`, the implementation MUST make the listed diagnostic facts observable so that the classic failure classes (input not found / injection failed / submission failed / observation failed) can be distinguished.
+
+Diagnostics report observed facts only.
+
+---
+
+# Part XXXVI — Formal State Transition Rules
+
+## 169–171. Input and Generation Transitions
+
+The legal transition tables and the list of illegal transitions from 1.05 remain normative.
+
+---
+
+# Part XXXVII — Conformance Invariants
+
+## 172–183. Invariants
+
+All invariants from GARP/1.05 are retained and remain in force.  
+Additional invariants for 1.06:
+
+### I78
+Binary header and JSON identity fields MUST match exactly when both are present.
+
+### I79
+Provider adapters MUST implement the minimum operation set defined in section 151.
+
+### I80
+Shared-secret compromise requires immediate session invalidation.
+
+### I81
+Silent discard of request-associated events is forbidden.
+
+---
+
+# Part XXXVIII — Conformance Test Suite
+
+## 184–195. Required Tests
+
+All test categories from 1.05 are retained.  
+Additional mandatory tests for 1.06:
+
+- Header/JSON identity consistency.
+- Mutual authentication (valid and invalid server proofs).
+- Revision gap detection and client recovery via `GET_RESPONSE`.
+- Explicit `DELTA` vs `REPLACE` reassembly.
+- Adapter minimum operation contract.
+- Response eviction signalling.
+- Reconnection with surviving request state.
+
+---
+
+# Part XXXIX — Compatibility
+
+## 196–199. Version Evolution
+
+GARP/1.06 is the direct successor to GARP/1.05.  
+Numeric registry and core architecture are intentionally stable.  
+Wire version `0x16` and protocol string `GARP/1.06` identify the new coherent set of schemas and rules.
+
+---
+
+# Part XL — Implementation Responsibility
+
+## 200–206. Component Boundaries
+
+Unchanged from 1.05.  
+`GarpConnection` remains free of provider logic.  
+Provider automation lives exclusively in adapters.
+
+---
+
+# Part XLI — Canonical Firefox Prompt Algorithm
+
+## 207. Required Ordering
+
+The 20-step ordered algorithm from 1.05 remains the normative logical sequence.
+
+---
+
+# Part XLII — Canonical Response/Event Model
+
+## 208–210. Diagrams
+
+Unchanged architectural diagrams.
+
+---
+
+# Part XLIII — Security Considerations
+
+## 211. Threat Model (Normative Summary)
+
+GARP/1.06 assumes:
+
+- The TCP connection may be local or network-exposed.
+- The shared secret is the sole long-term authenticator.
+- The browser and provider are untrusted.
+- An attacker may attempt replay, identity confusion, or diagnostic leakage.
+
+## 212. Required Protections
+
+- Mutual authentication with domain-separated transcripts.
+- Fresh nonces on every handshake.
+- Constant-time proof verification.
+- No secret material in diagnostics or logs.
+- Header/JSON identity consistency checks.
+- Fail-closed behaviour on any ambiguity.
+
+## 213. Shared Secret Management
+
+Implementations MUST provide a mechanism to rotate the shared secret.  
+After rotation, all existing authenticated connections MUST be terminated and re-authenticated.
+
+## 214. Recommendations
+
+- Prefer localhost or mutually authenticated TLS for non-local deployments.
+- Treat prompt and response content as sensitive; disable raw logging by default.
+- Monitor for excessive authentication failures.
+
+---
+
+# Part XLIV — Final Normative Principles
+
+## 215–228. Core Principles
+
+All principles from GARP/1.05 remain in force.  
+Additional explicit principles for 1.06:
+
+- **Complete identity consistency** — binary and JSON identities never disagree.
+- **Minimum adapter contract** — every provider adapter implements the defined operation set.
+- **Observable diagnostics** — classic automation failure classes are distinguishable under debug.
+- **Explicit retention and eviction** — clients can rely on advertised retention or receive a clear eviction signal.
+- **Security as a first-class concern** — authentication, secret handling, and diagnostic hygiene are normative.
+
+---
+
+## 229. Canonical Registry (GARP/1.06)
+
+```text
+0x0001  HELLO
+0x0002  HELLO_CHALLENGE
+0x0003  HELLO_AUTH
+0x0004  HELLO_ACK
+0x0005  RESPONSE
+0x0006  ERROR
+
+0x0010  CAPABILITIES
+0x0011  BROWSER_STATUS
+0x0012  LIST_TABS
+0x0013  OPEN_TAB
+0x0014  CLOSE_TAB
+0x0015  SELECT_TAB
+
+0x0020  CREATE_SESSION
+0x0021  ATTACH_SESSION
+0x0022  DETACH_SESSION
+0x0023  CLOSE_SESSION
+0x0024  RESET_SESSION
+
+0x0030  PROMPT
+0x0031  CANCEL_PROMPT
+0x0032  GET_PROMPT_STATUS
+0x0033  GET_RESPONSE
+0x0034  SUBSCRIBE_RESPONSE
+
+0x0040  SESSION_READY
+0x0041  SESSION_CHANGED
+0x0042  NAVIGATION
+
+0x0050  INPUT_SUBMITTED
+0x0051  GENERATION_STARTED
+0x0052  GENERATION_DELTA
+0x0053  GENERATION_PROGRESS
+0x0054  CONTINUATION_REQUIRED
+0x0055  CONTINUATION_SUBMITTED
+0x0056  GENERATION_COMPLETED
+0x0057  GENERATION_FAILED
+
+0x0060  PROVIDER_ERROR
+0x0061  AUTH_REQUIRED
+0x0062  RATE_LIMITED
+0x0063  DIAGNOSTIC
+
+0x0070  PING
+0x0071  PONG
+```
+
+---
+
+## 230. Status
+
+GARP/1.06 is the consolidated normative successor to GARP/1.05.
+
+It preserves the clean COMMAND / RESPONSE / EVENT architecture, the verified injection/submission model, page-generation fencing, and transport-only semantics, while adding:
+
+- fully specified 48-byte framing (inherited and locked);
+- mutual authentication with domain separation;
+- rigorous identity consistency rules;
+- explicit generation reassembly (`DELTA` / `REPLACE` + revision);
+- concrete cancellation arbitration;
+- normative minimum provider adapter contract;
+- flow-control and retention guarantees;
+- a dedicated Security Considerations section;
+- expanded conformance requirements.
+
+**GARP/1.06 is the recommended implementation target.**
