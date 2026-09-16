@@ -1,0 +1,1430 @@
+# GARP/1.24 — Generation Observation Regression Notes
+
+**Scope:** `browser/components/aistarter/requests/GarpRequest.sys.mjs`, `browser/components/aistarter/requests/GarpRequestManager.sys.mjs`, and the optional synthetic stability test.
+
+**Status:** Fixed and experimentally validated against a live DeepSeek session. One internal branch remains untested by design; see §7.
+
+This document is self-contained. All source files are included verbatim with their correct Firefox source-tree paths.
+
+---
+
+## 1. Summary
+
+Between the initial GARP/1.24 working build and the current one, three distinct defects caused same-session prompt reuse to fail: a prompt could be reported as complete after a single terminal-looking observation, and a second prompt on an already-used session could re-emit the first prompt's message as part of its own response.
+
+The observed failures were:
+
+- The second prompt's terminal event carried the previous prompt's `message_id` alongside the new one, in a `payload.messages` array instead of `payload.response`.
+- The client's strict response-text assertion failed with `Actual=""` (payload-shape issue) and later `Actual="GARP"` (premature completion on a transient provider state).
+
+Both are now fixed. This document records what changed, why, and what is deliberately left untested.
+
+---
+
+## 2. Root causes
+
+### 2.1 Stale message aggregation (parent)
+
+`observe()` passed the child's full DOM response-node list to `ensureMessage()` without regard to which nodes pre-existed the current prompt. On the second prompt of a reused session, the snapshot baseline was `messageCount = 1`, but the first observation returned both the old message and the new one. The parent emitted `GENERATION_STARTED` and `GENERATION_DELTA` for the old message under the new prompt's `request_id`, then produced a `payload.messages` terminal payload containing both.
+
+**Fixed by:** slicing the child's message array against the immutable snapshot baseline:
+
+```js
+const allObserved = Array.isArray(x.messages) && x.messages.length
+    ? x.messages
+    : text.trim().length > 0
+        ? [{ message_id: x.message_id || null, text }]
+        : [];
+const observedMessages =
+    allObserved.slice(Number(r.baselineMessageCount || 0));
+```
+
+### 2.2 Premature terminal commit (parent)
+
+The completion predicate had an early-return shortcut:
+
+```js
+if (r.responseStarted && x.authoritative_completion === true &&
+    x.streaming === false && x.continuation_required !== true) {
+    await this.completeCandidate(r, s, x);
+    return;
+}
+```
+
+A single observation in which the child reported `authoritative_completion: true` committed the terminal event, bypassing the stability counter that was already present in the code.
+
+**Fixed by:** removing the shortcut. Completion now depends solely on:
+
+```js
+if (terminalCandidate && stable >= 2) {
+    await this.completeCandidate(r, s, x);
+    return;
+}
+```
+
+### 2.3 Mutable baseline (parent)
+
+`GarpRequest` had only `baselineMessageCount` and `baselineMessageText`, and `observe()` was overwriting `baselineMessageText` on every iteration. The `identified` computation compared `text` against a field that had just been assigned `text`, so two of its three clauses were always false. The field was serving as both snapshot and previous-poll state, which made the identification logic effectively degenerate.
+
+**Fixed by:** adding a genuinely mutable `lastMessageText` field alongside the immutable baseline:
+
+```js
+this.baselineMessageCount = 0;   // snapshot, immutable
+this.baselineMessageText  = "";  // snapshot, immutable
+this.lastMessageCount     = 0;   // previous-poll, mutable
+this.lastMessageText      = "";  // previous-poll, mutable
+```
+
+`runPrompt` seeds the mutable pair from the immutable pair after `CaptureSnapshot`. `observe()` updates only the mutable pair. The child receives `previous_message_text: r.lastMessageText`.
+
+### 2.4 `GENERATION_STARTED` emitted before identification (parent)
+
+The message loop emitted `GENERATION_STARTED` before checking `r.responseStarted`, so a message that had not yet been established as belonging to the current prompt could still produce a start event.
+
+**Fixed by:** gating the emission on `responseStarted`, which is set from `observedMessages.length > 0` before the loop runs.
+
+---
+
+## 3. Symptoms
+
+### 3.1 Trace signature — stale aggregation
+
+Observed in the first double-prompt run:
+
+```
+seq 13  GENERATION_STARTED  message_id=b5197823…   ← previous prompt's message
+seq 15  GENERATION_DELTA    message_id=b5197823…
+seq 16  GENERATION_STARTED  message_id=41edff56…   ← new message
+seq 19  GENERATION_COMPLETED payload.messages = [b5197823…, 41edff56…]
+```
+
+The `b5197823…` UUID had already been reported as prompt #1's completed message several seconds earlier.
+
+### 3.2 Trace signature — premature completion
+
+Same run, second prompt, iteration 2:
+
+```
+messages: [{b5197823…, "GARP/1.24 TEST OK"}, {41edff56…, "GARP"}]
+streaming: false
+done: true
+authoritative_completion: true
+```
+
+The terminal event fired on that observation, reporting `response = "GARP"` while the provider was still writing.
+
+### 3.3 Client-visible symptom
+
+The Delphi test asserted the second prompt's response text equals the first. It failed with `Actual=""` in the aggregation case (because the payload used the multi-message shape, and the client was reading `payload.response`) and would have failed with `Actual="GARP"` in the premature-completion case.
+
+Both symptoms disappeared after the fix. A subsequent double-prompt run passed every assertion.
+
+---
+
+## 4. Post-fix invariants
+
+For any single prompt, the parent now guarantees:
+
+1. **No stale message leakage.** A message that existed in the DOM before `INPUT_SUBMITTED` cannot appear in the current prompt's `GENERATION_STARTED`, `GENERATION_DELTA`, or terminal payload.
+2. **At most one `GENERATION_STARTED` per new message.** Keyed on `message_id`, emitted only after `responseStarted`.
+3. **Single-message terminal payload when applicable.** If exactly one message was produced, `payload.response` is used; `payload.messages` appears only when multiple messages were genuinely produced.
+4. **Terminal commit requires two consecutive matching observations.** Both `count` and `text` must be identical across the last two observations before completion.
+
+---
+
+## 5. Bounded risk — the stability gate is not a proof of semantic completion
+
+The two-observation stability gate protects against brief false-terminal transitions. It does not protect against a provider that reports `done = true, streaming = false` for two or more consecutive polls during a genuine mid-stream pause.
+
+No observed provider exhibits this pattern. The limitation is documented rather than defended against, because tightening the gate further would delay legitimate completions.
+
+---
+
+## 6. File inventory
+
+The following files are included verbatim in §9, §10, and §11:
+
+| Path under Firefox source tree | Purpose |
+| --- | --- |
+| `browser/components/aistarter/requests/GarpRequest.sys.mjs` | Request model; message state; snapshot |
+| `browser/components/aistarter/requests/GarpRequestManager.sys.mjs` | Observation loop; stability; terminal commit |
+| `browser/components/aistarter/tests/GarpRequestManagerStabilityTest.sys.mjs` | Synthetic regression test (optional) |
+
+The two production files are the ones that must be present for the fix. The test file is optional; §12 describes how to register it.
+
+---
+
+## 7. Untested path — the reset branch
+
+The reset branch of the stability counter is:
+
+```js
+} else {
+    stable = 0;
+    stableMessageCount = null;
+    stableText = null;
+}
+```
+
+It is exercised in the recovery case by observation 2, but the current synthetic test does not distinguish between the branch running and the branch being absent, because the text change at observation 3 forces `stable` back to `1` on its own.
+
+A stronger script that would catch the reset removal would keep `text` identical across observations 1–4:
+
+```
+obs 1: done=true,  streaming=false, text="partial"  → stable = 1
+obs 2: done=false, streaming=true,  text="partial"  → reset → stable = 0
+obs 3: done=true,  streaming=false, text="partial"  → stable = 1 (not 2)
+obs 4: done=true,  streaming=false, text="partial"  → stable = 2 → commit
+```
+
+With the reset removed, `obs 3` would match `obs 1`'s `stableText` and `stable` would reach 2 there, committing one observation early.
+
+Two options to cover this branch:
+
+- **Option A — strengthen the synthetic test.** Replace the recovery script with the identical-text variant above.
+- **Option B — extract stability into a pure function.** Move the counter logic into a standalone function with no Firefox dependencies and test it under plain Node.
+
+Until either is done, the reset branch is code-reviewed but not test-covered.
+
+---
+
+## 8. Regression baseline
+
+The reference success run is a double-prompt conformance test on a reused DeepSeek session, with the second prompt using identical text to the first. Recorded trace properties:
+
+- Event sequences `1` through `20` monotonic across both prompts on a single session.
+- `GET_SESSION` after each prompt returns `state: "READY"`.
+- `GENERATION_COMPLETED` for prompt #2 carries `payload.response` (single-message form).
+- No `GENERATION_STARTED` or `GENERATION_DELTA` for prompt #1's `message_id` appears under prompt #2's `request_id`.
+- The client's strict identical-response assertion passes.
+
+Any future regression in these properties is a reopening of this defect.
+
+---
+
+## 9. `browser/components/aistarter/requests/GarpRequest.sys.mjs`
+
+```javascript
+import { GARP_UINT64_MAX } from "../garp/GarpRegistry.sys.mjs";
+import { GarpError, GarpErrorCode } from "../garp/GarpErrors.sys.mjs";
+export const PromptState = Object.freeze({ PENDING: "PENDING", SUBMITTING: "SUBMITTING", GENERATING: "GENERATING", WAITING_CONTINUATION: "WAITING_CONTINUATION", CANCELLING: "CANCELLING", COMPLETED: "COMPLETED", FAILED: "FAILED", CANCELLED: "CANCELLED" });
+export class GarpMessageState {
+    constructor(messageId) {
+        this.messageId = messageId;
+        this.revision = 0n;
+        this.content = "";
+        this.lastObservedText = "";
+        this.hasCommittedContent = false;
+        this.started = false;
+    }
+    apply(observed) {
+        const text = String(observed ?? "");
+        if (text === this.content)
+            return null;
+        let mode = "REPLACE", delta = text;
+        if (text.startsWith(this.content)) {
+            mode = "APPEND";
+            delta = text.slice(this.content.length);
+        }
+        const next = this.revision + 1n;
+        if (next > GARP_UINT64_MAX)
+            throw new GarpError(GarpErrorCode.REVISION_GAP, "Message revision overflow");
+        this.revision = next;
+        this.content = text;
+        this.lastObservedText = text;
+        if (text.length > 0)
+            this.hasCommittedContent = true;
+        return { revision: String(next), delta, mode };
+    }
+}
+export class GarpRequest {
+    constructor(requestId, sessionId, prompt, options = {}) {
+        this.requestId = requestId;
+        this.sessionId = sessionId;
+        this.prompt = prompt;
+        this.options = Object.freeze({ ...options });
+        this.state = PromptState.PENDING;
+        this.messages = new Map();
+        this.messageOrder = [];
+        this.baselineMessageCount = 0;
+        this.baselineMessageText = "";
+        this.lastMessageCount = 0;
+        this.lastMessageText = "";
+        this.lastPageGeneration = 1n;
+        this.actorInstance = null;
+        this.provider = null;
+        this.continuationCount = 0;
+        this.maxContinuations = Number(options.max_continuations ?? 8);
+        this.promptDeadline = null;
+        this.continuationWaitDeadline = null;
+        this.startedAt = globalThis.performance?.now?.() ?? Date.now();
+        this.completedAt = null;
+        this.responseStarted = false;
+        this.partial = false;
+        this.terminalCommitted = false;
+        this.error = null;
+        this.cancelAccepted = false;
+        this.cancellationVerified = false;
+        this.providerOperationEpoch = 0;
+        this.continuationEpoch = 0;
+        this.timeoutEpoch = 0;
+        this.timeoutTimer = null;
+        this.cancelEpoch = 0;
+        this.fencingEpoch = 0;
+    }
+    get terminal() {
+        return [PromptState.COMPLETED, PromptState.FAILED, PromptState.CANCELLED].includes(this.state);
+    }
+    get contentCommitted() {
+        if (this.partial)
+            return true;
+        for (const m of this.messages.values())
+            if (m.hasCommittedContent)
+                return true;
+        return false;
+    }
+    ensureMessage(id) {
+        let m = this.messages.get(id);
+        if (!m) {
+            m = new GarpMessageState(id);
+            this.messages.set(id, m);
+            this.messageOrder.push(id);
+        }
+        return m;
+    }
+    aggregateContent() {
+        if (this.messageOrder.length === 0)
+            return "";
+        if (this.messageOrder.length === 1)
+            return this.messages.get(this.messageOrder[0]).content;
+        return this.messages.get(this.messageOrder[this.messageOrder.length - 1]).content;
+    }
+    snapshot() {
+        const first = this.messageOrder.length ? this.messages.get(this.messageOrder[0]) : null;
+        return { success: true, prompt_request_id: this.requestId, state: this.state, page_generation: String(this.lastPageGeneration), message_id: first?.messageId ?? null, revision: first ? String(first.revision) : "0", continuation_count: this.continuationCount, max_continuations: this.maxContinuations, partial: this.partial, ...(this.error ? { error: this.error } : {}) };
+    }
+}
+```
+
+---
+
+## 10. `browser/components/aistarter/requests/GarpRequestManager.sys.mjs`
+
+```javascript
+import { GarpRequest, PromptState } from "./GarpRequest.sys.mjs";
+import { GarpError, GarpErrorCode } from "../garp/GarpErrors.sys.mjs";
+import { GARP_DEFAULT_CONTINUATION_WAIT_MS, GARP_MAX_GENERATION_BUFFER_MB, GARP_MAX_RESPONSE_SIZE, } from "../garp/GarpRegistry.sys.mjs";
+import { byteLength, createOneShotTimer, delayMs, monotonicNow, uuid, } from "../garp/GarpUtil.sys.mjs";
+import { garpDebug, garpError } from "../GarpDebug.sys.mjs";
+const ACTIVE = new Set(Object.values(PromptState).filter(x => !["COMPLETED", "FAILED", "CANCELLED"].includes(x)));
+const sleep = ms => delayMs(ms);
+export class GarpRequestManager {
+    constructor(service, sessionManager) {
+        this.service = service;
+        this.sessionManager = sessionManager;
+        this.requests = new Map();
+        this.subscribers = new Map();
+    }
+    get(id) {
+        const r = this.requests.get(id);
+        if (!r)
+            throw new GarpError(GarpErrorCode.PROMPT_NOT_FOUND, `Prompt not found: ${id}`);
+        return r;
+    }
+    getForSession(sid, id) {
+        const r = this.get(id);
+        if (r.sessionId !== sid)
+            throw new GarpError(GarpErrorCode.PROMPT_NOT_FOUND, `Prompt not found in session: ${id}`);
+        return r;
+    }
+    subscribe(id, connection) {
+        let s = this.subscribers.get(id);
+        if (!s) {
+            s = new Set();
+            this.subscribers.set(id, s);
+        }
+        s.add(connection);
+        garpDebug(2, "request subscribed", { request_id: id, subscribers: s.size });
+        return this.get(id);
+    }
+    startPrompt(connection, sid, rid, prompt, options = {}) {
+        garpDebug(1, "request manager startPrompt", {
+            request_id: rid,
+            session_id: sid,
+            prompt_length: String(prompt ?? "").length,
+            options,
+        });
+        const s = this.sessionManager.get(sid);
+        s.assertIdle();
+        if (this.requests.has(rid))
+            throw new GarpError(GarpErrorCode.DUPLICATE_REQUEST, "Prompt request ID already exists");
+        const r = new GarpRequest(rid || uuid(), sid, prompt, options);
+        r.provider = s.provider;
+        r.lastPageGeneration = s.pageGeneration;
+        r.actorInstance = s.actorInstance;
+        s.reservePrompt(r.requestId);
+        this.requests.set(r.requestId, r);
+        this.subscribe(r.requestId, connection);
+        const timeout = BigInt(options.timeout_ms ?? "0");
+        if (timeout > 0n) {
+            r.promptDeadline = monotonicNow() + Number(timeout);
+            this.scheduleTimer(r, r.promptDeadline, ++r.timeoutEpoch, GarpErrorCode.PROMPT_TIMEOUT, "Prompt timeout");
+        }
+        this.runPrompt(r).catch(e => {
+            garpError("runPrompt rejected", {
+                request_id: r.requestId,
+                session_id: r.sessionId,
+                provider: r.provider,
+                state: r.state,
+                code: e?.code || null,
+                message: e?.message || String(e),
+                stack: e?.stack || null,
+            });
+            this.failCandidate(r, e?.code || GarpErrorCode.PROVIDER_ERROR, e?.message || String(e), e);
+        });
+        return r;
+    }
+    scheduleTimer(r, deadline, epoch, code, message) {
+        const delay = Math.max(0, deadline - monotonicNow());
+        if (r.timeoutTimer) {
+            try {
+                r.timeoutTimer.cancel();
+            }
+            catch (_) { }
+            r.timeoutTimer = null;
+        }
+        r.timeoutTimer = createOneShotTimer(() => {
+            r.timeoutTimer = null;
+            if (!this.requests.has(r.requestId) ||
+                r.terminalCommitted ||
+                epoch !== r.timeoutEpoch) {
+                return;
+            }
+            if (monotonicNow() + 1 < deadline) {
+                this.scheduleTimer(r, deadline, epoch, code, message);
+                return;
+            }
+            this.failCandidate(r, code, message);
+        }, Math.min(delay + 10, 0x7fffffff));
+    }
+    _emitNow(r, s, type, payload) {
+        if (r.terminalCommitted && !type.startsWith("GENERATION_"))
+            return null;
+
+        const e = this.service.commitSessionEvent(
+            s,
+            type,
+            payload,
+            { broadcast: false }
+        );
+
+        const subscribers = this.subscribers.get(r.requestId) || new Set();
+
+        garpDebug(1, "request event committed", {
+            request_id: r.requestId,
+            session_id: s.sessionId,
+            provider: r.provider,
+            type,
+            sequence: e.sequence,
+            subscribers: subscribers.size,
+        });
+
+        for (const c of subscribers) {
+            if (!c.authenticated)
+                continue;
+
+            const sent = c.sendEnvelope(e, false);
+            garpDebug(2, "request event sent", {
+                request_id: r.requestId,
+                session_id: s.sessionId,
+                type,
+                sequence: e.sequence,
+                sent,
+                connection_closed: !!c.closed,
+            });
+        }
+
+        return e;
+    }
+
+    async emit(r, type, payload) {
+        const s = this.sessionManager.get(r.sessionId);
+        garpDebug(1, "request event queued", {
+            request_id: r.requestId,
+            session_id: s.sessionId,
+            provider: r.provider,
+            type,
+            state: r.state,
+            payload,
+        });
+        return s.enqueue(`event:${type}`, () =>
+            this._emitNow(r, s, type, payload)
+        );
+    }
+    async waitForReady(s, r) {
+        const deadline = monotonicNow() + Number(r.options.ready_timeout_ms ?? r.options.timeout_ms ?? 30000);
+        let attempt = 0;
+        garpDebug(1, "prompt readiness wait begin", {
+            request_id: r.requestId,
+            session_id: s.sessionId,
+            provider: s.provider,
+            state: s.state,
+        });
+        while (monotonicNow() < deadline) {
+            attempt++;
+            if (r.terminalCommitted)
+                return false;
+            if (r.cancelAccepted)
+                throw new GarpError(GarpErrorCode.PROMPT_CANCELLED, "Prompt cancelled during preparation");
+            try {
+                const x = await this.service.callChild(s, "InspectReady", { provider: s.provider, prompt_request_id: r.requestId });
+                garpDebug(2, "InspectReady result", {
+                    request_id: r.requestId,
+                    session_id: s.sessionId,
+                    attempt,
+                    result: x,
+                });
+                if (x.error)
+                    throw this.errorFromChild(x);
+                if (x.authenticated === false || x.state === "AUTH_REQUIRED")
+                    throw new GarpError(GarpErrorCode.PROVIDER_AUTH_REQUIRED, "Provider authentication required");
+                if (x.rate_limited || x.state === "RATE_LIMITED")
+                    throw new GarpError(GarpErrorCode.PROVIDER_RATE_LIMITED, "Provider rate limited");
+                s.inputState = x.input_state || (x.input_ready ? "READY" : "NOT_READY");
+                if (x.input_ready) {
+                    if (s.state === "PREPARING" || s.state === "RETRYING")
+                        s.transition("READY");
+                    garpDebug(1, "prompt readiness confirmed", {
+                        request_id: r.requestId,
+                        session_id: s.sessionId,
+                        attempt,
+                        input_state: s.inputState,
+                        page_generation: String(s.pageGeneration),
+                    });
+                    return true;
+                }
+            }
+            catch (e) {
+                garpDebug(2, "InspectReady exception", {
+                    request_id: r.requestId,
+                    session_id: s.sessionId,
+                    attempt,
+                    code: e?.code || null,
+                    message: e?.message || String(e),
+                });
+                if (![GarpErrorCode.STALE_ACTOR, GarpErrorCode.NAVIGATION_DRIFT, GarpErrorCode.TAB_UNAVAILABLE].includes(e?.code))
+                    throw e;
+            }
+            await sleep(250);
+        }
+        throw new GarpError(GarpErrorCode.PROMPT_TIMEOUT, "Provider input did not become ready before timeout");
+    }
+    async runPrompt(r) {
+        const s = this.sessionManager.get(r.sessionId);
+        garpDebug(1, "runPrompt begin", {
+            request_id: r.requestId,
+            session_id: r.sessionId,
+            provider: s.provider,
+            session_state: s.state,
+            page_generation: String(s.pageGeneration),
+            prompt_length: r.prompt.length,
+        });
+        garpDebug(2, "runPrompt waiting for ready", {
+            request_id: r.requestId,
+            session_id: r.sessionId,
+            state: s.state,
+        });
+        await this.waitForReady(s, r);
+        garpDebug(1, "runPrompt ready", {
+            request_id: r.requestId,
+            session_id: r.sessionId,
+            state: s.state,
+            input_state: s.inputState,
+            page_generation: String(s.pageGeneration),
+        });
+        if (r.terminalCommitted)
+            return;
+        r.state = PromptState.SUBMITTING;
+        garpDebug(2, "CaptureSnapshot begin", {
+            request_id: r.requestId,
+            session_id: r.sessionId,
+        });
+        const snap = await this.service.callChild(s, "CaptureSnapshot", { provider: s.provider, prompt_request_id: r.requestId });
+        garpDebug(1, "CaptureSnapshot result", {
+            request_id: r.requestId,
+            session_id: r.sessionId,
+            snapshot: snap,
+        });
+        if (snap.error)
+            throw this.errorFromChild(snap);
+        r.baselineMessageCount = Number(snap.last_message_count || 0);
+        r.baselineMessageText = String(snap.last_message_text || "");
+        r.lastMessageCount = r.baselineMessageCount;
+        r.lastMessageText = r.baselineMessageText;
+        r.lastPageGeneration = s.pageGeneration;
+        r.actorInstance = s.actorInstance;
+        garpDebug(1, "InjectPrompt begin", {
+            request_id: r.requestId,
+            session_id: r.sessionId,
+            provider: s.provider,
+            prompt_length: r.prompt.length,
+            force_focus: !!r.options.force_focus,
+            simulate_enter: !!r.options.simulate_enter,
+        });
+        const inj = await this.service.callChild(s, "InjectPrompt", { provider: s.provider, prompt: r.prompt, forceFocus: !!r.options.force_focus, simulateEnter: !!r.options.simulate_enter, prompt_request_id: r.requestId });
+        garpDebug(1, "InjectPrompt result", {
+            request_id: r.requestId,
+            session_id: r.sessionId,
+            result: inj,
+        });
+        if (inj.error)
+            throw this.errorFromChild(inj);
+        if (!inj.provider_submission_verified)
+            throw new GarpError(GarpErrorCode.SUBMISSION_FAILED, "Provider submission was not positively verified");
+        await this.emit(r, "INPUT_SUBMITTED", { prompt_request_id: r.requestId, page_generation: String(s.pageGeneration), strategy: inj.strategy || "provider_native_send" });
+        if (r.cancelAccepted) {
+            this.startCancellationResolution(r, s);
+            return;
+        }
+        garpDebug(1, "starting generation observation", {
+            request_id: r.requestId,
+            session_id: r.sessionId,
+            page_generation: String(s.pageGeneration),
+        });
+        this.observe(r).catch(e => {
+            garpError("observe rejected", {
+                request_id: r.requestId,
+                session_id: r.sessionId,
+                code: e?.code || null,
+                message: e?.message || String(e),
+                stack: e?.stack || null,
+            });
+            this.failCandidate(r, e?.code || GarpErrorCode.PROVIDER_ERROR, e?.message || String(e), e);
+        });
+    }
+    async observe(r) {
+        const s = this.sessionManager.get(r.sessionId);
+        let stable = 0;
+        let stableMessageCount = null;
+        let stableText = null;
+        let iteration = 0;
+        garpDebug(1, "generation observation begin", {
+            request_id: r.requestId,
+            session_id: r.sessionId,
+            provider: s.provider,
+            page_generation: String(s.pageGeneration),
+        });
+        for (;;) {
+            iteration++;
+            if (r.terminalCommitted)
+                return;
+            if (r.state === PromptState.CANCELLING) {
+                await this.resolveCancellationStep(r, s);
+                return;
+            }
+            if (r.promptDeadline !== null && monotonicNow() >= r.promptDeadline) {
+                await this.failCandidate(r, GarpErrorCode.PROMPT_TIMEOUT, "Prompt timeout");
+                return;
+            }
+            let x;
+            try {
+                garpDebug(2, "ObserveGeneration call", {
+                    request_id: r.requestId,
+                    session_id: r.sessionId,
+                    iteration,
+                    previous_message_count: r.lastMessageCount,
+                    previous_text_length: r.lastMessageText.length,
+                });
+                x = await this.service.callChild(s, "ObserveGeneration", { provider: s.provider, previous_message_count: r.lastMessageCount, previous_message_text: r.lastMessageText, prompt_request_id: r.requestId });
+                garpDebug(2, "ObserveGeneration result", {
+                    request_id: r.requestId,
+                    session_id: r.sessionId,
+                    iteration,
+                    result: x,
+                });
+            }
+            catch (e) {
+                if ([GarpErrorCode.STALE_ACTOR, GarpErrorCode.NAVIGATION_DRIFT].includes(e?.code)) {
+                    await this.handleNavigationDrift(r, s, e);
+                    return;
+                }
+                throw e;
+            }
+            if (x.error) {
+                garpDebug(1, "ObserveGeneration provider error", {
+                    request_id: r.requestId,
+                    session_id: r.sessionId,
+                    iteration,
+                    code: x.code || null,
+                    error: x.error,
+                });
+                const code = x.code || GarpErrorCode.PROVIDER_ERROR;
+                if (code === GarpErrorCode.PROVIDER_AUTH_REQUIRED)
+                    await this.service.commitSessionEvent(s, "PROVIDER_AUTH_REQUIRED", { provider: s.provider, reason: "LOGIN_REQUIRED", page_generation: String(s.pageGeneration) });
+                else if (code === GarpErrorCode.PROVIDER_RATE_LIMITED)
+                    await this.service.commitSessionEvent(s, "PROVIDER_RATE_LIMITED", { provider: s.provider, retry_after_ms: "0", page_generation: String(s.pageGeneration) });
+                else
+                    await this.service.commitSessionEvent(s, "PROVIDER_ERROR", { provider: s.provider, code, message: x.error || "Provider error", retryable: !!x.retryable, prompt_request_id: r.requestId, page_generation: String(s.pageGeneration) });
+                await this.failCandidate(r, code, x.error);
+                return;
+            }
+            garpDebug(1, "ObserveGeneration state", {
+                request_id: r.requestId,
+                session_id: s.sessionId,
+                iteration,
+                message_count: x.message_count ?? 0,
+                message_changed: !!x.message_changed,
+                streaming: !!x.streaming,
+                done: !!x.done,
+                continuation_required: !!x.continuation_required,
+                authoritative_generation_started: !!x.authoritative_generation_started,
+                authoritative_completion: !!x.authoritative_completion,
+                page_url: x.page_url || "",
+            });
+            const count = Number(x.message_count || 0);
+            const text = String(x.text ?? "");
+            const allObserved = Array.isArray(x.messages) && x.messages.length
+                ? x.messages
+                : text.trim().length > 0
+                    ? [{ message_id: x.message_id || null, text }]
+                    : [];
+            const observedMessages =
+                allObserved.slice(Number(r.baselineMessageCount || 0));
+
+            r.lastPageGeneration = s.pageGeneration;
+            r.actorInstance = s.actorInstance;
+
+            if (!r.responseStarted && observedMessages.length > 0) {
+                r.responseStarted = true;
+                r.state = PromptState.GENERATING;
+            }
+
+            for (const observed of observedMessages) {
+                if (!r.responseStarted)
+                    continue;
+
+                const mid = observed.message_id || r.messageOrder[0] || uuid();
+                const observedText = String(observed.text ?? "");
+                const m = r.ensureMessage(mid);
+                if (!m.started) {
+                    m.started = true;
+                    await this.emit(r, "GENERATION_STARTED", { prompt_request_id: r.requestId, message_id: mid, revision: "0", page_generation: String(s.pageGeneration) });
+                }
+                const delta = m.apply(observedText);
+                if (delta) {
+                    if (byteLength(m.content) > GARP_MAX_RESPONSE_SIZE) {
+                        await this.failCandidate(r, GarpErrorCode.RESPONSE_TOO_LARGE, "Response exceeds max_response_size");
+                        return;
+                    }
+                    if (byteLength(observedText) > GARP_MAX_GENERATION_BUFFER_MB * 1024 * 1024) {
+                        await this.failCandidate(r, GarpErrorCode.GENERATION_BUFFER_LIMIT, "Generation buffer limit exceeded");
+                        return;
+                    }
+                    r.partial = true;
+                    stable = 0;
+                    await this.emit(r, "GENERATION_DELTA", { prompt_request_id: r.requestId, message_id: m.messageId, revision: delta.revision, delta: delta.delta, mode: delta.mode, page_generation: String(s.pageGeneration) });
+                }
+            }
+            const terminalCandidate = r.responseStarted && x.done === true && x.streaming === false && x.continuation_required !== true && count > 0 && text.trim().length > 0;
+            if (terminalCandidate) {
+                if (stableMessageCount === count && stableText === text) {
+                    stable++;
+                } else {
+                    stableMessageCount = count;
+                    stableText = text;
+                    stable = 1;
+                }
+            } else {
+                stable = 0;
+                stableMessageCount = null;
+                stableText = null;
+            }
+            await this.emit(r, "GENERATION_PROGRESS", { prompt_request_id: r.requestId, message_count: count, page_generation: String(s.pageGeneration) });
+
+            r.lastMessageCount = count;
+            r.lastMessageText = text;
+
+            if (x.continuation_required) {
+                await this.handleContinuationRequired(r, s, x);
+                return;
+            }
+            if (terminalCandidate && stable >= 2) {
+                await this.completeCandidate(r, s, x);
+                return;
+            }
+            await sleep(500);
+        }
+    }
+    async handleContinuationRequired(r, s, x) {
+        if (r.cancelAccepted) {
+            this.startCancellationResolution(r, s);
+            return;
+        }
+        if (r.maxContinuations === 0) {
+            await this.failCandidate(r, GarpErrorCode.CONTINUATION_NOT_ALLOWED, "Continuation is disabled");
+            return;
+        }
+        if (r.continuationCount >= r.maxContinuations) {
+            await this.failCandidate(r, GarpErrorCode.CONTINUATION_LIMIT_REACHED, "Continuation limit reached");
+            return;
+        }
+        if (x.continuation_supported === false && !x.continuation_available) {
+            await this.failCandidate(r, GarpErrorCode.CONTINUATION_NOT_AVAILABLE, "Continuation unavailable");
+            return;
+        }
+        r.state = PromptState.WAITING_CONTINUATION;
+        r.continuationWaitDeadline = monotonicNow() + Number(GARP_DEFAULT_CONTINUATION_WAIT_MS);
+        const epoch = ++r.timeoutEpoch;
+        await this.emit(r, "CONTINUATION_REQUIRED", { prompt_request_id: r.requestId, continuation_count: r.continuationCount, max_continuations: r.maxContinuations, page_generation: String(s.pageGeneration) });
+        this.scheduleTimer(r, r.continuationWaitDeadline, epoch, GarpErrorCode.CONTINUATION_TIMEOUT, "Continuation timeout");
+        if (r.options.auto_continue === true)
+            this.autoContinue(r, s);
+    }
+    async autoContinue(r, s) {
+        try {
+            const reserved = await this.reserveContinuation(r, s, "auto");
+            if (reserved)
+                await this.runContinuation(r, s, reserved.epoch);
+        }
+        catch (_) { }
+    }
+    async reserveContinuation(r, s, source) {
+        return s.enqueue(`continue:${source}`, () => {
+            if (r.terminalCommitted || r.state !== PromptState.WAITING_CONTINUATION)
+                return source === "auto" ? null : Promise.reject(new GarpError(GarpErrorCode.PROMPT_NOT_ACTIVE, "Prompt is not waiting for continuation"));
+            if (r.continuationCount >= r.maxContinuations)
+                throw new GarpError(GarpErrorCode.CONTINUATION_LIMIT_REACHED, "Continuation limit reached");
+            const epoch = ++r.continuationEpoch;
+            r.state = PromptState.SUBMITTING;
+            return { epoch };
+        });
+    }
+    async continuePrompt(connection, sid, pid) {
+        const s = this.sessionManager.get(sid), r = this.getForSession(sid, pid);
+        if (r.terminal)
+            throw new GarpError(GarpErrorCode.PROMPT_ALREADY_TERMINAL, "Prompt is terminal");
+        if (r.state !== PromptState.WAITING_CONTINUATION)
+            throw new GarpError(GarpErrorCode.PROMPT_NOT_ACTIVE, "Prompt is not waiting for continuation");
+        if (s.ownerConnection && s.ownerConnection !== connection)
+            throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "Connection does not own session");
+        const reserved = await this.reserveContinuation(r, s, "explicit");
+        if (!reserved)
+            throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "Continuation reservation lost");
+        this.runContinuation(r, s, reserved.epoch).catch(e => this.failCandidate(r, e?.code || GarpErrorCode.PROVIDER_ERROR, e?.message || String(e), e));
+    }
+    async runContinuation(r, s, epoch) {
+        const result = await this.service.callChild(s, "ContinueGeneration", { provider: s.provider, prompt_request_id: r.requestId, continuation_epoch: epoch, reason: "provider_length_limit" });
+        if (r.cancelAccepted || r.terminalCommitted || epoch !== r.continuationEpoch)
+            return;
+        if (result.error)
+            throw this.errorFromChild(result);
+        if (!result.provider_submission_verified)
+            throw new GarpError(GarpErrorCode.SUBMISSION_FAILED, "Continuation submission was not positively verified");
+        r.continuationCount++;
+        r.state = PromptState.GENERATING;
+        await this.emit(r, "CONTINUATION_SUBMITTED", { prompt_request_id: r.requestId, page_generation: String(s.pageGeneration), continuation_count: r.continuationCount, strategy: result.strategy || "provider_native_send" });
+        this.observe(r).catch(e => this.failCandidate(r, e?.code || GarpErrorCode.PROVIDER_ERROR, e?.message || String(e), e));
+    }
+    async cancel(connection, sid, pid) {
+        const s = this.sessionManager.get(sid), r = this.getForSession(sid, pid);
+        if (s.ownerConnection && s.ownerConnection !== connection)
+            throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "Connection does not own session");
+        if (r.terminal)
+            throw new GarpError(GarpErrorCode.PROMPT_ALREADY_TERMINAL, "Prompt is terminal");
+        if (r.state === PromptState.CANCELLING)
+            throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, "Cancellation already in progress");
+        if (!ACTIVE.has(r.state))
+            throw new GarpError(GarpErrorCode.INVALID_MESSAGE_STATE, `Cannot cancel from ${r.state}`);
+        r.cancelAccepted = true;
+        r.state = PromptState.CANCELLING;
+        r.cancelEpoch++;
+        r.continuationEpoch++;
+        await s.enqueue("cancel-accept", () => {
+            if (s.state === "BUSY")
+                s.transition("RECOVERING");
+        });
+        this.startCancellationResolution(r, s);
+        return r;
+    }
+    startCancellationResolution(r, s) {
+        this.resolveCancellationStep(r, s).catch(e => this.failCandidate(r, GarpErrorCode.RECOVERY_FAILED, e.message, e));
+    }
+    async resolveCancellationStep(r, s) {
+        const deadline = monotonicNow() + 300000;
+        let issued = false;
+        const epoch = r.cancelEpoch;
+        while (monotonicNow() < deadline && !r.terminalCommitted && epoch === r.cancelEpoch) {
+            try {
+                if (!issued) {
+                    issued = true;
+                    const opEpoch = r.providerOperationEpoch + 1;
+                    r.providerOperationEpoch = opEpoch;
+                    await this.service.callChild(s, "CancelGeneration", { provider: s.provider, prompt_request_id: r.requestId, provider_operation_epoch: opEpoch });
+                }
+                const state = await this.service.callChild(s, "InspectProviderState", { provider: s.provider, prompt_request_id: r.requestId, previous_message_count: r.lastMessageCount, previous_message_text: r.lastMessageText, provider_operation_epoch: r.providerOperationEpoch });
+                if (state.streaming === false && state.authoritative_cessation === true) {
+                    r.cancellationVerified = true;
+                    await this.cancelCandidate(r, s);
+                    return;
+                }
+                if (state.streaming === false && state.authoritative_completion === true && r.responseStarted) {
+                    await this.completeCandidate(r, s, state);
+                    return;
+                }
+            }
+            catch (e) {
+                if (![GarpErrorCode.STALE_ACTOR, GarpErrorCode.NAVIGATION_DRIFT, GarpErrorCode.TAB_UNAVAILABLE].includes(e?.code) && e?.code !== GarpErrorCode.PROVIDER_ERROR) { }
+            }
+            await sleep(250);
+        }
+        if (!r.terminalCommitted)
+            await this.failCandidate(r, GarpErrorCode.RECOVERY_FAILED, "Cancellation state could not be authoritatively established");
+    }
+    currentFencing(r, s) {
+        return { session_id: s.sessionId, provider: s.provider, prompt_request_id: r.requestId, page_generation: s.pageGeneration, actor_instance: s.actorInstance, message_id: r.messageOrder[0] || null, fencing_epoch: r.fencingEpoch };
+    }
+    async completeCandidate(r, s, result) {
+        return s.enqueue("terminal-completed", () => this.commitTerminalCandidate({ kind: "COMPLETED", request: r, session: s, fencing: this.currentFencing(r, s), result }));
+    }
+    async cancelCandidate(r, s) {
+        return s.enqueue("terminal-cancelled", () => this.commitTerminalCandidate({ kind: "CANCELLED", request: r, session: s, fencing: this.currentFencing(r, s) }));
+    }
+    failCandidate(r, code, message, error = null) {
+        const s = this.sessionManager.sessions.get(r.sessionId);
+        if (!s || r.terminalCommitted)
+            return Promise.resolve(false);
+        garpError("prompt failure candidate", {
+            request_id: r.requestId,
+            session_id: r.sessionId,
+            provider: r.provider,
+            state: r.state,
+            code,
+            message,
+            partial: r.contentCommitted,
+            stack: error?.stack || null,
+        });
+        const c = { kind: "FAILED", request: r, session: s, fencing: this.currentFencing(r, s), code, message, partial: r.contentCommitted };
+        return s.enqueue(`terminal-failed:${code}`, () => this.commitTerminalCandidate(c));
+    }
+    async commitTerminalCandidate(c) {
+        const r = c.request, s = c.session;
+        garpDebug(1, "terminal candidate", {
+            request_id: r.requestId,
+            session_id: s.sessionId,
+            kind: c.kind,
+            state: r.state,
+            code: c.code || null,
+        });
+        if (r.terminalCommitted || s.activeRequestId !== r.requestId)
+            return false;
+        if (c.fencing.provider !== s.provider || c.fencing.prompt_request_id !== r.requestId)
+            return false;
+        if (c.kind !== "FAILED" && (!c.fencing.actor_instance || c.fencing.actor_instance !== s.actorInstance || c.fencing.page_generation !== s.pageGeneration))
+            return false;
+        if (r.timeoutTimer) {
+            try {
+                r.timeoutTimer.cancel();
+            }
+            catch (_) { }
+            r.timeoutTimer = null;
+        }
+        r.terminalCommitted = true;
+        r.completedAt = monotonicNow();
+        r.partial = r.partial || r.contentCommitted || !!c.partial;
+        const messages = r.messageOrder.map(id => { const m = r.messages.get(id); return { message_id: m.messageId, revision: String(m.revision), response: m.content }; });
+        if (c.kind === "COMPLETED") {
+            r.state = PromptState.COMPLETED;
+            s.clearActivePrompt();
+            s.lastMessageId = r.messageOrder[0] || null;
+            s.lastMessageText = r.aggregateContent();
+            s.lastMessageCount = Math.max(s.lastMessageCount, r.lastMessageCount);
+            const payload = messages.length === 1 ? { prompt_request_id: r.requestId, message_id: messages[0].message_id, revision: messages[0].revision, response: messages[0].response, page_generation: String(s.pageGeneration) } : { prompt_request_id: r.requestId, messages, page_generation: String(s.pageGeneration) };
+            this._emitNow(r, s, "GENERATION_COMPLETED", payload);
+        }
+        else if (c.kind === "CANCELLED") {
+            r.state = PromptState.CANCELLED;
+            s.clearActivePrompt();
+            const payload = messages.length === 1 ? { prompt_request_id: r.requestId, message_id: messages[0].message_id, revision: messages[0].revision, cancel_verified: true, partial: r.partial, response: messages[0].response, page_generation: String(s.pageGeneration) } : { prompt_request_id: r.requestId, cancel_verified: true, partial: r.partial, messages, page_generation: String(s.pageGeneration) };
+            this._emitNow(r, s, "GENERATION_CANCELLED", payload);
+        }
+        else {
+            r.state = PromptState.FAILED;
+            r.error = { code: c.code, message: c.message };
+            s.activeRequestId = null;
+            s.generationState = "IDLE";
+            if (c.code === GarpErrorCode.PROVIDER_AUTH_REQUIRED)
+                s.state = "AUTH_REQUIRED";
+            else if (c.code === GarpErrorCode.PROVIDER_RATE_LIMITED)
+                s.state = "RATE_LIMITED";
+            else if ([GarpErrorCode.NAVIGATION_DRIFT, GarpErrorCode.PROVIDER_UNAVAILABLE, GarpErrorCode.RESPONSE_TOO_LARGE, GarpErrorCode.GENERATION_BUFFER_LIMIT, GarpErrorCode.RECOVERY_FAILED].includes(c.code))
+                s.state = "RECOVERING";
+            else if (c.code === GarpErrorCode.EVENT_QUEUE_OVERFLOW)
+                s.state = "FAILED";
+            else
+                s.state = s.state === "CLOSED" ? "CLOSED" : "READY";
+            const payload = messages.length === 1 ? { prompt_request_id: r.requestId, error: r.error, partial: r.partial, response: messages[0].response || null, page_generation: String(s.pageGeneration) } : { prompt_request_id: r.requestId, error: r.error, partial: r.partial, messages, page_generation: String(s.pageGeneration) };
+            this._emitNow(r, s, "GENERATION_FAILED", payload);
+        }
+        return true;
+    }
+    async handleNavigationDrift(r, s, error) {
+        if (r.terminalCommitted)
+            return;
+        s.state = "RECOVERING";
+        await this.emit(r, "NAVIGATION_DRIFT", { page_generation: String(s.pageGeneration), reason: error?.reason || "DOCUMENT_REPLACED" });
+        await this.failCandidate(r, GarpErrorCode.NAVIGATION_DRIFT, "Navigation drift invalidated active prompt");
+        this.service.recoverSession(s, "DOCUMENT_REPLACED").catch(() => { });
+    }
+    async abortForSessionReset(s, reason) {
+        const id = s.activeRequestId;
+        if (!id)
+            return;
+        const r = this.requests.get(id);
+        if (!r || r.terminalCommitted)
+            return;
+        await this.failCandidate(r, GarpErrorCode.RECOVERY_FAILED, reason === "SESSION_CLOSE" ? "Session closed while prompt was active" : "Prompt invalidated by RESET_SESSION");
+        this.service.callChild(s, "CancelGeneration", { provider: s.provider, prompt_request_id: id }).catch(() => { });
+    }
+    unsubscribeConnection(connection) {
+        let removed = 0;
+        for (const [requestId, subscribers] of this.subscribers) {
+            if (subscribers.delete(connection))
+                removed++;
+            if (subscribers.size === 0)
+                this.subscribers.delete(requestId);
+        }
+        garpDebug(1, "connection unsubscribed from requests", {
+            removed,
+            remaining_request_subscriptions: this.subscribers.size,
+        });
+        return removed;
+    }
+    errorFromChild(result) {
+        return new GarpError(result.code || GarpErrorCode.PROVIDER_ERROR, result.error || "Provider operation failed", { retryable: !!result.retryable });
+    }
+    getResponse(r) {
+        if (!r.terminal)
+            throw new GarpError(GarpErrorCode.RESPONSE_NOT_READY, "The response is not terminally available");
+        if (r.messageOrder.length === 1)
+            return { success: true, state: r.state, partial: r.partial, response: r.messages.get(r.messageOrder[0]).content || null, ...(r.state === "FAILED" ? { error: r.error } : {}) };
+        return { success: true, state: r.state, partial: r.partial, messages: r.messageOrder.map(id => { const m = r.messages.get(id); return { message_id: m.messageId, revision: String(m.revision), response: m.content }; }), ...(r.state === "FAILED" ? { error: r.error } : {}) };
+    }
+    prune(retentionMs) {
+        const n = monotonicNow();
+        for (const [id, r] of this.requests)
+            if (r.terminalCommitted && r.completedAt !== null && n - r.completedAt > retentionMs) {
+                this.requests.delete(id);
+                this.subscribers.delete(id);
+            }
+    }
+}
+```
+
+---
+
+## 11. `browser/components/aistarter/tests/GarpRequestManagerStabilityTest.sys.mjs`
+
+This file is optional and inert unless registered. Do not add it to any `moz.build` unless you intend to run it.
+
+```javascript
+/*
+ * GarpRequestManager stability regression test.
+ *
+ * Purpose:
+ *   Prove that a terminal candidate is provisional until it remains stable
+ *   for two consecutive observations, and that a later non-terminal
+ *   observation invalidates the candidate.
+ *
+ * This module deliberately drives the real GarpRequestManager implementation
+ * with a fake service/session boundary. It does not use a provider DOM.
+ *
+ * The production manager keeps its 500 ms observation delay; no production
+ * sleep hook is introduced solely for this test.
+ */
+
+import { GarpRequest, PromptState } from "../requests/GarpRequest.sys.mjs";
+import { GarpRequestManager } from "../requests/GarpRequestManager.sys.mjs";
+
+class FakeSession {
+    constructor(sessionId) {
+        this.sessionId = sessionId;
+        this.provider = "synthetic";
+        this.pageGeneration = 1n;
+        this.actorInstance = "synthetic-actor";
+        this.activeRequestId = null;
+        this.state = "BUSY";
+        this.eventSequence = 0n;
+        this.generationState = "GENERATING";
+        this.lastMessageId = null;
+        this.lastMessageText = "";
+        this.lastMessageCount = 0;
+    }
+
+    enqueue(_label, operation) {
+        return Promise.resolve().then(operation);
+    }
+
+    clearActivePrompt() {
+        this.activeRequestId = null;
+        this.generationState = "IDLE";
+        this.state = "READY";
+    }
+}
+
+class FakeService {
+    constructor(script) {
+        this.script = script.map(item => structuredClone(item));
+        this.index = 0;
+        this.events = [];
+    }
+
+    async callChild(_session, operation) {
+        if (operation !== "ObserveGeneration")
+            throw new Error(`Unexpected child operation: ${operation}`);
+
+        if (this.index >= this.script.length) {
+            throw new Error(
+                `Unexpected ObserveGeneration call ${this.index + 1}; ` +
+                `script contains exactly ${this.script.length} observations`
+            );
+        }
+
+        const result = this.script[this.index];
+        this.index++;
+        return structuredClone(result);
+    }
+
+    commitSessionEvent(session, type, payload) {
+        const sequence = ++session.eventSequence;
+        const event = {
+            type,
+            sequence: String(sequence),
+            payload,
+        };
+        this.events.push(event);
+
+        return event;
+    }
+
+    assertNoEarlyCompletion(expectedObservationCount) {
+        const completions = this.events.filter(
+            event => event.type === "GENERATION_COMPLETED"
+        );
+        if (completions.length > 0 && this.index < expectedObservationCount) {
+            throw new Error(
+                `GENERATION_COMPLETED committed after observation ${this.index}; ` +
+                `expected at least ${expectedObservationCount} observations`
+            );
+        }
+    }
+}
+
+class FakeSessionManager {
+    constructor(session) {
+        this.session = session;
+        this.sessions = new Map([[session.sessionId, session]]);
+    }
+
+    get(sessionId) {
+        if (sessionId !== this.session.sessionId)
+            throw new Error(`Unexpected session: ${sessionId}`);
+        return this.session;
+    }
+}
+
+function assert(condition, message) {
+    if (!condition)
+        throw new Error(message);
+}
+
+function assertEqual(actual, expected, message) {
+    if (actual !== expected) {
+        throw new Error(
+            `${message}: expected=${JSON.stringify(expected)} actual=${JSON.stringify(actual)}`
+        );
+    }
+}
+
+function createRequest(session) {
+    const request = new GarpRequest(
+        `synthetic-${crypto.randomUUID()}`,
+        session.sessionId,
+        "synthetic stability test",
+        {}
+    );
+
+    request.provider = session.provider;
+    request.state = PromptState.SUBMITTING;
+    request.baselineMessageCount = 0;
+    request.baselineMessageText = "";
+    request.lastMessageCount = 0;
+    request.lastMessageText = "";
+    request.lastPageGeneration = session.pageGeneration;
+    request.actorInstance = session.actorInstance;
+
+    session.activeRequestId = request.requestId;
+    return request;
+}
+
+function terminalObservations() {
+    return [
+        // Observation 1: false terminal candidate.
+        {
+            messages: [{ message_id: "synthetic-message", text: "partial" }],
+            text: "partial",
+            done: true,
+            streaming: false,
+            continuation_required: false,
+            message_count: 1,
+        },
+
+        // Observation 2: provider resumes streaming. Stable candidate MUST reset.
+        {
+            messages: [{ message_id: "synthetic-message", text: "partial" }],
+            text: "partial",
+            done: false,
+            streaming: true,
+            continuation_required: false,
+            message_count: 1,
+        },
+
+        // Observation 3: response grows while streaming.
+        {
+            messages: [{ message_id: "synthetic-message", text: "partial+more" }],
+            text: "partial+more",
+            done: false,
+            streaming: true,
+            continuation_required: false,
+            message_count: 1,
+        },
+
+        // Observation 4: first stable terminal observation.
+        {
+            messages: [{ message_id: "synthetic-message", text: "partial+more" }],
+            text: "partial+more",
+            done: true,
+            streaming: false,
+            continuation_required: false,
+            message_count: 1,
+        },
+
+        // Observation 5: second consecutive stable terminal observation.
+        {
+            messages: [{ message_id: "synthetic-message", text: "partial+more" }],
+            text: "partial+more",
+            done: true,
+            streaming: false,
+            continuation_required: false,
+            message_count: 1,
+        },
+    ];
+}
+
+function prolongedFalseTerminalObservations() {
+    return [
+        {
+            messages: [{ message_id: "synthetic-message", text: "pause" }],
+            text: "pause",
+            done: true,
+            streaming: false,
+            continuation_required: false,
+            message_count: 1,
+        },
+        {
+            messages: [{ message_id: "synthetic-message", text: "pause" }],
+            text: "pause",
+            done: true,
+            streaming: false,
+            continuation_required: false,
+            message_count: 1,
+        },
+    ];
+}
+
+async function runRecoveryCase() {
+    const session = new FakeSession("synthetic-session-recovery");
+    const service = new FakeService(terminalObservations());
+    const sessions = new FakeSessionManager(session);
+    const manager = new GarpRequestManager(service, sessions);
+    const request = createRequest(session);
+
+    manager.requests.set(request.requestId, request);
+
+    const observationPromise = manager.observe(request);
+
+    // The first three observations must not terminate the request. The
+    // production observer sleeps 500 ms between observations, so wait until
+    // the scripted observer reaches completion instead of replacing sleep().
+    await observationPromise;
+
+    assertEqual(service.index, 5, "stability recovery observation count");
+    assertEqual(request.state, PromptState.COMPLETED, "stability recovery state");
+    assertEqual(session.activeRequestId, null, "session active request after completion");
+
+    const completed = service.events.filter(
+        event => event.type === "GENERATION_COMPLETED"
+    );
+    assertEqual(completed.length, 1, "stability recovery terminal event count");
+    assertEqual(
+        completed[0].payload.response,
+        "partial+more",
+        "stability recovery terminal response"
+    );
+
+    const started = service.events.filter(
+        event => event.type === "GENERATION_STARTED"
+    );
+    const deltas = service.events.filter(
+        event => event.type === "GENERATION_DELTA"
+    );
+    const progress = service.events.filter(
+        event => event.type === "GENERATION_PROGRESS"
+    );
+
+    assertEqual(started.length, 1, "stability recovery STARTED count");
+    assertEqual(deltas.length, 2, "stability recovery DELTA count");
+    assertEqual(progress.length, 5, "stability recovery PROGRESS count");
+
+    const completedSequence = Number(completed[0].sequence);
+    const progressSequences = progress.map(event => Number(event.sequence));
+    assert(
+        progressSequences.every(sequence => sequence < completedSequence),
+        "GENERATION_PROGRESS must precede GENERATION_COMPLETED"
+    );
+
+    return {
+        name: "terminal candidate resets on later non-terminal observation",
+        observations: service.index,
+        completedSequence,
+        response: completed[0].payload.response,
+    };
+}
+
+async function runBoundedRiskCase() {
+    const session = new FakeSession("synthetic-session-limit");
+    const service = new FakeService(prolongedFalseTerminalObservations());
+    const sessions = new FakeSessionManager(session);
+    const manager = new GarpRequestManager(service, sessions);
+    const request = createRequest(session);
+
+    manager.requests.set(request.requestId, request);
+    await manager.observe(request);
+
+    assertEqual(service.index, 2, "bounded-risk observation count");
+    assertEqual(request.state, PromptState.COMPLETED, "bounded-risk terminal state");
+
+    const completed = service.events.filter(
+        event => event.type === "GENERATION_COMPLETED"
+    );
+    assertEqual(completed.length, 1, "bounded-risk terminal event count");
+    assertEqual(
+        completed[0].payload.response,
+        "pause",
+        "bounded-risk terminal response"
+    );
+
+    return {
+        name: "two-poll false-terminal limitation is documented by executable test",
+        observations: service.index,
+        response: completed[0].payload.response,
+    };
+}
+
+export async function runGarpRequestManagerStabilityTest() {
+    const recovery = await runRecoveryCase();
+    const boundedRisk = await runBoundedRiskCase();
+
+    return {
+        passed: true,
+        recovery,
+        boundedRisk,
+    };
+}
+```
+
+---
+
+## 12. Integration
+
+### 12.1 Production files
+
+The two production files go directly into the existing component tree with no `moz.build` changes, because they are already listed in `browser/components/aistarter/moz.build` under `EXTRA_JS_MODULES.aistarter.requests`:
+
+```
+browser/components/aistarter/requests/GarpRequest.sys.mjs
+browser/components/aistarter/requests/GarpRequestManager.sys.mjs
+```
+
+If your checkout does not yet have them, copy them to those paths and confirm the two entries appear in the existing `EXTRA_JS_MODULES.aistarter.requests` list:
+
+```python
+EXTRA_JS_MODULES.aistarter.requests += [
+    'requests/GarpRequest.sys.mjs',
+    'requests/GarpRequestManager.sys.mjs',
+]
+```
+
+No other `moz.build` changes are needed for the fix.
+
+### 12.2 Optional test file — registration
+
+The test file is inert on disk unless registered. To register it:
+
+**Step 1.** Create `browser/components/aistarter/tests/moz.build`:
+
+```python
+TESTING_JS_MODULES += [
+    'GarpRequestManagerStabilityTest.sys.mjs',
+]
+```
+
+**Step 2.** Add `"tests"` to the `DIRS` list in the existing `browser/components/aistarter/moz.build`:
+
+```python
+DIRS += [
+    'tests',
+]
+```
+
+**Step 3.** Create `browser/components/aistarter/tests/xpcshell.toml`:
+
+```toml
+["test_garp_request_manager_stability.js"]
+```
+
+**Step 4.** Create `browser/components/aistarter/tests/test_garp_request_manager_stability.js`:
+
+```javascript
+add_task(async function garp_request_manager_stability() {
+    const { runGarpRequestManagerStabilityTest } = ChromeUtils.importESModule(
+        "resource://testing-common/aistarter/tests/GarpRequestManagerStabilityTest.sys.mjs"
+    );
+    const result = await runGarpRequestManagerStabilityTest();
+    Assert.ok(result.passed, "GarpRequestManager stability test passed");
+    Assert.equal(result.recovery.observations, 5, "recovery case observation count");
+    Assert.equal(result.boundedRisk.observations, 2, "bounded-risk case observation count");
+});
+```
+
+**Step 5.** Run:
+
+```bash
+./mach xpcshell-test browser/components/aistarter/tests/
+```
+
+The test takes roughly two seconds because `observe()` sleeps 500 ms between observations.
+
+If the harness reports `resource://testing-common/aistarter/...` cannot be resolved, it means the `TESTING_JS_MODULES` registration in Step 1 did not take effect; re-run `./mach build` before `./mach xpcshell-test`.
+
+### 12.3 Full path list for copy-in
+
+```
+browser/components/aistarter/requests/GarpRequest.sys.mjs                  (required)
+browser/components/aistarter/requests/GarpRequestManager.sys.mjs           (required)
+browser/components/aistarter/tests/moz.build                               (optional)
+browser/components/aistarter/tests/GarpRequestManagerStabilityTest.sys.mjs (optional)
+browser/components/aistarter/tests/xpcshell.toml                           (optional)
+browser/components/aistarter/tests/test_garp_request_manager_stability.js  (optional)
+```
+
+Only the two files under `requests/` are needed for the fix. The four files under `tests/` are only needed if you decide to wire up the synthetic regression test.
