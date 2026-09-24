@@ -1,0 +1,1109 @@
+﻿// File 1: GRISP.TUI.App.pas
+// Style: semantic-prefixes v2.0
+
+unit GRISP.TUI.App;
+
+interface
+
+uses
+    Winapi.Windows,
+    System.SysUtils,
+    GRISP.TUI.Console,
+    GRISP.TUI.Model,
+    GRISP.TUI.Renderer;
+
+type
+    TGrispTUIApplication = class
+    private
+        class procedure HandleKey(ParaKey: TInputRecord; ParaModel: TGrispModel; ParaRenderer: TGrispTUIRenderer; var ParaRunning: Boolean; var ParaFocusChat: Boolean); static;
+        class procedure SendInput(ParaModel: TGrispModel); static;
+    public
+        class procedure Run; static;
+    end;
+
+implementation
+
+class procedure TGrispTUIApplication.Run;
+var
+    vConsole: TGrispConsole;
+    vModel: TGrispModel;
+    vRenderer: TGrispTUIRenderer;
+    vKey: TInputRecord;
+    vRunning: Boolean;
+    vFocusChat: Boolean;
+begin
+    vConsole := TGrispConsole.Create;
+    try
+        vModel := TGrispModel.Create;
+        try
+            vRenderer := TGrispTUIRenderer.Create(vConsole, vModel);
+            try
+                vRunning := True;
+                vFocusChat := False;
+                while vRunning do
+                begin
+                    vRenderer.Render;
+                    if vFocusChat then
+                        vConsole.ShowCursor
+                    else
+                        vConsole.HideCursor;
+                    if vConsole.ReadKey(vKey) then
+                        HandleKey(vKey, vModel, vRenderer, vRunning, vFocusChat);
+                end;
+            finally
+                vRenderer.Free;
+            end;
+        finally
+            vModel.Free;
+        end;
+    finally
+        vConsole.Free;
+    end;
+end;
+
+class procedure TGrispTUIApplication.HandleKey(ParaKey: TInputRecord; ParaModel: TGrispModel; ParaRenderer: TGrispTUIRenderer; var ParaRunning: Boolean; var ParaFocusChat: Boolean);
+var
+    vKeyEvent: TKeyEventRecord;
+    vChar: WideChar;
+    vControl: Boolean;
+    vInputText: string;
+begin
+    vKeyEvent := ParaKey.Event.KeyEvent;
+    vChar := vKeyEvent.UnicodeChar;
+    vControl := (vKeyEvent.dwControlKeyState and (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0;
+
+    if vKeyEvent.wVirtualKeyCode = VK_ESCAPE then
+    begin
+        if ParaFocusChat and (ParaModel.InputText <> '') then
+        begin
+            ParaModel.InputText := '';
+            ParaFocusChat := False;
+        end
+        else
+            ParaRunning := False;
+        Exit;
+    end;
+
+    if vKeyEvent.wVirtualKeyCode = VK_F2 then
+    begin
+        ParaRenderer.ToggleExplorer;
+        Exit;
+    end;
+
+    if vKeyEvent.wVirtualKeyCode = VK_F3 then
+    begin
+        ParaRenderer.ToggleSessions;
+        Exit;
+    end;
+
+    if vKeyEvent.wVirtualKeyCode = VK_F4 then
+    begin
+        ParaRenderer.ToggleThink;
+        Exit;
+    end;
+
+    if vKeyEvent.wVirtualKeyCode = VK_F5 then
+    begin
+        ParaRenderer.TogglePlan;
+        Exit;
+    end;
+
+    if vControl and (vKeyEvent.wVirtualKeyCode = Ord('N')) then
+    begin
+        ParaModel.AddSession('New GRISP session');
+        ParaModel.InputText := '';
+        ParaFocusChat := True;
+        Exit;
+    end;
+
+    if vControl and (vKeyEvent.wVirtualKeyCode = Ord('L')) then
+    begin
+        ParaModel.InputText := '';
+        ParaFocusChat := True;
+        Exit;
+    end;
+
+    if not ParaFocusChat then
+    begin
+        if vKeyEvent.wVirtualKeyCode = VK_TAB then
+            ParaFocusChat := True;
+        Exit;
+    end;
+
+    if vKeyEvent.wVirtualKeyCode = VK_BACK then
+    begin
+        vInputText := ParaModel.InputText;
+        if Length(vInputText) > 0 then
+        begin
+            Delete(vInputText, Length(vInputText), 1);
+            ParaModel.InputText := vInputText;
+        end;
+        Exit;
+    end;
+
+    if vKeyEvent.wVirtualKeyCode = VK_RETURN then
+    begin
+        SendInput(ParaModel);
+        Exit;
+    end;
+
+    if vChar >= #32 then
+        ParaModel.InputText := ParaModel.InputText + vChar;
+end;
+
+class procedure TGrispTUIApplication.SendInput(ParaModel: TGrispModel);
+var
+    vText: string;
+begin
+    vText := Trim(ParaModel.InputText);
+    if vText = '' then
+        Exit;
+
+    ParaModel.AddUserMessage(vText);
+    ParaModel.InputText := '';
+    ParaModel.AddAssistantMessage([
+        'Prototype response received.',
+        '',
+        'The next step is to connect this view model to the real GRISP session/runtime.',
+        'The TUI deliberately keeps the workspace focused on conversation, resources,',
+        'permissions, sessions, plans and optional reasoning.'
+    ]);
+end;
+
+end.
+
+
+// File 2: GRISP.TUI.Console.pas
+// Style: semantic-prefixes v2.0
+
+unit GRISP.TUI.Console;
+
+interface
+
+uses
+    Winapi.Windows,
+    System.SysUtils,
+    System.Types;
+
+type
+    TGrispConsole = class
+    private
+        mInputHandle: THandle;
+        mOutputHandle: THandle;
+        mOriginalInputMode: DWORD;
+        mOriginalOutputMode: DWORD;
+        mWidth: Integer;
+        mHeight: Integer;
+        procedure ConfigureConsole;
+        procedure RestoreConsole;
+        procedure RefreshSize;
+    public
+        constructor Create;
+        destructor Destroy; override;
+        procedure BeginFrame;
+        procedure EndFrame;
+        procedure WriteAt(const ParaX, ParaY: Integer; const ParaText: string);
+        procedure WriteAnsi(const ParaText: string);
+        function ReadKey(out ParaKey: TInputRecord): Boolean;
+        function Width: Integer;
+        function Height: Integer;
+        procedure HideCursor;
+        procedure ShowCursor;
+    end;
+
+implementation
+
+constructor TGrispConsole.Create;
+begin
+    inherited Create;
+    mInputHandle := GetStdHandle(STD_INPUT_HANDLE);
+    mOutputHandle := GetStdHandle(STD_OUTPUT_HANDLE);
+    ConfigureConsole;
+    RefreshSize;
+end;
+
+destructor TGrispConsole.Destroy;
+begin
+    RestoreConsole;
+    inherited Destroy;
+end;
+
+procedure TGrispConsole.ConfigureConsole;
+var
+    vOutputMode: DWORD;
+    vInputMode: DWORD;
+begin
+    GetConsoleMode(mOutputHandle, mOriginalOutputMode);
+    GetConsoleMode(mInputHandle, mOriginalInputMode);
+
+    vOutputMode := mOriginalOutputMode or ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    SetConsoleMode(mOutputHandle, vOutputMode);
+
+    vInputMode := mOriginalInputMode;
+    vInputMode := vInputMode and not ENABLE_LINE_INPUT;
+    vInputMode := vInputMode and not ENABLE_ECHO_INPUT;
+    vInputMode := vInputMode or ENABLE_WINDOW_INPUT;
+    vInputMode := vInputMode or ENABLE_PROCESSED_INPUT;
+    SetConsoleMode(mInputHandle, vInputMode);
+
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+end;
+
+procedure TGrispConsole.RestoreConsole;
+begin
+    WriteAnsi(#27'[0m'#27'[?25h'#27'[2J'#27'[H');
+    SetConsoleMode(mInputHandle, mOriginalInputMode);
+    SetConsoleMode(mOutputHandle, mOriginalOutputMode);
+end;
+
+procedure TGrispConsole.RefreshSize;
+var
+    vInfo: TConsoleScreenBufferInfo;
+begin
+    if GetConsoleScreenBufferInfo(mOutputHandle, vInfo) then
+    begin
+        mWidth := vInfo.srWindow.Right - vInfo.srWindow.Left + 1;
+        mHeight := vInfo.srWindow.Bottom - vInfo.srWindow.Top + 1;
+    end
+    else
+    begin
+        mWidth := 120;
+        mHeight := 40;
+    end;
+end;
+
+procedure TGrispConsole.BeginFrame;
+begin
+    RefreshSize;
+    WriteAnsi(#27'[2J'#27'[H'#27'[?25l');
+end;
+
+procedure TGrispConsole.EndFrame;
+begin
+    WriteAnsi(#27'[0m');
+end;
+
+procedure TGrispConsole.WriteAt(const ParaX, ParaY: Integer; const ParaText: string);
+begin
+    WriteAnsi(Format(#27'[%d;%dH', [ParaY + 1, ParaX + 1]) + ParaText);
+end;
+
+procedure TGrispConsole.WriteAnsi(const ParaText: string);
+var
+    vWritten: DWORD;
+    vText: UnicodeString;
+begin
+    vText := UnicodeString(ParaText);
+    if Length(vText) = 0 then
+        Exit;
+    WriteConsoleW(mOutputHandle, PWideChar(vText), Length(vText), vWritten, nil);
+end;
+
+function TGrispConsole.ReadKey(out ParaKey: TInputRecord): Boolean;
+var
+    vRead: DWORD;
+    vRecord: TInputRecord;
+begin
+    Result := False;
+    while ReadConsoleInputW(mInputHandle, vRecord, 1, vRead) do
+    begin
+        if vRead <> 1 then
+            Continue;
+        if vRecord.EventType = KEY_EVENT then
+        begin
+            if vRecord.Event.KeyEvent.bKeyDown then
+            begin
+                ParaKey := vRecord;
+                Result := True;
+                Exit;
+            end;
+        end
+        else if vRecord.EventType = WINDOW_BUFFER_SIZE_EVENT then
+        begin
+            RefreshSize;
+        end;
+    end;
+end;
+
+function TGrispConsole.Width: Integer;
+begin
+    Result := mWidth;
+end;
+
+function TGrispConsole.Height: Integer;
+begin
+    Result := mHeight;
+end;
+
+procedure TGrispConsole.HideCursor;
+begin
+    WriteAnsi(#27'[?25l');
+end;
+
+procedure TGrispConsole.ShowCursor;
+begin
+    WriteAnsi(#27'[?25h');
+end;
+
+end.
+
+
+// File 3: GRISP.TUI.Model.pas
+// Style: semantic-prefixes v2.0
+
+unit GRISP.TUI.Model;
+
+interface
+
+uses
+    System.SysUtils;
+
+type
+    TGrispPermission = (gpRead, gpWrite, gpExecute);
+
+    TGrispResource = record
+        Name: string;
+        Kind: string;
+        Trust: Integer;
+        ReadAllowed: Boolean;
+        WriteAllowed: Boolean;
+        ExecuteAllowed: Boolean;
+        Depth: Integer;
+        IsFolder: Boolean;
+        Expanded: Boolean;
+    end;
+
+    TGrispSession = record
+        Title: string;
+        DateTimeText: string;
+    end;
+
+    TGrispMessage = record
+        Role: string;
+        TimeText: string;
+        Lines: TArray<string>;
+    end;
+
+    TGrispPlanItem = record
+        Title: string;
+        State: string;
+    end;
+
+    TGrispModel = class
+    private
+        mResources: TArray<TGrispResource>;
+        mSessions: TArray<TGrispSession>;
+        mMessages: TArray<TGrispMessage>;
+        mPlan: TArray<TGrispPlanItem>;
+        mSelectedResource: Integer;
+        mSelectedSession: Integer;
+        mInputText: string;
+    public
+        constructor Create;
+        procedure AddUserMessage(const ParaText: string);
+        procedure AddAssistantMessage(const ParaLines: array of string);
+        procedure AddSession(const ParaTitle: string);
+        property Resources: TArray<TGrispResource> read mResources;
+        property Sessions: TArray<TGrispSession> read mSessions;
+        property Messages: TArray<TGrispMessage> read mMessages;
+        property Plan: TArray<TGrispPlanItem> read mPlan;
+        property SelectedResource: Integer read mSelectedResource write mSelectedResource;
+        property SelectedSession: Integer read mSelectedSession write mSelectedSession;
+        property InputText: string read mInputText write mInputText;
+    end;
+
+implementation
+
+constructor TGrispModel.Create;
+begin
+    inherited Create;
+
+    mSelectedResource := 0;
+    mSelectedSession := 0;
+
+    SetLength(mResources, 11);
+
+    mResources[0].Name := 'GRISP';
+    mResources[0].Kind := 'Project';
+    mResources[0].Trust := 85;
+    mResources[0].ReadAllowed := True;
+    mResources[0].WriteAllowed := True;
+    mResources[0].ExecuteAllowed := True;
+    mResources[0].Depth := 0;
+    mResources[0].IsFolder := True;
+    mResources[0].Expanded := True;
+
+    mResources[1].Name := 'Local';
+    mResources[1].Kind := 'Folder';
+    mResources[1].Trust := 90;
+    mResources[1].ReadAllowed := True;
+    mResources[1].WriteAllowed := True;
+    mResources[1].ExecuteAllowed := False;
+    mResources[1].Depth := 1;
+    mResources[1].IsFolder := True;
+    mResources[1].Expanded := True;
+
+    mResources[2].Name := 'Projects';
+    mResources[2].Kind := 'Folder';
+    mResources[2].Trust := 90;
+    mResources[2].ReadAllowed := True;
+    mResources[2].WriteAllowed := True;
+    mResources[2].ExecuteAllowed := False;
+    mResources[2].Depth := 2;
+    mResources[2].IsFolder := True;
+    mResources[2].Expanded := True;
+
+    mResources[3].Name := 'GRISP';
+    mResources[3].Kind := 'Folder';
+    mResources[3].Trust := 85;
+    mResources[3].ReadAllowed := True;
+    mResources[3].WriteAllowed := True;
+    mResources[3].ExecuteAllowed := True;
+    mResources[3].Depth := 3;
+    mResources[3].IsFolder := True;
+    mResources[3].Expanded := True;
+
+    mResources[4].Name := 'src';
+    mResources[4].Kind := 'Folder';
+    mResources[4].Trust := 85;
+    mResources[4].ReadAllowed := True;
+    mResources[4].WriteAllowed := True;
+    mResources[4].ExecuteAllowed := False;
+    mResources[4].Depth := 4;
+    mResources[4].IsFolder := True;
+
+    mResources[5].Name := 'tests';
+    mResources[5].Kind := 'Folder';
+    mResources[5].Trust := 85;
+    mResources[5].ReadAllowed := True;
+    mResources[5].WriteAllowed := True;
+    mResources[5].ExecuteAllowed := False;
+    mResources[5].Depth := 4;
+    mResources[5].IsFolder := True;
+
+    mResources[6].Name := 'docs';
+    mResources[6].Kind := 'Folder';
+    mResources[6].Trust := 85;
+    mResources[6].ReadAllowed := True;
+    mResources[6].WriteAllowed := True;
+    mResources[6].ExecuteAllowed := False;
+    mResources[6].Depth := 4;
+    mResources[6].IsFolder := True;
+
+    mResources[7].Name := 'Models';
+    mResources[7].Kind := 'Folder';
+    mResources[7].Trust := 90;
+    mResources[7].ReadAllowed := True;
+    mResources[7].WriteAllowed := False;
+    mResources[7].ExecuteAllowed := False;
+    mResources[7].Depth := 1;
+    mResources[7].IsFolder := True;
+
+    mResources[8].Name := 'Agents';
+    mResources[8].Kind := 'Folder';
+    mResources[8].Trust := 80;
+    mResources[8].ReadAllowed := True;
+    mResources[8].WriteAllowed := True;
+    mResources[8].ExecuteAllowed := False;
+    mResources[8].Depth := 1;
+    mResources[8].IsFolder := True;
+
+    mResources[9].Name := 'Knowledge';
+    mResources[9].Kind := 'Folder';
+    mResources[9].Trust := 75;
+    mResources[9].ReadAllowed := True;
+    mResources[9].WriteAllowed := True;
+    mResources[9].ExecuteAllowed := False;
+    mResources[9].Depth := 1;
+    mResources[9].IsFolder := True;
+
+    mResources[10].Name := 'Workspace';
+    mResources[10].Kind := 'Folder';
+    mResources[10].Trust := 95;
+    mResources[10].ReadAllowed := True;
+    mResources[10].WriteAllowed := True;
+    mResources[10].ExecuteAllowed := True;
+    mResources[10].Depth := 1;
+    mResources[10].IsFolder := True;
+
+    SetLength(mSessions, 4);
+
+    mSessions[0].Title := 'GRISP architecture';
+    mSessions[0].DateTimeText := '22 Sep 2026 14:32';
+    mSessions[1].Title := 'Data model discussion';
+    mSessions[1].DateTimeText := '22 Sep 2026 11:48';
+    mSessions[2].Title := 'Bug investigation';
+    mSessions[2].DateTimeText := '21 Sep 2026 16:20';
+    mSessions[3].Title := 'Feature planning';
+    mSessions[3].DateTimeText := '20 Sep 2026 09:10';
+
+    SetLength(mPlan, 4);
+    mPlan[0].Title := 'Analyze architecture';
+    mPlan[0].State := 'DONE';
+    mPlan[1].Title := 'Review component details';
+    mPlan[1].State := 'ACTIVE';
+    mPlan[2].Title := 'Create diagram';
+    mPlan[2].State := 'TODO';
+    mPlan[3].Title := 'Update documentation';
+    mPlan[3].State := 'TODO';
+
+    AddUserMessage('Explain the GRISP architecture and its main components.');
+    AddAssistantMessage([
+        'GRISP is organized as a deterministic graph-based execution pipeline.',
+        '',
+        '1. SIR        Source Intermediate Representation',
+        '2. Planner     Creates an execution plan',
+        '3. Evaluator   Executes graph operations',
+        '4. Validator   Validates the resulting state',
+        '5. EIR         Execution Intermediate Representation',
+        '6. Runtime     Performs deterministic execution',
+        '7. WorldState  Holds persistent execution state',
+        '',
+        'The same session can expose resources, permissions, plans and events without',
+        'turning the main workspace into a monitoring dashboard.'
+    ]);
+end;
+
+procedure TGrispModel.AddUserMessage(const ParaText: string);
+var
+    vMessage: TGrispMessage;
+    vIndex: Integer;
+begin
+    vMessage.Role := 'YOU';
+    vMessage.TimeText := FormatDateTime('hh:nn', Now);
+    vMessage.Lines := ParaText.Split([sLineBreak]);
+    vIndex := Length(mMessages);
+    SetLength(mMessages, vIndex + 1);
+    mMessages[vIndex] := vMessage;
+end;
+
+procedure TGrispModel.AddAssistantMessage(const ParaLines: array of string);
+var
+    vMessage: TGrispMessage;
+    vIndex: Integer;
+    vLineIndex: Integer;
+begin
+    vMessage.Role := 'GRISP';
+    vMessage.TimeText := FormatDateTime('hh:nn', Now);
+    SetLength(vMessage.Lines, Length(ParaLines));
+    for vLineIndex := 0 to High(ParaLines) do
+        vMessage.Lines[vLineIndex] := ParaLines[vLineIndex];
+
+    vIndex := Length(mMessages);
+    SetLength(mMessages, vIndex + 1);
+    mMessages[vIndex] := vMessage;
+end;
+
+procedure TGrispModel.AddSession(const ParaTitle: string);
+var
+    vIndex: Integer;
+begin
+    vIndex := Length(mSessions);
+    SetLength(mSessions, vIndex + 1);
+    mSessions[vIndex].Title := ParaTitle;
+    mSessions[vIndex].DateTimeText := FormatDateTime('dd mmm yyyy hh:nn', Now);
+    mSelectedSession := vIndex;
+end;
+
+end.
+
+
+// File 4: GRISP.TUI.Renderer.pas
+﻿unit GRISP.TUI.Renderer;
+
+interface
+
+uses
+    System.SysUtils,
+    System.Math,
+    GRISP.TUI.Console,
+    GRISP.TUI.Model;
+
+type
+    TGrispTUIRenderer = class
+    private
+        mConsole: TGrispConsole;
+        mModel: TGrispModel;
+        mExplorerVisible: Boolean;
+        mSessionsVisible: Boolean;
+        mThinkVisible: Boolean;
+        mPlanVisible: Boolean;
+        mPanelWidth: Integer;
+        mHeaderHeight: Integer;
+        mFooterHeight: Integer;
+        procedure DrawBorder(ParaX, ParaY, ParaWidth, ParaHeight: Integer; const ParaTitle: string);
+        procedure DrawHeader;
+        procedure DrawFooter;
+        procedure DrawExplorer(ParaX, ParaY, ParaWidth, ParaHeight: Integer);
+        procedure DrawSessions(ParaX, ParaY, ParaWidth, ParaHeight: Integer);
+        procedure DrawChat(ParaX, ParaY, ParaWidth, ParaHeight: Integer);
+        procedure DrawMessage(ParaX: Integer; var ParaY: Integer; ParaWidth: Integer; const ParaMessage: TGrispMessage);
+        procedure DrawPlan(ParaX: Integer; var ParaY: Integer; ParaWidth: Integer);
+        procedure DrawThink(ParaX: Integer; var ParaY: Integer; ParaWidth: Integer);
+        procedure DrawInput(ParaX, ParaY, ParaWidth, ParaHeight: Integer);
+        function FitText(const ParaText: string; const ParaWidth: Integer): string;
+        function PermissionGlyph(const ParaAllowed: Boolean): string;
+        function RepeatChar(const ParaChar: string; const ParaCount: Integer): string;
+    public
+        constructor Create(ParaConsole: TGrispConsole; ParaModel: TGrispModel);
+        procedure Render;
+        procedure ToggleExplorer;
+        procedure ToggleSessions;
+        procedure ToggleThink;
+        procedure TogglePlan;
+        function ExplorerVisible: Boolean;
+        function SessionsVisible: Boolean;
+        function ThinkVisible: Boolean;
+        function PlanVisible: Boolean;
+    end;
+
+implementation
+
+const
+    C_RESET = #27'[0m';
+    C_BLUE = #27'[38;5;39m';
+    C_CYAN = #27'[38;5;51m';
+    C_DIM = #27'[38;5;67m';
+    C_WHITE = #27'[38;5;255m';
+    C_GREEN = #27'[38;5;46m';
+    C_YELLOW = #27'[38;5;220m';
+    C_RED = #27'[38;5;203m';
+    C_BG = #27'[48;5;17m';
+
+constructor TGrispTUIRenderer.Create(ParaConsole: TGrispConsole; ParaModel: TGrispModel);
+begin
+    inherited Create;
+    mConsole := ParaConsole;
+    mModel := ParaModel;
+    mExplorerVisible := True;
+    mSessionsVisible := False;
+    mThinkVisible := False;
+    mPlanVisible := True;
+    mPanelWidth := 30;
+    mHeaderHeight := 3;
+    mFooterHeight := 2;
+end;
+
+function TGrispTUIRenderer.RepeatChar(const ParaChar: string; const ParaCount: Integer): string;
+var
+    vIndex: Integer;
+begin
+    if (ParaCount <= 0) or (ParaChar = '') then
+        Exit('');
+
+    Result := '';
+
+    for vIndex := 1 to ParaCount do
+        Result := Result + ParaChar;
+end;
+
+procedure TGrispTUIRenderer.DrawBorder(ParaX, ParaY, ParaWidth, ParaHeight: Integer; const ParaTitle: string);
+var
+    vTop: string;
+    vMiddle: string;
+    vBottom: string;
+    vIndex: Integer;
+    vTitle: string;
+    vAvailable: Integer;
+begin
+    if (ParaWidth < 2) or (ParaHeight < 2) then
+        Exit;
+
+    vAvailable := Max(0, ParaWidth - 2);
+    vTitle := ParaTitle;
+
+    if vTitle <> '' then
+    begin
+        if Length(vTitle) > Max(0, vAvailable - 3) then
+            vTitle := FitText(vTitle, Max(0, vAvailable - 3));
+        vTop := '┌─ ' + vTitle + ' ' + RepeatChar('─', Max(0, ParaWidth - Length(vTitle) - 6)) + '┐';
+    end
+    else
+        vTop := '┌' + RepeatChar('─', vAvailable) + '┐';
+
+    vMiddle := '│' + RepeatChar(' ', vAvailable) + '│';
+    vBottom := '└' + RepeatChar('─', vAvailable) + '┘';
+
+    mConsole.WriteAt(ParaX, ParaY, C_BLUE + vTop + C_RESET);
+    for vIndex := 1 to ParaHeight - 2 do
+        mConsole.WriteAt(ParaX, ParaY + vIndex, C_BLUE + vMiddle + C_RESET);
+    mConsole.WriteAt(ParaX, ParaY + ParaHeight - 1, C_BLUE + vBottom + C_RESET);
+end;
+
+procedure TGrispTUIRenderer.DrawHeader;
+var
+    vWidth: Integer;
+    vLine: string;
+begin
+    vWidth := mConsole.Width;
+    vLine := '╔' + RepeatChar('═', Max(0, vWidth - 2)) + '╗';
+    mConsole.WriteAt(0, 0, C_BLUE + vLine + C_RESET);
+    mConsole.WriteAt(2, 1, C_CYAN + '◈ GRISP OS' + C_RESET + C_DIM + '   Deterministic AI Runtime' + C_RESET);
+    mConsole.WriteAt(36, 1, C_CYAN + '[ CHAT ]' + C_RESET + '  [ WORK ]  [ KNOWLEDGE ]');
+    mConsole.WriteAt(Max(0, vWidth - 18), 1, C_GREEN + '● READY' + C_RESET);
+    mConsole.WriteAt(0, 2, C_BLUE + '╠' + RepeatChar('═', Max(0, vWidth - 2)) + '╣' + C_RESET);
+end;
+
+procedure TGrispTUIRenderer.DrawFooter;
+var
+    vWidth: Integer;
+    vY: Integer;
+    vLine: string;
+begin
+    vWidth := mConsole.Width;
+    vY := mConsole.Height - 2;
+    vLine := '╠' + RepeatChar('═', Max(0, vWidth - 2)) + '╣';
+    mConsole.WriteAt(0, vY, C_BLUE + vLine + C_RESET);
+    mConsole.WriteAt(2, vY + 1,
+        C_DIM + 'GRISP:/Workspace' + C_RESET +
+        '   ' + C_CYAN + '[F2] Explorer' + C_RESET +
+        '  [F3] Sessions  [F4] Think  [F5] Plan  [Ctrl+N] New  [ESC] Quit');
+end;
+
+procedure TGrispTUIRenderer.DrawExplorer(ParaX, ParaY, ParaWidth, ParaHeight: Integer);
+var
+    vIndex: Integer;
+    vResource: TGrispResource;
+    vLine: string;
+    vIndent: string;
+    vY: Integer;
+begin
+    DrawBorder(ParaX, ParaY, ParaWidth, ParaHeight, 'EXPLORER');
+    mConsole.WriteAt(ParaX + 2, ParaY + 1, C_DIM + 'GRISP:/' + C_RESET);
+
+    for vIndex := 0 to High(mModel.Resources) do
+    begin
+        if ParaY + 3 + vIndex >= ParaY + ParaHeight - 1 then
+            Break;
+
+        vResource := mModel.Resources[vIndex];
+        vIndent := RepeatChar(' ', vResource.Depth * 2);
+
+        if vResource.IsFolder then
+        begin
+            if vResource.Expanded then
+                vLine := vIndent + '▾ ' + '■ ' + vResource.Name
+            else
+                vLine := vIndent + '▸ ' + '■ ' + vResource.Name;
+        end
+        else
+            vLine := vIndent + '  · ' + vResource.Name;
+
+        vLine := FitText(vLine, ParaWidth - 3);
+        if vIndex = mModel.SelectedResource then
+            vLine := C_WHITE + C_BG + ' ' + vLine + ' ' + C_RESET
+        else
+            vLine := C_WHITE + vLine + C_RESET;
+
+        mConsole.WriteAt(ParaX + 1, ParaY + 2 + vIndex, vLine);
+    end;
+
+    if ParaHeight > 12 then
+    begin
+        vY := ParaY + ParaHeight - 5;
+        mConsole.WriteAt(ParaX + 2, vY, C_DIM + 'PERMISSIONS' + C_RESET);
+        vResource := mModel.Resources[mModel.SelectedResource];
+        mConsole.WriteAt(ParaX + 2, vY + 1, 'R  ' + PermissionGlyph(vResource.ReadAllowed) + '  Read');
+        mConsole.WriteAt(ParaX + 2, vY + 2, 'W  ' + PermissionGlyph(vResource.WriteAllowed) + '  Write');
+        mConsole.WriteAt(ParaX + 2, vY + 3, 'X  ' + PermissionGlyph(vResource.ExecuteAllowed) + '  Execute');
+    end;
+end;
+
+procedure TGrispTUIRenderer.DrawSessions(ParaX, ParaY, ParaWidth, ParaHeight: Integer);
+var
+    vIndex: Integer;
+    vSession: TGrispSession;
+    vLine: string;
+begin
+    DrawBorder(ParaX, ParaY, ParaWidth, ParaHeight, 'SESSIONS');
+    for vIndex := 0 to High(mModel.Sessions) do
+    begin
+        if ParaY + 2 + vIndex * 2 >= ParaY + ParaHeight - 1 then
+            Break;
+
+        vSession := mModel.Sessions[vIndex];
+        vLine := FitText(vSession.Title, ParaWidth - 4);
+
+        if vIndex = mModel.SelectedSession then
+            mConsole.WriteAt(ParaX + 1, ParaY + 1 + vIndex * 2, C_WHITE + C_BG + ' ' + vLine + ' ' + C_RESET)
+        else
+            mConsole.WriteAt(ParaX + 2, ParaY + 1 + vIndex * 2, C_CYAN + vLine + C_RESET);
+
+        mConsole.WriteAt(ParaX + 3, ParaY + 2 + vIndex * 2, C_DIM + vSession.DateTimeText + C_RESET);
+    end;
+end;
+
+procedure TGrispTUIRenderer.DrawChat(ParaX, ParaY, ParaWidth, ParaHeight: Integer);
+var
+    vY: Integer;
+    vMessage: TGrispMessage;
+    vIndex: Integer;
+    vInputHeight: Integer;
+    vReservedHeight: Integer;
+begin
+    DrawBorder(ParaX, ParaY, ParaWidth, ParaHeight, 'SESSION: ' + mModel.Sessions[mModel.SelectedSession].Title);
+
+    vInputHeight := 4;
+    vReservedHeight := vInputHeight + 1;
+    vY := ParaY + 2;
+
+    for vIndex := 0 to High(mModel.Messages) do
+    begin
+        vMessage := mModel.Messages[vIndex];
+        if vY >= ParaY + ParaHeight - vReservedHeight - 1 then
+            Break;
+        DrawMessage(ParaX + 2, vY, ParaWidth - 4, vMessage);
+    end;
+
+    if mPlanVisible and (vY < ParaY + ParaHeight - vReservedHeight - 5) then
+        DrawPlan(ParaX + 2, vY, ParaWidth - 4);
+
+    if mThinkVisible and (vY < ParaY + ParaHeight - vReservedHeight - 4) then
+        DrawThink(ParaX + 2, vY, ParaWidth - 4);
+
+    DrawInput(ParaX + 2, ParaY + ParaHeight - vInputHeight - 1, ParaWidth - 4, vInputHeight);
+end;
+
+procedure TGrispTUIRenderer.DrawMessage(ParaX: Integer; var ParaY: Integer; ParaWidth: Integer; const ParaMessage: TGrispMessage);
+var
+    vIndex: Integer;
+    vPrefix: string;
+    vColor: string;
+begin
+    if ParaMessage.Role = 'YOU' then
+    begin
+        vPrefix := 'YOU';
+        vColor := C_WHITE;
+    end
+    else
+    begin
+        vPrefix := 'GRISP';
+        vColor := C_CYAN;
+    end;
+
+    mConsole.WriteAt(ParaX, ParaY, vColor + vPrefix + C_RESET + C_DIM + '  ' + ParaMessage.TimeText + C_RESET);
+    Inc(ParaY);
+
+    for vIndex := 0 to High(ParaMessage.Lines) do
+    begin
+        mConsole.WriteAt(ParaX, ParaY, C_WHITE + '│ ' + FitText(ParaMessage.Lines[vIndex], ParaWidth - 3) + C_RESET);
+        Inc(ParaY);
+    end;
+
+    Inc(ParaY);
+end;
+
+procedure TGrispTUIRenderer.DrawPlan(ParaX: Integer; var ParaY: Integer; ParaWidth: Integer);
+var
+    vIndex: Integer;
+    vItem: TGrispPlanItem;
+    vMark: string;
+    vColor: string;
+begin
+    mConsole.WriteAt(ParaX, ParaY, C_BLUE + '┌─ PLAN ' + RepeatChar('─', Max(0, ParaWidth - 8)) + '┐' + C_RESET);
+    Inc(ParaY);
+
+    for vIndex := 0 to High(mModel.Plan) do
+    begin
+        vItem := mModel.Plan[vIndex];
+
+        if vItem.State = 'DONE' then
+        begin
+            vMark := '✓';
+            vColor := C_GREEN;
+        end
+        else if vItem.State = 'ACTIVE' then
+        begin
+            vMark := '>';
+            vColor := C_YELLOW;
+        end
+        else
+        begin
+            vMark := ' ';
+            vColor := C_DIM;
+        end;
+
+        mConsole.WriteAt(ParaX, ParaY,
+            '│ ' + vColor + vMark + C_RESET + ' ' +
+            FitText(vItem.Title, Max(1, ParaWidth - Length(vItem.State) - 8)) +
+            ' ' + C_DIM + vItem.State + C_RESET);
+        Inc(ParaY);
+    end;
+
+    mConsole.WriteAt(ParaX, ParaY, C_BLUE + '└' + RepeatChar('─', Max(0, ParaWidth - 2)) + '┘' + C_RESET);
+    Inc(ParaY);
+end;
+
+procedure TGrispTUIRenderer.DrawThink(ParaX: Integer; var ParaY: Integer; ParaWidth: Integer);
+var
+    vTitle: string;
+    vLineWidth: Integer;
+begin
+    vTitle := '┌─ THINK (prototype) ';
+    vLineWidth := Max(0, ParaWidth - Length(vTitle) - 1);
+    mConsole.WriteAt(ParaX, ParaY, C_BLUE + vTitle + RepeatChar('─', vLineWidth) + '┐' + C_RESET);
+    Inc(ParaY);
+    mConsole.WriteAt(ParaX, ParaY, C_DIM + '│ > Analyze architecture' + C_RESET);
+    Inc(ParaY);
+    mConsole.WriteAt(ParaX, ParaY, C_DIM + '│ > Identify relevant components' + C_RESET);
+    Inc(ParaY);
+    mConsole.WriteAt(ParaX, ParaY, C_DIM + '│ > Construct response' + C_RESET);
+    Inc(ParaY);
+    mConsole.WriteAt(ParaX, ParaY, C_BLUE + '└' + RepeatChar('─', Max(0, ParaWidth - 2)) + '┘' + C_RESET);
+    Inc(ParaY);
+end;
+
+procedure TGrispTUIRenderer.DrawInput(ParaX, ParaY, ParaWidth, ParaHeight: Integer);
+begin
+    if ParaHeight < 3 then
+        Exit;
+
+    mConsole.WriteAt(ParaX, ParaY, C_BLUE + '┌─ MESSAGE ' + RepeatChar('─', Max(0, ParaWidth - 12)) + '┐' + C_RESET);
+    mConsole.WriteAt(ParaX, ParaY + 1, '│ ' + C_WHITE + FitText(mModel.InputText + '▌', Max(1, ParaWidth - 4)) + C_RESET);
+    mConsole.WriteAt(ParaX, ParaY + 2, C_BLUE + '└' + RepeatChar('─', Max(0, ParaWidth - 2)) + '┘' + C_RESET);
+end;
+
+procedure TGrispTUIRenderer.Render;
+var
+    vWidth: Integer;
+    vHeight: Integer;
+    vContentY: Integer;
+    vContentHeight: Integer;
+    vLeftWidth: Integer;
+    vChatX: Integer;
+    vChatWidth: Integer;
+begin
+    mConsole.BeginFrame;
+    vWidth := mConsole.Width;
+    vHeight := mConsole.Height;
+
+    if (vWidth < 80) or (vHeight < 20) then
+    begin
+        mConsole.WriteAt(0, 0, C_RED + 'GRISP TUI requires at least 80x20 terminal size.' + C_RESET);
+        mConsole.EndFrame;
+        Exit;
+    end;
+
+    DrawHeader;
+    DrawFooter;
+
+    vContentY := mHeaderHeight;
+    vContentHeight := vHeight - mHeaderHeight - mFooterHeight;
+
+    if mExplorerVisible or mSessionsVisible then
+    begin
+        vLeftWidth := Min(mPanelWidth, Max(20, vWidth div 3));
+        vChatX := vLeftWidth + 1;
+        vChatWidth := vWidth - vChatX;
+
+        if mExplorerVisible then
+            DrawExplorer(0, vContentY, vLeftWidth, vContentHeight)
+        else
+            DrawSessions(0, vContentY, vLeftWidth, vContentHeight);
+    end
+    else
+    begin
+        vChatX := 0;
+        vChatWidth := vWidth;
+    end;
+
+    DrawChat(vChatX, vContentY, vChatWidth, vContentHeight);
+    mConsole.EndFrame;
+end;
+
+function TGrispTUIRenderer.FitText(const ParaText: string; const ParaWidth: Integer): string;
+begin
+    if ParaWidth <= 0 then
+        Exit('');
+
+    if Length(ParaText) <= ParaWidth then
+        Exit(ParaText);
+
+    if ParaWidth = 1 then
+        Exit('…');
+
+    Result := Copy(ParaText, 1, ParaWidth - 1) + '…';
+end;
+
+function TGrispTUIRenderer.PermissionGlyph(const ParaAllowed: Boolean): string;
+begin
+    if ParaAllowed then
+        Result := C_GREEN + '✓' + C_RESET
+    else
+        Result := C_RED + '×' + C_RESET;
+end;
+
+procedure TGrispTUIRenderer.ToggleExplorer;
+begin
+    mExplorerVisible := not mExplorerVisible;
+    if mExplorerVisible then
+        mSessionsVisible := False;
+end;
+
+procedure TGrispTUIRenderer.ToggleSessions;
+begin
+    mSessionsVisible := not mSessionsVisible;
+    if mSessionsVisible then
+        mExplorerVisible := False;
+end;
+
+procedure TGrispTUIRenderer.ToggleThink;
+begin
+    mThinkVisible := not mThinkVisible;
+end;
+
+procedure TGrispTUIRenderer.TogglePlan;
+begin
+    mPlanVisible := not mPlanVisible;
+end;
+
+function TGrispTUIRenderer.ExplorerVisible: Boolean;
+begin
+    Result := mExplorerVisible;
+end;
+
+function TGrispTUIRenderer.SessionsVisible: Boolean;
+begin
+    Result := mSessionsVisible;
+end;
+
+function TGrispTUIRenderer.ThinkVisible: Boolean;
+begin
+    Result := mThinkVisible;
+end;
+
+function TGrispTUIRenderer.PlanVisible: Boolean;
+begin
+    Result := mPlanVisible;
+end;
+
+end.
+
+
+
+// File 5: GRISP.TUI.dpr
+program GRISP_TUI;
+
+{$APPTYPE CONSOLE}
+
+uses
+    System.SysUtils,
+    GRISP.TUI.App in 'GRISP.TUI.App.pas';
+
+begin
+    try
+        TGrispTUIApplication.Run;
+    except
+        on E: Exception do
+        begin
+            Writeln;
+            Writeln('GRISP TUI fatal error: ', E.ClassName, ': ', E.Message);
+            Writeln('Press ENTER to exit.');
+            Readln;
+            ExitCode := 1;
+        end;
+    end;
+end.
+
+
